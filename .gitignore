@@ -1,0 +1,31 @@
+# Gradle
+.gradle/
+build/
+out/
+classes/
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.project
+.classpath
+.settings/
+
+# Loom / Fabric
+remappedSrc/
+run/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Loominary state files
+config/loominary_state.json
+loominary_exports/
+
+# Logs
+*.log
+hs_err_pid*.log

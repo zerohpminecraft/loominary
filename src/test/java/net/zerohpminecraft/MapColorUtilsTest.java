@@ -12,6 +12,10 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class MapColorUtilsTest {
 
+    private static final float OKLAB_EPSILON = 1e-4f;
+
+    // ── countDistinct ────────────────────────────────────────────────────
+
     @Test
     void countDistinct_uniformColor() {
         byte[] colors = new byte[128 * 128];
@@ -40,36 +44,98 @@ class MapColorUtilsTest {
         assertEquals(255, PngToMapColors.countDistinct(colors));
     }
 
+    // ── chunksNeeded ─────────────────────────────────────────────────────
+
     @Test
     void chunksNeeded_exactDivisor() {
-        // Produce compressed bytes whose base64 length is exactly 3 * CHUNK_SIZE (48)
-        // so we get exactly 3 chunks with no remainder.
         byte[] data = new byte[128 * 128];
         byte[] compressed = Zstd.compress(data, Zstd.maxCompressionLevel());
         String b64 = Base64.getEncoder().encodeToString(compressed);
-
         int chunkSize = 48;
         int expected = (b64.length() + chunkSize - 1) / chunkSize;
         assertEquals(expected, PngToMapColors.chunksNeeded(compressed, chunkSize));
     }
 
     @Test
-    void chunksNeeded_oneByteOverBoundary() {
-        // Build a byte[] whose base64 is exactly chunkSize+1 chars long — must be 2 chunks.
-        // Base64: every 3 bytes → 4 chars.  For 49 chars we need ceiling(49*3/4) = 37 raw bytes.
-        // But it's easier to just parametrize with a known compressed output.
+    void chunksNeeded_ceilingBehavior() {
         int chunkSize = 4;
-        // 3 raw bytes → 4 base64 chars — but we want 5 chars = 2 chunks of size 4.
-        // 4 raw bytes → ceil = 8 base64 chars → 2 chunks of 4 exactly.
-        // 5 raw bytes → ceil = 8 base64 chars still.  Hard to control exact output size.
-        // Instead: just assert ceiling behavior directly on a constructed b64 length.
         for (int len = 1; len <= 32; len++) {
-            byte[] fake = new byte[len]; // doesn't matter what's in it, testing ceil formula
-            byte[] compressed = Zstd.compress(fake, Zstd.maxCompressionLevel());
+            byte[] compressed = Zstd.compress(new byte[len], Zstd.maxCompressionLevel());
             String b64 = Base64.getEncoder().encodeToString(compressed);
             int expected = (b64.length() + chunkSize - 1) / chunkSize;
             assertEquals(expected, PngToMapColors.chunksNeeded(compressed, chunkSize),
                     "failed for len=" + len);
         }
+    }
+
+    // ── srgbToLinear ─────────────────────────────────────────────────────
+
+    @Test
+    void srgbToLinear_zero_isZero() {
+        assertEquals(0f, PngToMapColors.srgbToLinear(0f), OKLAB_EPSILON);
+    }
+
+    @Test
+    void srgbToLinear_one_isOne() {
+        assertEquals(1f, PngToMapColors.srgbToLinear(1f), OKLAB_EPSILON);
+    }
+
+    @Test
+    void srgbToLinear_lowBranch_isLinear() {
+        // Below threshold (0.04045) the formula is c / 12.92
+        float c = 0.01f;
+        assertEquals(c / 12.92f, PngToMapColors.srgbToLinear(c), OKLAB_EPSILON);
+    }
+
+    @Test
+    void srgbToLinear_highBranch_isPower() {
+        // Above threshold the formula is ((c + 0.055) / 1.055)^2.4
+        float c = 0.5f;
+        float expected = (float) Math.pow((c + 0.055f) / 1.055f, 2.4);
+        assertEquals(expected, PngToMapColors.srgbToLinear(c), OKLAB_EPSILON);
+    }
+
+    // ── rgbToOklab ───────────────────────────────────────────────────────
+
+    @Test
+    void rgbToOklab_black_isOrigin() {
+        float[] lab = PngToMapColors.rgbToOklab(0x000000);
+        assertEquals(0f, lab[0], OKLAB_EPSILON);
+        assertEquals(0f, lab[1], OKLAB_EPSILON);
+        assertEquals(0f, lab[2], OKLAB_EPSILON);
+    }
+
+    @Test
+    void rgbToOklab_white_isLOne_abNearZero() {
+        float[] lab = PngToMapColors.rgbToOklab(0xFFFFFF);
+        assertEquals(1f,  lab[0], OKLAB_EPSILON);
+        assertEquals(0f,  lab[1], OKLAB_EPSILON);
+        assertEquals(0f,  lab[2], OKLAB_EPSILON);
+    }
+
+    @Test
+    void rgbToOklab_sameColor_zeroDistance() {
+        float[] a = PngToMapColors.rgbToOklab(0x4A90D9);
+        float[] b = PngToMapColors.rgbToOklab(0x4A90D9);
+        float dist = (a[0]-b[0])*(a[0]-b[0]) + (a[1]-b[1])*(a[1]-b[1]) + (a[2]-b[2])*(a[2]-b[2]);
+        assertEquals(0f, dist, OKLAB_EPSILON);
+    }
+
+    @Test
+    void rgbToOklab_differentColors_nonZeroDistance() {
+        float[] red   = PngToMapColors.rgbToOklab(0xFF0000);
+        float[] green = PngToMapColors.rgbToOklab(0x00FF00);
+        float dist = (red[0]-green[0])*(red[0]-green[0])
+                   + (red[1]-green[1])*(red[1]-green[1])
+                   + (red[2]-green[2])*(red[2]-green[2]);
+        assertTrue(dist > 0.01f, "red and green should be far apart in Oklab");
+    }
+
+    @Test
+    void rgbToOklab_midGray_abNearZero() {
+        // Neutral grays have chroma ≈ 0 in any perceptual color space
+        float[] lab = PngToMapColors.rgbToOklab(0x808080);
+        assertEquals(0f, lab[1], 0.01f, "mid-gray a should be near zero");
+        assertEquals(0f, lab[2], 0.01f, "mid-gray b should be near zero");
     }
 }

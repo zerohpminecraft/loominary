@@ -7,9 +7,13 @@ import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.util.Base64;
+
 /**
  * Converts a BufferedImage into the 128×128 byte array that MapState.colors uses,
  * and can progressively reduce color count to fit a compressed size budget.
+ *
+ * Nearest-color matching uses Oklab perceptual distance rather than RGB Euclidean,
+ * which gives noticeably better results in both quantization and palette reduction.
  */
 public class PngToMapColors {
 
@@ -42,10 +46,12 @@ public class PngToMapColors {
         g.drawImage(source, 0, 0, MAP_SIZE, MAP_SIZE, null);
         g.dispose();
 
+        float[][] oklabLookup = buildOklabLookup();
         byte[] out = new byte[MAP_BYTES];
         for (int y = 0; y < MAP_SIZE; y++) {
             for (int x = 0; x < MAP_SIZE; x++) {
-                out[x + y * MAP_SIZE] = findClosestMapColorByte(scaled.getRGB(x, y), legalOnly);
+                out[x + y * MAP_SIZE] = findClosestMapColorByte(
+                        scaled.getRGB(x, y), legalOnly, oklabLookup);
             }
         }
         return out;
@@ -78,13 +84,9 @@ public class PngToMapColors {
      * Algorithm:
      *   1. Count frequency of each distinct color byte
      *   2. Find the rarest color (fewest pixels)
-     *   3. Replace it with its nearest visual neighbor (by RGB distance)
+     *   3. Replace it with its nearest visual neighbor (by Oklab distance)
      *   4. Re-compress and check size
      *   5. Repeat until it fits
-     *
-     * This minimizes visual impact because the rarest colors affect the fewest
-     * pixels. Convergence is guaranteed — in the degenerate case we reduce to
-     * a single color, which compresses to nearly nothing.
      *
      * @param mapColors  the 128×128 map-color byte array (will be modified in place)
      * @param chunkSize  base64 chars per banner chunk
@@ -92,27 +94,19 @@ public class PngToMapColors {
      * @return FitResult with the reduced map colors and compression stats
      */
     public static FitResult reduceToFit(byte[] mapColors, int chunkSize, int maxChunks) {
-        // Pre-compute RGB for every possible map color byte (0–255)
-        // so we don't re-derive it during distance calculations.
-        int[] colorRgb = buildColorLookup();
+        float[][] oklabLookup = buildOklabLookup();
 
-        // Count original distinct colors (excluding transparent/0)
         int originalDistinct = countDistinct(mapColors);
         int colorsRemoved = 0;
         int pixelsAffected = 0;
 
-        // Initial compression attempt
         byte[] compressed = Zstd.compress(mapColors, Zstd.maxCompressionLevel());
         int chunks = chunksNeeded(compressed, chunkSize);
 
         while (chunks > maxChunks) {
-            // Count frequency of each color byte
             int[] freq = new int[256];
-            for (byte b : mapColors) {
-                freq[b & 0xFF]++;
-            }
+            for (byte b : mapColors) freq[b & 0xFF]++;
 
-            // Find the rarest non-zero-frequency color (skip byte 0 = transparent)
             int rarestColor = -1;
             int rarestFreq = Integer.MAX_VALUE;
             for (int c = 1; c < 256; c++) {
@@ -124,22 +118,17 @@ public class PngToMapColors {
 
             if (rarestColor == -1) break;
 
-            // Find the nearest visual neighbor among colors still in use
-            int bestNeighbor = findNearestNeighbor(rarestColor, freq, colorRgb);
+            int bestNeighbor = findNearestNeighbor(rarestColor, freq, oklabLookup);
             if (bestNeighbor == rarestColor) break;
 
-            // Replace all pixels of the rarest color with its nearest neighbor
             byte from = (byte) rarestColor;
-            byte to = (byte) bestNeighbor;
+            byte to   = (byte) bestNeighbor;
             for (int i = 0; i < mapColors.length; i++) {
-                if (mapColors[i] == from) {
-                    mapColors[i] = to;
-                }
+                if (mapColors[i] == from) mapColors[i] = to;
             }
             colorsRemoved++;
             pixelsAffected += rarestFreq;
 
-            // Re-compress and check
             compressed = Zstd.compress(mapColors, Zstd.maxCompressionLevel());
             chunks = chunksNeeded(compressed, chunkSize);
         }
@@ -149,7 +138,8 @@ public class PngToMapColors {
 
     /**
      * Builds an array mapping each possible map-color byte (0–255) to its
-     * rendered RGB value, for fast distance lookups.
+     * rendered RGB value. Used by the palette command for display; color matching
+     * uses buildOklabLookup() instead.
      */
     public static int[] buildColorLookup() {
         int[] rgb = new int[256];
@@ -168,7 +158,6 @@ public class PngToMapColors {
                 continue;
             }
 
-            // Find the Brightness with matching id
             for (MapColor.Brightness br : MapColor.Brightness.values()) {
                 if (br.id == shadeId) {
                     rgb[b] = mc.getRenderColor(br);
@@ -180,45 +169,63 @@ public class PngToMapColors {
     }
 
     /**
-     * Finds the color byte (among those currently in use) that is visually
-     * nearest to the given color, by squared RGB distance.
+     * Builds an Oklab lookup table for all valid map-color bytes.
+     * Entries for transparent or invalid bytes are null.
      */
-    private static int findNearestNeighbor(int color, int[] freq, int[] colorRgb) {
-        int cr = (colorRgb[color] >> 16) & 0xFF;
-        int cg = (colorRgb[color] >>  8) & 0xFF;
-        int cb =  colorRgb[color]        & 0xFF;
+    private static float[][] buildOklabLookup() {
+        float[][] oklab = new float[256][];
+        for (int b = 1; b < 256; b++) {
+            int colorId = (b >> 2) & 0x3F;
+            int shadeId = b & 0x3;
+            if (colorId == 0) continue;
 
-        int bestDist = Integer.MAX_VALUE;
-        int bestColor = color;
+            MapColor mc = MapColor.get(colorId);
+            if (mc == null || mc.color == 0) continue;
 
-        for (int c = 1; c < 256; c++) {
-            if (c == color || freq[c] == 0) continue;
-            if (colorRgb[c] == 0) continue;
-
-            int nr = (colorRgb[c] >> 16) & 0xFF;
-            int ng = (colorRgb[c] >>  8) & 0xFF;
-            int nb =  colorRgb[c]        & 0xFF;
-
-            int dr = cr - nr, dg = cg - ng, db = cb - nb;
-            int dist = dr * dr + dg * dg + db * db;
-
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestColor = c;
+            for (MapColor.Brightness br : MapColor.Brightness.values()) {
+                if (br.id == shadeId) {
+                    oklab[b] = rgbToOklab(mc.getRenderColor(br));
+                    break;
+                }
             }
         }
-        return bestColor;
+        return oklab;
+    }
+
+    /**
+     * Converts a packed sRGB int (0xRRGGBB) to Oklab float[]{L, a, b}.
+     * Alpha channel is ignored.
+     */
+    static float[] rgbToOklab(int rgb) {
+        float r  = srgbToLinear(((rgb >> 16) & 0xFF) / 255f);
+        float g  = srgbToLinear(((rgb >>  8) & 0xFF) / 255f);
+        float bl = srgbToLinear(( rgb        & 0xFF) / 255f);
+
+        float lms0 = 0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * bl;
+        float lms1 = 0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * bl;
+        float lms2 = 0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * bl;
+
+        float l_ = (float) Math.cbrt(lms0);
+        float m_ = (float) Math.cbrt(lms1);
+        float s_ = (float) Math.cbrt(lms2);
+
+        return new float[] {
+            0.2104542553f * l_ + 0.7936177850f * m_ - 0.0040720468f * s_,
+            1.9779984951f * l_ - 2.4285922050f * m_ + 0.4505937099f * s_,
+            0.0259040371f * l_ + 0.7827717662f * m_ - 0.8086757660f * s_
+        };
+    }
+
+    /** sRGB gamma expansion (IEC 61966-2-1). */
+    static float srgbToLinear(float c) {
+        return c <= 0.04045f ? c / 12.92f : (float) Math.pow((c + 0.055f) / 1.055f, 2.4);
     }
 
     public static int countDistinct(byte[] mapColors) {
         boolean[] seen = new boolean[256];
-        for (byte b : mapColors) {
-            seen[b & 0xFF] = true;
-        }
+        for (byte b : mapColors) seen[b & 0xFF] = true;
         int count = 0;
-        for (int i = 1; i < 256; i++) { // skip 0 = transparent
-            if (seen[i]) count++;
-        }
+        for (int i = 1; i < 256; i++) if (seen[i]) count++;
         return count;
     }
 
@@ -227,38 +234,51 @@ public class PngToMapColors {
         return (base64.length() + chunkSize - 1) / chunkSize;
     }
 
-    private static byte findClosestMapColorByte(int argb, boolean legalOnly) {
-        int alpha = (argb >>> 24) & 0xFF;
-        if (alpha < 128) return 0;
+    private static byte findClosestMapColorByte(int argb, boolean legalOnly,
+                                                 float[][] oklabLookup) {
+        if (((argb >>> 24) & 0xFF) < 128) return 0;
 
-        int pr = (argb >> 16) & 0xFF;
-        int pg = (argb >>  8) & 0xFF;
-        int pb =  argb        & 0xFF;
-
-        double bestDist = Double.MAX_VALUE;
+        float[] target = rgbToOklab(argb);
+        float bestDist = Float.MAX_VALUE;
         byte bestByte = 0;
 
-        for (int id = 1; id < MAX_COLOR_ID; id++) {
-            MapColor mc = MapColor.get(id);
-            if (mc == null || mc.color == 0) continue;
+        for (int b = 1; b < 256; b++) {
+            if (oklabLookup[b] == null) continue;
+            if (legalOnly && (b & 0x3) == UNOBTAINABLE_SHADE_ID) continue;
 
-            for (MapColor.Brightness brightness : MapColor.Brightness.values()) {
-                if (legalOnly && brightness.id == UNOBTAINABLE_SHADE_ID) continue;
+            float dL = target[0] - oklabLookup[b][0];
+            float da = target[1] - oklabLookup[b][1];
+            float db = target[2] - oklabLookup[b][2];
+            float dist = dL * dL + da * da + db * db;
 
-                int rgb = mc.getRenderColor(brightness);
-                int mr = (rgb >> 16) & 0xFF;
-                int mg = (rgb >>  8) & 0xFF;
-                int mb =  rgb        & 0xFF;
-
-                int dr = pr - mr, dg = pg - mg, db = pb - mb;
-                double dist = dr * dr + dg * dg + db * db;
-
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestByte = mc.getRenderColorByte(brightness);
-                }
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestByte = (byte) b;
             }
         }
         return bestByte;
+    }
+
+    private static int findNearestNeighbor(int color, int[] freq, float[][] oklabLookup) {
+        float[] target = oklabLookup[color];
+        if (target == null) return color;
+
+        float bestDist = Float.MAX_VALUE;
+        int bestColor = color;
+
+        for (int c = 1; c < 256; c++) {
+            if (c == color || freq[c] == 0 || oklabLookup[c] == null) continue;
+
+            float dL = target[0] - oklabLookup[c][0];
+            float da = target[1] - oklabLookup[c][1];
+            float db = target[2] - oklabLookup[c][2];
+            float dist = dL * dL + da * da + db * db;
+
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestColor = c;
+            }
+        }
+        return bestColor;
     }
 }

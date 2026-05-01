@@ -35,27 +35,19 @@ JUnit 5 wired up. 22 tests passing. Still missing:
 
 ## High-value features
 
-### Auto-right-click of banners with map
-Once banners are placed in a 128×128 area and the player is holding the right map, automate the right-click step. Each banner needs to be in range (~4.5 blocks) and visible. Probably:
-- Walk near each banner using vanilla movement
-- Look at it
-- Send `PlayerInteractEntityC2SPacket`
-- Verify the marker appeared
-- Move to the next
+### ~~Auto-right-click of banners with map~~
+~~Once banners are placed in a 128×128 area and the player is holding the right map, automate the right-click step.~~
 
-Anti-cheat-friendly version: do this slowly and with realistic movement deltas. Anti-cheat-aggressive version: just spam interactions and hope for the best.
+**Shipped.** `/loominary click` (toggle) / `/loominary click stop`. Player walks near each row of banners while holding the map; the handler scans a ±5-block cube every 5 ticks, picks the closest unregistered banner in reach, computes a face-aware `BlockHitResult`, and calls `interactionManager.interactBlock`. Auto-stops when `MapBannerDecoder` marks the map as claimed. Action-bar overlay shows remaining count. No movement automation — the player handles walking; the mod handles clicking.
 
-This is the single most tedious manual step in the workflow.
+Possible future improvement: automatic path-finding to unvisited banners so the player doesn't need to walk at all.
 
-### Wall-grid preview
-Currently `/loominary preview` paints only the active tile onto the crosshair-targeted map. Extend it to:
-- Detect that the active batch has multiple tiles
-- Look at any framed map in a wall of framed maps
-- Identify the grid layout from adjacent framed maps in 6 directions
-- Paint the entire grid in the appropriate orientation
-- Suppress decorations across all painted maps
+### ~~Wall-grid preview~~
+~~Currently `/loominary preview` paints only the active tile onto the crosshair-targeted map.~~
 
-Bonus: visual indicator showing which tile is going to which map before committing.
+**Shipped.** `/loominary preview` now BFS-flood-fills from the targeted frame along the wall plane (±right-axis, ±Y), discovers all adjacent same-facing filled-map frames within 24 blocks, and paints the matching tile onto each. Grid dimensions must match the batch exactly or the command refuses with a descriptive error. `originalColors` is populated for every frame so `/loominary revert` works on any map individually. Decoration suppression deferred (decoder relies on them).
+
+Open: visual pre-commit indicator ("which tile goes where" before painting).
 
 ### Floyd-Steinberg dithering (compression-aware variant)
 Differentiation angle vs. existing mapart tools:

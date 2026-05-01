@@ -81,6 +81,10 @@ public class PngToMapColors {
      * Progressively reduces the color palette of a map-color byte array until
      * the compressed+base64'd result fits within maxChunks banner chunks.
      *
+     * The optional {@code prefix} (e.g. manifest bytes) is prepended to mapColors
+     * before compression so that the size check includes its overhead. Pass an
+     * empty array or use the 3-arg form when there is no prefix.
+     *
      * Algorithm:
      *   1. Count frequency of each distinct color byte
      *   2. Find the rarest color (fewest pixels)
@@ -89,18 +93,19 @@ public class PngToMapColors {
      *   5. Repeat until it fits
      *
      * @param mapColors  the 128×128 map-color byte array (will be modified in place)
+     * @param prefix     bytes prepended before compression (manifest); may be empty
      * @param chunkSize  base64 chars per banner chunk
      * @param maxChunks  maximum number of chunks (banners) allowed
      * @return FitResult with the reduced map colors and compression stats
      */
-    public static FitResult reduceToFit(byte[] mapColors, int chunkSize, int maxChunks) {
+    public static FitResult reduceToFit(byte[] mapColors, byte[] prefix, int chunkSize, int maxChunks) {
         float[][] oklabLookup = buildOklabLookup();
 
         int originalDistinct = countDistinct(mapColors);
         int colorsRemoved = 0;
         int pixelsAffected = 0;
 
-        byte[] compressed = Zstd.compress(mapColors, Zstd.maxCompressionLevel());
+        byte[] compressed = compressCombined(prefix, mapColors);
         int chunks = chunksNeeded(compressed, chunkSize);
 
         while (chunks > maxChunks) {
@@ -129,11 +134,24 @@ public class PngToMapColors {
             colorsRemoved++;
             pixelsAffected += rarestFreq;
 
-            compressed = Zstd.compress(mapColors, Zstd.maxCompressionLevel());
+            compressed = compressCombined(prefix, mapColors);
             chunks = chunksNeeded(compressed, chunkSize);
         }
 
         return new FitResult(mapColors, compressed, colorsRemoved, originalDistinct, pixelsAffected);
+    }
+
+    /** Delegates to {@link #reduceToFit(byte[], byte[], int, int)} with no prefix. */
+    public static FitResult reduceToFit(byte[] mapColors, int chunkSize, int maxChunks) {
+        return reduceToFit(mapColors, new byte[0], chunkSize, maxChunks);
+    }
+
+    private static byte[] compressCombined(byte[] prefix, byte[] data) {
+        if (prefix.length == 0) return Zstd.compress(data, Zstd.maxCompressionLevel());
+        byte[] combined = new byte[prefix.length + data.length];
+        System.arraycopy(prefix, 0, combined, 0, prefix.length);
+        System.arraycopy(data, 0, combined, prefix.length, data.length);
+        return Zstd.compress(combined, Zstd.maxCompressionLevel());
     }
 
     /**

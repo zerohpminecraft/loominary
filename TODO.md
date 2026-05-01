@@ -4,31 +4,34 @@ Living roadmap for Loominary. Items grouped by rough priority. Strikethrough or 
 
 ## Foundational — do these first; they unblock or de-risk everything else
 
-### Versioned payload format
-Add a "manifest" structure (probably the first chunk per tile, or a reserved prefix) that records:
-- Format version number
-- Capability flags (dithering used, palette mode, etc.)
-- Tile dimensions (for grid awareness without requiring spatial inference)
-- Source filename hash or checksum
+### ~~Versioned payload format~~
+~~Add a "manifest" structure (probably the first chunk per tile, or a reserved prefix) that records:~~
+- ~~Format version number~~
+- ~~Capability flags (dithering used, palette mode, etc.)~~
+- ~~Tile dimensions (for grid awareness without requiring spatial inference)~~
+- ~~Source filename hash or checksum~~
 
-Without this, any future format change risks breaking everyone's existing encoded maps. With it, the decoder can detect old payloads and handle them gracefully, and new features can be opt-in via flags.
+~~Without this, any future format change risks breaking everyone's existing encoded maps. With it, the decoder can detect old payloads and handle them gracefully, and new features can be opt-in via flags.~~
 
-The manifest itself needs a stable, versioned format — meta-versioning. Probably a single byte for "manifest version" followed by a fixed schema for that version, with v0 being whatever we pick first.
+~~The manifest itself needs a stable, versioned format — meta-versioning. Probably a single byte for "manifest version" followed by a fixed schema for that version, with v0 being whatever we pick first.~~
 
-### Continuous integration via GitHub Actions
-- Build the mod on every push and PR
-- Run tests (once we have them)
-- On `v*` tag push, automatically build and attach jar to GitHub release
+**Shipped in v1.1.0.** Wire layout: `manifest_version`, `header_size` (skip-pointer), `flags`, `cols/rows/tile_col/tile_row`, `color_crc32` (CRC32 of map-color bytes, self-verifiable at decode), `username`, `title`. v0 payloads decode identically. `/loominary title` command sets the title embedded in subsequent encodes.
+
+### ~~Continuous integration via GitHub Actions~~
+- ~~Build the mod on every push and PR~~
+- ~~Run tests (once we have them)~~
+- ~~On `v*` tag push, automatically build and attach jar to GitHub release~~
 - Eventually: auto-publish to Modrinth/CurseForge on tagged release
 
-### Test infrastructure
-Currently zero tests. Targets that would benefit most from unit testing:
-- `PngToMapColors.convert` — color quantization is deterministic, easy to write fixtures for
-- `PngToMapColors.reduceToFit` — the reduction algorithm has clear before/after invariants
-- `MapBannerDecoder.reassemblePayload` — chunk reassembly with various edge cases
-- `LitematicExporter` — schematic NBT structure validation
+**Shipped in v1.1.0.** `build.yml` builds and runs tests on every push/PR. `release.yml` creates a GitHub release with the remapped jar on `v*` tag push.
 
-End-to-end testing the actual Minecraft integration is harder; probably out of scope for now.
+### Test infrastructure
+JUnit 5 wired up. 22 tests passing. Still missing:
+- `PngToMapColors.convert` — blocked on Minecraft API (`MapColor`); needs either Fabric game tests or extracting the color table as an injectable parameter
+- `PngToMapColors.reduceToFit` — same blocker
+- `LitematicExporter` — depends on Minecraft NBT API
+
+`MapBannerDecoder.reassemblePayload` is covered (6 tests including v0/v1, out-of-order chunks, corrupt payloads).
 
 ## High-value features
 

@@ -37,6 +37,13 @@ public class PayloadState {
     public static int gridRows = 1;
     public static int activeTileIndex = 0;
 
+    // ── Manifest metadata ──────────────────────────────────────────────
+
+    /** Whether the batch was encoded with allShades (FLAG_ALL_SHADES). */
+    public static boolean allShades = false;
+    /** Optional title embedded in every tile's manifest; null if not set. */
+    public static String currentTitle = null;
+
     // ── Per-tile data ──────────────────────────────────────────────────
 
     public static final List<TileData> tiles = new ArrayList<>();
@@ -52,6 +59,8 @@ public class PayloadState {
         int rows;
         int activeTileIndex;
         List<TileData> tiles;
+        boolean allShades;
+        String title;
     }
 
     public static int totalTiles() {
@@ -120,6 +129,8 @@ public class PayloadState {
             snap.rows = gridRows;
             snap.activeTileIndex = activeTileIndex;
             snap.tiles = new ArrayList<>(tiles);
+            snap.allShades = allShades;
+            snap.title = currentTitle;
             Files.writeString(stateFile(), GSON.toJson(snap));
         } catch (IOException e) {
             System.err.println(TAG + " Failed to save state: " + e.getMessage());
@@ -146,6 +157,8 @@ public class PayloadState {
             gridColumns = snap.columns > 0 ? snap.columns : 1;
             gridRows = snap.rows > 0 ? snap.rows : 1;
             activeTileIndex = snap.activeTileIndex;
+            allShades = snap.allShades;
+            currentTitle = snap.title;
 
             tiles.clear();
             tiles.addAll(snap.tiles);
@@ -174,6 +187,8 @@ public class PayloadState {
         gridColumns = 1;
         gridRows = 1;
         activeTileIndex = 0;
+        allShades = false;
+        currentTitle = null;
         tiles.clear();
         ACTIVE_CHUNKS.clear();
         activeChunkIndex = 0;

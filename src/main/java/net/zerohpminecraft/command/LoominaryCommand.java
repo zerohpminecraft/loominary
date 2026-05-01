@@ -20,6 +20,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.zerohpminecraft.MapBannerDecoder;
+import net.zerohpminecraft.PayloadManifest;
 import net.zerohpminecraft.PayloadState;
 import net.zerohpminecraft.PngToMapColors;
 import net.zerohpminecraft.SchematicExporter;
@@ -64,6 +65,31 @@ public class LoominaryCommand {
     private static final int MAX_CHUNKS = 255;
     private static final int MAP_SIZE = 128;
     private static final int MAP_BYTES = MAP_SIZE * MAP_SIZE;
+
+    // ── Encoding helpers ───────────────────────────────────────────────
+
+    /**
+     * Prepends the given manifest bytes to mapColors, compresses the combined
+     * payload with zstd, base64-encodes it, and splits it into indexed chunks
+     * ready to be stored as banner names.
+     */
+    private static List<String> buildChunks(byte[] manifestBytes, byte[] mapColors) {
+        byte[] combined = new byte[manifestBytes.length + mapColors.length];
+        System.arraycopy(manifestBytes, 0, combined, 0, manifestBytes.length);
+        System.arraycopy(mapColors, 0, combined, manifestBytes.length, mapColors.length);
+
+        byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+        String base64 = Base64.getEncoder().encodeToString(compressed);
+        int total = (base64.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        List<String> chunks = new ArrayList<>(total);
+        for (int i = 0; i < total; i++) {
+            int start = i * CHUNK_SIZE;
+            int end = Math.min(start + CHUNK_SIZE, base64.length());
+            chunks.add(String.format("%02x", i) + base64.substring(start, end));
+        }
+        return chunks;
+    }
 
     // ── Caches for revert / reduce undo ────────────────────────────────
 
@@ -156,6 +182,13 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("target", IntegerArgumentType.integer(1, 255))
                                             .executes(ctx -> reduce(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "target")))))
+
+                            // ── title ──────────────────────────────────────────
+                            .then(ClientCommandManager.literal("title")
+                                    .executes(ctx -> titleClear(ctx.getSource()))
+                                    .then(ClientCommandManager.argument("text", StringArgumentType.greedyString())
+                                            .executes(ctx -> titleSet(ctx.getSource(),
+                                                    StringArgumentType.getString(ctx, "text")))))
 
                             // ── export ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("export")
@@ -277,6 +310,9 @@ public class LoominaryCommand {
             int totalBannersNeeded = 0;
             int maxBannersPerTile = 0;
 
+            String playerName = source.getPlayer().getGameProfile().getName();
+            int tileFlags = allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+
             PayloadState.tiles.clear();
             List<String> tileNotes = new ArrayList<>();
             for (int tileIdx = 0; tileIdx < totalTiles; tileIdx++) {
@@ -287,29 +323,23 @@ public class LoominaryCommand {
                         col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE);
 
                 byte[] mapColors = PngToMapColors.convert(tileImg, !allShades);
-                byte[] compressed = Zstd.compress(mapColors, Zstd.maxCompressionLevel());
-                String base64 = Base64.getEncoder().encodeToString(compressed);
-                int tileChunks = (base64.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
                 String note = null;
-                if (tileChunks > MAX_CHUNKS) {
+                if (buildChunks(PayloadManifest.toBytes(tileFlags, columns, rows, col, row,
+                        0L, playerName, PayloadState.currentTitle), mapColors).size() > MAX_CHUNKS) {
                     PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
                             mapColors, CHUNK_SIZE, MAX_CHUNKS);
-                    compressed = fit.compressed;
-                    base64 = Base64.getEncoder().encodeToString(compressed);
-                    tileChunks = (base64.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
                     note = String.format("reduced %d→%d colors",
                             fit.originalDistinctColors,
                             fit.originalDistinctColors - fit.colorsRemoved);
                 }
+                byte[] manifestBytes = PayloadManifest.toBytes(
+                        tileFlags, columns, rows, col, row,
+                        PayloadManifest.crc32(mapColors), playerName, PayloadState.currentTitle);
+                List<String> chunks = buildChunks(manifestBytes, mapColors);
+                int tileChunks = chunks.size();
 
                 PayloadState.TileData tile = new PayloadState.TileData();
-                for (int i = 0; i < tileChunks; i++) {
-                    int start = i * CHUNK_SIZE;
-                    int end = Math.min(start + CHUNK_SIZE, base64.length());
-                    String chunk = base64.substring(start, end);
-                    tile.chunks.add(String.format("%02x", i) + chunk);
-                }
+                tile.chunks.addAll(chunks);
                 tile.currentIndex = 0;
                 PayloadState.tiles.add(tile);
                 tileNotes.add(note);
@@ -321,6 +351,7 @@ public class LoominaryCommand {
             PayloadState.currentSourceFilename = filename;
             PayloadState.gridColumns = columns;
             PayloadState.gridRows = rows;
+            PayloadState.allShades = allShades;
             PayloadState.activeTileIndex = 0;
             PayloadState.syncFromActiveTile();
             PayloadState.save();
@@ -386,21 +417,21 @@ public class LoominaryCommand {
             return 0;
 
         byte[] mapColors = fm.mapState.colors.clone();
-        byte[] compressed = Zstd.compress(mapColors, Zstd.maxCompressionLevel());
-        String base64 = Base64.getEncoder().encodeToString(compressed);
-        int totalChunks = (base64.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
+        String playerName = source.getPlayer().getGameProfile().getName();
+        // Stolen tiles are standalone — use 1×1 grid, allShades=false (unknown origin)
         String note = null;
-        if (totalChunks > MAX_CHUNKS) {
+        if (buildChunks(PayloadManifest.toBytes(0, 1, 1, 0, 0, 0L, playerName,
+                PayloadState.currentTitle), mapColors).size() > MAX_CHUNKS) {
             PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
                     mapColors, CHUNK_SIZE, MAX_CHUNKS);
-            compressed = fit.compressed;
-            base64 = Base64.getEncoder().encodeToString(compressed);
-            totalChunks = (base64.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
             note = String.format("reduced %d→%d colors",
                     fit.originalDistinctColors,
                     fit.originalDistinctColors - fit.colorsRemoved);
         }
+        byte[] manifestBytes = PayloadManifest.toBytes(
+                0, 1, 1, 0, 0, PayloadManifest.crc32(mapColors), playerName,
+                PayloadState.currentTitle);
+        List<String> chunks = buildChunks(manifestBytes, mapColors);
 
         // Append as a new tile
         if (!PayloadState.tiles.isEmpty()) {
@@ -408,12 +439,7 @@ public class LoominaryCommand {
         }
 
         PayloadState.TileData tile = new PayloadState.TileData();
-        for (int i = 0; i < totalChunks; i++) {
-            int start = i * CHUNK_SIZE;
-            int end = Math.min(start + CHUNK_SIZE, base64.length());
-            String chunk = base64.substring(start, end);
-            tile.chunks.add(String.format("%02x", i) + chunk);
-        }
+        tile.chunks.addAll(chunks);
         tile.currentIndex = 0;
         PayloadState.tiles.add(tile);
 
@@ -425,12 +451,11 @@ public class LoominaryCommand {
         PayloadState.syncFromActiveTile();
         PayloadState.save();
 
-        double ratio = 100.0 * compressed.length / mapColors.length;
         String msg = String.format(
-                "§aStole map id=%d at %s → %s: %d B compressed (%.1f%%), %d banners.",
+                "§aStole map id=%d at %s → %s: %d banners.",
                 fm.mapId.id(), maskedPos(fm.frame.getBlockPos()),
                 PayloadState.tileLabel(tileIdx),
-                compressed.length, ratio, totalChunks);
+                chunks.size());
         if (note != null)
             msg += " §e(" + note + ")";
         source.sendFeedback(Text.literal(msg));
@@ -463,6 +488,9 @@ public class LoominaryCommand {
                 fname, PayloadState.gridColumns, PayloadState.gridRows,
                 PayloadState.totalTiles(),
                 PayloadState.totalTiles() == 1 ? "" : "s")));
+        if (PayloadState.currentTitle != null) {
+            source.sendFeedback(Text.literal("§7Title: §f" + PayloadState.currentTitle));
+        }
 
         int totalDone = 0, totalChunks = 0;
         for (int i = 0; i < PayloadState.tiles.size(); i++) {
@@ -731,16 +759,19 @@ public class LoominaryCommand {
             PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
                     mapColors, CHUNK_SIZE, target);
 
-            String base64 = Base64.getEncoder().encodeToString(fit.compressed);
-            int newChunks = (base64.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            // Re-encode with manifest using current batch metadata
+            String playerName = source.getPlayer().getGameProfile().getName();
+            int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+            byte[] manifestBytes = PayloadManifest.toBytes(
+                    flags,
+                    PayloadState.gridColumns, PayloadState.gridRows,
+                    PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
+                    PayloadManifest.crc32(fit.mapColors), playerName, PayloadState.currentTitle);
+            List<String> newChunkList = buildChunks(manifestBytes, fit.mapColors);
+            int newChunks = newChunkList.size();
 
             PayloadState.ACTIVE_CHUNKS.clear();
-            for (int i = 0; i < newChunks; i++) {
-                int start = i * CHUNK_SIZE;
-                int end = Math.min(start + CHUNK_SIZE, base64.length());
-                String chunk = base64.substring(start, end);
-                PayloadState.ACTIVE_CHUNKS.add(String.format("%02x", i) + chunk);
-            }
+            PayloadState.ACTIVE_CHUNKS.addAll(newChunkList);
             PayloadState.activeChunkIndex = 0;
             PayloadState.save();
 
@@ -790,6 +821,34 @@ public class LoominaryCommand {
                 "§aUndid reduction on %s: §e%d §7→ §f%d §7banners restored.",
                 PayloadState.tileLabel(tileIdx),
                 reducedBanners, saved.size())));
+        return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // title [<text>]
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int titleSet(FabricClientCommandSource source, String text) {
+        text = text.trim();
+        if (text.isEmpty()) {
+            return titleClear(source);
+        }
+        byte[] encoded = text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        if (encoded.length > 64) {
+            source.sendFeedback(Text.literal(
+                    "§e⚠ Title exceeds 64 UTF-8 bytes and will be truncated in the manifest."));
+        }
+        PayloadState.currentTitle = text;
+        PayloadState.save();
+        source.sendFeedback(Text.literal("§aTitle set: §f" + text
+                + " §7(applies to the next encode, not existing tiles)"));
+        return 1;
+    }
+
+    private static int titleClear(FabricClientCommandSource source) {
+        PayloadState.currentTitle = null;
+        PayloadState.save();
+        source.sendFeedback(Text.literal("§aTitle cleared."));
         return 1;
     }
 

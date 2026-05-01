@@ -15,6 +15,7 @@ import net.minecraft.util.math.Box;
 import net.zerohpminecraft.mixin.MapStateAccessor;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -137,12 +138,47 @@ public class MapBannerDecoder {
         if (originalSize < 0) {
             throw new IllegalStateException("Missing zstd frame content size — corrupt payload?");
         }
-        if (originalSize != MAP_BYTES) {
-            throw new IllegalStateException("Decompressed size " + originalSize
-                    + " != expected " + MAP_BYTES + " map bytes");
-        }
 
-        return Zstd.decompress(compressed, (int) originalSize);
+        if (originalSize == MAP_BYTES) {
+            // v0 payload (Loominary 1.0.0) — no manifest, decode directly
+            return Zstd.decompress(compressed, MAP_BYTES);
+        } else if (originalSize > MAP_BYTES) {
+            // v1+ payload — manifest prefix precedes map-color bytes
+            byte[] full = Zstd.decompress(compressed, (int) originalSize);
+            PayloadManifest manifest = PayloadManifest.fromBytes(full);
+
+            int offset = manifest.headerSize;
+            if (offset + MAP_BYTES > full.length) {
+                throw new IllegalStateException(
+                        "Manifest header_size=" + offset + " would read past payload end (" + full.length + " bytes)");
+            }
+
+            if (manifest.manifestVersion > PayloadManifest.CURRENT_VERSION) {
+                System.out.println(TAG + " Unknown manifest version " + manifest.manifestVersion
+                        + " — rendering image without metadata");
+            } else {
+                System.out.println(TAG + " Manifest: grid=" + manifest.cols + "x" + manifest.rows
+                        + " tile=(" + manifest.tileCol + "," + manifest.tileRow + ")"
+                        + (manifest.username != null ? " by=" + manifest.username : "")
+                        + (manifest.title    != null ? " title=\"" + manifest.title + "\"" : ""));
+            }
+
+            byte[] mapColors = Arrays.copyOfRange(full, offset, offset + MAP_BYTES);
+
+            if (manifest.colorCrc32 >= 0) {
+                long actualCrc = PayloadManifest.crc32(mapColors);
+                if (actualCrc != manifest.colorCrc32) {
+                    System.err.println(TAG + " CRC32 mismatch on map " + "— expected "
+                            + Long.toHexString(manifest.colorCrc32) + " got "
+                            + Long.toHexString(actualCrc) + " (rendering anyway)");
+                }
+            }
+
+            return mapColors;
+        } else {
+            throw new IllegalStateException("Decompressed size " + originalSize
+                    + " is smaller than MAP_BYTES — corrupt payload?");
+        }
     }
 
     public static void paintMap(MinecraftClient client,

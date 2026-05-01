@@ -19,6 +19,10 @@ import net.minecraft.item.map.MapState;
 import net.minecraft.text.Text;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.MapBannerDecoder;
 import net.zerohpminecraft.PayloadManifest;
 import net.zerohpminecraft.PayloadState;
@@ -33,6 +37,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -56,6 +61,8 @@ import java.util.Map;
  * /loominary palette — color stats for active tile
  * /loominary reduce [target] — reduce active tile to fit (default 255)
  * /loominary reduce undo — restore tile to pre-reduction state
+ * /loominary click — toggle auto-right-click of banners while holding map
+ * /loominary click stop — stop auto-clicking
  * /loominary export [name] — write a Litematica .litematic for active tile
  * /loominary clear [memory|disk] — clear state
  */
@@ -95,6 +102,11 @@ public class LoominaryCommand {
 
     private static final Map<Integer, byte[]> originalColors = new HashMap<>();
     private static final Map<Integer, List<String>> preReductionChunks = new HashMap<>();
+
+    /** Used by BannerAutoClickHandler to decide whether to repaint a blanked map. */
+    public static boolean hasPreviewFor(int mapId) {
+        return originalColors.containsKey(mapId);
+    }
 
     // ── Filename suggestions for tab-completion ────────────────────────
 
@@ -183,6 +195,12 @@ public class LoominaryCommand {
                                             .executes(ctx -> reduce(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "target")))))
 
+                            // ── click ──────────────────────────────────────────
+                            .then(ClientCommandManager.literal("click")
+                                    .executes(ctx -> clickToggle(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("stop")
+                                            .executes(ctx -> clickStop(ctx.getSource()))))
+
                             // ── title ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("title")
                                     .executes(ctx -> titleClear(ctx.getSource()))
@@ -267,6 +285,100 @@ public class LoominaryCommand {
             MapState mapState) {
     }
 
+    // col/row coords are 0-based, (0,0) = top-left of the discovered wall
+    private record GridCell(ItemFrameEntity frame,
+            MapIdComponent mapId,
+            MapState mapState,
+            int col, int row) {
+    }
+
+    /**
+     * Flood-fills from startFrame along the wall plane to discover all adjacent
+     * item frames that hold filled maps and face the same direction.
+     *
+     * Returns cells with (col, row) normalised so (0,0) is the top-left corner.
+     * Returns null if startFrame is on a floor or ceiling (UP/DOWN facing).
+     *
+     * Note: ItemFrameEntity.getBlockPos() returns the air block the frame sits
+     * in (same as the wall block it is attached to), so adjacent frames on the
+     * same wall differ by exactly 1 in the right/up axes.
+     */
+    private static List<GridCell> discoverMapGrid(MinecraftClient client,
+            ItemFrameEntity startFrame) {
+        Direction facing = startFrame.getHorizontalFacing();
+        if (facing.getAxis() == Direction.Axis.Y) return null;
+
+        Direction right = wallRightAxis(facing);
+        int rx = right.getOffsetX(), rz = right.getOffsetZ();
+
+        // Index every same-facing filled-map frame within reach by block position.
+        Vec3d center = startFrame.getPos();
+        Box box = new Box(center.x - 24, center.y - 24, center.z - 24,
+                          center.x + 24, center.y + 24, center.z + 24);
+        Map<BlockPos, ItemFrameEntity> byPos = new HashMap<>();
+        for (ItemFrameEntity f : client.world.getEntitiesByClass(
+                ItemFrameEntity.class, box, e -> true)) {
+            if (f.getHorizontalFacing() == facing
+                    && f.getHeldItemStack().getItem() instanceof FilledMapItem) {
+                byPos.put(f.getBlockPos(), f);
+            }
+        }
+
+        // BFS flood-fill. col increases rightward, row increases downward.
+        Map<BlockPos, int[]> coords = new HashMap<>();
+        ArrayDeque<BlockPos> queue = new ArrayDeque<>();
+        BlockPos start = startFrame.getBlockPos();
+        coords.put(start, new int[]{0, 0});
+        queue.add(start);
+
+        int[][] deltas = {
+            { rx, 0, rz,  1, 0},  // right  → col+1
+            {-rx, 0,-rz, -1, 0},  // left   → col-1
+            {0,   1, 0,   0,-1},  // up     → row-1
+            {0,  -1, 0,   0, 1}   // down   → row+1
+        };
+        while (!queue.isEmpty()) {
+            BlockPos cur = queue.poll();
+            int[] cc = coords.get(cur);
+            for (int[] d : deltas) {
+                BlockPos nb = cur.add(d[0], d[1], d[2]);
+                if (coords.containsKey(nb) || !byPos.containsKey(nb)) continue;
+                coords.put(nb, new int[]{cc[0] + d[3], cc[1] + d[4]});
+                queue.add(nb);
+            }
+        }
+
+        // Normalise so min col = 0, min row = 0 (top-left = 0,0).
+        int minCol = Integer.MAX_VALUE, minRow = Integer.MAX_VALUE;
+        for (int[] c : coords.values()) {
+            if (c[0] < minCol) minCol = c[0];
+            if (c[1] < minRow) minRow = c[1];
+        }
+
+        List<GridCell> cells = new ArrayList<>();
+        for (Map.Entry<BlockPos, int[]> e : coords.entrySet()) {
+            ItemFrameEntity f = byPos.get(e.getKey());
+            if (f == null) continue;
+            MapIdComponent mid = f.getHeldItemStack().get(DataComponentTypes.MAP_ID);
+            if (mid == null) continue;
+            MapState ms = FilledMapItem.getMapState(mid, client.world);
+            if (ms == null) continue;
+            cells.add(new GridCell(f, mid, ms,
+                    e.getValue()[0] - minCol, e.getValue()[1] - minRow));
+        }
+        return cells;
+    }
+
+    private static Direction wallRightAxis(Direction facing) {
+        return switch (facing) {
+            case SOUTH -> Direction.EAST;
+            case NORTH -> Direction.WEST;
+            case EAST  -> Direction.NORTH;
+            case WEST  -> Direction.SOUTH;
+            default    -> Direction.EAST;
+        };
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // import <file> [cols] [rows] [allshades]
     // ════════════════════════════════════════════════════════════════════
@@ -323,11 +435,12 @@ public class LoominaryCommand {
                         col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE);
 
                 byte[] mapColors = PngToMapColors.convert(tileImg, !allShades);
+                byte[] manifestForSizeCheck = PayloadManifest.toBytes(
+                        tileFlags, columns, rows, col, row, 0L, playerName, PayloadState.currentTitle);
                 String note = null;
-                if (buildChunks(PayloadManifest.toBytes(tileFlags, columns, rows, col, row,
-                        0L, playerName, PayloadState.currentTitle), mapColors).size() > MAX_CHUNKS) {
+                if (buildChunks(manifestForSizeCheck, mapColors).size() > MAX_CHUNKS) {
                     PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                            mapColors, CHUNK_SIZE, MAX_CHUNKS);
+                            mapColors, manifestForSizeCheck, CHUNK_SIZE, MAX_CHUNKS);
                     note = String.format("reduced %d→%d colors",
                             fit.originalDistinctColors,
                             fit.originalDistinctColors - fit.colorsRemoved);
@@ -419,11 +532,12 @@ public class LoominaryCommand {
         byte[] mapColors = fm.mapState.colors.clone();
         String playerName = source.getPlayer().getGameProfile().getName();
         // Stolen tiles are standalone — use 1×1 grid, allShades=false (unknown origin)
+        byte[] manifestForSizeCheck = PayloadManifest.toBytes(
+                0, 1, 1, 0, 0, 0L, playerName, PayloadState.currentTitle);
         String note = null;
-        if (buildChunks(PayloadManifest.toBytes(0, 1, 1, 0, 0, 0L, playerName,
-                PayloadState.currentTitle), mapColors).size() > MAX_CHUNKS) {
+        if (buildChunks(manifestForSizeCheck, mapColors).size() > MAX_CHUNKS) {
             PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                    mapColors, CHUNK_SIZE, MAX_CHUNKS);
+                    mapColors, manifestForSizeCheck, CHUNK_SIZE, MAX_CHUNKS);
             note = String.format("reduced %d→%d colors",
                     fit.originalDistinctColors,
                     fit.originalDistinctColors - fit.colorsRemoved);
@@ -623,21 +737,87 @@ public class LoominaryCommand {
         if (fm == null)
             return 0;
 
+        List<GridCell> cells = discoverMapGrid(fm.client, fm.frame);
+        if (cells == null) {
+            source.sendError(Text.literal(
+                    "§cThat map is in a floor or ceiling frame — wall frames only."));
+            return 0;
+        }
+        if (cells.isEmpty()) {
+            source.sendError(Text.literal("§cCouldn't read map ID from that frame."));
+            return 0;
+        }
+
+        int expectedCols = PayloadState.gridColumns;
+        int expectedRows = PayloadState.gridRows;
+
         try {
-            if (!originalColors.containsKey(fm.mapId.id())) {
-                originalColors.put(fm.mapId.id(), fm.mapState.colors.clone());
+            // Flush active-tile state so every tiles[i].chunks is current.
+            PayloadState.syncToActiveTile();
+
+            int painted = 0;
+            int outOfBounds = 0;
+            boolean[] tileWasPainted = new boolean[PayloadState.totalTiles()];
+
+            for (GridCell cell : cells) {
+                // Skip frames that fall outside the expected grid dimensions.
+                if (cell.col() >= expectedCols || cell.row() >= expectedRows) {
+                    outOfBounds++;
+                    continue;
+                }
+                int tileIdx = cell.row() * expectedCols + cell.col();
+                if (tileIdx >= PayloadState.tiles.size()) continue;
+                PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+                if (tile.chunks.isEmpty()) continue;
+
+                byte[] mapColors = MapBannerDecoder.reassemblePayload(
+                        new ArrayList<>(tile.chunks));
+
+                if (!originalColors.containsKey(cell.mapId().id())) {
+                    originalColors.put(cell.mapId().id(), cell.mapState().colors.clone());
+                }
+                MapBannerDecoder.paintMap(fm.client, cell.mapId(), cell.mapState(), mapColors);
+                tileWasPainted[tileIdx] = true;
+                painted++;
             }
 
-            byte[] mapColors = MapBannerDecoder.reassemblePayload(
-                    new ArrayList<>(PayloadState.ACTIVE_CHUNKS));
-            MapBannerDecoder.paintMap(fm.client, fm.mapId, fm.mapState, mapColors);
+            // Collect tile indices that had no corresponding frame.
+            List<Integer> missingTiles = new ArrayList<>();
+            for (int i = 0; i < tileWasPainted.length; i++) {
+                if (!tileWasPainted[i]) missingTiles.add(i);
+            }
 
-            source.sendFeedback(Text.literal(String.format(
-                    "§aPainted preview of %s onto map id=%d at %s",
-                    PayloadState.tileLabel(PayloadState.activeTileIndex),
-                    fm.mapId.id(),
-                    maskedPos(fm.frame.getBlockPos()))));
-            return 1;
+            if (expectedCols == 1 && expectedRows == 1) {
+                source.sendFeedback(Text.literal(String.format(
+                        "§aPainted preview of %s onto map id=%d at %s",
+                        PayloadState.tileLabel(PayloadState.activeTileIndex),
+                        fm.mapId.id(),
+                        maskedPos(fm.frame.getBlockPos()))));
+            } else {
+                source.sendFeedback(Text.literal(String.format(
+                        "§aPainted %d/%d tiles onto %d×%d grid.",
+                        painted, PayloadState.totalTiles(), expectedCols, expectedRows)));
+                if (!missingTiles.isEmpty()) {
+                    StringBuilder sb = new StringBuilder("§eNo frame found for: ");
+                    for (int i = 0; i < missingTiles.size(); i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(PayloadState.tileLabel(missingTiles.get(i)));
+                    }
+                    source.sendFeedback(Text.literal(sb.toString()));
+                }
+                if (outOfBounds > 0) {
+                    source.sendFeedback(Text.literal(String.format(
+                            "§e%d frame%s outside the expected %d×%d area (ignored).",
+                            outOfBounds, outOfBounds == 1 ? "" : "s",
+                            expectedCols, expectedRows)));
+                }
+                if (painted > 0) {
+                    source.sendFeedback(Text.literal(
+                            "§7Look at any painted map and run §f/loominary revert§7 to restore it."));
+                }
+            }
+            return painted > 0 ? 1 : 0;
+
         } catch (Exception e) {
             source.sendError(Text.literal("§cFailed to render preview: " + e.getMessage()));
             e.printStackTrace();
@@ -756,12 +936,20 @@ public class LoominaryCommand {
 
             byte[] mapColors = MapBannerDecoder.reassemblePayload(
                     new ArrayList<>(PayloadState.ACTIVE_CHUNKS));
-            PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                    mapColors, CHUNK_SIZE, target);
 
-            // Re-encode with manifest using current batch metadata
+            // Build manifest for size-check (CRC unknown until after reduction, use 0)
             String playerName = source.getPlayer().getGameProfile().getName();
             int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+            byte[] manifestForSizeCheck = PayloadManifest.toBytes(
+                    flags,
+                    PayloadState.gridColumns, PayloadState.gridRows,
+                    PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
+                    0L, playerName, PayloadState.currentTitle);
+
+            PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
+                    mapColors, manifestForSizeCheck, CHUNK_SIZE, target);
+
+            // Re-encode with manifest using real CRC of the reduced colors
             byte[] manifestBytes = PayloadManifest.toBytes(
                     flags,
                     PayloadState.gridColumns, PayloadState.gridRows,
@@ -821,6 +1009,43 @@ public class LoominaryCommand {
                 "§aUndid reduction on %s: §e%d §7→ §f%d §7banners restored.",
                 PayloadState.tileLabel(tileIdx),
                 reducedBanners, saved.size())));
+        return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // click [stop]
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int clickToggle(FabricClientCommandSource source) {
+        if (BannerAutoClickHandler.isActive()) {
+            BannerAutoClickHandler.stop();
+            source.sendFeedback(Text.literal("§aAuto-click stopped."));
+            return 1;
+        }
+        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
+            source.sendError(Text.literal(
+                    "§cNo active batch. Run §f/loominary import§c first."));
+            return 0;
+        }
+        MinecraftClient client = MinecraftClient.getInstance();
+        boolean started = BannerAutoClickHandler.start(client);
+        if (!started) return 0;
+        source.sendFeedback(Text.literal(
+                "§aAuto-click started. Hold your map and walk near the banners."));
+        source.sendFeedback(Text.literal(
+                "§7Run §f/loominary click stop§7 to cancel. Active tile: "
+                        + PayloadState.tileLabel(PayloadState.activeTileIndex)
+                        + " (§f" + PayloadState.ACTIVE_CHUNKS.size() + "§7 banners)"));
+        return 1;
+    }
+
+    private static int clickStop(FabricClientCommandSource source) {
+        if (!BannerAutoClickHandler.isActive()) {
+            source.sendFeedback(Text.literal("§7Auto-click is not running."));
+            return 1;
+        }
+        BannerAutoClickHandler.stop();
+        source.sendFeedback(Text.literal("§aAuto-click stopped."));
         return 1;
     }
 
@@ -918,6 +1143,8 @@ public class LoominaryCommand {
         PayloadState.clear();
         originalColors.clear();
         preReductionChunks.clear();
+        BannerAutoClickHandler.stop();
+        BannerAutoClickHandler.clearMarkers();
         source.sendFeedback(Text.literal("§aCleared all state."));
         return 1;
     }
@@ -926,6 +1153,7 @@ public class LoominaryCommand {
         PayloadState.clearMemory();
         originalColors.clear();
         preReductionChunks.clear();
+        BannerAutoClickHandler.clearMarkers();
         source.sendFeedback(Text.literal("§aCleared in-memory state. §7Disk file untouched."));
         return 1;
     }

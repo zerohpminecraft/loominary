@@ -189,6 +189,10 @@ public class MapBannerDecoder {
         client.getMapTextureManager().setNeedsUpdate(mapId, mapState);
     }
 
+    public static boolean isClaimed(int mapId) {
+        return claimedMaps.contains(mapId);
+    }
+
     public static void clearCache() {
         claimedMaps.clear();
     }

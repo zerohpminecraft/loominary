@@ -19,5 +19,6 @@ public class ClientModInit implements ClientModInitializer {
         LoominaryKeybindings.register();
         AnvilAutoFillHandler.register();
         MapBannerDecoder.register();
+        BannerAutoClickHandler.register();
     }
 }

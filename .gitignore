@@ -4,6 +4,9 @@ build/
 out/
 classes/
 
+# IDE compiled output
+bin/
+
 # IDE
 .idea/
 *.iml

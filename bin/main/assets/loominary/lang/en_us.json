@@ -1,8 +1,0 @@
-{
-    "key.categories.loominary": "Loominary",
-    "key.loominary.steal": "Steal map at crosshair",
-    "key.loominary.preview": "Preview active tile on crosshair map",
-    "key.loominary.revert": "Revert previewed map at crosshair",
-    "key.loominary.tile_next": "Switch to next incomplete tile",
-    "key.loominary.status": "Show batch status"
-}

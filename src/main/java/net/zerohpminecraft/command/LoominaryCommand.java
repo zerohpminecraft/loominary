@@ -60,6 +60,7 @@ import java.util.concurrent.ThreadLocalRandom;
  * /loominary tile next — switch to next incomplete tile
  * /loominary preview — paint active tile onto crosshair map
  * /loominary revert — restore a previewed map to its original
+ * /loominary dither [all] [colors <n>] — re-encode from source with Floyd-Steinberg dithering
  * /loominary palette — color stats + rarity histogram for active tile
  * /loominary reduce [all] [<n>] — reduce tile(s) to n banners (default 255)
  * /loominary reduce [all] colors <n> — reduce tile(s) to n distinct colors
@@ -142,10 +143,16 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("filename", StringArgumentType.string())
                                             .suggests(FILENAME_SUGGESTIONS)
                                             .executes(ctx -> importFile(ctx.getSource(),
-                                                    StringArgumentType.getString(ctx, "filename"), 1, 1, false))
+                                                    StringArgumentType.getString(ctx, "filename"), 1, 1, false, false))
+                                            .then(ClientCommandManager.literal("dither")
+                                                    .executes(ctx -> importFile(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "filename"), 1, 1, false, true)))
                                             .then(ClientCommandManager.literal("allshades")
                                                     .executes(ctx -> importFile(ctx.getSource(),
-                                                            StringArgumentType.getString(ctx, "filename"), 1, 1, true)))
+                                                            StringArgumentType.getString(ctx, "filename"), 1, 1, true, false))
+                                                    .then(ClientCommandManager.literal("dither")
+                                                            .executes(ctx -> importFile(ctx.getSource(),
+                                                                    StringArgumentType.getString(ctx, "filename"), 1, 1, true, true))))
                                             .then(ClientCommandManager
                                                     .argument("columns", IntegerArgumentType.integer(1, 16))
                                                     .then(ClientCommandManager
@@ -153,15 +160,22 @@ public class LoominaryCommand {
                                                             .executes(ctx -> importFile(ctx.getSource(),
                                                                     StringArgumentType.getString(ctx, "filename"),
                                                                     IntegerArgumentType.getInteger(ctx, "columns"),
-                                                                    IntegerArgumentType.getInteger(ctx, "rows"), false))
+                                                                    IntegerArgumentType.getInteger(ctx, "rows"), false, false))
+                                                            .then(ClientCommandManager.literal("dither")
+                                                                    .executes(ctx -> importFile(ctx.getSource(),
+                                                                            StringArgumentType.getString(ctx, "filename"),
+                                                                            IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                            IntegerArgumentType.getInteger(ctx, "rows"), false, true)))
                                                             .then(ClientCommandManager.literal("allshades")
                                                                     .executes(ctx -> importFile(ctx.getSource(),
-                                                                            StringArgumentType.getString(ctx,
-                                                                                    "filename"),
-                                                                            IntegerArgumentType.getInteger(ctx,
-                                                                                    "columns"),
-                                                                            IntegerArgumentType.getInteger(ctx, "rows"),
-                                                                            true)))))))
+                                                                            StringArgumentType.getString(ctx, "filename"),
+                                                                            IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                            IntegerArgumentType.getInteger(ctx, "rows"), true, false))
+                                                                    .then(ClientCommandManager.literal("dither")
+                                                                            .executes(ctx -> importFile(ctx.getSource(),
+                                                                                    StringArgumentType.getString(ctx, "filename"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "rows"), true, true))))))))
 
                             // ── status ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("status")
@@ -230,6 +244,20 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("name", StringArgumentType.string())
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
+
+                            // ── dither ─────────────────────────────────────────
+                            .then(ClientCommandManager.literal("dither")
+                                    .executes(ctx -> dither(ctx.getSource(), false, 0))
+                                    .then(ClientCommandManager.literal("all")
+                                            .executes(ctx -> dither(ctx.getSource(), true, 0))
+                                            .then(ClientCommandManager.literal("colors")
+                                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
+                                                            .executes(ctx -> dither(ctx.getSource(), true,
+                                                                    IntegerArgumentType.getInteger(ctx, "n"))))))
+                                    .then(ClientCommandManager.literal("colors")
+                                            .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
+                                                    .executes(ctx -> dither(ctx.getSource(), false,
+                                                            IntegerArgumentType.getInteger(ctx, "n"))))))
 
                             // ── resalt ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("resalt")
@@ -404,7 +432,7 @@ public class LoominaryCommand {
     // ════════════════════════════════════════════════════════════════════
 
     private static int importFile(FabricClientCommandSource source,
-            String filename, int columns, int rows, boolean allShades) {
+            String filename, int columns, int rows, boolean allShades, boolean dither) {
         if (filename.isEmpty()) {
             source.sendError(Text.literal("§cUsage: /loominary import <filename> [cols] [rows] [allshades]"));
             return 0;
@@ -454,7 +482,9 @@ public class LoominaryCommand {
                 BufferedImage tileImg = scaled.getSubimage(
                         col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE);
 
-                byte[] mapColors = PngToMapColors.convert(tileImg, !allShades);
+                byte[] mapColors = dither
+                        ? PngToMapColors.convertTwoPass(tileImg, !allShades, 0, true)
+                        : PngToMapColors.convert(tileImg, !allShades);
                 byte[] manifestForSizeCheck = PayloadManifest.toBytes(
                         tileFlags, columns, rows, col, row, 0L, playerName, PayloadState.currentTitle);
                 String note = null;
@@ -498,11 +528,13 @@ public class LoominaryCommand {
                     totalBundles++;
             }
 
+            String modeTag = (allShades ? "all shades" : "legal palette")
+                    + (dither ? ", dithered" : "");
             source.sendFeedback(Text.literal(String.format(
                     "§aLoaded %s (%dx%d) as %dx%d grid (%d tile%s) §7[%s]",
                     filename, img.getWidth(), img.getHeight(),
                     columns, rows, totalTiles, totalTiles == 1 ? "" : "s",
-                    allShades ? "all shades" : "legal palette")));
+                    modeTag)));
 
             for (int i = 0; i < PayloadState.tiles.size(); i++) {
                 PayloadState.TileData tile = PayloadState.tiles.get(i);
@@ -1425,6 +1457,130 @@ public class LoominaryCommand {
         } catch (IOException e) {
             source.sendError(Text.literal("§cExport failed: " + e.getMessage()));
             e.printStackTrace();
+            return 0;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // dither [all] [colors <n>]
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int dither(FabricClientCommandSource source, boolean all, int targetColors) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+        if (PayloadState.currentSourceFilename == null) {
+            source.sendError(Text.literal(
+                    "§cNo source file on record. Stolen tiles cannot be re-encoded with dithering."));
+            return 0;
+        }
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        Path filePath = client.runDirectory.toPath()
+                .resolve("loominary_data")
+                .resolve(PayloadState.currentSourceFilename);
+
+        if (!Files.exists(filePath)) {
+            source.sendError(Text.literal("§cSource file not found: loominary_data/"
+                    + PayloadState.currentSourceFilename
+                    + "\n§cMove it back to re-encode with dithering."));
+            return 0;
+        }
+
+        try {
+            byte[] fileBytes = Files.readAllBytes(filePath);
+            BufferedImage img = ImageIO.read(new ByteArrayInputStream(fileBytes));
+            if (img == null) {
+                source.sendError(Text.literal("§cCouldn't decode source image."));
+                return 0;
+            }
+
+            int totalW = PayloadState.gridColumns * MAP_SIZE;
+            int totalH = PayloadState.gridRows    * MAP_SIZE;
+            BufferedImage scaled = new BufferedImage(totalW, totalH, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D g = scaled.createGraphics();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING,
+                    RenderingHints.VALUE_RENDER_QUALITY);
+            g.drawImage(img, 0, 0, totalW, totalH, null);
+            g.dispose();
+
+            PayloadState.syncToActiveTile();
+
+            String playerName = source.getPlayer().getGameProfile().getName();
+            int flags     = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+            boolean legal = !PayloadState.allShades;
+
+            int first = all ? 0 : PayloadState.activeTileIndex;
+            int last  = all ? PayloadState.tiles.size() - 1 : PayloadState.activeTileIndex;
+
+            int tilesEncoded = 0;
+            List<String> notes = new ArrayList<>();
+
+            for (int i = 0; i < PayloadState.tiles.size(); i++) {
+                if (i < first || i > last) { notes.add(null); continue; }
+                PayloadState.TileData tile = PayloadState.tiles.get(i);
+
+                int col = PayloadState.tileCol(i);
+                int row = PayloadState.tileRow(i);
+                BufferedImage tileImg = scaled.getSubimage(
+                        col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE);
+
+                // Save pre-dither state so reduce undo can restore it.
+                preReductionChunks.putIfAbsent(i, new ArrayList<>(tile.chunks));
+
+                byte[] mapColors = PngToMapColors.convertTwoPass(tileImg, legal, targetColors, true);
+
+                // Ensure within banner budget (reduceToFit is a no-op when already within).
+                byte[] manifest0 = PayloadManifest.toBytes(flags,
+                        PayloadState.gridColumns, PayloadState.gridRows,
+                        col, row, 0L, playerName, PayloadState.currentTitle, tile.nonce);
+                List<String> testChunks = buildChunks(manifest0, mapColors);
+                String budgetNote = "";
+                if (testChunks.size() > MAX_CHUNKS) {
+                    PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
+                            mapColors, manifest0, CHUNK_SIZE, MAX_CHUNKS);
+                    mapColors = fit.mapColors;
+                    budgetNote = String.format(", §ebudget reduced %d colors", fit.colorsRemoved);
+                }
+
+                byte[] manifest = PayloadManifest.toBytes(flags,
+                        PayloadState.gridColumns, PayloadState.gridRows,
+                        col, row, PayloadManifest.crc32(mapColors),
+                        playerName, PayloadState.currentTitle, tile.nonce);
+                List<String> newChunks = buildChunks(manifest, mapColors);
+
+                tile.chunks.clear();
+                tile.chunks.addAll(newChunks);
+                tile.currentIndex = 0;
+                tilesEncoded++;
+
+                notes.add(String.format("%d banners, %d colors%s",
+                        newChunks.size(), PngToMapColors.countDistinct(mapColors), budgetNote));
+            }
+
+            PayloadState.syncFromActiveTile();
+            PayloadState.save();
+
+            String colorNote = targetColors > 0
+                    ? String.format(" (palette: %d colors)", targetColors) : "";
+            source.sendFeedback(Text.literal(String.format(
+                    "§6=== Dithered %d tile%s%s ===",
+                    tilesEncoded, tilesEncoded == 1 ? "" : "s", colorNote)));
+            for (int i = 0; i < notes.size(); i++) {
+                if (notes.get(i) != null)
+                    source.sendFeedback(Text.literal(String.format("§7  %s: §f%s",
+                            PayloadState.tileLabel(i), notes.get(i))));
+            }
+            source.sendFeedback(Text.literal(
+                    "§7Use §f/loominary preview§7 to inspect. "
+                            + "§f/loominary reduce undo§7 reverts the active tile."));
+            return tilesEncoded > 0 ? 1 : 0;
+
+        } catch (IOException e) {
+            source.sendError(Text.literal("§cError reading source file: " + e.getMessage()));
             return 0;
         }
     }

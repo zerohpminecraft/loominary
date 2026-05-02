@@ -473,18 +473,24 @@ public class LoominaryCommand {
             String playerName = source.getPlayer().getGameProfile().getName();
             int tileFlags = allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
 
+            // When dithering, process the entire grid image at once so that palette
+            // pre-selection, the Otsu strength map, and error diffusion are globally
+            // consistent — no per-tile threshold resets or seams at tile boundaries.
+            byte[][] ditheredTiles = dither
+                    ? PngToMapColors.convertTwoPassGrid(scaled, !allShades, 0, true, columns, rows)
+                    : null;
+
             PayloadState.tiles.clear();
             List<String> tileNotes = new ArrayList<>();
             for (int tileIdx = 0; tileIdx < totalTiles; tileIdx++) {
                 int col = tileIdx % columns;
                 int row = tileIdx / columns;
 
-                BufferedImage tileImg = scaled.getSubimage(
-                        col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE);
-
                 byte[] mapColors = dither
-                        ? PngToMapColors.convertTwoPass(tileImg, !allShades, 0, true)
-                        : PngToMapColors.convert(tileImg, !allShades);
+                        ? ditheredTiles[tileIdx]
+                        : PngToMapColors.convert(
+                                scaled.getSubimage(col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE),
+                                !allShades);
                 byte[] manifestForSizeCheck = PayloadManifest.toBytes(
                         tileFlags, columns, rows, col, row, 0L, playerName, PayloadState.currentTitle);
                 String note = null;
@@ -1516,6 +1522,23 @@ public class LoominaryCommand {
             int first = all ? 0 : PayloadState.activeTileIndex;
             int last  = all ? PayloadState.tiles.size() - 1 : PayloadState.activeTileIndex;
 
+            // Process all affected tiles as a single image so palette selection,
+            // the Otsu dithering-strength map, and error diffusion are consistent
+            // across tile boundaries. For a single active tile use the 1×1 path.
+            byte[][] ditheredTiles;
+            if (all) {
+                ditheredTiles = PngToMapColors.convertTwoPassGrid(
+                        scaled, legal, targetColors, true,
+                        PayloadState.gridColumns, PayloadState.gridRows);
+            } else {
+                int col = PayloadState.tileCol(PayloadState.activeTileIndex);
+                int row = PayloadState.tileRow(PayloadState.activeTileIndex);
+                ditheredTiles = new byte[PayloadState.tiles.size()][];
+                ditheredTiles[PayloadState.activeTileIndex] = PngToMapColors.convertTwoPass(
+                        scaled.getSubimage(col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE),
+                        legal, targetColors, true);
+            }
+
             int tilesEncoded = 0;
             List<String> notes = new ArrayList<>();
 
@@ -1523,20 +1546,17 @@ public class LoominaryCommand {
                 if (i < first || i > last) { notes.add(null); continue; }
                 PayloadState.TileData tile = PayloadState.tiles.get(i);
 
-                int col = PayloadState.tileCol(i);
-                int row = PayloadState.tileRow(i);
-                BufferedImage tileImg = scaled.getSubimage(
-                        col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE);
-
                 // Save pre-dither state so reduce undo can restore it.
                 preReductionChunks.putIfAbsent(i, new ArrayList<>(tile.chunks));
 
-                byte[] mapColors = PngToMapColors.convertTwoPass(tileImg, legal, targetColors, true);
+                byte[] mapColors = ditheredTiles[i];
+                int tCol = PayloadState.tileCol(i);
+                int tRow = PayloadState.tileRow(i);
 
                 // Ensure within banner budget (reduceToFit is a no-op when already within).
                 byte[] manifest0 = PayloadManifest.toBytes(flags,
                         PayloadState.gridColumns, PayloadState.gridRows,
-                        col, row, 0L, playerName, PayloadState.currentTitle, tile.nonce);
+                        tCol, tRow, 0L, playerName, PayloadState.currentTitle, tile.nonce);
                 List<String> testChunks = buildChunks(manifest0, mapColors);
                 String budgetNote = "";
                 if (testChunks.size() > MAX_CHUNKS) {
@@ -1548,7 +1568,7 @@ public class LoominaryCommand {
 
                 byte[] manifest = PayloadManifest.toBytes(flags,
                         PayloadState.gridColumns, PayloadState.gridRows,
-                        col, row, PayloadManifest.crc32(mapColors),
+                        tCol, tRow, PayloadManifest.crc32(mapColors),
                         playerName, PayloadState.currentTitle, tile.nonce);
                 List<String> newChunks = buildChunks(manifest, mapColors);
 

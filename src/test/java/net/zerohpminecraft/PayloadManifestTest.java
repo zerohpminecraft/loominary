@@ -16,7 +16,7 @@ class PayloadManifestTest {
 
         PayloadManifest m = PayloadManifest.fromBytes(bytes);
 
-        assertEquals(PayloadManifest.CURRENT_VERSION, m.manifestVersion);
+        assertEquals(1, m.manifestVersion);
         assertEquals(bytes.length, m.headerSize);
         assertEquals(PayloadManifest.FLAG_ALL_SHADES, m.flags);
         assertEquals(3, m.cols);
@@ -102,6 +102,31 @@ class PayloadManifestTest {
         assertEquals(-1L, stub.colorCrc32);
         assertNull(stub.username);
         assertNull(stub.title);
+    }
+
+    @Test
+    void roundtrip_v2_withNonce() {
+        int nonce = 0x12345678;
+        byte[] bytes = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ALL_SHADES,
+                3, 2, 1, 0, 0xDEADBEEFL,
+                "Player", "Title", nonce);
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+
+        assertEquals(2, m.manifestVersion);
+        assertEquals(bytes.length, m.headerSize);
+        assertEquals(nonce, m.nonce);
+        assertEquals("Player", m.username);
+        assertEquals("Title", m.title);
+        assertTrue(m.allShades());
+    }
+
+    @Test
+    void toBytes_zeroNonce_producesV1() {
+        byte[] v1       = PayloadManifest.toBytes(0, 1, 1, 0, 0, 0L, "Player", "Title");
+        byte[] nonce0   = PayloadManifest.toBytes(0, 1, 1, 0, 0, 0L, "Player", "Title", 0);
+        assertArrayEquals(v1, nonce0, "nonce=0 should delegate to v1 encoding");
     }
 
     @Test

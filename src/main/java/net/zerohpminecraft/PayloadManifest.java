@@ -8,7 +8,7 @@ import java.util.zip.CRC32;
  * Manifest header prepended to map-color bytes inside the zstd frame.
  *
  * Wire layout (bytes at the start of the decompressed payload):
- *   [0]     manifest_version  u8  — schema version; currently 1
+ *   [0]     manifest_version  u8  — schema version; 1 or 2
  *   [1]     header_size       u8  — total bytes in this header (allows future
  *                                   clients to skip unknown versions and still
  *                                   find the map colors at offset header_size)
@@ -23,6 +23,12 @@ import java.util.zip.CRC32;
  *   [12…]   username          UTF-8
  *   […]     title_len         u8  — 0 if absent; max 64
  *   […]     title             UTF-8
+ *   (v2 only)
+ *   […]     nonce             u32 big-endian — random salt used by
+ *                                 /loominary resalt; changes all chunk names
+ *                                 without affecting the decoded image.
+ *                                 Informational only; decoders reach map colors
+ *                                 via header_size and ignore this field.
  *
  * The 16,384 map-color bytes follow immediately after the header.
  *
@@ -31,12 +37,13 @@ import java.util.zip.CRC32;
  * (encoded by Loominary 1.0.0) continue to decode identically.
  *
  * Manifest fields are informational only — none of them gate decode
- * behavior in v1. This keeps the decoder simple and means field
+ * behavior in v1 or v2. This keeps the decoder simple and means field
  * mistakes are cosmetic, not functional.
  */
 public class PayloadManifest {
 
-    public static final int CURRENT_VERSION = 1;
+    /** Highest manifest version this client can decode. */
+    public static final int CURRENT_VERSION = 2;
 
     public static final int FLAG_ALL_SHADES = 0x01;
 
@@ -52,10 +59,12 @@ public class PayloadManifest {
     public final long colorCrc32;
     public final String username; // null if absent
     public final String title;    // null if absent
+    /** v2 only: random nonce from /loominary resalt; 0 for v1 payloads. */
+    public final int nonce;
 
     private PayloadManifest(int manifestVersion, int headerSize, int flags,
                              int cols, int rows, int tileCol, int tileRow,
-                             long colorCrc32, String username, String title) {
+                             long colorCrc32, String username, String title, int nonce) {
         this.manifestVersion = manifestVersion;
         this.headerSize = headerSize;
         this.flags = flags;
@@ -66,6 +75,7 @@ public class PayloadManifest {
         this.colorCrc32 = colorCrc32;
         this.username = username;
         this.title = title;
+        this.nonce = nonce;
     }
 
     public boolean allShades() {
@@ -82,6 +92,7 @@ public class PayloadManifest {
 
     // ── Serialization ────────────────────────────────────────────────────
 
+    /** Produces a v1 manifest (no nonce). */
     public static byte[] toBytes(int flags, int cols, int rows, int tileCol, int tileRow,
                                   long colorCrc32, String username, String title) {
         byte[] usernameBytes = encodeString(username, 16);
@@ -92,8 +103,8 @@ public class PayloadManifest {
 
         byte[] out = new byte[totalSize];
         int i = 0;
-        out[i++] = (byte) CURRENT_VERSION;
-        out[i++] = (byte) totalSize;       // header_size
+        out[i++] = 1;                  // manifest_version = 1
+        out[i++] = (byte) totalSize;   // header_size
         out[i++] = (byte) flags;
         out[i++] = (byte) cols;
         out[i++] = (byte) rows;
@@ -113,6 +124,50 @@ public class PayloadManifest {
     }
 
     /**
+     * Produces a v2 manifest with a random nonce that changes all chunk names
+     * without affecting the decoded image. If {@code nonce == 0}, delegates to
+     * {@link #toBytes(int, int, int, int, int, long, String, String)} so callers
+     * can always pass the tile's stored nonce without checking it first.
+     */
+    public static byte[] toBytes(int flags, int cols, int rows, int tileCol, int tileRow,
+                                  long colorCrc32, String username, String title, int nonce) {
+        if (nonce == 0) return toBytes(flags, cols, rows, tileCol, tileRow,
+                colorCrc32, username, title);
+
+        byte[] usernameBytes = encodeString(username, 16);
+        byte[] titleBytes    = encodeString(title, 64);
+
+        // 7 fixed + 4 crc32 + 1 username_len + username + 1 title_len + title + 4 nonce
+        int totalSize = 17 + usernameBytes.length + titleBytes.length;
+
+        byte[] out = new byte[totalSize];
+        int i = 0;
+        out[i++] = 2;                  // manifest_version = 2
+        out[i++] = (byte) totalSize;   // header_size
+        out[i++] = (byte) flags;
+        out[i++] = (byte) cols;
+        out[i++] = (byte) rows;
+        out[i++] = (byte) tileCol;
+        out[i++] = (byte) tileRow;
+        out[i++] = (byte) ((colorCrc32 >> 24) & 0xFF);
+        out[i++] = (byte) ((colorCrc32 >> 16) & 0xFF);
+        out[i++] = (byte) ((colorCrc32 >>  8) & 0xFF);
+        out[i++] = (byte) ( colorCrc32        & 0xFF);
+        out[i++] = (byte) usernameBytes.length;
+        System.arraycopy(usernameBytes, 0, out, i, usernameBytes.length);
+        i += usernameBytes.length;
+        out[i++] = (byte) titleBytes.length;
+        System.arraycopy(titleBytes, 0, out, i, titleBytes.length);
+        i += titleBytes.length;
+        // nonce big-endian u32
+        out[i++] = (byte) ((nonce >> 24) & 0xFF);
+        out[i++] = (byte) ((nonce >> 16) & 0xFF);
+        out[i++] = (byte) ((nonce >>  8) & 0xFF);
+        out[i  ] = (byte) ( nonce        & 0xFF);
+        return out;
+    }
+
+    /**
      * Parses the manifest from the start of a decompressed payload.
      * For unknown future versions, returns a stub with only manifestVersion
      * and headerSize set — the caller can still locate the map colors.
@@ -128,10 +183,10 @@ public class PayloadManifest {
 
         if (ver > CURRENT_VERSION) {
             // Unknown version — return stub so the caller can still skip to map colors.
-            return new PayloadManifest(ver, headerSize, 0, 0, 0, 0, 0, -1L, null, null);
+            return new PayloadManifest(ver, headerSize, 0, 0, 0, 0, 0, -1L, null, null, 0);
         }
 
-        // Parse v1 manifest — minimum 13 bytes (11 fixed + 2 length fields)
+        // Parse v1/v2 manifest — minimum 13 bytes (11 fixed + 2 length fields)
         if (data.length < 13) {
             throw new IllegalArgumentException(
                     "v1 manifest too short: expected at least 13 bytes, got " + data.length);
@@ -172,10 +227,19 @@ public class PayloadManifest {
                         "v1 manifest title extends past payload end");
             }
             title = new String(data, i, titleLen, StandardCharsets.UTF_8);
+            i += titleLen;
+        }
+
+        int nonce = 0;
+        if (ver == 2 && i + 4 <= data.length) {
+            nonce = ((data[i    ] & 0xFF) << 24)
+                  | ((data[i + 1] & 0xFF) << 16)
+                  | ((data[i + 2] & 0xFF) <<  8)
+                  | ( data[i + 3] & 0xFF);
         }
 
         return new PayloadManifest(ver, headerSize, flags, cols, rows, tileCol, tileRow,
-                colorCrc32, username, title);
+                colorCrc32, username, title, nonce);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

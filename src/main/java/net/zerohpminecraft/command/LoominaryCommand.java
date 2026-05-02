@@ -22,6 +22,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.zerohpminecraft.AnvilAutoFillHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.MapBannerDecoder;
 import net.zerohpminecraft.PayloadManifest;
@@ -43,6 +44,7 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * The single Loominary command. All functionality is reachable as subcommands.
@@ -214,6 +216,10 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("name", StringArgumentType.string())
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
+
+                            // ── resalt ─────────────────────────────────────────
+                            .then(ClientCommandManager.literal("resalt")
+                                    .executes(ctx -> resalt(ctx.getSource())))
 
                             // ── clear ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("clear")
@@ -940,11 +946,12 @@ public class LoominaryCommand {
             // Build manifest for size-check (CRC unknown until after reduction, use 0)
             String playerName = source.getPlayer().getGameProfile().getName();
             int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+            int tileNonce = PayloadState.tiles.get(tileIdx).nonce;
             byte[] manifestForSizeCheck = PayloadManifest.toBytes(
                     flags,
                     PayloadState.gridColumns, PayloadState.gridRows,
                     PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
-                    0L, playerName, PayloadState.currentTitle);
+                    0L, playerName, PayloadState.currentTitle, tileNonce);
 
             PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
                     mapColors, manifestForSizeCheck, CHUNK_SIZE, target);
@@ -954,7 +961,8 @@ public class LoominaryCommand {
                     flags,
                     PayloadState.gridColumns, PayloadState.gridRows,
                     PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
-                    PayloadManifest.crc32(fit.mapColors), playerName, PayloadState.currentTitle);
+                    PayloadManifest.crc32(fit.mapColors), playerName, PayloadState.currentTitle,
+                    tileNonce);
             List<String> newChunkList = buildChunks(manifestBytes, fit.mapColors);
             int newChunks = newChunkList.size();
 
@@ -1131,6 +1139,70 @@ public class LoominaryCommand {
         } catch (IOException e) {
             source.sendError(Text.literal("§cExport failed: " + e.getMessage()));
             e.printStackTrace();
+            return 0;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // resalt
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int resalt(FabricClientCommandSource source) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
+            source.sendError(Text.literal("§cActive tile has no chunks."));
+            return 0;
+        }
+
+        int tileIdx   = PayloadState.activeTileIndex;
+        int doneCount = PayloadState.activeChunkIndex;
+
+        try {
+            byte[] mapColors = MapBannerDecoder.reassemblePayload(
+                    new ArrayList<>(PayloadState.ACTIVE_CHUNKS));
+
+            int nonce;
+            do {
+                nonce = ThreadLocalRandom.current().nextInt();
+            } while (nonce == 0);
+
+            String playerName = source.getPlayer().getGameProfile().getName();
+            int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+            byte[] manifestBytes = PayloadManifest.toBytes(
+                    flags,
+                    PayloadState.gridColumns, PayloadState.gridRows,
+                    PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
+                    PayloadManifest.crc32(mapColors),
+                    playerName, PayloadState.currentTitle, nonce);
+            List<String> newChunks = buildChunks(manifestBytes, mapColors);
+
+            PayloadState.tiles.get(tileIdx).nonce = nonce;
+            PayloadState.ACTIVE_CHUNKS.clear();
+            PayloadState.ACTIVE_CHUNKS.addAll(newChunks);
+            PayloadState.activeChunkIndex = 0;
+            PayloadState.save();
+
+            AnvilAutoFillHandler.clearHalt();
+
+            source.sendFeedback(Text.literal(String.format(
+                    "§a%s re-encoded with new chunk names (%d banners).",
+                    PayloadState.tileLabel(tileIdx), newChunks.size())));
+            if (doneCount > 0) {
+                source.sendFeedback(Text.literal(String.format(
+                        "§e⚠ %d banner%s already renamed for this tile are now orphaned — discard them before placing the maps.",
+                        doneCount, doneCount == 1 ? " is" : "s are")));
+            }
+            if (preReductionChunks.containsKey(tileIdx)) {
+                preReductionChunks.remove(tileIdx);
+                source.sendFeedback(Text.literal(
+                        "§e⚠ Reduction undo state for this tile was cleared."));
+            }
+            return 1;
+        } catch (Exception e) {
+            source.sendError(Text.literal("§cResalt failed: " + e.getMessage()));
             return 0;
         }
     }

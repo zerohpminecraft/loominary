@@ -51,6 +51,7 @@ public class PayloadState {
     public static class TileData {
         public List<String> chunks = new ArrayList<>();
         public int currentIndex = 0;
+        public int nonce = 0;  // 0 = v1 encoding; non-zero = v2 with this nonce (/loominary resalt)
     }
 
     private static class Snapshot {

@@ -12,12 +12,11 @@ import java.util.Base64;
  * Converts a BufferedImage into the 128×128 byte array that MapState.colors uses,
  * and can progressively reduce color count to fit a compressed size budget.
  *
- * Nearest-color matching uses Oklab perceptual distance rather than RGB Euclidean,
- * which gives noticeably better results in both quantization and palette reduction.
+ * Nearest-color matching uses Oklab perceptual distance rather than RGB Euclidean.
  *
  * Two encoding paths are available:
  *   convert()        — single-pass nearest-neighbor (fast, used for standard imports)
- *   convertTwoPass() — palette pre-selection + optional Floyd-Steinberg dithering
+ *   convertTwoPass() — palette pre-selection + optional adaptive Floyd-Steinberg dithering
  */
 public class PngToMapColors {
 
@@ -28,6 +27,14 @@ public class PngToMapColors {
     /** The unobtainable shade — id 3 (LOWEST brightness) never occurs naturally,
      *  even with staircasing. Skipping it limits us to ~186 reproducible colors. */
     private static final int UNOBTAINABLE_SHADE_ID = 3;
+
+    /**
+     * Error-floor for adaptive diffusion: squared Oklab distance below which
+     * quantization error is considered perceptually insignificant and is NOT
+     * diffused. Prevents spatial noise in well-matched regions.
+     * 0.015 Oklab units squared ≈ a barely-noticeable colour shift.
+     */
+    private static final float ERROR_FLOOR_SQ = 0.015f * 0.015f;
 
     // ── Public encode entry points ────────────────────────────────────────
 
@@ -58,21 +65,38 @@ public class PngToMapColors {
     }
 
     /**
-     * Two-pass encode: first-pass quantization to discover candidate map colors,
-     * optional palette reduction to {@code targetColors}, then a second render pass
-     * using only the selected colors — with or without Floyd-Steinberg dithering.
+     * Two-pass encode with optional adaptive Floyd-Steinberg dithering.
      *
-     * <p>When {@code targetColors <= 0} no palette reduction is performed and the
-     * second pass uses all colors the first pass produced. When {@code dither} is
-     * false the second pass is a plain restricted nearest-neighbor (useful for
-     * palette pre-selection without the dithering effect).
+     * <p><b>Pass 1</b> — nearest-neighbor quantization to discover the candidate
+     * palette (which map-color bytes the image naturally uses).
+     *
+     * <p><b>Palette pre-selection</b> (when {@code targetColors > 0}) — the
+     * candidate palette is pruned to N entries using the rarest-color-merge
+     * algorithm, applied at the palette level before any pixel is committed.
+     *
+     * <p><b>Pass 2</b> — re-renders every source pixel against the restricted
+     * palette. With {@code dither=true}, adaptive Floyd-Steinberg error diffusion
+     * runs in Oklab space. Dithering strength per pixel is controlled by two
+     * simultaneous conditions:
+     * <ul>
+     *   <li>Gradient suppression — local contrast (Oklab RMS distance to 4-connected
+     *       neighbours) is computed for every pixel; Otsu's method finds the
+     *       image-relative threshold that best separates smooth from edge regions;
+     *       dithering fades to zero with a linear soft zone around that threshold.
+     *       This preserves sharp edges while dithering smooth gradients fully.</li>
+     *   <li>Error floor — pixels whose quantization error magnitude is below a
+     *       small perceptual threshold are not diffused, preventing spatial noise
+     *       in regions the palette already covers well.</li>
+     * </ul>
+     *
+     * With {@code dither=false} the second pass is a plain palette-constrained
+     * nearest-neighbor (palette pre-selection without the dithering effect).
      *
      * @param source       source image (need not be 128×128; scaled internally)
      * @param legalOnly    if true, restrict to ~186 obtainable colors
      * @param targetColors pre-select this many colors before the second pass;
      *                     ≤ 0 means use all first-pass colors
-     * @param dither       if true, apply Floyd-Steinberg error diffusion in the
-     *                     second pass
+     * @param dither       if true, apply adaptive Floyd-Steinberg in the second pass
      */
     public static byte[] convertTwoPass(BufferedImage source, boolean legalOnly,
                                          int targetColors, boolean dither) {
@@ -88,19 +112,20 @@ public class PngToMapColors {
             }
         }
 
-        // Optional palette reduction: merge rarest colors into neighbors until
-        // at most targetColors distinct entries remain.
+        // Optional palette reduction: merge rarest colors into neighbors.
         if (targetColors > 0 && countDistinct(firstPass) > targetColors) {
             reduceColorsInPlace(firstPass, targetColors, oklabLookup);
         }
 
-        // Build the restricted palette mask from whatever survived pass 1.
+        // Build the restricted palette mask.
         boolean[] palette = buildPalette(firstPass);
 
         // Pass 2: re-render against the restricted palette.
-        return dither
-                ? renderDithered(scaled, palette, oklabLookup)
-                : renderNearest(scaled, palette, oklabLookup);
+        if (!dither) return renderNearest(scaled, palette, oklabLookup);
+
+        // Pre-compute per-pixel dithering strength for adaptive diffusion.
+        float[] ditherStrength = computeDitherStrength(scaled);
+        return renderDithered(scaled, palette, oklabLookup, ditherStrength);
     }
 
     // ── FitResult ────────────────────────────────────────────────────────
@@ -185,11 +210,6 @@ public class PngToMapColors {
      * Progressively reduces the color palette until at most {@code targetColors}
      * distinct map-color values remain, merging each rarest color into its nearest
      * visual neighbor.
-     *
-     * @param mapColors    the 128×128 map-color byte array (modified in place)
-     * @param prefix       bytes prepended before compression (manifest); may be empty
-     * @param chunkSize    base64 chars per banner chunk (used only to size the final result)
-     * @param targetColors maximum distinct colors to retain
      */
     public static FitResult reduceToColorCount(byte[] mapColors, byte[] prefix,
                                                int chunkSize, int targetColors) {
@@ -207,36 +227,22 @@ public class PngToMapColors {
 
     // ── Shared core: in-place palette reduction ───────────────────────────
 
-    /**
-     * Merges the rarest color into its nearest neighbor, repeatedly, until at most
-     * {@code targetColors} distinct values remain. Modifies {@code mapColors} in place.
-     *
-     * @return int[]{colorsRemoved, pixelsAffected}
-     */
+    /** @return int[]{colorsRemoved, pixelsAffected} */
     private static int[] reduceColorsInPlace(byte[] mapColors, int targetColors,
                                               float[][] oklabLookup) {
         int colorsRemoved = 0;
         int pixelsAffected = 0;
-
         while (countDistinct(mapColors) > targetColors) {
             int[] freq = new int[256];
             for (byte b : mapColors) freq[b & 0xFF]++;
-
-            int rarestColor = -1;
-            int rarestFreq  = Integer.MAX_VALUE;
+            int rarestColor = -1, rarestFreq = Integer.MAX_VALUE;
             for (int c = 1; c < 256; c++) {
-                if (freq[c] > 0 && freq[c] < rarestFreq) {
-                    rarestFreq = freq[c];
-                    rarestColor = c;
-                }
+                if (freq[c] > 0 && freq[c] < rarestFreq) { rarestFreq = freq[c]; rarestColor = c; }
             }
             if (rarestColor == -1) break;
-
             int bestNeighbor = findNearestNeighbor(rarestColor, freq, oklabLookup);
             if (bestNeighbor == rarestColor) break;
-
-            byte from = (byte) rarestColor;
-            byte to   = (byte) bestNeighbor;
+            byte from = (byte) rarestColor, to = (byte) bestNeighbor;
             for (int i = 0; i < mapColors.length; i++) {
                 if (mapColors[i] == from) mapColors[i] = to;
             }
@@ -246,12 +252,128 @@ public class PngToMapColors {
         return new int[]{colorsRemoved, pixelsAffected};
     }
 
-    // ── Two-pass helpers ──────────────────────────────────────────────────
+    // ── Adaptive dithering: strength map ─────────────────────────────────
 
     /**
-     * Scales {@code source} to 128×128 ARGB. Returns {@code source} unchanged when
-     * it is already the right size and type (avoids a redundant copy).
+     * Computes a per-pixel dithering strength in [0, 1] using two signals:
+     *
+     * <ol>
+     *   <li><b>Local contrast</b> — RMS Oklab distance to 4-connected neighbours.
+     *       High contrast = edge or fine detail = suppress dithering.
+     *       Low contrast = smooth gradient = allow dithering.</li>
+     *   <li><b>Otsu threshold</b> — the image-relative boundary that maximally
+     *       separates the smooth-pixel and edge-pixel populations, so the
+     *       suppression adapts to the contrast distribution of this specific image
+     *       rather than using a fixed percentile.</li>
+     * </ol>
+     *
+     * The soft zone spans [0.5 T, 1.5 T] around the Otsu threshold T, giving a
+     * linear transition from full diffusion to none rather than a hard binary cut.
+     *
+     * The error-floor check (applied separately in {@link #renderDithered}) handles
+     * the second condition: pixels whose quantization error is perceptually
+     * imperceptible are not diffused regardless of their strength value.
      */
+    private static float[] computeDitherStrength(BufferedImage scaled) {
+        // Pre-compute per-pixel Oklab values (avoids redundant RGB→Oklab conversions
+        // during the contrast pass).
+        float[] okL = new float[MAP_BYTES];
+        float[] okA = new float[MAP_BYTES];
+        float[] okB = new float[MAP_BYTES];
+        boolean[] opaque = new boolean[MAP_BYTES];
+
+        for (int y = 0; y < MAP_SIZE; y++) {
+            for (int x = 0; x < MAP_SIZE; x++) {
+                int argb = scaled.getRGB(x, y);
+                int i = x + y * MAP_SIZE;
+                if (((argb >>> 24) & 0xFF) >= 128) {
+                    float[] ok = rgbToOklab(argb);
+                    okL[i] = ok[0]; okA[i] = ok[1]; okB[i] = ok[2];
+                    opaque[i] = true;
+                }
+            }
+        }
+
+        // Compute local contrast: RMS Oklab distance to 4-connected neighbours.
+        float[] contrast = new float[MAP_BYTES];
+        for (int y = 0; y < MAP_SIZE; y++) {
+            for (int x = 0; x < MAP_SIZE; x++) {
+                int i = x + y * MAP_SIZE;
+                if (!opaque[i]) continue;
+                float sumSq = 0f;
+                int n = 0;
+                // left
+                if (x > 0           && opaque[i - 1])           { float dL=okL[i]-okL[i-1], da=okA[i]-okA[i-1], db=okB[i]-okB[i-1]; sumSq+=dL*dL+da*da+db*db; n++; }
+                // right
+                if (x < MAP_SIZE-1  && opaque[i + 1])           { float dL=okL[i]-okL[i+1], da=okA[i]-okA[i+1], db=okB[i]-okB[i+1]; sumSq+=dL*dL+da*da+db*db; n++; }
+                // up
+                if (y > 0           && opaque[i - MAP_SIZE])    { float dL=okL[i]-okL[i-MAP_SIZE], da=okA[i]-okA[i-MAP_SIZE], db=okB[i]-okB[i-MAP_SIZE]; sumSq+=dL*dL+da*da+db*db; n++; }
+                // down
+                if (y < MAP_SIZE-1  && opaque[i + MAP_SIZE])    { float dL=okL[i]-okL[i+MAP_SIZE], da=okA[i]-okA[i+MAP_SIZE], db=okB[i]-okB[i+MAP_SIZE]; sumSq+=dL*dL+da*da+db*db; n++; }
+                contrast[i] = n > 0 ? (float) Math.sqrt(sumSq / n) : 0f;
+            }
+        }
+
+        // Otsu's method on the contrast distribution to find the image-relative
+        // smooth/edge boundary.
+        float T = otsuThreshold(contrast);
+
+        // Soft threshold: linear fade from full strength (contrast ≤ 0.5 T)
+        // to zero (contrast ≥ 1.5 T).
+        float lower = T * 0.5f;
+        float upper = T * 1.5f;
+        float range = upper - lower;
+
+        float[] strength = new float[MAP_BYTES];
+        for (int i = 0; i < MAP_BYTES; i++) {
+            if (!opaque[i]) { strength[i] = 0f; continue; }
+            strength[i] = range > 1e-6f
+                    ? 1.0f - Math.min(1.0f, Math.max(0.0f, (contrast[i] - lower) / range))
+                    : (contrast[i] <= T ? 1.0f : 0.0f);
+        }
+        return strength;
+    }
+
+    /**
+     * Otsu's method on a float array: finds the threshold that maximises
+     * between-class variance between the two populations on either side.
+     *
+     * Operates on the sorted array (O(N log N)) rather than binning, so it is
+     * exact for continuous values without quantisation artefacts.
+     *
+     * @return the threshold value; falls back to the median if all values are equal
+     */
+    private static float otsuThreshold(float[] values) {
+        int N = values.length;
+        float[] sorted = values.clone();
+        java.util.Arrays.sort(sorted);
+
+        if (sorted[0] == sorted[N - 1]) return sorted[N / 2]; // all equal
+
+        double totalSum = 0;
+        for (float v : sorted) totalSum += v;
+
+        double cumSum = 0;
+        float bestVar = -1;
+        float threshold = sorted[N / 2];
+
+        for (int k = 1; k < N; k++) {
+            cumSum += sorted[k - 1];
+            double w0 = (double) k / N;
+            double w1 = 1.0 - w0;
+            double mu0 = cumSum / k;
+            double mu1 = (totalSum - cumSum) / (N - k);
+            float betweenVar = (float) (w0 * w1 * (mu0 - mu1) * (mu0 - mu1));
+            if (betweenVar > bestVar) {
+                bestVar = betweenVar;
+                threshold = sorted[k];
+            }
+        }
+        return threshold;
+    }
+
+    // ── Two-pass render helpers ───────────────────────────────────────────
+
     private static BufferedImage scale(BufferedImage source) {
         if (source.getWidth() == MAP_SIZE && source.getHeight() == MAP_SIZE
                 && source.getType() == BufferedImage.TYPE_INT_ARGB) {
@@ -268,17 +390,12 @@ public class PngToMapColors {
         return out;
     }
 
-    /** Returns a boolean[256] mask of which map-color bytes are present in mapColors. */
     private static boolean[] buildPalette(byte[] mapColors) {
         boolean[] palette = new boolean[256];
         for (byte b : mapColors) palette[b & 0xFF] = true;
         return palette;
     }
 
-    /**
-     * Second pass — nearest-neighbor, restricted to {@code palette}.
-     * Used when the caller wants palette pre-selection without dithering.
-     */
     private static byte[] renderNearest(BufferedImage scaled, boolean[] palette,
                                          float[][] oklabLookup) {
         byte[] out = new byte[MAP_BYTES];
@@ -295,26 +412,28 @@ public class PngToMapColors {
     }
 
     /**
-     * Second pass — Floyd-Steinberg error diffusion within {@code palette}.
+     * Floyd-Steinberg error diffusion, restricted to {@code palette}, with
+     * adaptive per-pixel diffusion strength.
      *
-     * Error is accumulated in Oklab space (same space as our distance metric) using
-     * two alternating row buffers so memory usage stays O(width) rather than O(area).
-     * The standard coefficient pattern is:
-     *   right       7/16
-     *   lower-left  3/16
-     *   below       5/16
-     *   lower-right 1/16
+     * Error is accumulated in Oklab space using two alternating row buffers
+     * (O(width) memory). For each pixel, the error is scaled by:
+     *   strength[i]  — gradient-suppression factor (0 at edges, 1 in smooth areas)
+     * and additionally gated by:
+     *   errMagSq > ERROR_FLOOR_SQ — error-floor check, so well-matched pixels
+     *                               (already covered by the palette) contribute
+     *                               no spatial noise.
+     *
+     * Standard FS coefficients: right 7/16, lower-left 3/16, below 5/16,
+     * lower-right 1/16.
      */
     private static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup) {
+                                          float[][] oklabLookup, float[] ditherStrength) {
         byte[] out = new byte[MAP_BYTES];
 
-        // Per-pixel Oklab error: [x*3], [x*3+1], [x*3+2] = ΔL, Δa, Δb
         float[] errCur = new float[MAP_SIZE * 3];
         float[] errNxt = new float[MAP_SIZE * 3];
 
         for (int y = 0; y < MAP_SIZE; y++) {
-            // Swap row buffers and clear the "next" row.
             float[] tmp = errCur; errCur = errNxt; errNxt = tmp;
             java.util.Arrays.fill(errNxt, 0f);
 
@@ -325,7 +444,6 @@ public class PngToMapColors {
                     continue;
                 }
 
-                // Source color in Oklab, shifted by accumulated error.
                 float[] src = rgbToOklab(argb);
                 int ei = x * 3;
                 float L = src[0] + errCur[ei    ];
@@ -335,42 +453,46 @@ public class PngToMapColors {
                 byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup);
                 out[x + y * MAP_SIZE] = chosen;
 
-                // Quantization error in Oklab.
                 float[] cl = oklabLookup[chosen & 0xFF];
                 float eL = L - cl[0];
                 float ea = a - cl[1];
                 float eb = b - cl[2];
 
-                // Distribute: right (7/16), lower-left (3/16), below (5/16), lower-right (1/16).
-                if (x + 1 < MAP_SIZE) {
-                    int ri = (x + 1) * 3;
-                    errCur[ri    ] += eL * (7f / 16f);
-                    errCur[ri + 1] += ea * (7f / 16f);
-                    errCur[ri + 2] += eb * (7f / 16f);
-                }
-                if (x - 1 >= 0) {
-                    int li = (x - 1) * 3;
-                    errNxt[li    ] += eL * (3f / 16f);
-                    errNxt[li + 1] += ea * (3f / 16f);
-                    errNxt[li + 2] += eb * (3f / 16f);
-                }
-                {
-                    errNxt[ei    ] += eL * (5f / 16f);
-                    errNxt[ei + 1] += ea * (5f / 16f);
-                    errNxt[ei + 2] += eb * (5f / 16f);
-                }
-                if (x + 1 < MAP_SIZE) {
-                    int ri = (x + 1) * 3;
-                    errNxt[ri    ] += eL * (1f / 16f);
-                    errNxt[ri + 1] += ea * (1f / 16f);
-                    errNxt[ri + 2] += eb * (1f / 16f);
+                // Gate diffusion: skip if error is perceptually insignificant
+                // OR the gradient-suppression map says we're at an edge.
+                float errMagSq = eL * eL + ea * ea + eb * eb;
+                float s = (errMagSq > ERROR_FLOOR_SQ)
+                        ? ditherStrength[x + y * MAP_SIZE] : 0f;
+
+                if (s > 0f) {
+                    float seL = eL * s, sea = ea * s, seb = eb * s;
+                    if (x + 1 < MAP_SIZE) {
+                        int ri = (x + 1) * 3;
+                        errCur[ri    ] += seL * (7f / 16f);
+                        errCur[ri + 1] += sea * (7f / 16f);
+                        errCur[ri + 2] += seb * (7f / 16f);
+                    }
+                    if (x - 1 >= 0) {
+                        int li = (x - 1) * 3;
+                        errNxt[li    ] += seL * (3f / 16f);
+                        errNxt[li + 1] += sea * (3f / 16f);
+                        errNxt[li + 2] += seb * (3f / 16f);
+                    }
+                    errNxt[ei    ] += seL * (5f / 16f);
+                    errNxt[ei + 1] += sea * (5f / 16f);
+                    errNxt[ei + 2] += seb * (5f / 16f);
+                    if (x + 1 < MAP_SIZE) {
+                        int ri = (x + 1) * 3;
+                        errNxt[ri    ] += seL * (1f / 16f);
+                        errNxt[ri + 1] += sea * (1f / 16f);
+                        errNxt[ri + 2] += seb * (1f / 16f);
+                    }
                 }
             }
         }
         return out;
     }
 
-    /** Nearest palette entry given already-accumulated Oklab coordinates. */
     private static byte findClosestInPalette(float L, float a, float b,
                                               boolean[] palette, float[][] oklabLookup) {
         float bestDist = Float.MAX_VALUE;
@@ -398,11 +520,6 @@ public class PngToMapColors {
 
     // ── Color-space helpers ───────────────────────────────────────────────
 
-    /**
-     * Builds an array mapping each possible map-color byte (0–255) to its
-     * rendered RGB value. Used by the palette command for display; color matching
-     * uses buildOklabLookup() instead.
-     */
     public static int[] buildColorLookup() {
         int[] rgb = new int[256];
         for (int b = 0; b < 256; b++) {
@@ -418,10 +535,6 @@ public class PngToMapColors {
         return rgb;
     }
 
-    /**
-     * Builds an Oklab lookup table for all valid map-color bytes.
-     * Entries for transparent or invalid bytes are null.
-     */
     private static float[][] buildOklabLookup() {
         float[][] oklab = new float[256][];
         for (int b = 1; b < 256; b++) {
@@ -437,10 +550,6 @@ public class PngToMapColors {
         return oklab;
     }
 
-    /**
-     * Converts a packed sRGB int (0xRRGGBB) to Oklab float[]{L, a, b}.
-     * Alpha channel is ignored.
-     */
     static float[] rgbToOklab(int rgb) {
         float r  = srgbToLinear(((rgb >> 16) & 0xFF) / 255f);
         float g  = srgbToLinear(((rgb >>  8) & 0xFF) / 255f);
@@ -461,7 +570,6 @@ public class PngToMapColors {
         };
     }
 
-    /** sRGB gamma expansion (IEC 61966-2-1). */
     static float srgbToLinear(float c) {
         return c <= 0.04045f ? c / 12.92f : (float) Math.pow((c + 0.055f) / 1.055f, 2.4);
     }

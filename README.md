@@ -16,9 +16,10 @@ This works on **any vanilla server** — the data lives in legitimate banner and
 - **Auto-right-click**: hold your map and walk near your placed banners — `/loominary click` handles every right-click automatically with live status and visual markers
 - **Client-side rendering** with marker suppression — the banner pins disappear, leaving a clean image
 - **Workflow automation** at the anvil: stack-aware banner extraction, automatic renaming, automatic bundle storage
+- **Stuck-chunk recovery**: if the server permanently rejects a banner name the handler halts cleanly after a few attempts; `/loominary resalt` re-encodes the tile with a random nonce — same image, new chunk names, no re-import needed
 - **Litematica schematic export** for placement guidance
 - **Grid-aware preview**: `/loominary preview` discovers the full wall of framed maps from any frame and paints all tiles at once
-- **Embedded metadata**: every payload records the image title, author username, grid position, and a CRC32 integrity check
+- **Embedded metadata**: every payload records the image title, author username, grid position, and a CRC32 integrity check; v2 payloads also carry an optional nonce used by `/loominary resalt`
 - **Persistent state** survives game restarts; pick up any unfinished batch
 - **Configurable hotkeys** for the most-used actions
 - **Crosshair-targeted commands** — preview, revert, and steal use whatever framed map you're looking at
@@ -32,7 +33,7 @@ This works on **any vanilla server** — the data lives in legitimate banner and
 
 ## Installation
 
-1. Download `loominary-1.1.1.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
+1. Download `loominary-1.2.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
 2. Drop it into your `mods/` folder alongside Fabric API
 3. Launch the game
 
@@ -118,6 +119,10 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 - `/loominary title <text>` — Set the title to embed in the next encode's manifest.
 - `/loominary title` — Clear the title.
 
+### Recovery
+
+- `/loominary resalt` — Re-encode the active tile with a random nonce, producing new chunk names for the same image without changing the visual result, author, flags, or title. Use this when the anvil handler shows "Stuck — run /loominary resalt." Only the current tile is re-encoded; other tiles in a multi-tile batch are untouched. Any banners already renamed for this tile are now orphaned — discard them before placing the maps.
+
 ### Palette reduction
 
 - `/loominary reduce` — Reduce the active tile to fit in 255 banners by merging the rarest colors into their visual neighbors.
@@ -159,7 +164,7 @@ Loominary exploits a chain of Minecraft mechanics that aren't normally connected
 
 **The encoding works in map-color space.** The image is quantized to Minecraft's map palette using Oklab perceptual distance (rather than RGB Euclidean), then the resulting `byte[16384]` is compressed. Spatial coherence in the quantized output makes zstd very effective — most images compress to 1,500–6,000 bytes. The maximum payload is 255 banners × 48 base64 chars ≈ 9,000 bytes of compressed data per map.
 
-**Payloads carry a versioned manifest.** Every payload begins with a small binary header recording the format version, grid position (col, row, total cols/rows), author username, optional title, and a CRC32 of the image data. This lets the decoder display metadata and handle future format changes gracefully without breaking old payloads.
+**Payloads carry a versioned manifest.** Every payload begins with a small binary header recording the format version, grid position (col, row, total cols/rows), author username, optional title, and a CRC32 of the image data. Version 2 manifests (produced by `/loominary resalt`) additionally carry a 4-byte random nonce; clients that don't understand v2 fall back to image-only rendering via the `header_size` field and still see the correct picture. This lets the decoder display metadata and handle future format changes gracefully without breaking old payloads.
 
 **Decorations are suppressed.** Once Loominary identifies a map as one of its own, it clears the decorations list in the client-side `MapState`, so the banner pin icons don't clutter the image.
 
@@ -216,6 +221,10 @@ Tens of kilobytes for a typical batch; low single-digit megabytes for many large
 ### Will Loominary update for newer Minecraft versions?
 
 The mod targets specific Minecraft internals. Each major Minecraft version requires a port. 1.21.4 is the current target.
+
+### The anvil handler says "Stuck — run /loominary resalt."
+
+The server permanently rejected a specific banner name, most likely because the old handler's retry loop triggered an anti-spam threshold before the retry limit was added. Running `/loominary resalt` re-encodes the active tile with a random nonce — the image is identical but all chunk names change, so the blocked name is no longer in the batch. If you had already renamed some banners for this tile, discard them before continuing; their names no longer match.
 
 ### How do I uninstall?
 

@@ -70,28 +70,67 @@ Still open:
 ## Medium-value features
 
 ### In-world editor mode
-A modal editor for live, in-world editing of the active tile. Keybind to enter/exit. Probably a fullscreen `Screen` subclass that shows the map at 4×–8× scale with pan/zoom, opened from a framed map at the player's crosshair.
 
-Tools to support, roughly in priority order:
-- Pixel paintbrush with selectable size and color
-- Fill bucket
-- Color picker (eyedropper)
-- Rectangle / lasso / magic-wand region selection
-- Per-region operation: re-quantize with different palette settings
-- Per-region operation: apply dithering (Floyd-Steinberg / Atkinson / Bayer / Sierra / none) — the adaptive Otsu system shipped in v1.2.1 handles the automatic case; the brush is for explicit overrides
-- Per-region operation: restrict palette to a subset (e.g., "only carpet colors in this area")
-- Undo / redo
+A modal editor for live, in-world pixel editing of the active tile. The two architecture decisions below are load-bearing and must be resolved before any code is written — they affect every tool and the undo model.
 
-On exit, re-encodes the modified map-color bytes back into the active tile's chunks. From there the existing anvil/preview/export pipeline takes over.
+**Architecture decisions (resolve first)**
 
-Open design questions:
-- Destructive edits vs. layered editing on top of the source image (v1 = destructive, undo-stack only)
-- How fine the brush gets (1 map pixel = ~0.78 blocks, so the GUI needs to abstract from world coordinates)
-- Whether to expose source-image awareness (re-quantize from original vs. re-quantize from current state)
+1. **Working colour space: map-color bytes.** The editor operates directly on the `byte[16384]` array, not on RGB. This means what you paint is exactly what encodes, with no re-quantization latency. The palette panel shows only the map colours (~186 legal or ~248 all-shades) — the same colour space the rest of the pipeline uses.
 
-This is a big feature — probably 1500+ lines of GUI code, tool framework, undo stack, and re-quantization plumbing — but it's purely client-side and unlocks a workflow no other mapart tool offers: edit the actual final pixel-perfect output, in-world, with live preview, and immediately re-encode.
+2. **Undo model: full-frame snapshots.** Before each destructive operation, snapshot the entire 128×128 byte array and push it onto a `Deque<byte[]>` (cap at 20). At 16 KB per snapshot, 20 levels costs 320 KB — fine. No branching undo; v1 is linear only. Ctrl+Z / Ctrl+Y.
 
-The per-region dither idea from the Floyd-Steinberg entry naturally lives inside this editor.
+3. **Source-image awareness (deferred).** Per-region re-quantization from the original image is Phase 6+ work. v1 edits are destructive; source awareness is not required to ship the core editor.
+
+---
+
+**Phase 1 — Screen skeleton** *(delivers: see-only viewer)*
+- `MapEditorScreen extends Screen`: renders the 128×128 colour array as a grid of coloured quads at a configurable scale (default 4×, max ~8× depending on screen resolution)
+- Middle-click drag to pan; scroll wheel to zoom
+- Mouse → pixel coordinate mapping (accounts for pan/zoom offset)
+- Hovered pixel highlighted with an outline or inverted border
+- Keybind to open from the crosshair-targeted item-frame map (or `/loominary edit`)
+- On close: re-encode the (possibly modified) byte array back into the active tile's chunks and save state
+
+**Phase 2 — Undo stack + single-pixel paint** *(delivers: useful v0 editor)*
+- `EditHistory`: snapshot-based undo/redo with Ctrl+Z / Ctrl+Y
+- Left-click to paint the hovered pixel with the active colour
+- Active colour displayed in a small swatch in the UI corner
+- Phase 2 alone — viewer + paint + undo — is already more useful than any existing tool for touching up individual pixels
+
+**Phase 3 — Palette panel + eyedropper** *(delivers: full basic colour workflow)*
+- Side panel listing all distinct colours currently in the tile (sorted by frequency), each as a clickable swatch
+- Optional "all colours" toggle to expand to the full map palette
+- Right-click on canvas = eyedropper: sets active colour to the clicked pixel's value
+- Hover shows colour index and pixel count in a tooltip
+
+**Phase 4 — Brush size and fill bucket**
+- Configurable brush radius (1 / 2 / 3 / 5 / 7 px); circle footprint; footprint previewed as cursor overlay
+- Fill bucket: 4-connected flood fill in map-colour space; snapshots the full frame before filling
+
+**Phase 5 — Rectangle selection**
+- Drag to define selection marquee; visual overlay (dashed border, semi-transparent tint)
+- All paint/fill operations clamp to selection when one is active
+- Escape or click-outside to deselect
+- Establishes the selection infrastructure that later phases build on
+
+**Phase 6 — Per-region re-quantize from source** *(requires source file in `loominary_data/`)*
+- Load source image, extract the region that maps to the current selection
+- Run `convertTwoPassGrid` on that region with the tile's current settings (legal/allshades, dither on/off, colour count)
+- Preview before committing; error clearly if source file is missing
+
+**Phase 7 — Dithering strength brush**
+- Paint a `float[128*128]` dither-mask overlay (values 0–1)
+- Re-render the masked region via `renderDithered` with mask values used as the `ditherStrength` array instead of the Otsu-computed values
+- Brush strength adjustable via scroll; eraser mode sets to 0 (suppress dithering)
+- This is the "explicit override" complement to the automatic Otsu system
+
+**Phase 8 — Advanced selections**
+- Lasso: freehand polygon selection (point list, filled via scanline)
+- Magic wand: flood-fill selection by colour (4-connected, within a configurable colour-distance tolerance in Oklab)
+
+---
+
+Estimated scope: Phase 1–3 ≈ 400–500 lines; Phases 4–5 add ~300; Phases 6–8 add ~500 each. Total ≈ 1800–2000 lines. Phases 1–5 can ship as a useful standalone feature before any source-image integration is needed.
 
 ### Animated map art
 Encode multiple frames into a single payload. Decoder cycles frames on a timer, re-rendering the map texture.

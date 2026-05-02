@@ -17,6 +17,10 @@ This works on **any vanilla server** — the data lives in legitimate banner and
 - **Client-side rendering** with marker suppression — the banner pins disappear, leaving a clean image
 - **Workflow automation** at the anvil: stack-aware banner extraction, automatic renaming, automatic bundle storage
 - **Stuck-chunk recovery**: if the server permanently rejects a banner name the handler halts cleanly after a few attempts; `/loominary resalt` re-encodes the tile with a random nonce — same image, new chunk names, no re-import needed
+- **Two-pass dithering with adaptive edge detection**: Floyd-Steinberg error diffusion runs after palette pre-selection, with per-pixel strength controlled by an image-relative Otsu threshold — smooth gradients dither fully, sharp edges stay crisp, solid fills stay clean
+- **Multi-tile grid consistency**: when dithering a multi-tile image, palette pre-selection, the Otsu dither-strength map, and error diffusion all operate on the full grid image before splitting into tiles, eliminating colour and texture discontinuities at seams
+- **Color palette histogram**: `/loominary palette` shows a rarity distribution histogram and cumulative removal-cost table to guide reduction decisions
+- **Flexible palette reduction**: reduce by banner count or distinct colour count, on the active tile or all tiles at once
 - **Litematica schematic export** for placement guidance
 - **Grid-aware preview**: `/loominary preview` discovers the full wall of framed maps from any frame and paints all tiles at once
 - **Embedded metadata**: every payload records the image title, author username, grid position, and a CRC32 integrity check; v2 payloads also carry an optional nonce used by `/loominary resalt`
@@ -33,7 +37,7 @@ This works on **any vanilla server** — the data lives in legitimate banner and
 
 ## Installation
 
-1. Download `loominary-1.2.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
+1. Download `loominary-1.2.1.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
 2. Drop it into your `mods/` folder alongside Fabric API
 3. Launch the game
 
@@ -89,7 +93,7 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 - `/loominary import <filename>` — Import an image from `loominary_data/`. Defaults to a single 128×128 tile.
 - `/loominary import <filename> <cols> <rows>` — Split image into a `cols × rows` grid.
-- `/loominary import <filename> [cols] [rows] allshades` — Use the full ~248-color palette including the unobtainable shade. Default is the ~186-color legal palette.
+- `/loominary import <filename> [cols rows] [allshades] dither` — Import with adaptive Floyd-Steinberg dithering. For multi-tile images the full grid is processed together so palette, dithering calibration, and error propagation are consistent across tile seams. Combines with `allshades`.
 - `/loominary import steal` — Append the framed map at your crosshair as a new tile.
 
 ### Inspecting state
@@ -122,6 +126,12 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 ### Recovery
 
 - `/loominary resalt` — Re-encode the active tile with a random nonce, producing new chunk names for the same image without changing the visual result, author, flags, or title. Use this when the anvil handler shows "Stuck — run /loominary resalt." Only the current tile is re-encoded; other tiles in a multi-tile batch are untouched. Any banners already renamed for this tile are now orphaned — discard them before placing the maps.
+
+### Quality and dithering
+
+- `/loominary dither` — Re-encode the active tile from the source image using two-pass adaptive dithering: palette pre-selection then Floyd-Steinberg error diffusion with per-pixel strength controlled by an image-relative Otsu threshold. Requires the source file to still be in `loominary_data/`. Stolen tiles are not re-encodable.
+- `/loominary dither all` — Re-encode every tile. The entire grid image is processed together so palette selection, dithering calibration, and error propagation are seamless across tile boundaries.
+- `/loominary dither [all] colors <n>` — Pre-select `n` colours globally before dithering (1–248). The palette is chosen from the full image, then the dithered render uses only those colours.
 
 ### Palette reduction
 
@@ -168,6 +178,8 @@ Loominary exploits a chain of Minecraft mechanics that aren't normally connected
 **The client renders maps from a `byte[16384]` color array.** Loominary intercepts maps whose banner markers start with two hex digits, reassembles the chunks in order, base64-decodes and zstd-decompresses the result, and overwrites the client's local color array. The server is unaware.
 
 **The encoding works in map-color space.** The image is quantized to Minecraft's map palette using Oklab perceptual distance (rather than RGB Euclidean), then the resulting `byte[16384]` is compressed. Spatial coherence in the quantized output makes zstd very effective — most images compress to 1,500–6,000 bytes. The maximum payload is 255 banners × 48 base64 chars ≈ 9,000 bytes of compressed data per map.
+
+**The dithering pipeline operates on the full grid.** When dithering is requested, a first-pass nearest-neighbor quantization discovers the candidate palette; an optional pre-selection step reduces it to N colours globally; a per-pixel dithering-strength map is computed via Otsu's method on the local-contrast distribution (smooth areas get full diffusion, edges get none); and Floyd-Steinberg error diffusion runs across the entire `cols×128 × rows×128` pixel array before it is split into tiles. This ensures consistent palette, dithering density, and error carry-over across every tile seam.
 
 **Payloads carry a versioned manifest.** Every payload begins with a small binary header recording the format version, grid position (col, row, total cols/rows), author username, optional title, and a CRC32 of the image data. Version 2 manifests (produced by `/loominary resalt`) additionally carry a 4-byte random nonce; clients that don't understand v2 fall back to image-only rendering via the `header_size` field and still see the correct picture. This lets the decoder display metadata and handle future format changes gracefully without breaking old payloads.
 

@@ -49,19 +49,23 @@ Possible future improvement: automatic path-finding to unvisited banners so the 
 
 Open: visual pre-commit indicator ("which tile goes where" before painting).
 
-### Floyd-Steinberg dithering (compression-aware variant)
-Differentiation angle vs. existing mapart tools:
-- Operates on the full ~248-color palette including unbuildable shades, not just the buildable subset
-- Compression-aware: prefers dither patterns that compress well, since blown budgets are a real cost
-- Live in-world preview of multiple dither algorithms (Floyd-Steinberg, Atkinson, Bayer, Sierra, none)
-- Per-region dither control via the in-world editor
+### ~~Floyd-Steinberg dithering~~
 
-Implementation lives in `PngToMapColors.convert`. Per-import flag to opt in/out. Default probably should be off until we know how it interacts with the compression budget in practice.
+**Shipped in v1.2.1.** Two-pass pipeline in `PngToMapColors.convertTwoPassGrid`:
+- Pass 1 nearest-neighbor discovers candidate map colours; optional palette pre-selection (`colors <n>`) reduces to N global colours.
+- Adaptive strength map: local contrast (RMS Oklab distance to 4-connected neighbours) computed across the full grid image; Otsu's method finds the image-relative smooth/edge threshold; linear soft zone [0.5T, 1.5T] gives a gradual fade rather than a binary cut.
+- Floyd-Steinberg error diffusion in Oklab space, gated by both the gradient-suppression map and a perceptual error floor (0.015 Oklab units) to avoid noise in well-matched regions.
+- Full-grid processing: palette pre-selection, Otsu calibration, and error diffusion all operate on the complete `cols×128 × rows×128` image before tile splitting, eliminating palette discontinuities, dithering-density jumps, and error-reset artefacts at seams.
+- `/loominary import … dither`, `/loominary dither [all] [colors <n>]`.
 
-### LAB color space matching
-Switch nearest-color matching from RGB Euclidean distance to CIE LAB or Oklab. Better perceptual results everywhere — encoding, palette reduction, dither error distribution.
+Still open:
+- Compression-aware variant (prefer dither patterns that compress well; current approach reduces after dithering if needed)
+- Live in-world preview of multiple algorithms (Floyd-Steinberg, Atkinson, Bayer, Sierra)
+- Per-region dither control via brush → lives in the in-world editor (see below)
 
-Maybe 30 lines. Applies automatically once switched.
+### ~~LAB color space matching~~
+
+**Shipped.** All nearest-color matching and error distribution uses Oklab perceptual distance throughout — encoding, palette reduction (`reduceToFit`, `reduceToColorCount`), and dither error diffusion.
 
 ## Medium-value features
 
@@ -74,7 +78,7 @@ Tools to support, roughly in priority order:
 - Color picker (eyedropper)
 - Rectangle / lasso / magic-wand region selection
 - Per-region operation: re-quantize with different palette settings
-- Per-region operation: apply dithering (Floyd-Steinberg / Atkinson / Bayer / Sierra / none)
+- Per-region operation: apply dithering (Floyd-Steinberg / Atkinson / Bayer / Sierra / none) — the adaptive Otsu system shipped in v1.2.1 handles the automatic case; the brush is for explicit overrides
 - Per-region operation: restrict palette to a subset (e.g., "only carpet colors in this area")
 - Undo / redo
 
@@ -113,8 +117,9 @@ Good fit for a community-driven gallery model.
 ### Hotkey for export
 Add a key binding for `/loominary export`. One-line addition.
 
-### Color histogram in palette command
-`/loominary palette` currently lists the rarest 10 colors as text. Augment with a visual representation — clickable widget, or just a colored bar chart in chat.
+### ~~Color histogram in palette command~~
+
+**Shipped in v1.2.1.** `/loominary palette` now shows a proportional `█` bar chart bucketed by pixel frequency (1 / 2–5 / 6–20 / 21–100 / 101+), plus a cumulative removal-cost table at the 5/10/20/50-color thresholds. Also shipped in the same release: multi-tile reduce (`reduce all`), color-count reduction target (`reduce [all] colors <n>`), and reduction undo across tiles.
 
 ## Lower-priority / nice-to-have
 

@@ -60,9 +60,10 @@ import java.util.concurrent.ThreadLocalRandom;
  * /loominary tile next — switch to next incomplete tile
  * /loominary preview — paint active tile onto crosshair map
  * /loominary revert — restore a previewed map to its original
- * /loominary palette — color stats for active tile
- * /loominary reduce [target] — reduce active tile to fit (default 255)
- * /loominary reduce undo — restore tile to pre-reduction state
+ * /loominary palette — color stats + rarity histogram for active tile
+ * /loominary reduce [all] [<n>] — reduce tile(s) to n banners (default 255)
+ * /loominary reduce [all] colors <n> — reduce tile(s) to n distinct colors
+ * /loominary reduce undo — restore active tile to pre-reduction state
  * /loominary click — toggle auto-right-click of banners while holding map
  * /loominary click stop — stop auto-clicking
  * /loominary export [name] — write a Litematica .litematic for active tile
@@ -190,11 +191,24 @@ public class LoominaryCommand {
                             .then(ClientCommandManager.literal("palette")
                                     .executes(ctx -> palette(ctx.getSource())))
                             .then(ClientCommandManager.literal("reduce")
-                                    .executes(ctx -> reduce(ctx.getSource(), 255))
+                                    .executes(ctx -> reduceOne(ctx.getSource(), 255))
                                     .then(ClientCommandManager.literal("undo")
                                             .executes(ctx -> reduceUndo(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("all")
+                                            .executes(ctx -> reduceAll(ctx.getSource(), 255))
+                                            .then(ClientCommandManager.literal("colors")
+                                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
+                                                            .executes(ctx -> reduceAllColors(ctx.getSource(),
+                                                                    IntegerArgumentType.getInteger(ctx, "n")))))
+                                            .then(ClientCommandManager.argument("target", IntegerArgumentType.integer(1, 255))
+                                                    .executes(ctx -> reduceAll(ctx.getSource(),
+                                                            IntegerArgumentType.getInteger(ctx, "target")))))
+                                    .then(ClientCommandManager.literal("colors")
+                                            .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
+                                                    .executes(ctx -> reduceOneColors(ctx.getSource(),
+                                                            IntegerArgumentType.getInteger(ctx, "n")))))
                                     .then(ClientCommandManager.argument("target", IntegerArgumentType.integer(1, 255))
-                                            .executes(ctx -> reduce(ctx.getSource(),
+                                            .executes(ctx -> reduceOne(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "target")))))
 
                             // ── click ──────────────────────────────────────────
@@ -854,6 +868,16 @@ public class LoominaryCommand {
     // ════════════════════════════════════════════════════════════════════
     // palette / reduce / reduce undo
     // ════════════════════════════════════════════════════════════════════
+    //
+    // Four reduce paths:
+    //   reduceOne(banners)      — active tile, banner-count target
+    //   reduceOneColors(n)      — active tile, color-count target
+    //   reduceAll(banners)      — every tile, banner-count target
+    //   reduceAllColors(n)      — every tile, color-count target
+    //
+    // All four save pre-reduction chunks in preReductionChunks so that
+    // "reduce undo" can restore the active tile.
+    // ════════════════════════════════════════════════════════════════════
 
     private static int palette(FabricClientCommandSource source) {
         if (PayloadState.tiles.isEmpty()) {
@@ -900,9 +924,58 @@ public class LoominaryCommand {
                 source.sendFeedback(Text.literal("§7Reduction:       §eactive §7(undo available)"));
             }
 
+            // ── Rarity distribution histogram ──────────────────────────────
+            int[] bucketBounds  = {1, 5, 20, 100, Integer.MAX_VALUE};
+            String[] bucketLbls = {"    1px", " 2- 5px", " 6-20px", "21-100px", "  101+px"};
+            int[] bucketColors  = new int[5];
+            int[] bucketPixels  = new int[5];
+            for (int c = 1; c < 256; c++) {
+                if (freq[c] == 0) continue;
+                for (int b = 0; b < bucketBounds.length; b++) {
+                    if (freq[c] <= bucketBounds[b]) {
+                        bucketColors[b]++;
+                        bucketPixels[b] += freq[c];
+                        break;
+                    }
+                }
+            }
+            int maxBucket = 0;
+            for (int cnt : bucketColors) maxBucket = Math.max(maxBucket, cnt);
+
+            source.sendFeedback(Text.literal("§7Color rarity distribution:"));
+            final int BAR_WIDTH = 16;
+            for (int b = 0; b < 5; b++) {
+                if (bucketColors[b] == 0) continue;
+                int bars = maxBucket > 0
+                        ? Math.max(1, bucketColors[b] * BAR_WIDTH / maxBucket) : 0;
+                String bar = "§a" + "█".repeat(bars) + "§8" + "░".repeat(BAR_WIDTH - bars);
+                source.sendFeedback(Text.literal(String.format(
+                        "§7 %s §f%3d §7colors  %s §7%.1f%%",
+                        bucketLbls[b], bucketColors[b], bar, 100.0 * bucketPixels[b] / MAP_BYTES)));
+            }
+
+            // ── Cumulative removal cost at fixed thresholds ────────────────
+            if (distinctColors > 2) {
+                int[] thresholds = {5, 10, 20, 50};
+                source.sendFeedback(Text.literal("§7Removal cost (rarest-first):"));
+                int cumPixels = 0, threshIdx = 0;
+                for (int i = 0; i < colorsByFreq.size() - 1 && threshIdx < thresholds.length; i++) {
+                    if (thresholds[threshIdx] >= distinctColors) break;
+                    cumPixels += colorsByFreq.get(i)[1];
+                    if (i + 1 == thresholds[threshIdx]) {
+                        source.sendFeedback(Text.literal(String.format(
+                                "§7  remove %2d: §f%5d §7px (§f%.1f%%§7 of tile)",
+                                thresholds[threshIdx], cumPixels,
+                                100.0 * cumPixels / MAP_BYTES)));
+                        threshIdx++;
+                    }
+                }
+            }
+
+            // ── Rarest individual colors ───────────────────────────────────
             int showCount = Math.min(10, colorsByFreq.size());
             source.sendFeedback(Text.literal(String.format(
-                    "§7Rarest %d colors (merge candidates):", showCount)));
+                    "§7Rarest %d colors:", showCount)));
             for (int i = 0; i < showCount; i++) {
                 int[] entry = colorsByFreq.get(i);
                 int rgb = colorRgb[entry[0]];
@@ -918,7 +991,7 @@ public class LoominaryCommand {
         }
     }
 
-    private static int reduce(FabricClientCommandSource source, int target) {
+    private static int reduceOne(FabricClientCommandSource source, int target) {
         if (PayloadState.tiles.isEmpty()) {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
@@ -993,6 +1066,219 @@ public class LoominaryCommand {
             e.printStackTrace();
             return 0;
         }
+    }
+
+    private static int reduceOneColors(FabricClientCommandSource source, int targetColors) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
+            source.sendError(Text.literal("§cActive tile has no chunks."));
+            return 0;
+        }
+
+        int tileIdx = PayloadState.activeTileIndex;
+
+        try {
+            byte[] mapColors = MapBannerDecoder.reassemblePayload(
+                    new ArrayList<>(PayloadState.ACTIVE_CHUNKS));
+            int currentColors = PngToMapColors.countDistinct(mapColors);
+            if (currentColors <= targetColors) {
+                source.sendFeedback(Text.literal(String.format(
+                        "§aTile already has %d distinct colors (≤ %d). No reduction needed.",
+                        currentColors, targetColors)));
+                return 1;
+            }
+
+            preReductionChunks.put(tileIdx, new ArrayList<>(PayloadState.ACTIVE_CHUNKS));
+
+            String playerName = source.getPlayer().getGameProfile().getName();
+            int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+            int tileNonce = PayloadState.tiles.get(tileIdx).nonce;
+            byte[] prefix = PayloadManifest.toBytes(flags,
+                    PayloadState.gridColumns, PayloadState.gridRows,
+                    PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
+                    0L, playerName, PayloadState.currentTitle, tileNonce);
+
+            PngToMapColors.FitResult fit = PngToMapColors.reduceToColorCount(
+                    mapColors, prefix, CHUNK_SIZE, targetColors);
+
+            byte[] manifestBytes = PayloadManifest.toBytes(flags,
+                    PayloadState.gridColumns, PayloadState.gridRows,
+                    PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
+                    PayloadManifest.crc32(fit.mapColors), playerName, PayloadState.currentTitle,
+                    tileNonce);
+            List<String> newChunks = buildChunks(manifestBytes, fit.mapColors);
+            int newColors = fit.originalDistinctColors - fit.colorsRemoved;
+
+            PayloadState.ACTIVE_CHUNKS.clear();
+            PayloadState.ACTIVE_CHUNKS.addAll(newChunks);
+            PayloadState.activeChunkIndex = 0;
+            PayloadState.save();
+
+            source.sendFeedback(Text.literal(String.format(
+                    "§6=== Reduced %s ===", PayloadState.tileLabel(tileIdx))));
+            source.sendFeedback(Text.literal(String.format(
+                    "§7Colors:  §e%d §7→ §a%d §7(%d removed)",
+                    fit.originalDistinctColors, newColors, fit.colorsRemoved)));
+            source.sendFeedback(Text.literal(String.format(
+                    "§7Banners: §f%d", newChunks.size())));
+            source.sendFeedback(Text.literal(String.format(
+                    "§7Pixels affected: §f%d §7(%.1f%% of tile)",
+                    fit.pixelsAffected, 100.0 * fit.pixelsAffected / MAP_BYTES)));
+            source.sendFeedback(Text.literal(
+                    "§7Use §f/loominary preview§7 to inspect. "
+                            + "§f/loominary reduce undo§7 to revert."));
+            return 1;
+        } catch (Exception e) {
+            source.sendError(Text.literal("§cReduction failed: " + e.getMessage()));
+            return 0;
+        }
+    }
+
+    private static int reduceAll(FabricClientCommandSource source, int targetBanners) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+
+        PayloadState.syncToActiveTile();
+
+        String playerName = source.getPlayer().getGameProfile().getName();
+        int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+        int tilesReduced = 0, totalColorsRemoved = 0, totalPixelsAffected = 0;
+        List<String> notes = new ArrayList<>();
+
+        for (int i = 0; i < PayloadState.tiles.size(); i++) {
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            if (tile.chunks.isEmpty() || tile.chunks.size() <= targetBanners) {
+                notes.add(null);
+                continue;
+            }
+            preReductionChunks.putIfAbsent(i, new ArrayList<>(tile.chunks));
+            try {
+                byte[] mapColors = MapBannerDecoder.reassemblePayload(new ArrayList<>(tile.chunks));
+                byte[] manifest0 = PayloadManifest.toBytes(flags,
+                        PayloadState.gridColumns, PayloadState.gridRows,
+                        PayloadState.tileCol(i), PayloadState.tileRow(i),
+                        0L, playerName, PayloadState.currentTitle, tile.nonce);
+                PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
+                        mapColors, manifest0, CHUNK_SIZE, targetBanners);
+                byte[] manifest = PayloadManifest.toBytes(flags,
+                        PayloadState.gridColumns, PayloadState.gridRows,
+                        PayloadState.tileCol(i), PayloadState.tileRow(i),
+                        PayloadManifest.crc32(fit.mapColors), playerName,
+                        PayloadState.currentTitle, tile.nonce);
+                List<String> newChunks = buildChunks(manifest, fit.mapColors);
+                int oldSize = tile.chunks.size();
+                tile.chunks.clear();
+                tile.chunks.addAll(newChunks);
+                tile.currentIndex = 0;
+                tilesReduced++;
+                totalColorsRemoved  += fit.colorsRemoved;
+                totalPixelsAffected += fit.pixelsAffected;
+                notes.add(String.format("§e%d §7→ §a%d §7banners, %d colors merged",
+                        oldSize, newChunks.size(), fit.colorsRemoved));
+            } catch (Exception e) {
+                notes.add("§cfailed: " + e.getMessage());
+            }
+        }
+
+        PayloadState.syncFromActiveTile();
+        PayloadState.save();
+
+        if (tilesReduced == 0) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§aAll tiles already fit in %d banners. No reduction needed.", targetBanners)));
+            return 1;
+        }
+        source.sendFeedback(Text.literal(String.format(
+                "§6=== Reduced All Tiles (target: %d banners) ===", targetBanners)));
+        for (int i = 0; i < notes.size(); i++) {
+            if (notes.get(i) != null)
+                source.sendFeedback(Text.literal(String.format("§7  %s: %s",
+                        PayloadState.tileLabel(i), notes.get(i))));
+        }
+        source.sendFeedback(Text.literal(String.format(
+                "§7%d tile%s reduced. Total: %d colors merged, %d pixels affected.",
+                tilesReduced, tilesReduced == 1 ? "" : "s",
+                totalColorsRemoved, totalPixelsAffected)));
+        source.sendFeedback(Text.literal(
+                "§7Use §f/loominary tile <n>§7 + §f/loominary reduce undo§7 to restore individual tiles."));
+        return 1;
+    }
+
+    private static int reduceAllColors(FabricClientCommandSource source, int targetColors) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+
+        PayloadState.syncToActiveTile();
+
+        String playerName = source.getPlayer().getGameProfile().getName();
+        int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+        int tilesReduced = 0, totalColorsRemoved = 0, totalPixelsAffected = 0;
+        List<String> notes = new ArrayList<>();
+
+        for (int i = 0; i < PayloadState.tiles.size(); i++) {
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            if (tile.chunks.isEmpty()) { notes.add(null); continue; }
+            preReductionChunks.putIfAbsent(i, new ArrayList<>(tile.chunks));
+            try {
+                byte[] mapColors = MapBannerDecoder.reassemblePayload(new ArrayList<>(tile.chunks));
+                int currentColors = PngToMapColors.countDistinct(mapColors);
+                if (currentColors <= targetColors) { notes.add(null); continue; }
+                byte[] prefix = PayloadManifest.toBytes(flags,
+                        PayloadState.gridColumns, PayloadState.gridRows,
+                        PayloadState.tileCol(i), PayloadState.tileRow(i),
+                        0L, playerName, PayloadState.currentTitle, tile.nonce);
+                PngToMapColors.FitResult fit = PngToMapColors.reduceToColorCount(
+                        mapColors, prefix, CHUNK_SIZE, targetColors);
+                byte[] manifest = PayloadManifest.toBytes(flags,
+                        PayloadState.gridColumns, PayloadState.gridRows,
+                        PayloadState.tileCol(i), PayloadState.tileRow(i),
+                        PayloadManifest.crc32(fit.mapColors), playerName,
+                        PayloadState.currentTitle, tile.nonce);
+                List<String> newChunks = buildChunks(manifest, fit.mapColors);
+                int newColors = fit.originalDistinctColors - fit.colorsRemoved;
+                tile.chunks.clear();
+                tile.chunks.addAll(newChunks);
+                tile.currentIndex = 0;
+                tilesReduced++;
+                totalColorsRemoved  += fit.colorsRemoved;
+                totalPixelsAffected += fit.pixelsAffected;
+                notes.add(String.format("§e%d §7→ §a%d §7colors, %d banners",
+                        currentColors, newColors, newChunks.size()));
+            } catch (Exception e) {
+                notes.add("§cfailed: " + e.getMessage());
+            }
+        }
+
+        PayloadState.syncFromActiveTile();
+        PayloadState.save();
+
+        if (tilesReduced == 0) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§aAll tiles already at or below %d distinct colors. No reduction needed.",
+                    targetColors)));
+            return 1;
+        }
+        source.sendFeedback(Text.literal(String.format(
+                "§6=== Reduced All Tiles (target: %d colors) ===", targetColors)));
+        for (int i = 0; i < notes.size(); i++) {
+            if (notes.get(i) != null)
+                source.sendFeedback(Text.literal(String.format("§7  %s: %s",
+                        PayloadState.tileLabel(i), notes.get(i))));
+        }
+        source.sendFeedback(Text.literal(String.format(
+                "§7%d tile%s reduced. Total: %d colors merged, %d pixels affected.",
+                tilesReduced, tilesReduced == 1 ? "" : "s",
+                totalColorsRemoved, totalPixelsAffected)));
+        source.sendFeedback(Text.literal(
+                "§7Use §f/loominary tile <n>§7 + §f/loominary reduce undo§7 to restore individual tiles."));
+        return 1;
     }
 
     private static int reduceUndo(FabricClientCommandSource source) {

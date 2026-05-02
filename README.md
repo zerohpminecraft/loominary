@@ -125,9 +125,14 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 ### Palette reduction
 
+- `/loominary palette` — Shows color stats, a rarity distribution histogram (how many colors fall in each frequency bucket), and a cumulative removal-cost table so you can see how many pixels each additional color removal would affect.
 - `/loominary reduce` — Reduce the active tile to fit in 255 banners by merging the rarest colors into their visual neighbors.
-- `/loominary reduce <target>` — Reduce to a specific banner count (1–255).
-- `/loominary reduce undo` — Restore the active tile to its pre-reduction state.
+- `/loominary reduce <n>` — Reduce the active tile to at most `n` banners (1–255).
+- `/loominary reduce colors <n>` — Reduce the active tile to at most `n` distinct colors (1–248).
+- `/loominary reduce all` — Apply banner-count reduction (target 255) to every tile in the batch.
+- `/loominary reduce all <n>` — Apply banner-count reduction to every tile with target `n`.
+- `/loominary reduce all colors <n>` — Apply color-count reduction to every tile.
+- `/loominary reduce undo` — Restore the active tile to its pre-reduction state. For multi-tile reduces, switch to each tile first with `/loominary tile <n>` then undo.
 
 ### Export
 

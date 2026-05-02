@@ -31,13 +31,15 @@ public class LoominaryKeybindings {
     private static KeyBinding keyRevert;
     private static KeyBinding keyTileNext;
     private static KeyBinding keyStatus;
+    private static KeyBinding keyEdit;
 
     public static void register() {
-        keySteal = registerUnbound("key.loominary.steal");
-        keyPreview = registerUnbound("key.loominary.preview");
-        keyRevert = registerUnbound("key.loominary.revert");
+        keySteal    = registerUnbound("key.loominary.steal");
+        keyPreview  = registerUnbound("key.loominary.preview");
+        keyRevert   = registerUnbound("key.loominary.revert");
         keyTileNext = registerUnbound("key.loominary.tile_next");
-        keyStatus = registerUnbound("key.loominary.status");
+        keyStatus   = registerUnbound("key.loominary.status");
+        keyEdit     = registerUnbound("key.loominary.edit");
 
         ClientTickEvents.END_CLIENT_TICK.register(LoominaryKeybindings::onTick);
     }
@@ -60,6 +62,7 @@ public class LoominaryKeybindings {
         while (keyRevert.wasPressed())   runCommand(client, "loominary revert");
         while (keyTileNext.wasPressed()) runCommand(client, "loominary tile next");
         while (keyStatus.wasPressed())   runCommand(client, "loominary status");
+        while (keyEdit.wasPressed())     runCommand(client, "loominary edit");
     }
 
     private static void runCommand(MinecraftClient client, String command) {

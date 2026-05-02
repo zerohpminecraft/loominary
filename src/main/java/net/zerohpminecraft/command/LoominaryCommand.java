@@ -60,6 +60,7 @@ import java.util.concurrent.ThreadLocalRandom;
  * /loominary tile next — switch to next incomplete tile
  * /loominary preview — paint active tile onto crosshair map
  * /loominary revert — restore a previewed map to its original
+ * /loominary edit — open the map editor for the active tile
  * /loominary dither [all] [colors <n>] — re-encode from source with Floyd-Steinberg dithering
  * /loominary palette — color stats + rarity histogram for active tile
  * /loominary reduce [all] [<n>] — reduce tile(s) to n banners (default 255)
@@ -244,6 +245,10 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("name", StringArgumentType.string())
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
+
+                            // ── edit ───────────────────────────────────────────
+                            .then(ClientCommandManager.literal("edit")
+                                    .executes(ctx -> edit(ctx.getSource())))
 
                             // ── dither ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("dither")
@@ -1463,6 +1468,39 @@ public class LoominaryCommand {
         } catch (IOException e) {
             source.sendError(Text.literal("§cExport failed: " + e.getMessage()));
             e.printStackTrace();
+            return 0;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // edit
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int edit(FabricClientCommandSource source) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal(
+                    "§cNo active batch. Run §f/loominary import§c first."));
+            return 0;
+        }
+        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
+            source.sendError(Text.literal("§cActive tile has no chunks to edit."));
+            return 0;
+        }
+
+        try {
+            byte[] mapColors = MapBannerDecoder.reassemblePayload(
+                    new ArrayList<>(PayloadState.ACTIVE_CHUNKS));
+            int tileIdx = PayloadState.activeTileIndex;
+            String label = PayloadState.tileLabel(tileIdx);
+
+            // setScreen must run on the main client thread; client commands already
+            // execute there, but send() is the safe pattern if that ever changes.
+            MinecraftClient.getInstance().send(() ->
+                    MinecraftClient.getInstance().setScreen(
+                            new net.zerohpminecraft.MapEditorScreen(mapColors, tileIdx, label)));
+            return 1;
+        } catch (Exception e) {
+            source.sendError(Text.literal("§cFailed to decode tile: " + e.getMessage()));
             return 0;
         }
     }

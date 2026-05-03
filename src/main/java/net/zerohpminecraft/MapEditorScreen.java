@@ -79,10 +79,11 @@ public class MapEditorScreen extends Screen {
     private int hoverMapX = -1, hoverMapY = -1;
 
     // Tools (Phase 2–4)
-    private Tool    currentTool = Tool.BRUSH;
-    private int     activeColor = 1;   // map-color byte value 0–255
-    private int     brushRadius = 0;   // 0 = single pixel
-    private boolean stroking    = false;
+    private Tool    currentTool   = Tool.BRUSH;
+    private int     activeColor   = 1;    // map-color byte value 0–255
+    private int     brushRadius   = 0;    // 0 = single pixel
+    private float   fillTolerance = 0f;   // Oklab distance; 0 = exact match only
+    private boolean stroking      = false;
 
     private final EditHistory history = new EditHistory();
 
@@ -281,15 +282,16 @@ public class MapEditorScreen extends Screen {
         ctx.fill(0, barY, width, height, COL_STATUS_BG);
         ctx.fill(0, barY, width, barY + 1, COL_STATUS_SEP);
 
-        // Left: label + active tool (highlighted) + inactive tool + undo hint
-        String brushLabel  = currentTool == Tool.BRUSH ? "§a[B]Brush§r" : "§8[B]Brush";
-        String fillLabel   = currentTool == Tool.FILL  ? "§a[F]Fill§r"  : "§8[F]Fill";
-        String brushDetail = currentTool == Tool.BRUSH
-                ? String.format(" r:%d  §8[/] size", brushRadius) : "";
-        String undoHint    = history.canUndo() ? "  §8Ctrl+Z" : "";
-        String redoHint    = history.canRedo() ? "  §8Ctrl+Y" : "";
-        String left = String.format("§8%s  §r%s%s  %s%s%s",
-                tileLabel, brushLabel, brushDetail, fillLabel, undoHint, redoHint);
+        // Left: label + active tool with its secondary parameter + inactive tool + undo
+        String brushLabel = currentTool == Tool.BRUSH ? "§a[B]Brush§r" : "§8[B]Brush";
+        String fillLabel  = currentTool == Tool.FILL  ? "§a[F]Fill§r"  : "§8[F]Fill";
+        String toolDetail = currentTool == Tool.BRUSH
+                ? String.format(" r:%d", brushRadius)
+                : String.format(" tol:%.3f", fillTolerance);
+        String undoHint = history.canUndo() ? "  §8Ctrl+Z" : "";
+        String redoHint = history.canRedo() ? "  §8Ctrl+Y" : "";
+        String left = String.format("§8%s  §r%s%s §8(Sh+scroll)  %s%s%s",
+                tileLabel, brushLabel, toolDetail, fillLabel, undoHint, redoHint);
         ctx.drawTextWithShadow(textRenderer, Text.literal(left), 4, barY + 3, 0xFFFFFF);
 
         // Right: hover info or controls hint
@@ -315,6 +317,22 @@ public class MapEditorScreen extends Screen {
     public boolean mouseScrolled(double mouseX, double mouseY,
                                   double hAmt, double vAmt) {
         if (mouseX >= width - PANEL_W) return false;
+
+        if (hasShiftDown()) {
+            // Shift+Scroll: secondary parameter of the active tool.
+            if (currentTool == Tool.BRUSH) {
+                brushRadius = Math.max(0, Math.min(MAX_BRUSH,
+                        brushRadius + (int) Math.signum(vAmt)));
+            } else {
+                // Snap fillTolerance to the nearest 0.025 step (avoids float drift).
+                fillTolerance = Math.max(0f, Math.min(0.5f,
+                        fillTolerance + (float) Math.signum(vAmt) * 0.025f));
+                fillTolerance = Math.round(fillTolerance * 40) / 40f;
+            }
+            return true;
+        }
+
+        // Unmodified scroll: zoom, keeping the pixel under the cursor fixed.
         int old = scale;
         scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE,
                 scale + (int) Math.signum(vAmt)));
@@ -416,11 +434,15 @@ public class MapEditorScreen extends Screen {
         if (ctrl && keyCode == GLFW.GLFW_KEY_Y) { history.redo(); return true; }
         if (keyCode == GLFW.GLFW_KEY_B) { currentTool = Tool.BRUSH; return true; }
         if (keyCode == GLFW.GLFW_KEY_F) { currentTool = Tool.FILL;  return true; }
-        if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET)  {
-            brushRadius = Math.max(0, brushRadius - 1); return true;
+        // [ and ] change brush size (US layout; Shift+Scroll works on all layouts).
+        if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET)  { brushRadius = Math.max(0, brushRadius - 1);        return true; }
+        if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) { brushRadius = Math.min(MAX_BRUSH, brushRadius + 1); return true; }
+        // = and - adjust fill tolerance (Shift+Scroll also works).
+        if (keyCode == GLFW.GLFW_KEY_EQUAL && currentTool == Tool.FILL) {
+            fillTolerance = Math.round(Math.min(0.5f, fillTolerance + 0.025f) * 40) / 40f; return true;
         }
-        if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) {
-            brushRadius = Math.min(MAX_BRUSH, brushRadius + 1); return true;
+        if (keyCode == GLFW.GLFW_KEY_MINUS && currentTool == Tool.FILL) {
+            fillTolerance = Math.round(Math.max(0f,  fillTolerance - 0.025f) * 40) / 40f; return true;
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
     }
@@ -441,25 +463,53 @@ public class MapEditorScreen extends Screen {
         dirty = true;
     }
 
-    /** 4-connected flood fill from (startX, startY) replacing target colour. */
+    /**
+     * 4-connected flood fill from (startX, startY).
+     * With fillTolerance > 0, fills pixels whose colour is within that Oklab
+     * distance of the target rather than requiring an exact match.
+     * A visited[] guard prevents revisiting pixels, which is essential when
+     * tolerance makes the "matches" condition non-transitive.
+     */
     private void applyFillAt(int startX, int startY) {
         int target = mapColors[startX + startY * MAP_SIZE] & 0xFF;
         if (target == activeColor) return;
+        float[] targetOklab = fillTolerance > 0f ? getMapColorOklab(target) : null;
         history.snapshot();
+        boolean[] visited = new boolean[MAP_BYTES];
         Deque<int[]> queue = new ArrayDeque<>();
         queue.push(new int[]{startX, startY});
         while (!queue.isEmpty()) {
             int[] p = queue.pop();
             int x = p[0], y = p[1];
             if (!inMapBounds(x, y)) continue;
-            if ((mapColors[x + y * MAP_SIZE] & 0xFF) != target) continue;
-            mapColors[x + y * MAP_SIZE] = (byte) activeColor;
+            int idx = x + y * MAP_SIZE;
+            if (visited[idx]) continue;
+            visited[idx] = true;
+            if (!colorMatches(mapColors[idx] & 0xFF, target, targetOklab)) continue;
+            mapColors[idx] = (byte) activeColor;
             queue.push(new int[]{x+1, y});
             queue.push(new int[]{x-1, y});
             queue.push(new int[]{x, y+1});
             queue.push(new int[]{x, y-1});
         }
         dirty = true;
+    }
+
+    private boolean colorMatches(int color, int target, float[] targetOklab) {
+        if (color == target) return true;
+        if (targetOklab == null) return false;
+        float[] colorOklab = getMapColorOklab(color);
+        if (colorOklab == null) return false;
+        float dL = targetOklab[0] - colorOklab[0];
+        float da = targetOklab[1] - colorOklab[1];
+        float db = targetOklab[2] - colorOklab[2];
+        return dL*dL + da*da + db*db <= fillTolerance * fillTolerance;
+    }
+
+    private float[] getMapColorOklab(int colorByte) {
+        if (colorByte == 0) return null;
+        int rgb = colorLookup[colorByte];
+        return rgb == 0 ? null : PngToMapColors.rgbToOklab(rgb);
     }
 
     // ── Re-encode on close ───────────────────────────────────────────────
@@ -519,11 +569,18 @@ public class MapEditorScreen extends Screen {
             if (freq[c] > 0) entries.add(new int[]{c, freq[c]});
         }
         entries.sort((a, b) -> b[1] - a[1]);
-        return entries.stream().mapToInt(e -> e[0]).toArray();
+        int[] sorted = entries.stream().mapToInt(e -> e[0]).toArray();
+        if (freq[0] == 0) return sorted;
+        // Transparent pixels present — prepend color 0 regardless of frequency rank.
+        int[] out = new int[sorted.length + 1];
+        System.arraycopy(sorted, 0, out, 1, sorted.length);
+        return out; // out[0] = 0 (transparent)
     }
 
     private int[] computeAllMapColors() {
+        // Color 0 (transparent / erase) is always first.
         List<Integer> all = new ArrayList<>();
+        all.add(0);
         for (int c = 1; c < 256; c++) {
             if (colorLookup[c] != 0) all.add(c);
         }

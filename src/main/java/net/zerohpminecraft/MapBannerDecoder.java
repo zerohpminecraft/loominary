@@ -285,6 +285,20 @@ public class MapBannerDecoder {
                     + (manifest.animated() ? " frames=" + manifest.frameCount : ""));
         }
 
+        // De-interleave frame region before CRC check and frame extraction so both
+        // steps always work with frame-sequential data regardless of FLAG_INTERLEAVED.
+        if (manifest.interleaved() && manifest.animated() && manifest.frameCount > 1) {
+            int fc = manifest.frameCount;
+            int regionLen = fc * MAP_BYTES;
+            if (offset + regionLen <= full.length) {
+                byte[] sequential = PayloadManifest.deinterleaveFlat(
+                        Arrays.copyOfRange(full, offset, offset + regionLen), fc);
+                byte[] newFull = Arrays.copyOf(full, full.length);
+                System.arraycopy(sequential, 0, newFull, offset, regionLen);
+                full = newFull;
+            }
+        }
+
         if (manifest.colorCrc32 >= 0) {
             byte[] frame0 = Arrays.copyOfRange(full, offset, offset + MAP_BYTES);
             long actualCrc = PayloadManifest.crc32(frame0);
@@ -485,6 +499,16 @@ public class MapBannerDecoder {
 
             int fc = manifest.frameCount;
             int offset = manifest.headerSize;
+
+            // De-interleave before frame extraction when FLAG_INTERLEAVED is set.
+            if (manifest.interleaved() && offset + fc * MAP_BYTES <= full.length) {
+                byte[] sequential = PayloadManifest.deinterleaveFlat(
+                        Arrays.copyOfRange(full, offset, offset + fc * MAP_BYTES), fc);
+                byte[] newFull = Arrays.copyOf(full, full.length);
+                System.arraycopy(sequential, 0, newFull, offset, sequential.length);
+                full = newFull;
+            }
+
             byte[][] frames = new byte[fc][MAP_BYTES];
             for (int f = 0; f < fc; f++) {
                 int start = offset + f * MAP_BYTES;

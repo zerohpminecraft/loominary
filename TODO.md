@@ -113,32 +113,119 @@ A modal editor for live, in-world pixel editing of the active tile. The two arch
 - Escape or click-outside to deselect
 - Establishes the selection infrastructure that later phases build on
 
-**Phase 6 — Per-region re-quantize from source** *(requires source file in `loominary_data/`)*
-- Load source image, extract the region that maps to the current selection
-- Run `convertTwoPassGrid` on that region with the tile's current settings (legal/allshades, dither on/off, colour count)
-- Preview before committing; error clearly if source file is missing
+**Shipped in current version.** All phases 6–8 + Eyedropper:
 
-**Phase 7 — Dithering strength brush**
-- Paint a `float[128*128]` dither-mask overlay (values 0–1)
-- Re-render the masked region via `renderDithered` with mask values used as the `ditherStrength` array instead of the Otsu-computed values
-- Brush strength adjustable via scroll; eraser mode sets to 0 (suppress dithering)
-- This is the "explicit override" complement to the automatic Otsu system
+*Phase 6* — `R` re-quantizes the active selection (or whole tile) from the source image. `D` toggles Floyd-Steinberg dithering. Enter/Y commits the preview, Esc cancels. `PayloadState.dither` persists the dither setting across sessions.
 
-**Phase 8 — Advanced selections**
-- Lasso: freehand polygon selection (point list, filled via scanline)
-- Magic wand: flood-fill selection by colour (4-connected, within a configurable colour-distance tolerance in Oklab)
+*Phase 7* — `T` activates the dither-strength brush. Left-click paints strength 0–1 into a `float[16384]` overlay; right-click erases to 0. `M` shows/hides the yellow heat overlay. Shift+scroll or `=`/`-` adjusts paint strength. When a custom mask exists and dither is on, `R` (re-quantize) uses the mask instead of the Otsu-computed strength.
+
+*Phase 8* — Selection refactored from a rect to `boolean[16384]` to support non-rectangular shapes. `L` activates the lasso (freehand drag, closes on release via `Path2D`). `W` activates the magic wand (4-connected Oklab flood-fill; tolerance shared with fill bucket via Shift+scroll or `=`/`-`).
+
+*Eyedropper* — `E` activates a dedicated eyedropper tool; left-click picks colour and auto-reverts to the previous tool. Right-click eyedropper still works universally on BRUSH and FILL tools.
 
 ---
 
 Estimated scope: Phase 1–3 ≈ 400–500 lines; Phases 4–5 add ~300; Phases 6–8 add ~500 each. Total ≈ 1800–2000 lines. Phases 1–5 can ship as a useful standalone feature before any source-image integration is needed.
 
 ### Animated map art
-Encode multiple frames into a single payload. Decoder cycles frames on a timer, re-rendering the map texture.
-- Frame data layout in payload TBD — probably a manifest field declaring frame count + delay
-- Cycle pauses if the player is far from the map (no point burning ticks)
-- Need to think about how this interacts with multi-tile murals
 
-Big creative unlock. People will make signs, banners with mottos that scroll, etc.
+Encode a GIF as multiple frames in a single payload. The decoder cycles frames on a tick timer, repainting the map texture each transition. Big creative unlock — scrolling text, blinking signs, looping sprites.
+
+---
+
+**Capacity analysis (must read first)**
+
+Available space per tile: 255 banners × 48 b64 chars = 12,240 chars → ~9,180 bytes compressed.
+
+Frame storage layout: **concatenated raw frames** — frame 0 bytes followed immediately by frame 1, etc. (`frame_count × 16,384` map-color bytes after the manifest header). Zstd operates on the full combined payload and naturally exploits inter-frame repetition without any delta-coding complexity. Measured estimate:
+
+- Static tile (1 frame): ~1.5–3 KB compressed (typical mapart content)
+- 2 frames, similar content: ~2–4 KB
+- 4 frames, similar content: ~3–6 KB (realistic target for most GIFs)
+- 8 frames, high-similarity: possible but image-dependent
+
+Hard cap: if `frame_count × 16384` bytes do not fit in 9,180 compressed bytes, encoding must fail with a descriptive error (suggest reducing frames or simplifying palette). There is no automatic truncation.
+
+**Backward compatibility:** old decoders (v0–v2) find map colors at `header_size`, read exactly 16,384 bytes, and get frame 0. They render a static image and ignore the rest. No action needed on their side.
+
+---
+
+**Architecture decisions (resolve before writing code)**
+
+1. **Wire format: manifest v3.** Add `FLAG_ANIMATED = 0x02` to the flags byte. New fields appended after existing v2 fields:
+   - `frame_count` u8 — total frames; 1 for non-animated tiles (always present in v3 but meaningless unless FLAG_ANIMATED is set)
+   - `loop_count` u16 big-endian — 0 = loop forever; >0 = stop after N loops
+   - `delay_mode` u8 — 0 = single shared delay, 1 = per-frame table
+   - `delay` u16 big-endian (if delay_mode=0) or `frame_count × u16` (if delay_mode=1) — milliseconds per frame
+
+   `header_size` skip-pointer allows future decoders (and old ones) to land at the right byte regardless of delay table length. Map-color bytes follow at `header_size`, totalling `frame_count × 16384` bytes.
+
+2. **GIF ingest: coalesce frames before quantizing.** `ImageIO`'s GIF decoder returns each frame as a partial image with a disposal metadata field (`doNotDispose`, `restoreToBackground`, `restoreToPrevious`). You must composit each decoded frame onto a running canvas (full 128×128 RGBA) respecting the disposal mode before scaling to 128×128 and quantizing. Getting this wrong produces corrupted frames on any GIF that uses partial-region updates.
+
+3. **Shared palette across frames.** Palette reduction (`reduceToColorCount`, dither pre-selection) runs once over the **union** of all frames' pixel sets, then each frame is quantized against the same global palette. This prevents inter-frame color flicker and gives zstd more repetition to exploit.
+
+4. **`PayloadState` extension.** `TileData` gains `int frameCount` and `List<Integer> frameDelays`. The `byte[][]` frame data is **not** stored in `PayloadState` — it is reconstructed from chunks on demand (same as today). The state file only stores frame metadata so the editor knows how many frames exist without decoding.
+
+5. **Decoder reshape (`MapBannerDecoder`).** Currently single-write-then-claim. Animated maps require:
+   - Per-map frame state: `Map<Integer, AnimatedMapState>` keyed by map ID storing `byte[][]` frames, current frame index, delay table, loop counter, and a `lastAdvanceTick` timestamp.
+   - Tick driver: advances frame index when `currentTick - lastAdvanceTick >= delayTicks`. Updates `MapState.colors` and calls `setNeedsUpdate`.
+   - Distance culling: pause advancement when the player is >32 blocks from the map's item frame. Resume on re-approach.
+   - Multi-tile sync: all tiles in a mural must declare the same `frame_count` and `frameDelays`. On decode, the decoder groups frames by mural (grid position from manifest) and advances them together in a single tick pass so the grid never shows mixed frames.
+
+6. **Editor frame model.** `MapEditorScreen` gains:
+   - `byte[][] frames` working copy (loaded from chunks on open; frame 0 is current static tile, additional frames appended when editing animated content).
+   - `int activeFrame` index; `←`/`→` (or `[`/`]`) navigate frames.
+   - Per-frame undo stack: `Deque<byte[]>[]` — one deque per frame, same 20-snapshot cap.
+   - Frame ops: `Ins` to duplicate the active frame, `Del` to remove it (minimum 1 frame).
+   - Dither mask `float[16384]`: **per-frame** to allow different dither densities per frame.
+   - Onion skin toggle (`O`): composites previous frame at 30% opacity underneath the active frame's pixels as a visual guide.
+
+7. **Multi-tile enforcement.** `/loominary import <file.gif> …` encodes all tiles with the same `frame_count` and `frameDelays` (derived from GIF metadata). The encoder rejects any per-tile result that exceeds the 255-banner cap and reports which frame and tile failed. `/loominary dither all` on an animated batch must re-encode all frames; single-tile dither is blocked with an explanatory error.
+
+---
+
+**Phase 0 — Manifest v3 + format scaffolding** *(no visible behavior change)*
+
+- Add `FLAG_ANIMATED`, `frame_count`, `loop_count`, `delay_mode`, `delay` to `PayloadManifest.toBytes` and `fromBytes`. Manifest version bumps to 3.
+- `PayloadManifest.CURRENT_VERSION = 3`.
+- Unit tests: encode/decode round-trip with 1 frame (no behavioral change), 4 frames, per-frame vs. global delays.
+- `PayloadState.TileData` gains `frameCount` and `frameDelays`; `Snapshot` serializes them. No behavioral change.
+
+**Phase 1 — GIF ingest + multi-frame encode** *(delivers: `/loominary import file.gif` works)*
+
+- `PngToMapColors.convertGif(Path)`: reads GIF with `ImageIO`, coalesces frames respecting disposal metadata, scales each coalesced frame to `128 × 128`, extracts frame delays from metadata.
+- Shared-palette path: run `reduceToColorCount` / dither pre-selection over the pixel union of all frames, then quantize each frame independently against the global palette.
+- `LoominaryCommand.importFile`: detect `.gif` extension, delegate to GIF path, build one `TileData` per spatial tile (each containing `frame_count × 16384` bytes worth of chunks).
+- Error path: if any tile's chunk count > 255, report `"Tile (col,row): N chunks for M frames — reduce colors or frame count"`.
+- Non-animated files (`.png`, `.jpg`) continue to use the existing single-frame path unchanged.
+
+**Phase 2 — Animated decoder** *(delivers: GIF plays in-world)*
+
+- `MapBannerDecoder`: on decode, if `FLAG_ANIMATED` is set, parse all frames from the decompressed payload (`frame_count × 16384` bytes starting at `header_size`).
+- `AnimatedMapState`: record struct holding frames array, delays, loop count, current frame, last-advance tick.
+- Tick driver: per-map, compare elapsed ticks to current frame's delay; advance if due. Call `paintMap` and `setNeedsUpdate`.
+- Distance culling: skip tick advancement if no item frame containing this map ID is within 32 blocks of the player.
+- Multi-tile sync: group maps by `(title, cols, rows)` or by mural spatial proximity; advance all in the same pass.
+
+**Phase 3 — Editor frame nav** *(delivers: frame-by-frame editing in MapEditorScreen)*
+
+- Open: if tile has `frameCount > 1`, decode all frames from chunks into `byte[][] frames`. Otherwise `frames = new byte[][]{currentColors}`.
+- Frame nav HUD: "Frame N/M" indicator in corner; `[` / `]` to step.
+- Per-frame undo (`Deque<byte[]>[]`).
+- Frame ops: `Ins` = duplicate active frame after current position; `Del` = remove active frame (blocked if frameCount == 1).
+- On close: re-encode all frames back into chunks; update `TileData.frameCount` and `TileData.frameDelays`.
+
+**Phase 4 — Per-frame dither mask + onion skin** *(quality-of-life for animators)*
+
+- Per-frame `float[16384]` dither mask; `M` overlay works per-frame.
+- Onion skin: `O` toggle composites the previous frame at ~30% opacity beneath the current frame's paint layer. Read-only guide layer, never encoded.
+- `R` (re-quantize) applies shared-palette re-quantization to the active frame only; uses this frame's dither mask.
+
+---
+
+Files touched across all phases: `PayloadManifest` (v3 wire format), `PngToMapColors` (GIF ingest, shared-palette multi-frame), `PayloadState` (frame metadata persistence), `MapBannerDecoder` (cycling, culling, multi-tile sync), `MapEditorScreen` (frame nav, per-frame undo, onion skin), `LoominaryCommand` (GIF detection, import wiring), `ChunkAssemblyTest` / `PayloadManifestTest` (v3 coverage).
+
+Estimated scope: Phase 0 ≈ 100 lines; Phase 1 ≈ 300; Phase 2 ≈ 250; Phase 3 ≈ 200; Phase 4 ≈ 150. Total ≈ 1,000 lines.
 
 ### Encoding throughput optimization
 Brute-force pixel-by-pixel quantization is slow on larger grids. Replace with:

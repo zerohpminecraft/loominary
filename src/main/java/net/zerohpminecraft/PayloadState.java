@@ -41,6 +41,8 @@ public class PayloadState {
 
     /** Whether the batch was encoded with allShades (FLAG_ALL_SHADES). */
     public static boolean allShades = false;
+    /** Whether the batch was (last) encoded with Floyd-Steinberg dithering. */
+    public static boolean dither = false;
     /** Optional title embedded in every tile's manifest; null if not set. */
     public static String currentTitle = null;
 
@@ -51,7 +53,17 @@ public class PayloadState {
     public static class TileData {
         public List<String> chunks = new ArrayList<>();
         public int currentIndex = 0;
-        public int nonce = 0;  // 0 = v1 encoding; non-zero = v2 with this nonce (/loominary resalt)
+        public int nonce = 0;          // 0 = v1 encoding; non-zero = v2+ with this nonce
+        public int frameCount = 1;     // 1 = static; >1 = animated (FLAG_ANIMATED set)
+        public List<Integer> frameDelays = null; // null → single global 100ms default
+        /** True when this tile uses the carpet-hybrid encoding (carpet platform + optional overflow banners). */
+        public boolean carpetEncoded = false;
+        /**
+         * Full zstd-compressed payload as base64, present only when {@code carpetEncoded == true}.
+         * Stored so the schematic can be re-exported and map-color preview works without the
+         * physical carpet platform being scanned.  Typically 2–14 KB as base64 per tile.
+         */
+        public String carpetCompressedB64 = null;
     }
 
     private static class Snapshot {
@@ -61,6 +73,7 @@ public class PayloadState {
         int activeTileIndex;
         List<TileData> tiles;
         boolean allShades;
+        boolean dither;
         String title;
     }
 
@@ -131,6 +144,7 @@ public class PayloadState {
             snap.activeTileIndex = activeTileIndex;
             snap.tiles = new ArrayList<>(tiles);
             snap.allShades = allShades;
+            snap.dither = dither;
             snap.title = currentTitle;
             Files.writeString(stateFile(), GSON.toJson(snap));
         } catch (IOException e) {
@@ -159,6 +173,7 @@ public class PayloadState {
             gridRows = snap.rows > 0 ? snap.rows : 1;
             activeTileIndex = snap.activeTileIndex;
             allShades = snap.allShades;
+            dither = snap.dither;
             currentTitle = snap.title;
 
             tiles.clear();
@@ -189,6 +204,7 @@ public class PayloadState {
         gridRows = 1;
         activeTileIndex = 0;
         allShades = false;
+        dither = false;
         currentTitle = null;
         tiles.clear();
         ACTIVE_CHUNKS.clear();

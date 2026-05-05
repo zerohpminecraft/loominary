@@ -3,10 +3,22 @@ package net.zerohpminecraft;
 import com.github.luben.zstd.Zstd;
 import net.minecraft.block.MapColor;
 
+import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
+import javax.imageio.metadata.IIOMetadata;
+import javax.imageio.stream.ImageInputStream;
+import org.w3c.dom.NamedNodeMap;
+import org.w3c.dom.Node;
+
+import java.awt.AlphaComposite;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Base64;
+import java.util.Iterator;
 
 /**
  * Converts a BufferedImage into the 128×128 byte array that MapState.colors uses,
@@ -361,7 +373,7 @@ public class PngToMapColors {
      *       well).</li>
      * </ol>
      */
-    private static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
+    static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
                                           float[][] oklabLookup, float[] ditherStrength,
                                           int width, int height) {
         byte[] out = new byte[width * height];
@@ -430,7 +442,7 @@ public class PngToMapColors {
 
     // ── Scaling ───────────────────────────────────────────────────────────
 
-    private static BufferedImage scale(BufferedImage source, int targetW, int targetH) {
+    static BufferedImage scale(BufferedImage source, int targetW, int targetH) {
         if (source.getWidth() == targetW && source.getHeight() == targetH
                 && source.getType() == BufferedImage.TYPE_INT_ARGB) {
             return source;
@@ -448,7 +460,7 @@ public class PngToMapColors {
 
     // ── Palette helpers ───────────────────────────────────────────────────
 
-    private static boolean[] buildPalette(byte[] mapColors) {
+    static boolean[] buildPalette(byte[] mapColors) {
         boolean[] palette = new boolean[256];
         for (byte b : mapColors) palette[b & 0xFF] = true;
         return palette;
@@ -493,7 +505,7 @@ public class PngToMapColors {
         return rgb;
     }
 
-    private static float[][] buildOklabLookup() {
+    static float[][] buildOklabLookup() {
         float[][] oklab = new float[256][];
         for (int b = 1; b < 256; b++) {
             int colorId = (b >> 2) & 0x3F, shadeId = b & 0x3;
@@ -546,7 +558,7 @@ public class PngToMapColors {
         return (base64.length() + chunkSize - 1) / chunkSize;
     }
 
-    private static byte findClosestMapColorByte(int argb, boolean legalOnly,
+    static byte findClosestMapColorByte(int argb, boolean legalOnly,
                                                  float[][] oklabLookup) {
         if (((argb >>> 24) & 0xFF) < 128) return 0;
         float[] target = rgbToOklab(argb);
@@ -574,5 +586,186 @@ public class PngToMapColors {
             if (dist < bestDist) { bestDist = dist; bestColor = c; }
         }
         return bestColor;
+    }
+
+    // ── GIF multi-frame encode ────────────────────────────────────────────
+
+    /**
+     * Result of encoding a GIF file.
+     * {@code tileFrames[tileIndex][frameIndex]} is the 16,384-byte map-color array
+     * for that spatial tile and animation frame. Tile index is row-major.
+     */
+    public static class GifResult {
+        public final byte[][][] tileFrames;
+        public final int[] frameDelays; // ms per frame, length == frameCount
+        GifResult(byte[][][] tileFrames, int[] frameDelays) {
+            this.tileFrames = tileFrames;
+            this.frameDelays = frameDelays;
+        }
+        public int frameCount() { return frameDelays.length; }
+    }
+
+    private record GifFrameInfo(int left, int top, int delayMs, String disposal) {}
+
+    /**
+     * Reads a GIF, coalesces its frames (respecting disposal methods), and encodes
+     * each frame as a grid of 128×128 map-color tiles using a shared palette.
+     *
+     * Shared palette: pass 1 nearest-neighbor on the union of all frames so that the
+     * same region in different frames maps to the same map-color bytes, preventing
+     * inter-frame color flicker and improving zstd compression of the combined payload.
+     */
+    public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
+                                        boolean dither, int cols, int rows) throws IOException {
+        try (ImageInputStream iis = ImageIO.createImageInputStream(Files.newInputStream(gifPath))) {
+            Iterator<ImageReader> readers = ImageIO.getImageReadersByMIMEType("image/gif");
+            if (!readers.hasNext()) throw new IOException("No GIF image reader available");
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(iis, false);
+                return readGif(reader, legalOnly, targetColors, dither, cols, rows);
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    private static GifResult readGif(ImageReader reader, boolean legalOnly, int targetColors,
+                                      boolean dither, int cols, int rows) throws IOException {
+        // Screen dimensions from stream metadata (reliable; Java's GIF reader always provides it).
+        int screenW = 0, screenH = 0;
+        IIOMetadata streamMeta = reader.getStreamMetadata();
+        if (streamMeta != null) {
+            Node root = streamMeta.getAsTree("javax_imageio_gif_stream_1.0");
+            for (Node c = root.getFirstChild(); c != null; c = c.getNextSibling()) {
+                if ("LogicalScreenDescriptor".equals(c.getNodeName())) {
+                    NamedNodeMap a = c.getAttributes();
+                    screenW = intAttr(a, "logicalScreenWidth", 0);
+                    screenH = intAttr(a, "logicalScreenHeight", 0);
+                }
+            }
+        }
+        if (screenW <= 0 || screenH <= 0) {
+            throw new IOException("Could not read GIF logical screen dimensions from stream metadata");
+        }
+
+        int numFrames = reader.getNumImages(true);
+        if (numFrames <= 0) throw new IOException("GIF has no frames");
+
+        // Coalesce frames respecting disposal methods.
+        BufferedImage canvas = new BufferedImage(screenW, screenH, BufferedImage.TYPE_INT_ARGB);
+        BufferedImage prevCanvas = null;
+        BufferedImage[] coalesced = new BufferedImage[numFrames];
+        int[] frameDelays = new int[numFrames];
+
+        for (int f = 0; f < numFrames; f++) {
+            BufferedImage subframe = reader.read(f);
+            GifFrameInfo info = parseGifFrameMeta(reader.getImageMetadata(f));
+            frameDelays[f] = info.delayMs();
+
+            if ("restoreToPrevious".equals(info.disposal())) prevCanvas = deepCopy(canvas);
+
+            Graphics2D g = canvas.createGraphics();
+            g.drawImage(subframe, info.left(), info.top(), null);
+            g.dispose();
+
+            coalesced[f] = deepCopy(canvas);
+
+            if ("restoreToBackground".equals(info.disposal())) {
+                Graphics2D gc = canvas.createGraphics();
+                gc.setComposite(AlphaComposite.getInstance(AlphaComposite.CLEAR));
+                gc.fillRect(info.left(), info.top(), subframe.getWidth(), subframe.getHeight());
+                gc.dispose();
+            } else if ("restoreToPrevious".equals(info.disposal()) && prevCanvas != null) {
+                canvas = prevCanvas;
+                prevCanvas = null;
+            }
+        }
+
+        // Scale all frames to the target grid resolution.
+        int totalW = cols * MAP_SIZE;
+        int totalH = rows * MAP_SIZE;
+        BufferedImage[] scaled = new BufferedImage[numFrames];
+        for (int f = 0; f < numFrames; f++) scaled[f] = scale(coalesced[f], totalW, totalH);
+
+        // Shared palette: pass 1 on the union of all frames.
+        float[][] oklabLookup = buildOklabLookup();
+        byte[] union = new byte[numFrames * totalW * totalH];
+        for (int f = 0; f < numFrames; f++) {
+            int base = f * totalW * totalH;
+            for (int y = 0; y < totalH; y++) {
+                for (int x = 0; x < totalW; x++) {
+                    union[base + x + y * totalW] = findClosestMapColorByte(
+                            scaled[f].getRGB(x, y), legalOnly, oklabLookup);
+                }
+            }
+        }
+        if (targetColors > 0 && countDistinct(union) > targetColors) {
+            reduceColorsInPlace(union, targetColors, oklabLookup);
+        }
+        boolean[] sharedPalette = buildPalette(union);
+
+        // Pass 2: render each frame against the shared palette, then split into tiles.
+        int tileCount = cols * rows;
+        byte[][][] tileFrames = new byte[tileCount][numFrames][MAP_BYTES];
+        for (int f = 0; f < numFrames; f++) {
+            byte[] fullResult;
+            if (dither) {
+                float[] strength = computeDitherStrength(scaled[f], totalW, totalH);
+                fullResult = renderDithered(scaled[f], sharedPalette, oklabLookup, strength, totalW, totalH);
+            } else {
+                fullResult = renderNearest(scaled[f], sharedPalette, oklabLookup, totalW, totalH);
+            }
+            byte[][] split = splitIntoTiles(fullResult, totalW, cols, rows);
+            for (int t = 0; t < tileCount; t++) tileFrames[t][f] = split[t];
+        }
+
+        return new GifResult(tileFrames, frameDelays);
+    }
+
+    private static GifFrameInfo parseGifFrameMeta(IIOMetadata meta) {
+        int left = 0, top = 0, delayMs = 100;
+        String disposal = "none";
+        try {
+            Node root = meta.getAsTree("javax_imageio_gif_image_1.0");
+            for (Node child = root.getFirstChild(); child != null; child = child.getNextSibling()) {
+                NamedNodeMap a = child.getAttributes();
+                switch (child.getNodeName()) {
+                    case "ImageDescriptor":
+                        left = intAttr(a, "imageLeftPosition", 0);
+                        top  = intAttr(a, "imageTopPosition",  0);
+                        break;
+                    case "GraphicControlExtension":
+                        int cs = intAttr(a, "delayTime", 10); // centiseconds
+                        delayMs = Math.max(20, cs * 10);      // min 20ms per convention
+                        disposal = strAttr(a, "disposalMethod", "none");
+                        break;
+                }
+            }
+        } catch (Exception ignored) {}
+        return new GifFrameInfo(left, top, delayMs, disposal);
+    }
+
+    private static BufferedImage deepCopy(BufferedImage src) {
+        BufferedImage copy = new BufferedImage(src.getWidth(), src.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = copy.createGraphics();
+        g.setComposite(AlphaComposite.Src);
+        g.drawImage(src, 0, 0, null);
+        g.dispose();
+        return copy;
+    }
+
+    private static int intAttr(NamedNodeMap attrs, String name, int fallback) {
+        if (attrs == null) return fallback;
+        Node n = attrs.getNamedItem(name);
+        if (n == null) return fallback;
+        try { return Integer.parseInt(n.getNodeValue()); }
+        catch (NumberFormatException e) { return fallback; }
+    }
+
+    private static String strAttr(NamedNodeMap attrs, String name, String fallback) {
+        if (attrs == null) return fallback;
+        Node n = attrs.getNamedItem(name);
+        return n == null ? fallback : n.getNodeValue();
     }
 }

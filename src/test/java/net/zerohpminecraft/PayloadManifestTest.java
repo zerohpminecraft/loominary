@@ -2,6 +2,8 @@ package net.zerohpminecraft;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 class PayloadManifestTest {
@@ -151,5 +153,99 @@ class PayloadManifestTest {
         bytes[11] = 20;
         assertThrows(IllegalArgumentException.class,
                 () -> PayloadManifest.fromBytes(bytes));
+    }
+
+    // ── v3 animated manifest ──────────────────────────────────────────────
+
+    @Test
+    void roundtrip_v3_globalDelay() {
+        byte[] bytes = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED,
+                2, 1, 0, 0, 0xABCDL,
+                "Artist", "Anim Title", 0,
+                4, 3, new int[]{200});
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+
+        assertEquals(3, m.manifestVersion);
+        assertEquals(bytes.length, m.headerSize);
+        assertTrue(m.animated());
+        assertEquals(4, m.frameCount);
+        assertEquals(3, m.loopCount);
+        assertEquals(1, m.frameDelays.length);
+        assertEquals(200, m.frameDelays[0]);
+        assertEquals("Artist", m.username);
+        assertEquals("Anim Title", m.title);
+    }
+
+    @Test
+    void roundtrip_v3_perFrameDelays() {
+        int[] delays = {100, 200, 150, 300};
+        byte[] bytes = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED,
+                1, 1, 0, 0, 0L,
+                null, null, 0,
+                4, 0, delays);
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+
+        assertEquals(3, m.manifestVersion);
+        assertEquals(bytes.length, m.headerSize);
+        assertTrue(m.animated());
+        assertEquals(4, m.frameCount);
+        assertEquals(0, m.loopCount);
+        assertArrayEquals(delays, m.frameDelays);
+    }
+
+    @Test
+    void v3_headerSize_isSkipPointer() {
+        // Verify that header_size correctly skips over all animation fields.
+        // Append a known sentinel after the manifest and confirm the skip lands on it.
+        byte[] manifest = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED,
+                1, 1, 0, 0, 0L,
+                "User", "Title", 0x99887766,
+                5, 0, new int[]{100, 200, 150, 300, 50});
+        byte sentinel = (byte) 0xAB;
+        byte[] combined = Arrays.copyOf(manifest, manifest.length + 1);
+        combined[manifest.length] = sentinel;
+
+        PayloadManifest m = PayloadManifest.fromBytes(combined);
+        assertEquals(sentinel, combined[m.headerSize],
+                "header_size must point to the first byte after the manifest");
+    }
+
+    @Test
+    void v3_tooManyFrames_throws() {
+        // 78 per-frame delays × 2 bytes = 156 bytes of delays alone;
+        // combined with max strings this should overflow the u8 header_size.
+        // In practice the frame count that trips the limit depends on string lengths.
+        // With no strings: 21 + 78*2 = 177 bytes — still under 255.
+        // With max strings (16 + 64 = 80 bytes): 21 + 80 + 78*2 = 257 bytes — over.
+        String maxUsername = "A".repeat(16);
+        String maxTitle    = "B".repeat(64);
+        int[] manyDelays   = new int[78]; // 78 per-frame delays
+        java.util.Arrays.fill(manyDelays, 100);
+
+        assertThrows(IllegalArgumentException.class, () ->
+                PayloadManifest.toBytes(
+                        PayloadManifest.FLAG_ANIMATED,
+                        1, 1, 0, 0, 0L,
+                        maxUsername, maxTitle, 0,
+                        78, 0, manyDelays));
+    }
+
+    @Test
+    void v3_staticTile_flagNotSet() {
+        // A v3 manifest with frameCount=1 and no FLAG_ANIMATED is a valid static tile.
+        byte[] bytes = PayloadManifest.toBytes(
+                0, 1, 1, 0, 0, 0xDEADL,
+                null, null, 0x11223344,
+                1, 0, new int[]{100});
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+        assertEquals(3, m.manifestVersion);
+        assertFalse(m.animated());
+        assertEquals(1, m.frameCount);
     }
 }

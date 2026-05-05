@@ -14,6 +14,7 @@ public class ClientModInit implements ClientModInitializer {
 
         LOGGER.info("§a[Loominary] MapFrameScanner registered (tick-based detection active)");
 
+        CarpetChannel.init();
         PayloadState.load();
         LoominaryCommand.register();
         LoominaryKeybindings.register();

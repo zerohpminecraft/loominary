@@ -242,18 +242,15 @@ public class LoominaryCommand {
             PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
             int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
 
-            // Concatenate frame bytes sequentially, then interleave for better compression.
-            byte[] sequential = new byte[frameCount * MAP_BYTES];
+            // Concatenate all frame bytes into the payload
+            byte[] payloadBytes = new byte[frameCount * MAP_BYTES];
             for (int f = 0; f < frameCount; f++) {
-                System.arraycopy(allFrames[f], 0, sequential, f * MAP_BYTES, MAP_BYTES);
+                System.arraycopy(allFrames[f], 0, payloadBytes, f * MAP_BYTES, MAP_BYTES);
             }
-            byte[] payloadBytes = frameCount > 1
-                    ? PayloadManifest.interleaveFlat(sequential, frameCount)
-                    : sequential;
 
             byte[] manifest;
             if (frameCount > 1) {
-                flags |= PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_INTERLEAVED;
+                flags |= PayloadManifest.FLAG_ANIMATED;
                 int[] delays;
                 if (editorDelays != null && editorDelays.length == frameCount) {
                     delays = editorDelays;
@@ -376,17 +373,6 @@ public class LoominaryCommand {
         PayloadManifest manifest = PayloadManifest.fromBytes(full);
         int fc = Math.max(1, manifest.frameCount);
         int offset = manifest.headerSize;
-
-        // De-interleave frame region when FLAG_INTERLEAVED is set so the extraction
-        // loop below always works with sequential frame data.
-        if (manifest.interleaved() && fc > 1 && offset + fc * MAP_BYTES <= full.length) {
-            byte[] sequential = PayloadManifest.deinterleaveFlat(
-                    Arrays.copyOfRange(full, offset, offset + fc * MAP_BYTES), fc);
-            byte[] newFull = Arrays.copyOf(full, full.length);
-            System.arraycopy(sequential, 0, newFull, offset, sequential.length);
-            full = newFull;
-        }
-
         byte[][] frames = new byte[fc][MAP_BYTES];
         for (int f = 0; f < fc; f++) {
             int start = offset + f * MAP_BYTES;
@@ -1034,8 +1020,7 @@ public class LoominaryCommand {
                 for (int d : rawDelays) if (d != rawDelays[0]) { uniformDelay = false; break; }
                 int[] manifestDelays = uniformDelay ? new int[]{rawDelays[0]} : rawDelays;
 
-                int tileFlags = (frameCount > 1
-                        ? PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_INTERLEAVED : 0)
+                int tileFlags = (frameCount > 1 ? PayloadManifest.FLAG_ANIMATED : 0)
                         | (allShades ? PayloadManifest.FLAG_ALL_SHADES : 0);
                 int totalTiles = columns * rows;
                 List<PayloadState.TileData> newTiles = new ArrayList<>();
@@ -1047,11 +1032,9 @@ public class LoominaryCommand {
                 for (int tileIdx = 0; tileIdx < totalTiles; tileIdx++) {
                     int col = tileIdx % columns;
                     int row = tileIdx / columns;
-                    byte[] sequential = new byte[frameCount * MAP_BYTES];
+                    byte[] allFramesBytes = new byte[frameCount * MAP_BYTES];
                     for (int f = 0; f < frameCount; f++)
-                        System.arraycopy(result.tileFrames[tileIdx][f], 0, sequential, f * MAP_BYTES, MAP_BYTES);
-                    byte[] allFramesBytes = frameCount > 1
-                            ? PayloadManifest.interleaveFlat(sequential, frameCount) : sequential;
+                        System.arraycopy(result.tileFrames[tileIdx][f], 0, allFramesBytes, f * MAP_BYTES, MAP_BYTES);
                     long crc = PayloadManifest.crc32(result.tileFrames[tileIdx][0]);
                     byte[] manifest = PayloadManifest.toBytes(
                             tileFlags, columns, rows, col, row, crc, playerName, capturedTitle,
@@ -1345,8 +1328,7 @@ public class LoominaryCommand {
             for (int d : rawDelays) if (d != rawDelays[0]) { uniformDelay = false; break; }
             int[] manifestDelays = uniformDelay ? new int[]{rawDelays[0]} : rawDelays;
 
-            int tileFlags = (frameCount > 1
-                    ? PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_INTERLEAVED : 0)
+            int tileFlags = (frameCount > 1 ? PayloadManifest.FLAG_ANIMATED : 0)
                     | (allShades ? PayloadManifest.FLAG_ALL_SHADES : 0);
 
             int totalTiles = columns * rows;
@@ -1359,11 +1341,9 @@ public class LoominaryCommand {
                 int col = tileIdx % columns;
                 int row = tileIdx / columns;
 
-                byte[] sequential = new byte[frameCount * MAP_BYTES];
+                byte[] allFramesBytes = new byte[frameCount * MAP_BYTES];
                 for (int f = 0; f < frameCount; f++)
-                    System.arraycopy(result.tileFrames[tileIdx][f], 0, sequential, f * MAP_BYTES, MAP_BYTES);
-                byte[] allFramesBytes = frameCount > 1
-                        ? PayloadManifest.interleaveFlat(sequential, frameCount) : sequential;
+                    System.arraycopy(result.tileFrames[tileIdx][f], 0, allFramesBytes, f * MAP_BYTES, MAP_BYTES);
 
                 long crc = PayloadManifest.crc32(result.tileFrames[tileIdx][0]);
                 byte[] manifestBytes = (frameCount > 1)
@@ -2136,7 +2116,7 @@ public class LoominaryCommand {
             int flags, int frameCount, int[] delays) {
         if (frameCount > 1) {
             return PayloadManifest.toBytes(
-                    flags | PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_INTERLEAVED,
+                    flags | PayloadManifest.FLAG_ANIMATED,
                     PayloadState.gridColumns, PayloadState.gridRows,
                     PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
                     crc, playerName, PayloadState.currentTitle,
@@ -2217,13 +2197,11 @@ public class LoominaryCommand {
 
                 long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
-                byte[] payload  = fc > 1
-                        ? PayloadManifest.interleaveFlat(fit.mapColors, fc) : fit.mapColors;
 
                 client.execute(() -> {
                     try {
                         PayloadState.TileData liveTile = PayloadState.tiles.get(tileIdx);
-                        int newCount = saveTileData(tileIdx, manifest, payload);
+                        int newCount = saveTileData(tileIdx, manifest, fit.mapColors);
                         liveTile.frameCount = fc;
                         PayloadState.syncFromActiveTile();
                         PayloadState.save();
@@ -2325,8 +2303,6 @@ public class LoominaryCommand {
 
                 long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
-                byte[] payload  = fc > 1
-                        ? PayloadManifest.interleaveFlat(fit.mapColors, fc) : fit.mapColors;
 
                 client.execute(() -> {
                     try {
@@ -2336,7 +2312,7 @@ public class LoominaryCommand {
                         if (liveTile.carpetEncoded && liveTile.carpetCompressedB64 != null)
                             preReductionCarpetB64.put(tileIdx, liveTile.carpetCompressedB64);
 
-                        int newCount  = saveTileData(tileIdx, manifest, payload);
+                        int newCount  = saveTileData(tileIdx, manifest, fit.mapColors);
                         liveTile.frameCount = fc;
                         int newColors = fit.originalDistinctColors - fit.colorsRemoved;
                         PayloadState.syncFromActiveTile();
@@ -2439,13 +2415,11 @@ public class LoominaryCommand {
                             union, prefix, CHUNK_SIZE, tileTarget);
                     long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
-                    byte[] payload  = fc > 1
-                            ? PayloadManifest.interleaveFlat(fit.mapColors, fc) : fit.mapColors;
                     int oldSz = oldSizes.get(i);
                     String note = tileSnap.carpetEncoded
                             ? String.format("carpet, %d colors merged (committing...)", fit.colorsRemoved)
                             : String.format("§e%d §7→ §a? §7banners, %d colors merged", oldSz, fit.colorsRemoved);
-                    results.add(new TileResult(manifest, payload, fc, note));
+                    results.add(new TileResult(manifest, fit.mapColors, fc, note));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
                     totalPixelsAffected += fit.pixelsAffected;
@@ -2571,9 +2545,7 @@ public class LoominaryCommand {
                             union, prefix, CHUNK_SIZE, targetColors);
                     long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
-                    byte[] payload  = fc > 1
-                            ? PayloadManifest.interleaveFlat(fit.mapColors, fc) : fit.mapColors;
-                    results.add(new TileResult(manifest, payload, fc,
+                    results.add(new TileResult(manifest, fit.mapColors, fc,
                             current, current - fit.colorsRemoved, null));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
@@ -3108,8 +3080,7 @@ public class LoominaryCommand {
         try {
             byte[][] frames = resolveAllFramesForTile(tile, PayloadState.ACTIVE_CHUNKS);
             int fc = frames.length;
-            byte[] sequential = mergeFrames(frames);
-            byte[] fullData = fc > 1 ? PayloadManifest.interleaveFlat(sequential, fc) : sequential;
+            byte[] fullData = mergeFrames(frames);
 
             int nonce;
             do { nonce = ThreadLocalRandom.current().nextInt(); } while (nonce == 0);
@@ -3117,7 +3088,7 @@ public class LoominaryCommand {
             String playerName = source.getPlayer().getGameProfile().getName();
             int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
             int[] delays = tileDelays(tile, fc);
-            long crc = PayloadManifest.crc32(Arrays.copyOf(sequential, MAP_BYTES));
+            long crc = PayloadManifest.crc32(Arrays.copyOf(fullData, MAP_BYTES));
             tile.nonce = nonce; // must be set before buildReduceManifest reads it
             byte[] manifestBytes = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
             int newCount = saveTileData(tileIdx, manifestBytes, fullData);

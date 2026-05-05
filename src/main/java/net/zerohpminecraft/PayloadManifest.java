@@ -50,24 +50,9 @@ public class PayloadManifest {
     /** Highest manifest version this client can decode. */
     public static final int CURRENT_VERSION = 3;
 
-    public static final int FLAG_ALL_SHADES  = 0x01;
+    public static final int FLAG_ALL_SHADES = 0x01;
     /** Set when the payload contains multiple animation frames. */
-    public static final int FLAG_ANIMATED    = 0x02;
-    /**
-     * Set when FLAG_ANIMATED is set and the frame bytes are stored in temporal-interleaved
-     * order rather than frame-sequential order.
-     *
-     * Interleaved layout: [f0_px0, f1_px0, ..., fN_px0, f0_px1, f1_px1, ..., fN_px(P-1)]
-     * Sequential  layout: [f0_px0…f0_px(P-1), f1_px0…f1_px(P-1), ...]
-     *
-     * Interleaving groups same-position pixels from all frames together, which exposes
-     * long runs of identical bytes for static pixels and compresses significantly better
-     * for map art animations with mostly-static backgrounds.
-     *
-     * Old clients (without this flag) will see garbled frame data for interleaved tiles.
-     * Old tiles without this flag continue to decode correctly via the sequential path.
-     */
-    public static final int FLAG_INTERLEAVED = 0x04;
+    public static final int FLAG_ANIMATED   = 0x02;
 
     public final int manifestVersion;
     /** Total bytes consumed by this header; map colors begin at this offset. */
@@ -123,41 +108,6 @@ public class PayloadManifest {
 
     public boolean animated() {
         return (flags & FLAG_ANIMATED) != 0;
-    }
-
-    public boolean interleaved() {
-        return (flags & FLAG_INTERLEAVED) != 0;
-    }
-
-    // ── Interleave / de-interleave utilities ─────────────────────────────
-
-    /**
-     * Converts a frame-sequential byte array into temporal-interleaved order.
-     * Input:  [f0_px0, f0_px1, ..., f0_px(P-1), f1_px0, ..., f(F-1)_px(P-1)]
-     * Output: [f0_px0, f1_px0, ..., f(F-1)_px0, f0_px1, ..., f(F-1)_px(P-1)]
-     */
-    public static byte[] interleaveFlat(byte[] sequential, int frameCount) {
-        if (frameCount <= 1) return sequential;
-        int ppf = sequential.length / frameCount;
-        byte[] out = new byte[sequential.length];
-        for (int p = 0; p < ppf; p++)
-            for (int f = 0; f < frameCount; f++)
-                out[p * frameCount + f] = sequential[f * ppf + p];
-        return out;
-    }
-
-    /**
-     * Reverses {@link #interleaveFlat}: converts temporal-interleaved back to
-     * frame-sequential order so downstream code can extract frames normally.
-     */
-    public static byte[] deinterleaveFlat(byte[] interleaved, int frameCount) {
-        if (frameCount <= 1) return interleaved;
-        int ppf = interleaved.length / frameCount;
-        byte[] out = new byte[interleaved.length];
-        for (int p = 0; p < ppf; p++)
-            for (int f = 0; f < frameCount; f++)
-                out[f * ppf + p] = interleaved[p * frameCount + f];
-        return out;
     }
 
     // ── CRC helper ───────────────────────────────────────────────────────

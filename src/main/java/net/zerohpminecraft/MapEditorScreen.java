@@ -6,6 +6,7 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.text.Text;
+import net.zerohpminecraft.command.LoominaryCommand;
 import org.lwjgl.glfw.GLFW;
 
 import javax.imageio.ImageIO;
@@ -64,6 +65,12 @@ public class MapEditorScreen extends Screen {
     private static final int MAX_BRUSH       = 10;
     private static final int UNDO_DEPTH      = 20;
 
+    // ── Minimap constants ────────────────────────────────────────────────
+    private static final int THUMB_SZ        = 32;   // px per thumbnail
+    private static final int MINI_GAP        = 4;    // gap between thumbnails
+    private static final int MINI_PAD        = 8;    // panel padding
+    private static final int MINI_HEADER_H   = 14;   // header row height
+
     // ── UI colours ──────────────────────────────────────────────────────
     private static final int COL_BG          = 0xFF1A1A1A;
     private static final int COL_PANEL_BG    = 0xFF141414;
@@ -89,8 +96,12 @@ public class MapEditorScreen extends Screen {
     private int[]    frameDelayMs;  // per-frame delay in ms (length == totalFrames)
 
     private final int[]  colorLookup;
-    private final int    tileIndex;
-    private final String tileLabel;
+    private int          tileIndex;
+    private String       tileLabel;
+
+    // Minimap
+    private boolean showMinimap   = false;
+    private byte[][] thumbnails   = null;  // null = not yet computed
 
     // Navigation
     private int   scale;
@@ -228,6 +239,7 @@ public class MapEditorScreen extends Screen {
         renderPalettePanel(ctx, mouseX, mouseY);
         renderStatusBar(ctx);
         renderGuidePanel(ctx);
+        if (showMinimap) renderMinimap(ctx, mouseX, mouseY);
         super.render(ctx, mouseX, mouseY, delta);
     }
 
@@ -568,6 +580,163 @@ public class MapEditorScreen extends Screen {
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8.  delay +10ms"), x, y, 0xFFFFFF); y += 9;
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8Del  drop frame"), x, y, 0xFFFFFF);
         }
+        if (PayloadState.tiles.size() > 1) {
+            y += 9;
+            ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
+            int totalTiles = PayloadState.tiles.size();
+            String tileHdr = "§eTile " + (tileIndex + 1) + "/" + totalTiles
+                    + " §7(" + PayloadState.tileCol(tileIndex) + "," + PayloadState.tileRow(tileIndex) + ")";
+            ctx.drawTextWithShadow(textRenderer, Text.literal(tileHdr), x, y, 0xFFFFFF); y += 9;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8G  minimap"), x, y, 0xFFFFFF); y += 9;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+Sh+[  prev"), x, y, 0xFFFFFF); y += 9;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+Sh+]  next"), x, y, 0xFFFFFF);
+        }
+    }
+
+    // ── Minimap overlay ─────────────────────────────────────────────────
+
+    private void computeMinimapThumbnails() {
+        int count = PayloadState.tiles.size();
+        thumbnails = new byte[count][];
+        for (int i = 0; i < count; i++) {
+            if (i == tileIndex) continue;  // rendered live from mapColors
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            try {
+                byte[][] frames = LoominaryCommand.resolveAllFramesForTile(tile, tile.chunks);
+                thumbnails[i] = downsample(frames[0]);
+            } catch (Exception e) {
+                thumbnails[i] = null;
+            }
+        }
+    }
+
+    private byte[] downsample(byte[] frame) {
+        byte[] thumb = new byte[THUMB_SZ * THUMB_SZ];
+        for (int ty = 0; ty < THUMB_SZ; ty++) {
+            for (int tx = 0; tx < THUMB_SZ; tx++) {
+                int mx = tx * MAP_SIZE / THUMB_SZ;
+                int my = ty * MAP_SIZE / THUMB_SZ;
+                thumb[tx + ty * THUMB_SZ] = frame[mx + my * MAP_SIZE];
+            }
+        }
+        return thumb;
+    }
+
+    private void renderMinimap(DrawContext ctx, int mouseX, int mouseY) {
+        if (PayloadState.tiles.isEmpty()) { showMinimap = false; return; }
+        if (thumbnails == null) computeMinimapThumbnails();
+
+        int cols = PayloadState.gridColumns;
+        int rows = PayloadState.gridRows;
+        int cellSz  = THUMB_SZ + MINI_GAP;
+        int panelW  = MINI_PAD * 2 + cols * cellSz - MINI_GAP;
+        int panelH  = MINI_HEADER_H + MINI_PAD + rows * cellSz - MINI_GAP + MINI_PAD;
+
+        int cx = GUIDE_W + (width - PANEL_W - GUIDE_W) / 2;
+        int cy = (height - STATUS_H) / 2;
+        int panelX = Math.max(GUIDE_W + 2, Math.min(width - PANEL_W - panelW - 2, cx - panelW / 2));
+        int panelY = Math.max(2, Math.min(height - STATUS_H - panelH - 2, cy - panelH / 2));
+
+        // Drop-shadow
+        ctx.fill(panelX + 3, panelY + 3, panelX + panelW + 3, panelY + panelH + 3, 0x88000000);
+        // Border + background
+        ctx.fill(panelX - 1, panelY - 1, panelX + panelW + 1, panelY + panelH + 1, COL_MAP_BORDER);
+        ctx.fill(panelX, panelY, panelX + panelW, panelY + panelH, 0xFF0D0D0D);
+
+        // Header
+        ctx.drawTextWithShadow(textRenderer, Text.literal("§7TILES   §8G=close  Ctrl+Shift+[/]"), panelX + 4, panelY + 3, 0xFFFFFF);
+        ctx.fill(panelX, panelY + MINI_HEADER_H - 1, panelX + panelW, panelY + MINI_HEADER_H, COL_PANEL_SEP);
+
+        int gridOriginX = panelX + MINI_PAD;
+        int gridOriginY = panelY + MINI_HEADER_H + MINI_PAD;
+
+        byte[] activeThumb = downsample(mapColors);
+
+        int totalTiles = PayloadState.tiles.size();
+        for (int ti = 0; ti < totalTiles; ti++) {
+            int tc = PayloadState.tileCol(ti);
+            int tr = PayloadState.tileRow(ti);
+            if (tc >= cols || tr >= rows) continue;
+            int tx = gridOriginX + tc * cellSz;
+            int ty = gridOriginY + tr * cellSz;
+
+            boolean isActive  = (ti == tileIndex);
+            boolean isHovered = mouseX >= tx && mouseX < tx + THUMB_SZ
+                             && mouseY >= ty && mouseY < ty + THUMB_SZ;
+
+            int borderColor = isActive ? COL_RING : (isHovered ? COL_HOVER_RING : COL_PANEL_SEP);
+            ctx.fill(tx - 1, ty - 1, tx + THUMB_SZ + 1, ty + THUMB_SZ + 1, borderColor);
+
+            byte[] thumb = isActive ? activeThumb : thumbnails[ti];
+            if (thumb != null) {
+                for (int py = 0; py < THUMB_SZ; py++) {
+                    for (int px = 0; px < THUMB_SZ; px++) {
+                        int cb   = thumb[px + py * THUMB_SZ] & 0xFF;
+                        int argb = cb == 0 ? COL_TRANSPARENT : (0xFF000000 | colorLookup[cb]);
+                        ctx.fill(tx + px, ty + py, tx + px + 1, ty + py + 1, argb);
+                    }
+                }
+            } else {
+                ctx.fill(tx, ty, tx + THUMB_SZ, ty + THUMB_SZ, 0xFF1A1A2A);
+            }
+
+            // Dim non-active tiles slightly
+            if (!isActive) ctx.fill(tx, ty, tx + THUMB_SZ, ty + THUMB_SZ, 0x33000000);
+
+            // Col,row label
+            String posLabel = tc + "," + tr;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§0" + posLabel), tx + 2, ty + 2, 0xFFFFFF);
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§f" + posLabel), tx + 1, ty + 1, 0xFFFFFF);
+        }
+    }
+
+    private void switchToTile(int newIdx) {
+        if (newIdx == tileIndex) { showMinimap = false; return; }
+        if (PayloadState.tiles.isEmpty() || newIdx < 0 || newIdx >= PayloadState.tiles.size()) return;
+
+        if (dirty) {
+            reEncode();
+            dirty = false;
+        }
+
+        PayloadState.switchTile(newIdx);
+        tileIndex = newIdx;
+        tileLabel = PayloadState.tileLabel(newIdx);
+
+        PayloadState.TileData tile = PayloadState.tiles.get(newIdx);
+        try {
+            allFrames = LoominaryCommand.resolveAllFramesForTile(tile, PayloadState.ACTIVE_CHUNKS);
+        } catch (Exception e) {
+            setStatusMsg("Failed to load tile " + newIdx + ": " + e.getMessage());
+            return;
+        }
+
+        totalFrames = allFrames.length;
+        activeFrame = 0;
+        mapColors   = allFrames[0];
+
+        frameDelayMs = new int[totalFrames];
+        List<Integer> stored = tile.frameDelays;
+        if (stored != null && !stored.isEmpty()) {
+            for (int i = 0; i < totalFrames; i++)
+                frameDelayMs[i] = stored.get(Math.min(i, stored.size() - 1));
+        } else {
+            Arrays.fill(frameDelayMs, 100);
+        }
+
+        history.clear();
+        inPreview      = false;
+        previewColors  = null;
+        previewSelMask = null;
+        selMask        = null;
+        lassoPoints    = null;
+        ditherMask     = null;
+        useCustomMask  = false;
+        thumbnails     = null;  // force thumbnail recompute
+        showMinimap    = false;
+
+        rebuildTileColors();
+        setStatusMsg("Switched to " + tileLabel);
     }
 
     private void renderStatusBar(DrawContext ctx) {
@@ -604,8 +773,9 @@ public class MapEditorScreen extends Screen {
                     ? frameDelayMs[activeFrame] : 100;
             String frameHint = totalFrames > 1
                     ? "  §e" + (activeFrame + 1) + "/" + totalFrames + " " + frameDelay + "ms§r §8Ctrl+[/]" : "";
+            String minimapHint = PayloadState.tiles.size() > 1 ? "  §8[G]tiles" : "";
             left = "§8" + tileLabel + "  §r" + toolStr + undoHint + redoHint
-                    + ditherHint + reqHint + selHint + frameHint;
+                    + ditherHint + reqHint + selHint + frameHint + minimapHint;
         }
         ctx.drawTextWithShadow(textRenderer, Text.literal(left), 4, barY + 3, 0xFFFFFF);
 
@@ -665,6 +835,44 @@ public class MapEditorScreen extends Screen {
     public boolean mouseClicked(double mouseX, double mouseY, int button) {
         if (inPreview) return true;
         int panelX = width - PANEL_W;
+
+        // ── Minimap: intercept left-clicks on tile thumbnails ────────────
+        if (showMinimap && button == 0) {
+            int cols = PayloadState.gridColumns;
+            int rows = PayloadState.gridRows;
+            int cellSz  = THUMB_SZ + MINI_GAP;
+            int panelW  = MINI_PAD * 2 + cols * cellSz - MINI_GAP;
+            int panelH  = MINI_HEADER_H + MINI_PAD + rows * cellSz - MINI_GAP + MINI_PAD;
+            int cx = GUIDE_W + (width - PANEL_W - GUIDE_W) / 2;
+            int cy = (height - STATUS_H) / 2;
+            int mpx = Math.max(GUIDE_W + 2, Math.min(width - PANEL_W - panelW - 2, cx - panelW / 2));
+            int mpy = Math.max(2, Math.min(height - STATUS_H - panelH - 2, cy - panelH / 2));
+            int gridX0 = mpx + MINI_PAD;
+            int gridY0 = mpy + MINI_HEADER_H + MINI_PAD;
+
+            int mx = (int) mouseX, my = (int) mouseY;
+            if (mx >= mpx && mx < mpx + panelW && my >= mpy && my < mpy + panelH) {
+                // Within the panel — check thumbnail cells
+                int relX = mx - gridX0, relY = my - gridY0;
+                if (relX >= 0 && relY >= 0) {
+                    int tc = relX / cellSz, tr = relY / cellSz;
+                    int offX = relX % cellSz, offY = relY % cellSz;
+                    if (offX < THUMB_SZ && offY < THUMB_SZ && tc < cols && tr < rows) {
+                        int ti = tr * cols + tc;
+                        if (ti < PayloadState.tiles.size()) {
+                            switchToTile(ti);
+                            return true;
+                        }
+                    }
+                }
+                // Click inside the panel but not on a tile — still consume the event
+                return true;
+            } else {
+                // Click outside the panel dismisses it
+                showMinimap = false;
+                return true;
+            }
+        }
 
         if (mouseX < GUIDE_W) return false;
 
@@ -834,8 +1042,20 @@ public class MapEditorScreen extends Screen {
         if (ctrl && keyCode == GLFW.GLFW_KEY_Z) { history.undo(); return true; }
         if (ctrl && keyCode == GLFW.GLFW_KEY_Y) { history.redo(); return true; }
 
+        // Tile navigation (Ctrl+Shift+[ / Ctrl+Shift+]) — across tiles in the batch
+        if (ctrl && shift && PayloadState.tiles.size() > 1) {
+            if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET) {
+                int prev = (tileIndex - 1 + PayloadState.tiles.size()) % PayloadState.tiles.size();
+                switchToTile(prev); return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) {
+                int next = (tileIndex + 1) % PayloadState.tiles.size();
+                switchToTile(next); return true;
+            }
+        }
+
         // Frame navigation for animated tiles (Ctrl+[ / Ctrl+])
-        if (ctrl && totalFrames > 1) {
+        if (ctrl && !shift && totalFrames > 1) {
             if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET) {
                 switchFrame((activeFrame - 1 + totalFrames) % totalFrames); return true;
             }
@@ -888,13 +1108,18 @@ public class MapEditorScreen extends Screen {
         if (keyCode == GLFW.GLFW_KEY_D) { editorDither = !editorDither; return true; }
         if (keyCode == GLFW.GLFW_KEY_R) { applyRequantize(); return true; }
         if (keyCode == GLFW.GLFW_KEY_M) { showMask = !showMask; return true; }
+        if (keyCode == GLFW.GLFW_KEY_G) {
+            showMinimap = !showMinimap;
+            if (showMinimap && thumbnails == null) computeMinimapThumbnails();
+            return true;
+        }
 
-        // Brush / dither-brush radius via [ ]
-        if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET
+        // Brush / dither-brush radius via [ ] (not when Ctrl held — that nav frames/tiles)
+        if (!ctrl && keyCode == GLFW.GLFW_KEY_LEFT_BRACKET
                 && (currentTool == Tool.BRUSH || currentTool == Tool.DITHER_BRUSH)) {
             brushRadius = Math.max(0, brushRadius - 1); return true;
         }
-        if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET
+        if (!ctrl && keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET
                 && (currentTool == Tool.BRUSH || currentTool == Tool.DITHER_BRUSH)) {
             brushRadius = Math.min(MAX_BRUSH, brushRadius + 1); return true;
         }

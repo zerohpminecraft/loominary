@@ -30,6 +30,7 @@ public class LoominaryKeybindings {
     private static KeyBinding keyPreview;
     private static KeyBinding keyRevert;
     private static KeyBinding keyTileNext;
+    private static KeyBinding keyTilePrev;
     private static KeyBinding keyStatus;
     private static KeyBinding keyEdit;
 
@@ -38,6 +39,7 @@ public class LoominaryKeybindings {
         keyPreview  = registerUnbound("key.loominary.preview");
         keyRevert   = registerUnbound("key.loominary.revert");
         keyTileNext = registerUnbound("key.loominary.tile_next");
+        keyTilePrev = registerUnbound("key.loominary.tile_prev");
         keyStatus   = registerUnbound("key.loominary.status");
         keyEdit     = registerUnbound("key.loominary.edit");
 
@@ -61,6 +63,7 @@ public class LoominaryKeybindings {
         while (keyPreview.wasPressed())  runCommand(client, "loominary preview");
         while (keyRevert.wasPressed())   runCommand(client, "loominary revert");
         while (keyTileNext.wasPressed()) runCommand(client, "loominary tile next");
+        while (keyTilePrev.wasPressed()) runCommand(client, "loominary tile prev");
         while (keyStatus.wasPressed())   runCommand(client, "loominary status");
         while (keyEdit.wasPressed())     runCommand(client, "loominary edit");
     }

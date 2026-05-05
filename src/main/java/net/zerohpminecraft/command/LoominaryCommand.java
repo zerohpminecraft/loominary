@@ -60,6 +60,8 @@ import java.util.concurrent.ThreadLocalRandom;
  * /loominary seek <n> — set chunk index on active tile
  * /loominary tile <n> — switch to tile n
  * /loominary tile next — switch to next incomplete tile
+ * /loominary tile prev — switch to previous tile (by index, wrapping)
+ * /loominary tile pos <col> <row> — switch to tile at grid position
  * /loominary preview — paint active tile onto crosshair map
  * /loominary revert — restore a previewed map to its original
  * /loominary edit — open the map editor for the active tile
@@ -566,6 +568,14 @@ public class LoominaryCommand {
                             .then(ClientCommandManager.literal("tile")
                                     .then(ClientCommandManager.literal("next")
                                             .executes(ctx -> tileNext(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("prev")
+                                            .executes(ctx -> tilePrev(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("pos")
+                                            .then(ClientCommandManager.argument("col", IntegerArgumentType.integer(0))
+                                                    .then(ClientCommandManager.argument("row", IntegerArgumentType.integer(0))
+                                                            .executes(ctx -> tileSwitchPos(ctx.getSource(),
+                                                                    IntegerArgumentType.getInteger(ctx, "col"),
+                                                                    IntegerArgumentType.getInteger(ctx, "row"))))))
                                     .then(ClientCommandManager.argument("index", IntegerArgumentType.integer(0))
                                             .executes(ctx -> tileSwitch(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "index")))))
@@ -1785,6 +1795,38 @@ public class LoominaryCommand {
                 PayloadState.tileLabel(next),
                 tile.currentIndex, tile.chunks.size())));
         return 1;
+    }
+
+    private static int tilePrev(FabricClientCommandSource source) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+        int count = PayloadState.tiles.size();
+        int prev = (PayloadState.activeTileIndex - 1 + count) % count;
+        PayloadState.switchTile(prev);
+        PayloadState.save();
+        PayloadState.TileData tile = PayloadState.tiles.get(prev);
+        source.sendFeedback(Text.literal(String.format(
+                "§aSwitched to %s §7(%d/%d banners done)",
+                PayloadState.tileLabel(prev),
+                tile.currentIndex, tile.chunks.size())));
+        return 1;
+    }
+
+    private static int tileSwitchPos(FabricClientCommandSource source, int col, int row) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+        if (col >= PayloadState.gridColumns || row >= PayloadState.gridRows) {
+            source.sendError(Text.literal(String.format(
+                    "§cPosition (%d,%d) out of range for %d×%d grid.",
+                    col, row, PayloadState.gridColumns, PayloadState.gridRows)));
+            return 0;
+        }
+        int index = row * PayloadState.gridColumns + col;
+        return tileSwitch(source, index);
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -86,6 +86,7 @@ public class MapEditorScreen extends Screen {
     private byte[][] allFrames;    // one entry per animation frame (always ≥ 1)
     private int      activeFrame  = 0;
     private int      totalFrames  = 1;
+    private int[]    frameDelayMs;  // per-frame delay in ms (length == totalFrames)
 
     private final int[]  colorLookup;
     private final int    tileIndex;
@@ -161,6 +162,21 @@ public class MapEditorScreen extends Screen {
         this.tileLabel    = tileLabel;
         this.colorLookup  = PngToMapColors.buildColorLookup();
         this.editorDither = PayloadState.dither;
+        // Load per-frame delays from tile state
+        this.frameDelayMs = new int[frames.length];
+        if (!PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size()) {
+            List<Integer> stored = PayloadState.tiles.get(tileIndex).frameDelays;
+            if (stored != null && !stored.isEmpty()) {
+                for (int i = 0; i < frames.length; i++) {
+                    // pad with last stored delay if tile had fewer entries (e.g. after drop)
+                    frameDelayMs[i] = stored.get(Math.min(i, stored.size() - 1));
+                }
+            } else {
+                Arrays.fill(frameDelayMs, 100);
+            }
+        } else {
+            Arrays.fill(frameDelayMs, 100);
+        }
         MinecraftClient mc = MinecraftClient.getInstance();
         this.savedBlur = mc.options.getMenuBackgroundBlurriness().getValue();
         mc.options.getMenuBackgroundBlurriness().setValue(0);
@@ -542,10 +558,15 @@ public class MapEditorScreen extends Screen {
         if (totalFrames > 1) {
             y += 9;
             ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
-            String frmHdr = "§eFrames: " + (activeFrame + 1) + "/" + totalFrames;
+            int delay = frameDelayMs != null && activeFrame < frameDelayMs.length
+                    ? frameDelayMs[activeFrame] : 100;
+            String frmHdr = "§eFrames: " + (activeFrame + 1) + "/" + totalFrames + " §7(" + delay + "ms)";
             ctx.drawTextWithShadow(textRenderer, Text.literal(frmHdr), x, y, 0xFFFFFF); y += 9;
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+[  prev"), x, y, 0xFFFFFF); y += 9;
-            ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+]  next"), x, y, 0xFFFFFF);
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+]  next"), x, y, 0xFFFFFF); y += 9;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8,  delay -10ms"), x, y, 0xFFFFFF); y += 9;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8.  delay +10ms"), x, y, 0xFFFFFF); y += 9;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8Del  drop frame"), x, y, 0xFFFFFF);
         }
     }
 
@@ -579,8 +600,10 @@ public class MapEditorScreen extends Screen {
             String ditherHint = "  " + (editorDither ? "§a[D]dither§r" : "§8[D]dither");
             String reqHint   = PayloadState.currentSourceFilename != null ? "  §8[R]req" : "";
             String selHint   = selMask != null ? "  §e[sel]§r" : "";
+            int frameDelay = frameDelayMs != null && activeFrame < frameDelayMs.length
+                    ? frameDelayMs[activeFrame] : 100;
             String frameHint = totalFrames > 1
-                    ? "  §e" + (activeFrame + 1) + "/" + totalFrames + "§r §8Ctrl+[/]" : "";
+                    ? "  §e" + (activeFrame + 1) + "/" + totalFrames + " " + frameDelay + "ms§r §8Ctrl+[/]" : "";
             left = "§8" + tileLabel + "  §r" + toolStr + undoHint + redoHint
                     + ditherHint + reqHint + selHint + frameHint;
         }
@@ -787,7 +810,8 @@ public class MapEditorScreen extends Screen {
 
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        boolean ctrl = hasControlDown();
+        boolean ctrl  = hasControlDown();
+        boolean shift = hasShiftDown();
 
         // Preview mode is modal — only Enter/Y/Esc act
         if (inPreview) {
@@ -818,6 +842,28 @@ public class MapEditorScreen extends Screen {
             if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) {
                 switchFrame((activeFrame + 1) % totalFrames); return true;
             }
+        }
+
+        // Frame delay editing (,/. = -10ms/+10ms; Shift = ×10)
+        if (totalFrames > 1 && frameDelayMs != null) {
+            int delta = shift ? 100 : 10;
+            if (keyCode == GLFW.GLFW_KEY_COMMA) {
+                frameDelayMs[activeFrame] = Math.max(10, frameDelayMs[activeFrame] - delta);
+                dirty = true;
+                setStatusMsg("Frame " + (activeFrame + 1) + " delay: " + frameDelayMs[activeFrame] + "ms");
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_PERIOD) {
+                frameDelayMs[activeFrame] = Math.min(10000, frameDelayMs[activeFrame] + delta);
+                dirty = true;
+                setStatusMsg("Frame " + (activeFrame + 1) + " delay: " + frameDelayMs[activeFrame] + "ms");
+                return true;
+            }
+        }
+
+        // Drop current frame (Delete) — blocked if only one frame
+        if (keyCode == GLFW.GLFW_KEY_DELETE && totalFrames > 1) {
+            dropCurrentFrame(); return true;
         }
 
         if (ctrl && keyCode == GLFW.GLFW_KEY_A) {
@@ -1086,7 +1132,7 @@ public class MapEditorScreen extends Screen {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.player == null || PayloadState.tiles.isEmpty()) return;
         String playerName = client.player.getGameProfile().getName();
-        net.zerohpminecraft.command.LoominaryCommand.saveEditorChanges(allFrames, tileIndex, playerName);
+        net.zerohpminecraft.command.LoominaryCommand.saveEditorChanges(allFrames, frameDelayMs, tileIndex, playerName);
         System.out.println("[Loominary] Editor: saved changes for " + tileLabel
                 + (totalFrames > 1 ? " (" + totalFrames + " frames)" : ""));
     }
@@ -1142,6 +1188,33 @@ public class MapEditorScreen extends Screen {
         history.clear();
         inPreview = false; previewColors = null; previewSelMask = null;
         rebuildTileColors();
+    }
+
+    private void dropCurrentFrame() {
+        if (totalFrames <= 1) {
+            setStatusMsg("Cannot drop the last frame.");
+            return;
+        }
+        int drop = activeFrame;
+        byte[][] newFrames = new byte[totalFrames - 1][];
+        int[] newDelays = new int[totalFrames - 1];
+        int dst = 0;
+        for (int i = 0; i < totalFrames; i++) {
+            if (i == drop) continue;
+            newFrames[dst] = allFrames[i];
+            newDelays[dst] = frameDelayMs != null && i < frameDelayMs.length ? frameDelayMs[i] : 100;
+            dst++;
+        }
+        allFrames    = newFrames;
+        frameDelayMs = newDelays;
+        totalFrames  = newFrames.length;
+        activeFrame  = Math.min(activeFrame, totalFrames - 1);
+        mapColors    = allFrames[activeFrame];
+        history.clear();
+        inPreview = false; previewColors = null; previewSelMask = null;
+        rebuildTileColors();
+        dirty = true;
+        setStatusMsg("Dropped frame " + (drop + 1) + ". " + totalFrames + " frame" + (totalFrames == 1 ? "" : "s") + " remaining.");
     }
 
     // ── EditHistory ──────────────────────────────────────────────────────

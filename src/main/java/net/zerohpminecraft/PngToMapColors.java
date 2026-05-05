@@ -616,14 +616,14 @@ public class PngToMapColors {
      * inter-frame color flicker and improving zstd compression of the combined payload.
      */
     public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
-                                        boolean dither, int cols, int rows) throws IOException {
+                                        boolean dither, int cols, int rows, int stride) throws IOException {
         try (ImageInputStream iis = ImageIO.createImageInputStream(Files.newInputStream(gifPath))) {
             Iterator<ImageReader> readers = ImageIO.getImageReadersByMIMEType("image/gif");
             if (!readers.hasNext()) throw new IOException("No GIF image reader available");
             ImageReader reader = readers.next();
             try {
                 reader.setInput(iis, false);
-                return readGif(reader, legalOnly, targetColors, dither, cols, rows);
+                return readGif(reader, legalOnly, targetColors, dither, cols, rows, stride);
             } finally {
                 reader.dispose();
             }
@@ -631,7 +631,7 @@ public class PngToMapColors {
     }
 
     private static GifResult readGif(ImageReader reader, boolean legalOnly, int targetColors,
-                                      boolean dither, int cols, int rows) throws IOException {
+                                      boolean dither, int cols, int rows, int stride) throws IOException {
         // Screen dimensions from stream metadata (reliable; Java's GIF reader always provides it).
         int screenW = 0, screenH = 0;
         IIOMetadata streamMeta = reader.getStreamMetadata();
@@ -680,6 +680,24 @@ public class PngToMapColors {
                 canvas = prevCanvas;
                 prevCanvas = null;
             }
+        }
+
+        // Subsample frames by stride — keep every Nth coalesced frame,
+        // accumulating the skipped delays into the kept frame's delay.
+        if (stride > 1) {
+            int kept = (numFrames + stride - 1) / stride;
+            BufferedImage[] sampledFrames = new BufferedImage[kept];
+            int[]           sampledDelays = new int[kept];
+            for (int i = 0; i < kept; i++) {
+                int src = i * stride;
+                sampledFrames[i] = coalesced[src];
+                int acc = 0;
+                for (int j = src; j < Math.min(src + stride, numFrames); j++) acc += frameDelays[j];
+                sampledDelays[i] = acc;
+            }
+            coalesced   = sampledFrames;
+            frameDelays = sampledDelays;
+            numFrames   = kept;
         }
 
         // Scale all frames to the target grid resolution.

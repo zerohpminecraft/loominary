@@ -1773,18 +1773,10 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
         }
-
-        PayloadState.syncToActiveTile();
-        int next = PayloadState.findNextIncompleteTile();
-        if (next == -1) {
-            source.sendFeedback(Text.literal(
-                    "§aAll tiles complete! Place your maps in item frames to view the result."));
-            return 1;
-        }
-
+        int count = PayloadState.tiles.size();
+        int next = (PayloadState.activeTileIndex + 1) % count;
         PayloadState.switchTile(next);
         PayloadState.save();
-
         PayloadState.TileData tile = PayloadState.tiles.get(next);
         source.sendFeedback(Text.literal(String.format(
                 "§aSwitched to %s §7(%d/%d banners done)",
@@ -2799,81 +2791,100 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cA long operation is already in progress."));
             return 0;
         }
-        int tileIdx = PayloadState.activeTileIndex;
-        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-        if (tile.frameCount <= 1) {
-            source.sendError(Text.literal("§cActive tile is not animated (only 1 frame)."));
+
+        PayloadState.syncToActiveTile();
+
+        // Snapshot all animated tiles before releasing the game thread.
+        final String playerName = source.getPlayer().getGameProfile().getName();
+        final int tileCount = PayloadState.tiles.size();
+        final List<List<String>> allChunks = new ArrayList<>();
+        final List<PayloadState.TileData> allSnaps = new ArrayList<>();
+        int animatedCount = 0;
+        for (int i = 0; i < tileCount; i++) {
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            allChunks.add(new ArrayList<>(i == PayloadState.activeTileIndex
+                    ? PayloadState.ACTIVE_CHUNKS : tile.chunks));
+            allSnaps.add(snapshotTile(tile));
+            if (tile.frameCount > 1) animatedCount++;
+        }
+        if (animatedCount == 0) {
+            source.sendError(Text.literal("§cNo animated tiles in this batch."));
             return 0;
         }
 
-        final List<String> chunksSnap = new ArrayList<>(PayloadState.ACTIVE_CHUNKS);
-        final PayloadState.TileData tileSnap = snapshotTile(tile);
-        final String playerName = source.getPlayer().getGameProfile().getName();
-        final String label = PayloadState.tileLabel(tileIdx);
-
         importInProgress = true;
         source.sendFeedback(Text.literal(String.format(
-                "§7Applying %s %d to %s...", isStride ? "stride" : "skip", n, label)));
+                "§7Applying %s %d to all %d animated tile%s...",
+                isStride ? "stride" : "skip", n, animatedCount, animatedCount == 1 ? "" : "s")));
+
+        record FS(byte[][] frames, int[] delays) {}
 
         MinecraftClient client = MinecraftClient.getInstance();
         Thread t = new Thread(() -> {
-            try {
-                byte[][] frames = resolveAllFramesForTile(tileSnap, chunksSnap);
-                int[] delays = tileDelays(tileSnap, frames.length);
-
-                record FS(byte[][] frames, int[] delays) {}
-                FS result;
-                if (isStride) {
-                    int kept = (frames.length + n - 1) / n;
-                    byte[][] kf = new byte[kept][];
-                    int[]    kd = new int[kept];
-                    for (int i = 0; i < kept; i++) {
-                        int src = i * n;
-                        kf[i] = frames[src];
-                        int acc = 0;
-                        for (int j = src; j < Math.min(src + n, frames.length); j++) acc += delays[j];
-                        kd[i] = acc;
-                    }
-                    result = new FS(kf, kd);
-                } else {
-                    int keptCount = 0;
-                    for (int i = 0; i < frames.length; i++)
-                        if ((i + 1) % n != 0) keptCount++;
-                    if (keptCount == 0) keptCount = 1;
-                    byte[][] kf = new byte[keptCount][];
-                    int[]    kd = new int[keptCount];
-                    int dst = 0, pending = 0;
-                    for (int i = 0; i < frames.length; i++) {
-                        if ((i + 1) % n == 0) {
-                            pending += delays[i];
-                        } else {
-                            kf[dst] = frames[i];
-                            kd[dst] = delays[i] + pending;
-                            pending = 0;
-                            dst++;
+            // Per-tile results: null = skipped (static tile), non-null = transformed frames+delays
+            List<FS> results = new ArrayList<>();
+            for (int i = 0; i < tileCount; i++) {
+                PayloadState.TileData snap = allSnaps.get(i);
+                if (snap.frameCount <= 1) { results.add(null); continue; }
+                try {
+                    byte[][] frames = resolveAllFramesForTile(snap, allChunks.get(i));
+                    int[] delays = tileDelays(snap, frames.length);
+                    FS r;
+                    if (isStride) {
+                        int kept = (frames.length + n - 1) / n;
+                        byte[][] kf = new byte[kept][];
+                        int[]    kd = new int[kept];
+                        for (int j = 0; j < kept; j++) {
+                            int src = j * n;
+                            kf[j] = frames[src];
+                            int acc = 0;
+                            for (int k = src; k < Math.min(src + n, frames.length); k++) acc += delays[k];
+                            kd[j] = acc;
                         }
+                        r = new FS(kf, kd);
+                    } else {
+                        int keptCount = 0;
+                        for (int j = 0; j < frames.length; j++)
+                            if ((j + 1) % n != 0) keptCount++;
+                        if (keptCount == 0) keptCount = 1;
+                        byte[][] kf = new byte[keptCount][];
+                        int[]    kd = new int[keptCount];
+                        int dst = 0, pending = 0;
+                        for (int j = 0; j < frames.length; j++) {
+                            if ((j + 1) % n == 0) {
+                                pending += delays[j];
+                            } else {
+                                kf[dst] = frames[j];
+                                kd[dst] = delays[j] + pending;
+                                pending = 0;
+                                dst++;
+                            }
+                        }
+                        if (pending > 0 && dst > 0) kd[dst - 1] += pending;
+                        r = new FS(kf, kd);
                     }
-                    if (pending > 0 && dst > 0) kd[dst - 1] += pending;
-                    result = new FS(kf, kd);
+                    results.add(r);
+                } catch (Exception e) {
+                    results.add(null);
                 }
-
-                final int before = frames.length, after = result.frames().length;
-                client.execute(() -> {
-                    try {
-                        saveEditorChanges(result.frames(), result.delays(), tileIdx, playerName);
-                        source.sendFeedback(Text.literal(String.format(
-                                "§a%s %d applied to %s: §e%d §7→ §a%d §7frames.",
-                                isStride ? "Stride" : "Skip", n, label, before, after)));
-                    } finally {
-                        importInProgress = false;
-                    }
-                });
-            } catch (Exception e) {
-                client.execute(() -> {
-                    source.sendError(Text.literal("§cFailed: " + e.getMessage()));
-                    importInProgress = false;
-                });
             }
+
+            client.execute(() -> {
+                try {
+                    int saved = 0;
+                    for (int i = 0; i < tileCount; i++) {
+                        FS r = results.get(i);
+                        if (r == null) continue;
+                        saveEditorChanges(r.frames(), r.delays(), i, playerName);
+                        saved++;
+                    }
+                    source.sendFeedback(Text.literal(String.format(
+                            "§a%s %d applied to %d tile%s.",
+                            isStride ? "Stride" : "Skip", n, saved, saved == 1 ? "" : "s")));
+                } finally {
+                    importInProgress = false;
+                }
+            });
         });
         t.setDaemon(true);
         t.start();

@@ -20,7 +20,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Deque;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * In-world map pixel editor — Phases 1–8 + Eyedropper.
@@ -53,7 +55,7 @@ public class MapEditorScreen extends Screen {
     private static final int PANEL_W         = 80;
     private static final int GUIDE_W         = 100;
     private static final int SWATCH_SZ       = 12;
-    private static final int SWATCH_GAP      = 2;
+    private static final int SWATCH_GAP      = 4;   // extra 2px used for frequency bar
     private static final int SWATCH_STRIDE   = SWATCH_SZ + SWATCH_GAP;
     private static final int PANEL_MARGIN    = 2;
     private static final int SWATCHES_PER_ROW = (PANEL_W - PANEL_MARGIN * 2) / SWATCH_STRIDE;
@@ -81,6 +83,7 @@ public class MapEditorScreen extends Screen {
     private static final int COL_TRANSPARENT = 0xFF111122;
     private static final int COL_RING        = 0xFFFFFFFF;
     private static final int COL_HOVER_RING  = 0xFF888888;
+    private static final int COL_MERGE_RING  = 0xFFFF7722;  // orange — merge source
 
     // ── Tool enum ───────────────────────────────────────────────────────
     private enum Tool { BRUSH, FILL, SELECT, EYEDROPPER, DITHER_BRUSH, LASSO, MAGIC_WAND }
@@ -133,8 +136,13 @@ public class MapEditorScreen extends Screen {
 
     // Palette panel
     private int[]   tileColors;
+    private int[]   tileColorFreqs = new int[0];  // parallel to tileColors: pixel count per color
+    private int     maxTileFreq    = 0;
     private int[]   allMapColors;
     private boolean paletteShowAll = false;
+
+    // Color-merge state: Ctrl+click swatches to build the source set, C to commit
+    private final Set<Integer> mergeSources = new LinkedHashSet<>();
 
     // Phase 6 — re-quantize from source (R key)
     private boolean   editorDither;
@@ -421,8 +429,10 @@ public class MapEditorScreen extends Screen {
         ctx.fill(panelX, 0, width, panelH, COL_PANEL_BG);
         ctx.fill(panelX, 0, panelX + 1, panelH, COL_PANEL_SEP);
 
-        ctx.drawTextWithShadow(textRenderer,
-                Text.literal("§7PALETTE"), panelX + 4, 3, 0xFFFFFF);
+        String paletteHeader = mergeSources.isEmpty()
+                ? "§7PALETTE"
+                : "§7PALETTE §c[" + mergeSources.size() + " merge src" + (mergeSources.size() == 1 ? "" : "s") + "]";
+        ctx.drawTextWithShadow(textRenderer, Text.literal(paletteHeader), panelX + 4, 3, 0xFFFFFF);
         ctx.fill(panelX, 13, width, 14, COL_PANEL_SEP);
 
         int activeRgb = activeColor == 0
@@ -454,12 +464,19 @@ public class MapEditorScreen extends Screen {
             int c   = palette[i];
             int rgb = c == 0 ? (COL_TRANSPARENT & 0xFFFFFF) : colorLookup[c];
             boolean isActive  = (c == activeColor);
+            boolean isMerge   = mergeSources.contains(c);
             boolean isHovered = mouseX >= swx && mouseX < swx+SWATCH_SZ
                              && mouseY >= swy && mouseY < swy+SWATCH_SZ;
-            if (isActive || isHovered)
-                ctx.fill(swx-1, swy-1, swx+SWATCH_SZ+1, swy+SWATCH_SZ+1,
-                        isActive ? COL_RING : COL_HOVER_RING);
+            int ringCol = isMerge ? COL_MERGE_RING : (isActive ? COL_RING : COL_HOVER_RING);
+            if (isActive || isHovered || isMerge)
+                ctx.fill(swx-1, swy-1, swx+SWATCH_SZ+1, swy+SWATCH_SZ+1, ringCol);
             ctx.fill(swx, swy, swx+SWATCH_SZ, swy+SWATCH_SZ, 0xFF000000|rgb);
+
+            // Frequency bar: 2px strip in the gap below the swatch (tile-color mode only)
+            if (!paletteShowAll && i < tileColorFreqs.length && maxTileFreq > 0) {
+                int barW = Math.max(1, SWATCH_SZ * tileColorFreqs[i] / maxTileFreq);
+                ctx.fill(swx, swy + SWATCH_SZ + 1, swx + barW, swy + SWATCH_SZ + 3, 0xFF2A6644);
+            }
         }
     }
 
@@ -566,7 +583,19 @@ public class MapEditorScreen extends Screen {
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+Y  redo"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8R  requantize"), x, y, 0xFFFFFF); y += 9;
         String ditherLbl = editorDither ? "§aD  §r§8dither:on" : "§8D  dither:off";
-        ctx.drawTextWithShadow(textRenderer, Text.literal(ditherLbl), x, y, 0xFFFFFF);
+        ctx.drawTextWithShadow(textRenderer, Text.literal(ditherLbl), x, y, 0xFFFFFF); y += 9;
+        ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
+        ctx.drawTextWithShadow(textRenderer, Text.literal("§7Merge colors"), x, y, 0xFFFFFF); y += 9;
+        ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+clk: queue src"), x, y, 0xFFFFFF); y += 9;
+        if (mergeSources.isEmpty()) {
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8C: commit merge"), x, y, 0xFFFFFF);
+        } else {
+            String mergeTarget = activeColor == 0 ? "trans" : String.format("#%06X", colorLookup[activeColor] & 0xFFFFFF);
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal(String.format("§c%d src  §7→ §f%s", mergeSources.size(), mergeTarget)),
+                    x, y, 0xFFFFFF); y += 9;
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§aC: commit  §8Esc: clear"), x, y, 0xFFFFFF);
+        }
         if (totalFrames > 1) {
             y += 9;
             ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
@@ -732,6 +761,7 @@ public class MapEditorScreen extends Screen {
         lassoPoints    = null;
         ditherMask     = null;
         useCustomMask  = false;
+        mergeSources.clear();
         thumbnails     = null;  // force thumbnail recompute
         showMinimap    = false;
 
@@ -774,8 +804,10 @@ public class MapEditorScreen extends Screen {
             String frameHint = totalFrames > 1
                     ? "  §e" + (activeFrame + 1) + "/" + totalFrames + " " + frameDelay + "ms§r §8Ctrl+[/]" : "";
             String minimapHint = PayloadState.tiles.size() > 1 ? "  §8[G]tiles" : "";
+            String mergeHint   = mergeSources.isEmpty() ? ""
+                    : "  §c[" + mergeSources.size() + " merge]§r §8C=commit";
             left = "§8" + tileLabel + "  §r" + toolStr + undoHint + redoHint
-                    + ditherHint + reqHint + selHint + frameHint + minimapHint;
+                    + ditherHint + reqHint + selHint + frameHint + minimapHint + mergeHint;
         }
         ctx.drawTextWithShadow(textRenderer, Text.literal(left), 4, barY + 3, 0xFFFFFF);
 
@@ -889,7 +921,16 @@ public class MapEditorScreen extends Screen {
                 int col = (relX - PANEL_MARGIN) / SWATCH_STRIDE;
                 if (col >= 0 && col < SWATCHES_PER_ROW) {
                     int idx = row * SWATCHES_PER_ROW + col;
-                    if (idx < palette.length) { activeColor = palette[idx]; return true; }
+                    if (idx < palette.length) {
+                        int c = palette[idx];
+                        if (button == 0 && hasControlDown()) {
+                            // Ctrl+click: toggle color in merge-source set
+                            if (!mergeSources.remove(c)) mergeSources.add(c);
+                        } else {
+                            activeColor = c;
+                        }
+                        return true;
+                    }
                 }
             }
             return false;
@@ -1032,8 +1073,9 @@ public class MapEditorScreen extends Screen {
             return true;
         }
 
-        // Escape: cancel lasso → deselect → close
+        // Escape: clear merge sources → cancel lasso → deselect → close
         if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+            if (!mergeSources.isEmpty()) { mergeSources.clear(); return true; }
             if (lassoPoints != null) { lassoPoints = null; return true; }
             if (selMask != null)     { selMask = null;     return true; }
             // fall through to super → close()
@@ -1111,6 +1153,14 @@ public class MapEditorScreen extends Screen {
         if (keyCode == GLFW.GLFW_KEY_G) {
             showMinimap = !showMinimap;
             if (showMinimap && thumbnails == null) computeMinimapThumbnails();
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_C) {
+            if (mergeSources.isEmpty()) {
+                setStatusMsg("Ctrl+click palette swatches to queue colors for merging, then press C.");
+            } else {
+                commitMerge();
+            }
             return true;
         }
 
@@ -1351,6 +1401,35 @@ public class MapEditorScreen extends Screen {
         useCustomMask = true;
     }
 
+    // ── Color merge ──────────────────────────────────────────────────────
+
+    private void commitMerge() {
+        if (mergeSources.isEmpty()) return;
+        // Exclude the replacement color itself from the source set (it's a no-op anyway,
+        // but excluding it keeps the "N sources replaced" count accurate).
+        mergeSources.remove(activeColor);
+        if (mergeSources.isEmpty()) {
+            setStatusMsg("All queued colors are already the target color.");
+            return;
+        }
+        history.snapshot();
+        int replaced = 0;
+        for (int i = 0; i < MAP_BYTES; i++) {
+            if (selMask != null && !selMask[i]) continue;
+            if (mergeSources.contains(mapColors[i] & 0xFF)) {
+                mapColors[i] = (byte) activeColor;
+                replaced++;
+            }
+        }
+        dirty = true;
+        rebuildTileColors();
+        String sel = selMask != null ? " (in selection)" : "";
+        setStatusMsg(String.format("Merged %d color%s → idx %d: %d pixel%s replaced%s.",
+                mergeSources.size(), mergeSources.size() == 1 ? "" : "s",
+                activeColor, replaced, replaced == 1 ? "" : "s", sel));
+        mergeSources.clear();
+    }
+
     // ── Re-encode on close ───────────────────────────────────────────────
 
     private void reEncode() {
@@ -1372,10 +1451,19 @@ public class MapEditorScreen extends Screen {
             if (freq[c] > 0) entries.add(new int[]{c, freq[c]});
         }
         entries.sort((a, b) -> b[1] - a[1]);
-        int[] sorted = entries.stream().mapToInt(e -> e[0]).toArray();
-        if (freq[0] == 0) return sorted;
-        int[] out = new int[sorted.length + 1];
-        System.arraycopy(sorted, 0, out, 1, sorted.length);
+
+        boolean hasTransparent = freq[0] > 0;
+        int offset = hasTransparent ? 1 : 0;
+        int sz = entries.size() + offset;
+        int[] out   = new int[sz];
+        int[] freqs = new int[sz];
+        if (hasTransparent) { out[0] = 0; freqs[0] = freq[0]; }
+        for (int i = 0; i < entries.size(); i++) {
+            out[offset + i]   = entries.get(i)[0];
+            freqs[offset + i] = entries.get(i)[1];
+        }
+        tileColorFreqs = freqs;
+        maxTileFreq = entries.isEmpty() ? 0 : entries.get(0)[1];
         return out;
     }
 

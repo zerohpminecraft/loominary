@@ -400,10 +400,6 @@ public class LoominaryCommand {
      */
     private static boolean titleIsUserSet = false;
 
-    /** Frame stride for the next GIF import. 1 = all frames; N = every Nth frame. */
-    private static int importStride = 1;
-    /** Frame skip for the next GIF import. 1 = off; N = drop every Nth frame. */
-    private static int importSkip = 1;
 
     /** Set while any import is running on the background thread. */
     private static volatile boolean importInProgress = false;
@@ -627,16 +623,14 @@ public class LoominaryCommand {
 
                             // ── stride ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("stride")
-                                    .executes(ctx -> strideReset(ctx.getSource()))
-                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 100))
-                                            .executes(ctx -> strideSet(ctx.getSource(),
+                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(2, 100))
+                                            .executes(ctx -> applyStrideTile(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "n")))))
 
                             // ── skip ───────────────────────────────────────────
                             .then(ClientCommandManager.literal("skip")
-                                    .executes(ctx -> skipReset(ctx.getSource()))
                                     .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(2, 100))
-                                            .executes(ctx -> skipSet(ctx.getSource(),
+                                            .executes(ctx -> applySkipTile(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "n")))))
 
                             // ── export ─────────────────────────────────────────
@@ -1014,15 +1008,13 @@ public class LoominaryCommand {
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
         final String playerName = source.getPlayer().getGameProfile().getName();
-        final int capturedStride = importStride;
-        final int capturedSkip   = importSkip;
         final MinecraftClient client = MinecraftClient.getInstance();
         source.sendFeedback(Text.literal("§7Importing §f" + filename + "§7 in background..."));
 
         Thread t = new Thread(() -> {
             try {
                 PngToMapColors.GifResult result = PngToMapColors.convertGif(
-                        filePath, !allShades, 0, dither, columns, rows, capturedStride, capturedSkip);
+                        filePath, !allShades, 0, dither, columns, rows);
 
                 int frameCount = result.frameCount();
                 int[] rawDelays = result.frameDelays;
@@ -1322,15 +1314,13 @@ public class LoominaryCommand {
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
         final String playerName = source.getPlayer().getGameProfile().getName();
-        final int capturedStride = importStride;
-        final int capturedSkip   = importSkip;
         final MinecraftClient client = MinecraftClient.getInstance();
         source.sendFeedback(Text.literal("§7Importing §f" + filename + "§7 in background..."));
 
         Thread t = new Thread(() -> {
           try {
             PngToMapColors.GifResult result = PngToMapColors.convertGif(
-                    filePath, !allShades, 0, dither, columns, rows, capturedStride, capturedSkip);
+                    filePath, !allShades, 0, dither, columns, rows);
 
             int frameCount = result.frameCount();
             int[] rawDelays = result.frameDelays;
@@ -1644,16 +1634,6 @@ public class LoominaryCommand {
                 PayloadState.totalTiles() == 1 ? "" : "s")));
         if (PayloadState.currentTitle != null) {
             source.sendFeedback(Text.literal("§7Title: §f" + PayloadState.currentTitle));
-        }
-        if (importStride != 1) {
-            source.sendFeedback(Text.literal(String.format(
-                    "§7Stride: §e%d §7(next GIF import keeps every %dth frame — use /loominary stride to reset)",
-                    importStride, importStride)));
-        }
-        if (importSkip != 1) {
-            source.sendFeedback(Text.literal(String.format(
-                    "§7Skip:   §e%d §7(next GIF import drops every %dth frame — use /loominary skip to reset)",
-                    importSkip, importSkip)));
         }
 
         int totalDone = 0, totalChunks = 0;
@@ -2799,40 +2779,104 @@ public class LoominaryCommand {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // stride [n]
+    // stride <n> / skip <n>  — direct operations on the active tile
     // ════════════════════════════════════════════════════════════════════
 
-    private static int strideSet(FabricClientCommandSource source, int n) {
-        importStride = n;
-        if (n == 1) {
-            source.sendFeedback(Text.literal("§aFrame stride set to 1 (all frames)."));
-        } else {
-            source.sendFeedback(Text.literal(String.format(
-                    "§aFrame stride set to §f%d §7— next GIF import will keep every %dth frame.", n, n)));
+    private static int applyStrideTile(FabricClientCommandSource source, int n) {
+        return applyFrameTransform(source, n, true);
+    }
+
+    private static int applySkipTile(FabricClientCommandSource source, int n) {
+        return applyFrameTransform(source, n, false);
+    }
+
+    private static int applyFrameTransform(FabricClientCommandSource source, int n, boolean isStride) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
         }
-        return 1;
-    }
+        if (importInProgress) {
+            source.sendError(Text.literal("§cA long operation is already in progress."));
+            return 0;
+        }
+        int tileIdx = PayloadState.activeTileIndex;
+        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+        if (tile.frameCount <= 1) {
+            source.sendError(Text.literal("§cActive tile is not animated (only 1 frame)."));
+            return 0;
+        }
 
-    private static int strideReset(FabricClientCommandSource source) {
-        importStride = 1;
-        source.sendFeedback(Text.literal("§aFrame stride reset to 1 (all frames)."));
-        return 1;
-    }
+        final List<String> chunksSnap = new ArrayList<>(PayloadState.ACTIVE_CHUNKS);
+        final PayloadState.TileData tileSnap = snapshotTile(tile);
+        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String label = PayloadState.tileLabel(tileIdx);
 
-    // ════════════════════════════════════════════════════════════════════
-    // skip [n]
-    // ════════════════════════════════════════════════════════════════════
-
-    private static int skipSet(FabricClientCommandSource source, int n) {
-        importSkip = n;
+        importInProgress = true;
         source.sendFeedback(Text.literal(String.format(
-                "§aFrame skip set to §f%d §7— next GIF import will drop every %dth frame.", n, n)));
-        return 1;
-    }
+                "§7Applying %s %d to %s...", isStride ? "stride" : "skip", n, label)));
 
-    private static int skipReset(FabricClientCommandSource source) {
-        importSkip = 1;
-        source.sendFeedback(Text.literal("§aFrame skip reset (no frames dropped)."));
+        MinecraftClient client = MinecraftClient.getInstance();
+        Thread t = new Thread(() -> {
+            try {
+                byte[][] frames = resolveAllFramesForTile(tileSnap, chunksSnap);
+                int[] delays = tileDelays(tileSnap, frames.length);
+
+                record FS(byte[][] frames, int[] delays) {}
+                FS result;
+                if (isStride) {
+                    int kept = (frames.length + n - 1) / n;
+                    byte[][] kf = new byte[kept][];
+                    int[]    kd = new int[kept];
+                    for (int i = 0; i < kept; i++) {
+                        int src = i * n;
+                        kf[i] = frames[src];
+                        int acc = 0;
+                        for (int j = src; j < Math.min(src + n, frames.length); j++) acc += delays[j];
+                        kd[i] = acc;
+                    }
+                    result = new FS(kf, kd);
+                } else {
+                    int keptCount = 0;
+                    for (int i = 0; i < frames.length; i++)
+                        if ((i + 1) % n != 0) keptCount++;
+                    if (keptCount == 0) keptCount = 1;
+                    byte[][] kf = new byte[keptCount][];
+                    int[]    kd = new int[keptCount];
+                    int dst = 0, pending = 0;
+                    for (int i = 0; i < frames.length; i++) {
+                        if ((i + 1) % n == 0) {
+                            pending += delays[i];
+                        } else {
+                            kf[dst] = frames[i];
+                            kd[dst] = delays[i] + pending;
+                            pending = 0;
+                            dst++;
+                        }
+                    }
+                    if (pending > 0 && dst > 0) kd[dst - 1] += pending;
+                    result = new FS(kf, kd);
+                }
+
+                final int before = frames.length, after = result.frames().length;
+                client.execute(() -> {
+                    try {
+                        saveEditorChanges(result.frames(), result.delays(), tileIdx, playerName);
+                        source.sendFeedback(Text.literal(String.format(
+                                "§a%s %d applied to %s: §e%d §7→ §a%d §7frames.",
+                                isStride ? "Stride" : "Skip", n, label, before, after)));
+                    } finally {
+                        importInProgress = false;
+                    }
+                });
+            } catch (Exception e) {
+                client.execute(() -> {
+                    source.sendError(Text.literal("§cFailed: " + e.getMessage()));
+                    importInProgress = false;
+                });
+            }
+        });
+        t.setDaemon(true);
+        t.start();
         return 1;
     }
 

@@ -617,13 +617,18 @@ public class PngToMapColors {
      */
     public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
                                         boolean dither, int cols, int rows, int stride) throws IOException {
+        return convertGif(gifPath, legalOnly, targetColors, dither, cols, rows, stride, 1);
+    }
+
+    public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
+                                        boolean dither, int cols, int rows, int stride, int skip) throws IOException {
         try (ImageInputStream iis = ImageIO.createImageInputStream(Files.newInputStream(gifPath))) {
             Iterator<ImageReader> readers = ImageIO.getImageReadersByMIMEType("image/gif");
             if (!readers.hasNext()) throw new IOException("No GIF image reader available");
             ImageReader reader = readers.next();
             try {
                 reader.setInput(iis, false);
-                return readGif(reader, legalOnly, targetColors, dither, cols, rows, stride);
+                return readGif(reader, legalOnly, targetColors, dither, cols, rows, stride, skip);
             } finally {
                 reader.dispose();
             }
@@ -631,7 +636,7 @@ public class PngToMapColors {
     }
 
     private static GifResult readGif(ImageReader reader, boolean legalOnly, int targetColors,
-                                      boolean dither, int cols, int rows, int stride) throws IOException {
+                                      boolean dither, int cols, int rows, int stride, int skip) throws IOException {
         // Screen dimensions from stream metadata (reliable; Java's GIF reader always provides it).
         int screenW = 0, screenH = 0;
         IIOMetadata streamMeta = reader.getStreamMetadata();
@@ -698,6 +703,37 @@ public class PngToMapColors {
             coalesced   = sampledFrames;
             frameDelays = sampledDelays;
             numFrames   = kept;
+        }
+
+        // Drop every Nth frame — opposite of stride: thins the sequence by 1-in-N
+        // rather than keeping only 1-in-N. Dropped frame delays are folded into the
+        // preceding kept frame (or carried forward to the next if dropped at the start).
+        if (skip > 1 && numFrames > 1) {
+            int pending = 0;
+            int dst = 0;
+            // Count kept frames first so we can allocate exact arrays.
+            int keptCount = 0;
+            for (int i = 0; i < numFrames; i++)
+                if ((i + 1) % skip != 0) keptCount++;
+            if (keptCount == 0) keptCount = 1; // always keep at least one frame
+            BufferedImage[] keptFrames = new BufferedImage[keptCount];
+            int[]           keptDelays = new int[keptCount];
+            for (int i = 0; i < numFrames; i++) {
+                if ((i + 1) % skip == 0) {
+                    // Drop this frame; carry its delay into the next kept frame.
+                    pending += frameDelays[i];
+                } else {
+                    keptFrames[dst] = coalesced[i];
+                    keptDelays[dst] = frameDelays[i] + pending;
+                    pending = 0;
+                    dst++;
+                }
+            }
+            // Any trailing pending delay goes on the last kept frame.
+            if (pending > 0 && dst > 0) keptDelays[dst - 1] += pending;
+            coalesced   = keptFrames;
+            frameDelays = keptDelays;
+            numFrames   = keptCount;
         }
 
         // Scale all frames to the target grid resolution.

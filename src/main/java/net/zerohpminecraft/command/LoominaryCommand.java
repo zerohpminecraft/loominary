@@ -402,6 +402,8 @@ public class LoominaryCommand {
 
     /** Frame stride for the next GIF import. 1 = all frames; N = every Nth frame. */
     private static int importStride = 1;
+    /** Frame skip for the next GIF import. 1 = off; N = drop every Nth frame. */
+    private static int importSkip = 1;
 
     /** Set while any import is running on the background thread. */
     private static volatile boolean importInProgress = false;
@@ -628,6 +630,13 @@ public class LoominaryCommand {
                                     .executes(ctx -> strideReset(ctx.getSource()))
                                     .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 100))
                                             .executes(ctx -> strideSet(ctx.getSource(),
+                                                    IntegerArgumentType.getInteger(ctx, "n")))))
+
+                            // ── skip ───────────────────────────────────────────
+                            .then(ClientCommandManager.literal("skip")
+                                    .executes(ctx -> skipReset(ctx.getSource()))
+                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(2, 100))
+                                            .executes(ctx -> skipSet(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "n")))))
 
                             // ── export ─────────────────────────────────────────
@@ -1006,13 +1015,14 @@ public class LoominaryCommand {
         final String capturedTitle = PayloadState.currentTitle;
         final String playerName = source.getPlayer().getGameProfile().getName();
         final int capturedStride = importStride;
+        final int capturedSkip   = importSkip;
         final MinecraftClient client = MinecraftClient.getInstance();
         source.sendFeedback(Text.literal("§7Importing §f" + filename + "§7 in background..."));
 
         Thread t = new Thread(() -> {
             try {
                 PngToMapColors.GifResult result = PngToMapColors.convertGif(
-                        filePath, !allShades, 0, dither, columns, rows, capturedStride);
+                        filePath, !allShades, 0, dither, columns, rows, capturedStride, capturedSkip);
 
                 int frameCount = result.frameCount();
                 int[] rawDelays = result.frameDelays;
@@ -1313,13 +1323,14 @@ public class LoominaryCommand {
         final String capturedTitle = PayloadState.currentTitle;
         final String playerName = source.getPlayer().getGameProfile().getName();
         final int capturedStride = importStride;
+        final int capturedSkip   = importSkip;
         final MinecraftClient client = MinecraftClient.getInstance();
         source.sendFeedback(Text.literal("§7Importing §f" + filename + "§7 in background..."));
 
         Thread t = new Thread(() -> {
           try {
             PngToMapColors.GifResult result = PngToMapColors.convertGif(
-                    filePath, !allShades, 0, dither, columns, rows, capturedStride);
+                    filePath, !allShades, 0, dither, columns, rows, capturedStride, capturedSkip);
 
             int frameCount = result.frameCount();
             int[] rawDelays = result.frameDelays;
@@ -1638,6 +1649,11 @@ public class LoominaryCommand {
             source.sendFeedback(Text.literal(String.format(
                     "§7Stride: §e%d §7(next GIF import keeps every %dth frame — use /loominary stride to reset)",
                     importStride, importStride)));
+        }
+        if (importSkip != 1) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§7Skip:   §e%d §7(next GIF import drops every %dth frame — use /loominary skip to reset)",
+                    importSkip, importSkip)));
         }
 
         int totalDone = 0, totalChunks = 0;
@@ -2800,6 +2816,23 @@ public class LoominaryCommand {
     private static int strideReset(FabricClientCommandSource source) {
         importStride = 1;
         source.sendFeedback(Text.literal("§aFrame stride reset to 1 (all frames)."));
+        return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // skip [n]
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int skipSet(FabricClientCommandSource source, int n) {
+        importSkip = n;
+        source.sendFeedback(Text.literal(String.format(
+                "§aFrame skip set to §f%d §7— next GIF import will drop every %dth frame.", n, n)));
+        return 1;
+    }
+
+    private static int skipReset(FabricClientCommandSource source) {
+        importSkip = 1;
+        source.sendFeedback(Text.literal("§aFrame skip reset (no frames dropped)."));
         return 1;
     }
 

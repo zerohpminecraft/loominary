@@ -2121,10 +2121,11 @@ public class LoominaryCommand {
     /** Creates a minimal TileData snapshot safe to pass to the background thread. */
     private static PayloadState.TileData snapshotTile(PayloadState.TileData tile) {
         PayloadState.TileData snap = new PayloadState.TileData();
-        snap.carpetEncoded      = tile.carpetEncoded;
+        snap.carpetEncoded       = tile.carpetEncoded;
         snap.carpetCompressedB64 = tile.carpetCompressedB64;
-        snap.frameDelays        = tile.frameDelays != null ? new ArrayList<>(tile.frameDelays) : null;
-        snap.nonce              = tile.nonce;
+        snap.frameDelays         = tile.frameDelays != null ? new ArrayList<>(tile.frameDelays) : null;
+        snap.frameCount          = tile.frameCount;
+        snap.nonce               = tile.nonce;
         return snap;
     }
 

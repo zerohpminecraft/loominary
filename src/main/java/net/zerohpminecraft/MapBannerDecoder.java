@@ -408,27 +408,35 @@ public class MapBannerDecoder {
     private static byte[] assembleAndDecompress(List<String> names) {
         names.sort(Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
 
-        StringBuilder b64 = new StringBuilder();
-        int expectedIndex = 0;
-        for (String s : names) {
-            int idx = Integer.parseInt(s.substring(0, 2), 16);
-            if (idx != expectedIndex) {
-                throw new IllegalStateException("Non-contiguous chunk index: expected "
-                        + expectedIndex + " but got " + idx);
+        // Detect encoding: CJK payload chars are ≥ U+4E00; base64 chars are all ASCII (≤ 0x7F).
+        boolean cjk = !names.isEmpty() && names.get(0).length() > 2
+                && names.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
+
+        byte[] compressed;
+        if (cjk) {
+            StringBuilder sb = new StringBuilder();
+            for (String s : names) sb.append(s.substring(2));
+            compressed = CjkCodec.decode(sb.toString());
+        } else {
+            StringBuilder b64 = new StringBuilder();
+            int expectedIndex = 0;
+            for (String s : names) {
+                int idx = Integer.parseInt(s.substring(0, 2), 16);
+                if (idx != expectedIndex)
+                    throw new IllegalStateException("Non-contiguous chunk index: expected "
+                            + expectedIndex + " but got " + idx);
+                expectedIndex++;
+                b64.append(s.substring(2));
             }
-            expectedIndex++;
-            b64.append(s.substring(2));
+            compressed = Base64.getDecoder().decode(b64.toString());
         }
 
-        byte[] compressed = Base64.getDecoder().decode(b64.toString());
         long originalSize = Zstd.getFrameContentSize(compressed);
-        if (originalSize < 0) {
+        if (originalSize < 0)
             throw new IllegalStateException("Missing zstd frame content size — corrupt payload?");
-        }
-        if (originalSize < MAP_BYTES) {
+        if (originalSize < MAP_BYTES)
             throw new IllegalStateException("Decompressed size " + originalSize
                     + " is smaller than MAP_BYTES — corrupt payload?");
-        }
         return Zstd.decompress(compressed, (int) originalSize);
     }
 

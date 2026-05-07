@@ -165,6 +165,25 @@ public class PngToMapColors {
     // ── Reduction: banner-count target ───────────────────────────────────
 
     public static FitResult reduceToFit(byte[] mapColors, byte[] prefix, int chunkSize, int maxChunks) {
+        return reduceToFitCore(mapColors, prefix, maxChunks,
+                compressed -> chunksNeeded(compressed, chunkSize));
+    }
+
+    public static FitResult reduceToFit(byte[] mapColors, int chunkSize, int maxChunks) {
+        return reduceToFit(mapColors, new byte[0], chunkSize, maxChunks);
+    }
+
+    /** CJK-aware variant: measures banner budget using {@link CjkCodec#chunksNeeded}. */
+    public static FitResult reduceToFitKJ(byte[] mapColors, byte[] prefix, int maxChunks) {
+        return reduceToFitCore(mapColors, prefix, maxChunks, CjkCodec::chunksNeeded);
+    }
+
+    public static FitResult reduceToFitKJ(byte[] mapColors, int maxChunks) {
+        return reduceToFitKJ(mapColors, new byte[0], maxChunks);
+    }
+
+    private static FitResult reduceToFitCore(byte[] mapColors, byte[] prefix, int maxChunks,
+            java.util.function.ToIntFunction<byte[]> chunkCounter) {
         float[][] oklabLookup = buildOklabLookup();
 
         int originalDistinct = countDistinct(mapColors);
@@ -172,7 +191,7 @@ public class PngToMapColors {
         int pixelsAffected = 0;
 
         byte[] compressed = compressCombined(prefix, mapColors);
-        int chunks = chunksNeeded(compressed, chunkSize);
+        int chunks = chunkCounter.applyAsInt(compressed);
 
         while (chunks > maxChunks) {
             int[] freq = new int[256];
@@ -195,14 +214,10 @@ public class PngToMapColors {
             pixelsAffected += rarestFreq;
 
             compressed = compressCombined(prefix, mapColors);
-            chunks = chunksNeeded(compressed, chunkSize);
+            chunks = chunkCounter.applyAsInt(compressed);
         }
 
         return new FitResult(mapColors, compressed, colorsRemoved, originalDistinct, pixelsAffected);
-    }
-
-    public static FitResult reduceToFit(byte[] mapColors, int chunkSize, int maxChunks) {
-        return reduceToFit(mapColors, new byte[0], chunkSize, maxChunks);
     }
 
     // ── Reduction: color-count target ────────────────────────────────────

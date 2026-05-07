@@ -1,9 +1,11 @@
 package net.zerohpminecraft;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.AnvilScreen;
 import net.minecraft.component.DataComponentTypes;
+import net.minecraft.item.BannerItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.c2s.play.RenameItemC2SPacket;
 import net.minecraft.screen.AnvilScreenHandler;
@@ -17,66 +19,85 @@ import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 /**
- * Probes the server's item-rename alphabet with ~28 targeted test cases, designed
- * to fit on a single cheap item (cobblestone, dirt, etc.) before hitting the
- * "Too Expensive!" threshold (~6 anvil uses in survival).
+ * Probes the server's item-rename alphabet using a single banner renamed
+ * repeatedly at the anvil.  If the anvil closes mid-run (breaks, player
+ * walks away), the test pauses and resumes automatically the next time
+ * the player opens any anvil.
  *
- * <p>Key questions answered:
- * <ul>
- *   <li><b>Counting mode</b>: does the 50-char limit use UTF-16 code units or Unicode
- *       code points? (discriminated by sending supplementary-plane chars × 25/26/50)</li>
- *   <li><b>Character acceptance</b>: are non-ASCII, control, NFC-affected, and private-use
- *       chars preserved unmodified?</li>
- *   <li><b>Normalization</b>: does the server apply NFC, stripping combining chars or
- *       collapsing compatibility equivalents?</li>
- * </ul>
- *
- * <p>Usage: open an anvil with <em>any</em> cheap item in the left slot (cobblestone
- * works fine), then run {@code /loominary alphabettest [wait_ticks]}.
- * Increase {@code wait_ticks} on laggy servers (e.g., 12 for ~500 ms ping on 2b2t).
+ * <p>Usage: run {@code /loominary alphabettest [wait]} before opening the
+ * anvil, then open an anvil with exactly one banner anywhere in inventory.
  *
  * <p>Output: {@code loominary_exports/alphabettest_TIMESTAMP.tsv}
- * Columns: label | sent_units | sent_cps | output_empty | got_units | got_cps | match | got_sample
  */
 public class AlphabetTestHandler {
 
-    private enum Phase { IDLE, AFTER_RENAME, AFTER_TAKE, AFTER_RETURN }
+    private static final String TAG                = "[AlphabetTest]";
+    private static final int ACTION_COOLDOWN_TICKS = 5;
+    private static final int MIN_XP_FOR_RENAME     = 1;
+    private static final int RENAME_TIMEOUT_TICKS  = 60;
 
-    private static Phase phase       = Phase.IDLE;
-    private static int   timer       = 0;
-    private static int   waitTicks   = 6;
-    private static int   idx         = 0;
-    private static int   emptyStreak = 0;
-    private static boolean armed     = false; // waiting for anvil to open
+    private static final int LEFT_CLICK  = 0;
+    private static final int RIGHT_CLICK = 1;
+
+    private enum Phase { IDLE, PAUSED, EXTRACTING, RENAMING, TAKING, RETURNING }
+
+    private static Phase   phase        = Phase.IDLE;
+    private static int     cooldown     = 0;
+    private static int     renameTicks  = 0;
+    private static int     emptyStreak  = 0;
+    private static int     idx          = 0;
+    private static int     waitTicks    = 6;
+    private static boolean armed        = false;
+
+    // Extraction sub-state — same 3-step protocol as AnvilAutoFillHandler
+    private static int extractState = 0;
+    private static int extractSlot  = -1;
+
+    private static boolean xpPausedLogged = false;
 
     private static final List<String> labels  = new ArrayList<>();
     private static final List<String> strings = new ArrayList<>();
-
     private static PrintWriter writer = null;
 
     // ── Public API ────────────────────────────────────────────────────────
 
     public static void register() {
+        ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
+            if (!(screen instanceof AnvilScreen)) return;
+            if (armed) {
+                doStart(client);
+            } else if (phase == Phase.PAUSED) {
+                resumeOnAnvil(client);
+            }
+        });
         ClientTickEvents.END_CLIENT_TICK.register(AlphabetTestHandler::tick);
     }
 
-    public static boolean isActive() { return phase != Phase.IDLE; }
+    public static boolean isActive() { return phase != Phase.IDLE || armed; }
 
     public static boolean start(MinecraftClient client, int wait) {
         waitTicks = Math.max(2, wait);
         if (!(client.currentScreen instanceof AnvilScreen)) {
             armed = true;
             msg(client, "§aAlphabet test armed (wait=" + waitTicks
-                    + " ticks). Open an anvil with any cheap item in the left slot to begin.");
+                    + " ticks). Open an anvil with one banner in your inventory.");
             return true;
         }
-        armed = false;
-        idx         = 0;
-        emptyStreak = 0;
+        return doStart(client);
+    }
+
+    private static boolean doStart(MinecraftClient client) {
+        armed        = false;
+        idx          = 0;
+        emptyStreak  = 0;
+        renameTicks  = 0;
+        extractState = 0;
+        extractSlot  = -1;
+        cooldown     = 0;
+        xpPausedLogged = false;
         buildTests();
 
         try {
@@ -89,16 +110,24 @@ public class AlphabetTestHandler {
             writer.flush();
             msg(client, "§aAlphabet test started — " + strings.size()
                     + " cases, wait=" + waitTicks + " ticks. Log: " + p.getFileName());
-            msg(client, "§7One cheap item is enough for the whole run. XP cost: ~" + strings.size() + " levels.");
         } catch (IOException e) {
             msg(client, "§cLog open failed: " + e.getMessage());
             return false;
         }
 
-        phase = Phase.AFTER_RENAME;
-        sendRename(client);
-        timer = waitTicks;
+        phase = Phase.EXTRACTING;
         return true;
+    }
+
+    /** Called by ScreenEvents when anvil opens while test is paused. */
+    private static void resumeOnAnvil(MinecraftClient client) {
+        extractState   = 0;
+        extractSlot    = -1;
+        cooldown       = 0;
+        renameTicks    = 0;
+        xpPausedLogged = false;
+        phase = Phase.EXTRACTING;
+        msg(client, "§aAlphabet test resuming — test " + (idx + 1) + "/" + strings.size());
     }
 
     public static void stop(MinecraftClient client) {
@@ -106,186 +135,203 @@ public class AlphabetTestHandler {
         abort(client, "stopped by user");
     }
 
-    // ── Test catalogue ────────────────────────────────────────────────────
-    //
-    // 28 tests total — comfortably under the ~6-rename "Too Expensive!" limit
-    // for a single item in survival. Groups are ordered by importance so you
-    // can abort early once you have the critical discriminator results.
-
-    private static void buildTests() {
-        labels.clear();
-        strings.clear();
-
-        // ── Group 1: Supplement counting-mode discriminator (6 tests) ─────
-        //
-        // A supplementary char (e.g., 😀 U+1F600) is 2 UTF-16 code units.
-        // ×25 = 50 units / 25 cps   → accepted regardless of counting mode
-        // ×26 = 52 units / 26 cps   → accepted only if server counts by codepoint
-        // ×50 = 100 units / 50 cps  → accepted only if server counts by codepoint
-        //
-        // If ×26 succeeds: server counts by codepoint (huge potential gain).
-        // If ×26 fails:    server counts by code unit (no benefit from supplementary chars).
-        addSupp(0x1F600, "emoji_1F600", 25);
-        addSupp(0x1F600, "emoji_1F600", 26);
-        addSupp(0x1F600, "emoji_1F600", 50);
-        addSupp(0x10000, "linB_10000",  25);
-        addSupp(0x10000, "linB_10000",  26);
-        addSupp(0x10000, "linB_10000",  50);
-
-        // ── Group 2: ASCII edge cases (5 tests) ───────────────────────────
-        //
-        // Baseline 'A' verifies the anvil is working.
-        // JSON special chars (", \) and control chars may be stripped by the
-        // Text serialiser or filtered server-side.
-        addBMP('A',    50, "ascii_A");
-        addBMP('"',    50, "ascii_quote");
-        addBMP('\\',   50, "ascii_backslash");
-        addBMP(0x01,   50, "ctrl_SOH");       // non-printable control
-        addBMP(0x7F,   50, "ctrl_DEL");
-
-        // ── Group 3: Non-ASCII BMP acceptance (7 tests) ───────────────────
-        //
-        // Tests whether the server treats the name as an opaque byte sequence
-        // or as text with charset restrictions.
-        addBMP(0x00E9, 50, "U+00E9_e-acute");  // é — Latin-1, very common
-        addBMP(0x0410, 50, "U+0410_Cyrillic"); // А
-        addBMP(0x4E00, 50, "U+4E00_CJK");      // 一
-        addBMP(0x2603, 50, "U+2603_snowman");  // ☃ — BMP symbol
-        addBMP(0xD800, 50, "U+D800_hi-surr");  // lone high surrogate — invalid UTF
-        addBMP(0xE000, 50, "U+E000_PUA");      // private use area
-        addBMP(0xFFFD, 50, "U+FFFD_replacement"); // replacement character
-
-        // ── Group 4: NFC normalisation (4 tests) ──────────────────────────
-        //
-        // Minecraft's Text system may apply NFC normalisation when deserialising
-        // the name, collapsing some precomposed/decomposed pairs.
-        // Compare tests 17 vs 18: if they produce different got_str lengths,
-        // the server normalised one of them.
-        addBMP(0x00E9,  50, "U+00E9_precomp-e-acute");  // é (precomposed)
-        addStr("é".repeat(25), "U+0065+0301_decomp-e-acute_x25"); // e + combining acute, 50 code units
-        addBMP(0x212B,  50, "U+212B_angstrom");   // Ångström sign — NFC→U+00C5
-        addBMP(0x00C5,  50, "U+00C5_A-ring");     // Å — the NFC form of U+212B
-
-        // ── Group 5: Special whitespace / invisible chars (4 tests) ──────
-        //
-        // These may be stripped, normalised to regular space, or preserved.
-        addBMP(0x00A0, 50, "U+00A0_NBSP");        // non-breaking space
-        addBMP(0x200B, 50, "U+200B_ZWSP");        // zero-width space
-        addBMP(0x2028, 50, "U+2028_line-sep");    // line separator
-        addBMP(0xFEFF, 50, "U+FEFF_BOM");         // byte-order mark / ZWNBSP
-
-        // ── Group 6: Extended ASCII density check (2 tests) ──────────────
-        //
-        // If all Latin-1 chars are accepted unmodified, a 256-char alphabet
-        // gives 8 bits/char vs base64's 6 bits/char (33 % gain).
-        addBMP(0x00FF, 50, "U+00FF_y-diaeresis"); // last Latin-1 char
-        addBMP(0x0100, 50, "U+0100_A-macron");    // first char beyond Latin-1
-    }
-
-    // ── Test helpers ──────────────────────────────────────────────────────
-
-    /** Add a test using a single BMP character repeated {@code n} times. */
-    private static void addBMP(int cp, int n, String label) {
-        char c = (char) cp;
-        char[] arr = new char[n];
-        Arrays.fill(arr, c);
-        labels.add(label);
-        strings.add(new String(arr));
-    }
-
-    /** Add a test using a supplementary-plane character (2 code units) repeated {@code n} times. */
-    private static void addSupp(int cp, String tag, int n) {
-        String ch = new String(Character.toChars(cp));
-        String s  = ch.repeat(n);
-        labels.add(tag + "_x" + n
-                + "(" + s.length() + "u_" + s.codePointCount(0, s.length()) + "cp)");
-        strings.add(s);
-    }
-
-    /** Add a test with a fully specified string. */
-    private static void addStr(String s, String label) {
-        labels.add(label + "_(" + s.length() + "u_" + s.codePointCount(0, s.length()) + "cp)");
-        strings.add(s);
-    }
-
-    // ── Tick state machine ────────────────────────────────────────────────
+    // ── Tick ──────────────────────────────────────────────────────────────
 
     private static void tick(MinecraftClient client) {
-        // Armed: waiting for the player to open an anvil.
-        if (armed && phase == Phase.IDLE) {
-            if (client.currentScreen instanceof AnvilScreen) {
-                armed = false;
-                start(client, waitTicks); // anvil is now open — begin
+        if (phase == Phase.IDLE) return;
+        if (client.world == null || client.player == null) { abort(client, "disconnected"); return; }
+        if (phase == Phase.PAUSED) return; // waiting for ScreenEvents to fire
+
+        if (!(client.currentScreen instanceof AnvilScreen)) {
+            // Anvil closed mid-test — pause and wait for the next anvil open.
+            // TAKING and RETURNING mean the current test's result was already logged
+            // but idx hasn't incremented yet; advance it so we don't re-run it.
+            if (phase == Phase.TAKING || phase == Phase.RETURNING) {
+                idx++;
+                if (idx >= strings.size()) { done(client); return; }
+            }
+            phase = Phase.PAUSED;
+            msg(client, "§eAlphabet test paused (anvil closed) — open any anvil to resume. "
+                    + "Test " + (idx + 1) + "/" + strings.size());
+            return;
+        }
+
+        if (cooldown > 0) { cooldown--; return; }
+
+        AnvilScreenHandler h = (AnvilScreenHandler) client.player.currentScreenHandler;
+        ItemStack cursor = h.getCursorStack();
+        ItemStack slot0  = h.getSlot(0).getStack();
+        ItemStack slot2  = h.getSlot(2).getStack();
+
+        // XP gate — only RENAMING consumes XP.
+        if (phase == Phase.RENAMING) {
+            if (client.player.experienceLevel < MIN_XP_FOR_RENAME) {
+                if (!xpPausedLogged) {
+                    xpPausedLogged = true;
+                    msg(client, "§e" + TAG + " Paused — out of XP. Restore XP to continue.");
+                }
+                client.inGameHud.setOverlayMessage(
+                        Text.literal("§e" + TAG + " Paused — out of XP"), false);
+                return;
+            }
+            if (xpPausedLogged) {
+                xpPausedLogged = false;
+                sendRename(client);
+                renameTicks = 0;
+                cooldown = waitTicks * 4;
+                msg(client, "§a" + TAG + " XP restored — resuming.");
+                return;
+            }
+        }
+
+        switch (phase) {
+            case EXTRACTING -> tickExtract(client, h, cursor, slot0);
+            case RENAMING   -> tickRename(client, h, slot0, slot2);
+            case TAKING     -> tickTake(client, h, cursor);
+            case RETURNING  -> tickReturn(client);
+            default -> {}
+        }
+    }
+
+    // ── Extraction ────────────────────────────────────────────────────────
+
+    private static void tickExtract(MinecraftClient client, AnvilScreenHandler h,
+                                     ItemStack cursor, ItemStack slot0) {
+        // Banner already in slot 0 — skip extraction, start renaming.
+        if (!slot0.isEmpty() && slot0.getItem() instanceof BannerItem && slot0.getCount() == 1) {
+            sendRename(client);
+            phase = Phase.RENAMING;
+            renameTicks = 0;
+            cooldown = waitTicks * 4;
+            return;
+        }
+
+        if (extractState == 1) {
+            client.interactionManager.clickSlot(
+                    h.syncId, 0, RIGHT_CLICK, SlotActionType.PICKUP, client.player);
+            extractState = 2;
+            cooldown = ACTION_COOLDOWN_TICKS;
+            return;
+        }
+        if (extractState == 2) {
+            client.interactionManager.clickSlot(
+                    h.syncId, extractSlot, LEFT_CLICK, SlotActionType.PICKUP, client.player);
+            extractState = 0;
+            extractSlot  = -1;
+            cooldown = ACTION_COOLDOWN_TICKS;
+            return;
+        }
+
+        // Cursor safety
+        if (!cursor.isEmpty()) {
+            int dst = findEmptySlot(h);
+            if (dst != -1) {
+                client.interactionManager.clickSlot(
+                        h.syncId, dst, LEFT_CLICK, SlotActionType.PICKUP, client.player);
+                cooldown = ACTION_COOLDOWN_TICKS;
             }
             return;
         }
-        if (phase == Phase.IDLE) return;
-        if (client.world == null || client.player == null) { abort(client, "disconnected"); return; }
-        if (!(client.currentScreen instanceof AnvilScreen)) { abort(client, "anvil closed"); return; }
-        if (timer > 0) { timer--; return; }
 
-        AnvilScreenHandler h = (AnvilScreenHandler) client.player.currentScreenHandler;
+        // Find ANY banner in inventory — may be named if we're resuming after a pause.
+        for (int i = 3; i < h.slots.size(); i++) {
+            ItemStack s = h.getSlot(i).getStack();
+            if (s.isEmpty() || !(s.getItem() instanceof BannerItem)) continue;
+            client.interactionManager.clickSlot(
+                    h.syncId, i, LEFT_CLICK, SlotActionType.PICKUP, client.player);
+            extractState = 1;
+            extractSlot  = i;
+            cooldown = ACTION_COOLDOWN_TICKS;
+            return;
+        }
 
-        switch (phase) {
-            case AFTER_RENAME -> {
-                client.interactionManager.clickSlot(h.syncId, 2, 0, SlotActionType.PICKUP, client.player);
-                phase = Phase.AFTER_TAKE;
-                timer = waitTicks;
-            }
-            case AFTER_TAKE -> {
-                ItemStack cursor = h.getCursorStack();
-                logResult(cursor);
+        abort(client, "no banner in inventory — put one in and re-run /loominary alphabettest");
+    }
 
-                if (cursor.isEmpty()) {
-                    emptyStreak++;
-                    if (emptyStreak >= 3) {
-                        // Three consecutive empty outputs after at least one success
-                        // almost certainly means "Too Expensive!", not character rejection.
-                        abort(client, "3 consecutive empty outputs — item likely Too Expensive. "
-                                + "Replace the item in the anvil and re-run the command.");
-                        return;
-                    }
-                    // Single empty is probably a rejected character — continue.
-                    advance(client);
-                } else {
-                    emptyStreak = 0;
-                    // Return the item to the input slot.
-                    client.interactionManager.clickSlot(h.syncId, 0, 0, SlotActionType.PICKUP, client.player);
-                    phase = Phase.AFTER_RETURN;
-                    timer = waitTicks;
-                }
-            }
-            case AFTER_RETURN -> advance(client);
+    // ── Rename ────────────────────────────────────────────────────────────
+
+    private static void tickRename(MinecraftClient client, AnvilScreenHandler h,
+                                    ItemStack slot0, ItemStack slot2) {
+        if (!slot2.isEmpty() && slot2.getItem() instanceof BannerItem) {
+            logResult(slot2);
+            emptyStreak = 0;
+            client.interactionManager.clickSlot(
+                    h.syncId, 2, LEFT_CLICK, SlotActionType.PICKUP, client.player);
+            phase = Phase.TAKING;
+            cooldown = ACTION_COOLDOWN_TICKS;
+            return;
+        }
+
+        renameTicks++;
+        if (renameTicks < RENAME_TIMEOUT_TICKS) return;
+        renameTicks = 0;
+
+        logResult(ItemStack.EMPTY);
+        emptyStreak++;
+        if (emptyStreak >= 3) {
+            abort(client, "3 consecutive empty outputs — banner may be Too Expensive. "
+                    + "Replace it and re-run /loominary alphabettest.");
+            return;
+        }
+
+        idx++;
+        if (idx >= strings.size()) { done(client); return; }
+        if (slot0.isEmpty()) {
+            phase = Phase.EXTRACTING;
+            extractState = 0;
+            cooldown = ACTION_COOLDOWN_TICKS;
+        } else {
+            sendRename(client);
+            cooldown = waitTicks * 4;
         }
     }
+
+    // ── Take / Return ─────────────────────────────────────────────────────
+
+    private static void tickTake(MinecraftClient client, AnvilScreenHandler h, ItemStack cursor) {
+        if (cursor.isEmpty()) {
+            abort(client, "cursor empty after clicking output slot — unexpected state");
+            return;
+        }
+        client.interactionManager.clickSlot(
+                h.syncId, 0, LEFT_CLICK, SlotActionType.PICKUP, client.player);
+        phase = Phase.RETURNING;
+        cooldown = ACTION_COOLDOWN_TICKS;
+    }
+
+    private static void tickReturn(MinecraftClient client) {
+        idx++;
+        if (idx >= strings.size()) { done(client); return; }
+        sendRename(client);
+        phase = Phase.RENAMING;
+        renameTicks = 0;
+        cooldown = waitTicks * 4;
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
 
     private static void sendRename(MinecraftClient client) {
         client.player.networkHandler.sendPacket(new RenameItemC2SPacket(strings.get(idx)));
     }
 
-    private static void advance(MinecraftClient client) {
-        idx++;
-        if (idx >= strings.size()) { done(client); return; }
-        sendRename(client);
-        phase = Phase.AFTER_RENAME;
-        timer = waitTicks;
+    private static int findEmptySlot(AnvilScreenHandler h) {
+        for (int i = 3; i < h.slots.size(); i++) {
+            if (h.getSlot(i).getStack().isEmpty()) return i;
+        }
+        return -1;
     }
 
     // ── Logging ───────────────────────────────────────────────────────────
 
-    private static void logResult(ItemStack cursor) {
+    private static void logResult(ItemStack result) {
         String s      = strings.get(idx);
         int    sentU  = s.length();
         int    sentCP = s.codePointCount(0, s.length());
-        boolean empty = cursor.isEmpty();
+        boolean empty = result.isEmpty();
 
-        String got    = "";
-        int    gotU   = 0;
-        int    gotCP  = 0;
-        boolean match = false;
-
+        String got = ""; int gotU = 0, gotCP = 0; boolean match = false;
         if (!empty) {
-            Text name = cursor.get(DataComponentTypes.CUSTOM_NAME);
+            Text name = result.get(DataComponentTypes.CUSTOM_NAME);
             if (name != null) got = name.getString();
             gotU  = got.length();
             gotCP = got.isEmpty() ? 0 : got.codePointCount(0, got.length());
@@ -306,13 +352,15 @@ public class AlphabetTestHandler {
     private static void done(MinecraftClient client) {
         phase = Phase.IDLE;
         close();
-        msg(client, "§aAlphabet test complete — " + strings.size() + " cases. Share the .tsv file.");
+        msg(client, "§aAlphabet test complete — " + strings.size()
+                + " cases. Results in loominary_exports/");
     }
 
     private static void abort(MinecraftClient client, String reason) {
         phase = Phase.IDLE;
+        extractState = 0;
+        extractSlot  = -1;
         close();
-        if (writer != null) { writer.flush(); writer.close(); writer = null; }
         msg(client, "§cAlphabet test stopped: " + reason);
     }
 
@@ -322,5 +370,39 @@ public class AlphabetTestHandler {
 
     private static void msg(MinecraftClient client, String text) {
         if (client.player != null) client.player.sendMessage(Text.literal(text), false);
+    }
+
+    // ── Test catalogue ────────────────────────────────────────────────────
+
+    private static void buildTests() {
+        labels.clear();
+        strings.clear();
+
+        // ── CJK range probe for efficient banner encoding ──────────────────
+        //
+        // The proposed alphabet is U+4E00–U+63FF (8192 chars, 13 bits each).
+        // U+4E00 (一) is already confirmed passing from the previous run.
+        // These tests verify the rest of the proposed range and the wider
+        // CJK block, so we know exactly how far the safe alphabet extends.
+        //
+        // All CJK Unified Ideographs (U+4E00–U+9FFF) are NFC-stable by
+        // Unicode spec — no canonical decomposition — so normalization is
+        // not a risk here.
+        addBMP(0x4E01, 50, "KJ_4E01_near-start");   // 丁 — one past confirmed U+4E00
+        addBMP(0x5000, 50, "KJ_5000_mid-lo");        // within proposed range
+        addBMP(0x5800, 50, "KJ_5800_mid");           // within proposed range
+        addBMP(0x6000, 50, "KJ_6000_mid-hi");        // within proposed range
+        addBMP(0x63FF, 50, "KJ_63FF_end-proposed");  // last char of proposed 8192-char range
+        addBMP(0x6400, 50, "KJ_6400_beyond");        // first char past proposed range
+        addBMP(0x7000, 50, "KJ_7000_upper");         // well into wider CJK block
+        addBMP(0x9000, 50, "KJ_9000_near-end");      // near end of CJK Unified block
+        addBMP(0xF900, 50, "KJ_F900_compat");        // CJK Compatibility Ideograph (different sub-block)
+    }
+
+    private static void addBMP(int cp, int n, String label) {
+        char[] arr = new char[n];
+        java.util.Arrays.fill(arr, (char) cp);
+        labels.add(label);
+        strings.add(new String(arr));
     }
 }

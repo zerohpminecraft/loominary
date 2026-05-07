@@ -44,6 +44,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import net.zerohpminecraft.CjkCodec;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -91,25 +92,15 @@ public class LoominaryCommand {
 
     /**
      * Prepends the given manifest bytes to mapColors, compresses the combined
-     * payload with zstd, base64-encodes it, and splits it into indexed chunks
-     * ready to be stored as banner names (legacy banner encoding).
+     * payload with zstd, and splits it into CJK-encoded indexed banner name
+     * chunks (U+4E00-alphabet, 14 bits/char, 84 bytes per banner).
      */
     private static List<String> buildChunks(byte[] manifestBytes, byte[] mapColors) {
         byte[] combined = new byte[manifestBytes.length + mapColors.length];
         System.arraycopy(manifestBytes, 0, combined, 0, manifestBytes.length);
         System.arraycopy(mapColors, 0, combined, manifestBytes.length, mapColors.length);
-
         byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
-        String base64 = Base64.getEncoder().encodeToString(compressed);
-        int total = (base64.length() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-
-        List<String> chunks = new ArrayList<>(total);
-        for (int i = 0; i < total; i++) {
-            int start = i * CHUNK_SIZE;
-            int end = Math.min(start + CHUNK_SIZE, base64.length());
-            chunks.add(String.format("%02x", i) + base64.substring(start, end));
-        }
-        return chunks;
+        return CjkCodec.buildChunks(compressed);
     }
 
     /**
@@ -406,12 +397,20 @@ public class LoominaryCommand {
             if (size < 0) throw new IllegalStateException("Invalid compressed data in carpet tile.");
             return Zstd.decompress(compressed, (int) size);
         }
-        // Banner tile: reassemble chunks → base64 decode → decompress
+        // Banner tile: reassemble chunks → CJK or base64 decode → decompress
         List<String> names = new ArrayList<>(chunks);
         names.sort(java.util.Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
-        StringBuilder b64 = new StringBuilder();
-        for (String s : names) b64.append(s.substring(2));
-        byte[] compressed = Base64.getDecoder().decode(b64.toString());
+        byte[] compressed;
+        if (!names.isEmpty() && names.get(0).length() > 2
+                && names.get(0).charAt(2) >= CjkCodec.ALPHA_BASE) {
+            StringBuilder sb = new StringBuilder();
+            for (String s : names) sb.append(s.substring(2));
+            compressed = CjkCodec.decode(sb.toString());
+        } else {
+            StringBuilder b64 = new StringBuilder();
+            for (String s : names) b64.append(s.substring(2));
+            compressed = Base64.getDecoder().decode(b64.toString());
+        }
         long originalSize = Zstd.getFrameContentSize(compressed);
         if (originalSize < 0) throw new IllegalStateException("Missing zstd frame size in banner payload.");
         return Zstd.decompress(compressed, (int) originalSize);
@@ -970,8 +969,8 @@ public class LoominaryCommand {
                             tileFlags, columns, rows, col, row, 0L, playerName, capturedTitle);
                     String note = null;
                     if (buildChunks(manifestCheck, mapColors).size() > MAX_CHUNKS) {
-                        PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                                mapColors, manifestCheck, CHUNK_SIZE, MAX_CHUNKS);
+                        PngToMapColors.FitResult fit = PngToMapColors.reduceToFitKJ(
+                                mapColors, manifestCheck, MAX_CHUNKS);
                         mapColors = fit.mapColors;
                         note = String.format("reduced %d→%d colors",
                                 fit.originalDistinctColors,
@@ -1552,8 +1551,8 @@ public class LoominaryCommand {
                 0, 1, 1, 0, 0, 0L, playerName, PayloadState.currentTitle);
         String note = null;
         if (buildChunks(manifestForSizeCheck, mapColors).size() > MAX_CHUNKS) {
-            PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                    mapColors, manifestForSizeCheck, CHUNK_SIZE, MAX_CHUNKS);
+            PngToMapColors.FitResult fit = PngToMapColors.reduceToFitKJ(
+                    mapColors, manifestForSizeCheck, MAX_CHUNKS);
             note = String.format("reduced %d→%d colors",
                     fit.originalDistinctColors,
                     fit.originalDistinctColors - fit.colorsRemoved);
@@ -2250,8 +2249,8 @@ public class LoominaryCommand {
                 int[] delays = tileDelays(tileSnap, fc);
                 byte[] prefix = buildReduceManifest(tileIdx, 0L, playerName, flags, fc, delays);
 
-                PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                        union, prefix, CHUNK_SIZE, effectiveTarget);
+                PngToMapColors.FitResult fit = PngToMapColors.reduceToFitKJ(
+                        union, prefix, effectiveTarget);
 
                 long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
@@ -2469,8 +2468,8 @@ public class LoominaryCommand {
                     byte[] union = mergeFrames(frames);
                     int[] delays = tileDelays(tileSnap, fc);
                     byte[] prefix = buildReduceManifest(i, 0L, playerName, flags, fc, delays);
-                    PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                            union, prefix, CHUNK_SIZE, tileTarget);
+                    PngToMapColors.FitResult fit = PngToMapColors.reduceToFitKJ(
+                            union, prefix, tileTarget);
                     long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
                     int oldSz = oldSizes.get(i);

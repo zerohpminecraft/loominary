@@ -313,6 +313,13 @@ public class BannerAutoClickHandler {
             if (nameText == null) continue;
             String s = nameText.getString();
             if (s.length() < 2) continue;
+            // LC/LS manifest banners
+            if ((s.startsWith("LC") && s.length() >= 6)
+                    || (s.startsWith("LS") && s.length() >= 10)) {
+                names.add(s);
+                continue;
+            }
+            // Hex-indexed overflow chunks (00..3D)
             try {
                 Integer.parseInt(s.substring(0, 2), 16);
                 names.add(s);

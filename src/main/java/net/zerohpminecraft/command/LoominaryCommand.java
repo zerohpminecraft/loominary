@@ -22,6 +22,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.zerohpminecraft.AlphabetTestHandler;
 import net.zerohpminecraft.AnvilAutoFillHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.CarpetChannel;
@@ -118,7 +119,9 @@ public class LoominaryCommand {
     record CarpetEncoding(
             byte[] compressed,       // full zstd-compressed payload
             int carpetBytes,         // bytes going into the carpet channel (≤8192)
+            int shadeBytes,          // bytes going into the shade channel (≤2032); 0 = flat
             byte[] nibbles,          // 16384 nibble array for schematic generation
+            int[][] heights,         // [col][row] height map; null when shadeBytes==0
             String lcBannerName,     // "LC<NNNN>[<overflow-b64>]"
             List<String> hexChunks   // hex-indexed overflow banners "00".."3D"
     ) {
@@ -146,25 +149,42 @@ public class LoominaryCommand {
         int total = compressed.length;
 
         int carpetBytes = Math.min(total, CarpetChannel.MAX_CARPET_BYTES);
-        byte[] nibbles  = CarpetChannel.encodeNibbles(compressed, carpetBytes);
+        // Use the shade channel only when the flat LC+overflow scheme can't hold the payload.
+        // This keeps encoding simple for the common case; staircase is only built when necessary.
+        int shadeBytes = total > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES
+                ? Math.min(total - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
+        int overflowStart = carpetBytes + shadeBytes;
 
-        // Build overflow base64 string (may be empty)
+        byte[] nibbles = CarpetChannel.encodeNibbles(compressed, carpetBytes);
+
+        int[][] heights = null;
+        if (shadeBytes > 0) {
+            byte[] shadeData = new byte[shadeBytes];
+            System.arraycopy(compressed, carpetBytes, shadeData, 0, shadeBytes);
+            heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
+        }
+
+        // Build overflow base64 string from bytes beyond carpet + shade channels
         String overflowB64 = "";
-        if (total > carpetBytes) {
-            byte[] overflow = new byte[total - carpetBytes];
-            System.arraycopy(compressed, carpetBytes, overflow, 0, overflow.length);
+        if (total > overflowStart) {
+            byte[] overflow = new byte[total - overflowStart];
+            System.arraycopy(compressed, overflowStart, overflow, 0, overflow.length);
             overflowB64 = Base64.getEncoder().encodeToString(overflow);
         }
 
-        // LC banner: "LC" + 4-hex total + up to LC_PAYLOAD_CHARS b64 chars
-        String lcPayload = overflowB64.isEmpty() ? ""
-                : overflowB64.substring(0, Math.min(CarpetChannel.LC_PAYLOAD_CHARS, overflowB64.length()));
-        String lcName = String.format("LC%04X", total) + lcPayload;
+        // LS<4-hex-total><4-hex-shade>[<40-b64>] when shade channel is used;
+        // LC<4-hex-total>[<44-b64>] for carpet-only tiles (old format, old decoders work).
+        int payloadChars = shadeBytes > 0 ? CarpetChannel.LS_PAYLOAD_CHARS : CarpetChannel.LC_PAYLOAD_CHARS;
+        String bannerPayload = overflowB64.isEmpty() ? ""
+                : overflowB64.substring(0, Math.min(payloadChars, overflowB64.length()));
+        String lcName = shadeBytes > 0
+                ? String.format("LS%04X%04X", total, shadeBytes) + bannerPayload
+                : String.format("LC%04X",     total)              + bannerPayload;
 
         // Remaining overflow → hex-indexed banners 00..3D
         List<String> hexChunks = new ArrayList<>();
-        if (overflowB64.length() > CarpetChannel.LC_PAYLOAD_CHARS) {
-            String rest = overflowB64.substring(CarpetChannel.LC_PAYLOAD_CHARS);
+        if (overflowB64.length() > payloadChars) {
+            String rest = overflowB64.substring(payloadChars);
             int idx = 0;
             for (int pos = 0; pos < rest.length(); pos += CHUNK_SIZE) {
                 hexChunks.add(String.format("%02x", idx++)
@@ -172,7 +192,44 @@ public class LoominaryCommand {
             }
         }
 
-        return new CarpetEncoding(compressed, carpetBytes, nibbles, lcName, hexChunks);
+        return new CarpetEncoding(compressed, carpetBytes, shadeBytes, nibbles, heights, lcName, hexChunks);
+    }
+
+    /**
+     * Reconstructs the LC/LS banner name list from raw compressed bytes.
+     * Used by {@code exportSchematic} to migrate old LC tiles to LS format.
+     */
+    private static List<String> rebuildCarpetChunks(
+            byte[] compressed, int total, int carpetBytes, int shadeBytes) {
+        int overflowStart = carpetBytes + shadeBytes;
+        String overflowB64 = total > overflowStart
+                ? Base64.getEncoder().encodeToString(
+                        Arrays.copyOfRange(compressed, overflowStart, total))
+                : "";
+        int payloadChars = shadeBytes > 0 ? CarpetChannel.LS_PAYLOAD_CHARS : CarpetChannel.LC_PAYLOAD_CHARS;
+        String bannerPayload = overflowB64.isEmpty() ? ""
+                : overflowB64.substring(0, Math.min(payloadChars, overflowB64.length()));
+        String mainBanner = shadeBytes > 0
+                ? String.format("LS%04X%04X", total, shadeBytes) + bannerPayload
+                : String.format("LC%04X",     total)              + bannerPayload;
+        List<String> chunks = new ArrayList<>();
+        chunks.add(mainBanner);
+        if (overflowB64.length() > payloadChars) {
+            String rest = overflowB64.substring(payloadChars);
+            int idx = 0;
+            for (int pos = 0; pos < rest.length(); pos += CHUNK_SIZE)
+                chunks.add(String.format("%02x", idx++) + rest.substring(pos, Math.min(pos + CHUNK_SIZE, rest.length())));
+        }
+        return chunks;
+    }
+
+    /** Exports the correct schematic type (flat or staircase) for a carpet encoding. */
+    private static Path exportCarpetSchematic(CarpetEncoding enc, String name) throws IOException {
+        if (enc.shadeBytes() > 0) {
+            return SchematicExporter.exportCarpetStaircase(
+                    enc.nibbles(), enc.carpetBytes(), enc.heights(), name);
+        }
+        return SchematicExporter.exportCarpetTile(enc.nibbles(), enc.carpetBytes(), name);
     }
 
     /** Decodes map-color bytes for the active tile (carpet or banner). */
@@ -639,6 +696,13 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("name", StringArgumentType.string())
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
+
+                            // ── alphabettest ───────────────────────────────────
+                            .then(ClientCommandManager.literal("alphabettest")
+                                    .executes(ctx -> alphabetTest(ctx.getSource(), 6))
+                                    .then(ClientCommandManager.argument("wait", IntegerArgumentType.integer(2, 40))
+                                            .executes(ctx -> alphabetTest(ctx.getSource(),
+                                                    IntegerArgumentType.getInteger(ctx, "wait")))))
 
                             // ── edit ───────────────────────────────────────────
                             .then(ClientCommandManager.literal("edit")
@@ -1225,7 +1289,7 @@ public class LoominaryCommand {
                     }
                     String schName = SchematicExporter.resolveSchematicName(
                             capturedTitle != null ? capturedTitle + (totalTiles > 1 ? "_tile" + tileIdx : "") : null);
-                    schematicPaths.add(SchematicExporter.exportCarpetTile(enc.nibbles(), enc.carpetBytes(), schName));
+                    schematicPaths.add(exportCarpetSchematic(enc, schName));
                     PayloadState.TileData tile = new PayloadState.TileData();
                     tile.chunks.addAll(enc.allChunks());
                     tile.currentIndex = 0;
@@ -1266,9 +1330,14 @@ public class LoominaryCommand {
                             String lcName = tile.chunks.isEmpty() ? "" : tile.chunks.get(0);
                             int totalBytes = lcName.length() >= 6 ? Integer.parseInt(lcName.substring(2, 6), 16) : 0;
                             boolean overBudget = totalBytes > CarpetChannel.MAX_TOTAL_BYTES;
-                            int carpetRows = (Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES) * 2 + 127) / 128;
-                            String line = String.format("§7  %s: §f%d carpet rows, %d overflow banner%s §7(%d bytes)%s",
-                                    PayloadState.tileLabel(i), carpetRows, tile.chunks.size() - 1,
+                            int cb = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
+                            int sb = Math.min(totalBytes - cb, CarpetChannel.MAX_SHADE_BYTES);
+                            int carpetRows = sb > 0 ? 128 : (cb * 2 + 127) / 128;
+                            String channelInfo = sb > 0
+                                    ? carpetRows + " carpet rows (staircase) + " + sb + " shade bytes"
+                                    : carpetRows + " carpet rows";
+                            String line = String.format("§7  %s: §f%s, %d overflow banner%s §7(%d bytes)%s",
+                                    PayloadState.tileLabel(i), channelInfo, tile.chunks.size() - 1,
                                     tile.chunks.size() == 2 ? "" : "s", totalBytes,
                                     overBudget ? " §c[OVER BUDGET]" : "");
                             if (finalNotes.get(i) != null) line += " §e(" + finalNotes.get(i) + ")";
@@ -1363,7 +1432,7 @@ public class LoominaryCommand {
 
                 String schName = SchematicExporter.resolveSchematicName(
                         capturedTitle + (totalTiles > 1 ? "_tile" + tileIdx : ""));
-                schematicPaths.add(SchematicExporter.exportCarpetTile(enc.nibbles(), enc.carpetBytes(), schName));
+                schematicPaths.add(exportCarpetSchematic(enc, schName));
 
                 PayloadState.TileData tile = new PayloadState.TileData();
                 tile.chunks.addAll(enc.allChunks());
@@ -1583,7 +1652,7 @@ public class LoominaryCommand {
         try {
             String schematicName = SchematicExporter.resolveSchematicName(
                     PayloadState.currentTitle + (PayloadState.tiles.size() > 1 ? "_tile" + tileIdx : ""));
-            Path schPath = SchematicExporter.exportCarpetTile(enc.nibbles(), enc.carpetBytes(), schematicName);
+            Path schPath = exportCarpetSchematic(enc, schematicName);
             PayloadState.save();
             String msg = String.format(
                     "§aStole map id=%d at %s → %s [carpet, %d rows, %d compressed bytes].",
@@ -2926,21 +2995,52 @@ public class LoominaryCommand {
                 byte[] compressed = Base64.getDecoder().decode(tile.carpetCompressedB64);
                 int totalBytes = compressed.length;
                 int carpetBytes = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
+                int shadeBytes  = totalBytes > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES
+                        ? Math.min(totalBytes - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
                 byte[] nibbles = CarpetChannel.encodeNibbles(compressed, carpetBytes);
 
-                Path output = SchematicExporter.exportCarpetTile(nibbles, carpetBytes, name);
-                int carpetRows = (carpetBytes * 2 + 127) / 128;
+                Path output;
+                if (shadeBytes > 0) {
+                    byte[] shadeData = new byte[shadeBytes];
+                    System.arraycopy(compressed, carpetBytes, shadeData, 0, shadeBytes);
+                    int[][] heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
+                    output = SchematicExporter.exportCarpetStaircase(nibbles, carpetBytes, heights, name);
+                } else {
+                    output = SchematicExporter.exportCarpetTile(nibbles, carpetBytes, name);
+                }
+
+                // Migrate old LC banner names to LS if the tile now uses the shade channel.
+                // This happens when state was saved before LS support was added.
+                boolean migrated = false;
+                String firstChunk = tile.chunks.isEmpty() ? "" : tile.chunks.get(0);
+                if (shadeBytes > 0 && firstChunk.startsWith("LC")) {
+                    List<String> newChunks = rebuildCarpetChunks(compressed, totalBytes, carpetBytes, shadeBytes);
+                    tile.chunks.clear();
+                    tile.chunks.addAll(newChunks);
+                    tile.currentIndex = 0;
+                    if (tileIdx == PayloadState.activeTileIndex) PayloadState.syncFromActiveTile();
+                    PayloadState.save();
+                    migrated = true;
+                }
+
+                int carpetRows = shadeBytes > 0 ? 128 : (carpetBytes * 2 + 127) / 128;
                 int overflowBanners = tile.chunks.size() - 1;
 
                 source.sendFeedback(Text.literal(String.format(
-                        "§aExported §f%s §a(%d carpet rows × 128, %d compressed bytes):",
-                        name + ".litematic", carpetRows, totalBytes)));
+                        "§aExported §f%s §a(%s, %d compressed bytes):",
+                        name + ".litematic",
+                        shadeBytes > 0
+                                ? carpetRows + " carpet rows × 128 (staircase, " + shadeBytes + " shade bytes)"
+                                : carpetRows + " carpet rows × 128",
+                        totalBytes)));
                 source.sendFeedback(Text.literal("§7  " + output.getFileName()));
-                if (overflowBanners > 0) {
+                if (migrated)
+                    source.sendFeedback(Text.literal(
+                            "§eBanner names updated from LC → LS format. Rename fresh banners at the anvil."));
+                if (overflowBanners > 0)
                     source.sendFeedback(Text.literal(String.format(
                             "§7  + %d overflow banner%s still needed (rename at anvil).",
                             overflowBanners, overflowBanners == 1 ? "" : "s")));
-                }
                 return 1;
             }
 
@@ -2971,6 +3071,19 @@ public class LoominaryCommand {
 
     // ════════════════════════════════════════════════════════════════════
     // edit
+    // ════════════════════════════════════════════════════════════════════
+    // alphabettest
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int alphabetTest(FabricClientCommandSource source, int wait) {
+        if (AlphabetTestHandler.isActive()) {
+            AlphabetTestHandler.stop(MinecraftClient.getInstance());
+            return 1;
+        }
+        AlphabetTestHandler.start(MinecraftClient.getInstance(), wait);
+        return 1;
+    }
+
     // ════════════════════════════════════════════════════════════════════
 
     private static int edit(FabricClientCommandSource source) {

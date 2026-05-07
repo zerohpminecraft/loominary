@@ -2,6 +2,7 @@ package net.zerohpminecraft;
 
 import com.github.luben.zstd.Zstd;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.MapIdComponent;
@@ -45,19 +46,19 @@ public class MapBannerDecoder {
         /** Length 1 = global delay; length N = per-frame delay table. */
         final int[] delaysMs;
         final int loopCount;
-        final BlockPos framePos;
+        BlockPos framePos;
         /** Manifest grid dimensions, used to group sibling tiles for sync. */
         final int manifestCols;
         final int manifestRows;
         final String syncUsername;
         final String syncTitle;
         int  currentFrame;
-        long lastAdvanceTick;
+        long lastAdvanceMs;
         int  loopsCompleted;
 
         AnimatedMapState(MapIdComponent mapId, byte[][] frames, int[] delaysMs, int loopCount,
                          BlockPos framePos, int manifestCols, int manifestRows,
-                         String syncUsername, String syncTitle, long startTick) {
+                         String syncUsername, String syncTitle) {
             this.mapId = mapId;
             this.frames = frames;
             this.delaysMs = delaysMs;
@@ -68,7 +69,7 @@ public class MapBannerDecoder {
             this.syncUsername = syncUsername;
             this.syncTitle = syncTitle;
             this.currentFrame = 0;
-            this.lastAdvanceTick = startTick;
+            this.lastAdvanceMs = System.currentTimeMillis();
             this.loopsCompleted = 0;
         }
 
@@ -84,6 +85,8 @@ public class MapBannerDecoder {
     }
 
     public static void register() {
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clearCache());
+
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.world == null || client.player == null)
                 return;
@@ -125,6 +128,10 @@ public class MapBannerDecoder {
         Map<String, MapDecoration> decorations = ((MapStateAccessor) mapState).getDecorations();
 
         if (claimedMaps.contains(mapId.id())) {
+            AnimatedMapState anim = animatedMaps.get(mapId.id());
+            if (anim != null) {
+                anim.framePos = frame.getBlockPos();
+            }
             if (!decorations.isEmpty()) {
                 decorations.clear();
             }
@@ -134,12 +141,14 @@ public class MapBannerDecoder {
         if (decorations.isEmpty())
             return;
 
-        // Check for carpet-hybrid LC manifest banner first.
+        // Check for carpet-hybrid LC/LS manifest banner first.
         for (MapDecoration dec : decorations.values()) {
             Text text = dec.name().orElse(null);
             if (text == null) continue;
             String s = text.getString();
-            if (s.length() >= 6 && s.startsWith("LC")) {
+            boolean isLC = s.length() >= 6  && s.startsWith("LC");
+            boolean isLS = s.length() >= 10 && s.startsWith("LS");
+            if (isLC || isLS) {
                 processCarpetFrame(client, mapId, mapState, s, decorations, frame);
                 return;
             }
@@ -188,8 +197,10 @@ public class MapBannerDecoder {
      *
      * <p>Format: the carpet platform encodes the first {@code min(N,8192)} bytes of
      * the zstd-compressed payload as nibble pairs in {@code mapState.colors}.
-     * Overflow bytes (when {@code N > 8192}) are carried by the LC manifest banner
-     * payload (first 44 base64 chars) and hex-indexed banners {@code 00}–{@code 3D}.
+     * When N > 8192, the next {@code min(N−8192, 2032)} bytes are read from the shade
+     * channel (1 shade bit per pixel, rows 1–127). Any remaining bytes are carried by
+     * the LC manifest banner payload (first 44 base64 chars) and hex-indexed banners
+     * {@code 00}–{@code 3D}.
      *
      * @param lcName name of the LC manifest banner: {@code LC<4-hex-N>[<b64-overflow>]}
      */
@@ -198,14 +209,30 @@ public class MapBannerDecoder {
             String lcName, Map<String, MapDecoration> decorations,
             ItemFrameEntity frame) {
         try {
+            // LS<4-hex-total><4-hex-shade>[<b64-overflow>]  — shade channel present
+            // LC<4-hex-total>[<b64-overflow>]               — carpet only (old format)
+            boolean hasShade = lcName.startsWith("LS");
             int totalBytes = Integer.parseInt(lcName.substring(2, 6), 16);
-            String lcPayload = lcName.length() > 6 ? lcName.substring(6) : "";
+            int shadeBytes;
+            String lcPayload;
+            if (hasShade) {
+                shadeBytes = Integer.parseInt(lcName.substring(6, 10), 16);
+                lcPayload  = lcName.length() > 10 ? lcName.substring(10) : "";
+            } else {
+                shadeBytes = 0;
+                lcPayload  = lcName.length() > 6 ? lcName.substring(6) : "";
+            }
 
             int carpetBytes = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
             byte[] carpetData = CarpetChannel.decodeBytes(mapState.colors, carpetBytes);
 
+            byte[] shadeData = shadeBytes > 0
+                    ? CarpetChannel.decodeShade(mapState.colors, shadeBytes)
+                    : new byte[0];
+
+            int overflowStart = carpetBytes + shadeBytes;
             byte[] overflowData = new byte[0];
-            if (totalBytes > CarpetChannel.MAX_CARPET_BYTES) {
+            if (totalBytes > overflowStart) {
                 // Collect hex-indexed overflow banners, sorted by index.
                 List<String> overflowNames = new ArrayList<>();
                 for (MapDecoration dec : decorations.values()) {
@@ -225,9 +252,10 @@ public class MapBannerDecoder {
                 overflowData = Base64.getDecoder().decode(b64.toString());
             }
 
-            byte[] compressed = new byte[carpetBytes + overflowData.length];
-            System.arraycopy(carpetData,   0, compressed, 0,           carpetBytes);
-            System.arraycopy(overflowData, 0, compressed, carpetBytes, overflowData.length);
+            byte[] compressed = new byte[carpetBytes + shadeData.length + overflowData.length];
+            System.arraycopy(carpetData,  0, compressed, 0,                              carpetBytes);
+            System.arraycopy(shadeData,   0, compressed, carpetBytes,                    shadeData.length);
+            System.arraycopy(overflowData, 0, compressed, carpetBytes + shadeData.length, overflowData.length);
 
             long frameSize = Zstd.getFrameContentSize(compressed);
             if (frameSize < 0) throw new IllegalStateException("Missing zstd frame size");
@@ -235,7 +263,7 @@ public class MapBannerDecoder {
 
             System.out.println(TAG + " Carpet-decoded map id=" + mapId.id()
                     + " (" + totalBytes + " compressed bytes, "
-                    + carpetBytes + " from carpet channel)");
+                    + carpetBytes + " carpet + " + shadeBytes + " shade)");
 
             processDecompressedPayload(client, mapId, mapState, frame, full);
 
@@ -312,7 +340,7 @@ public class MapBannerDecoder {
             AnimatedMapState animState = new AnimatedMapState(
                     mapId, frames, manifest.frameDelays, manifest.loopCount,
                     frameEntity.getBlockPos(), manifest.cols, manifest.rows,
-                    manifest.username, manifest.title, client.world.getTime());
+                    manifest.username, manifest.title);
             animatedMaps.put(mapId.id(), animState);
             paintMap(client, mapId, mapState, frames[0]);
         } else {
@@ -324,7 +352,7 @@ public class MapBannerDecoder {
     // ── Animation tick ────────────────────────────────────────────────────
 
     private static void advanceAnimatedFrames(MinecraftClient client) {
-        long currentTick = client.world.getTime();
+        long currentMs = System.currentTimeMillis();
         Vec3d playerPos = client.player.getPos();
 
         // Group maps by sync key so sibling tiles in a mural advance together.
@@ -341,8 +369,7 @@ public class MapBannerDecoder {
                 AnimatedMapState s = animatedMaps.get(id);
                 if (!isInRange(playerPos, s)) continue;
                 if (s.loopCount > 0 && s.loopsCompleted >= s.loopCount) continue;
-                long delayTicks = Math.max(1, Math.round(s.currentDelayMs() / 50.0));
-                if (currentTick - s.lastAdvanceTick >= delayTicks) { anyDue = true; break; }
+                if (currentMs - s.lastAdvanceMs >= s.currentDelayMs()) { anyDue = true; break; }
             }
             if (!anyDue) continue;
 
@@ -353,8 +380,8 @@ public class MapBannerDecoder {
 
                 int nextFrame = (s.currentFrame + 1) % s.frames.length;
                 if (nextFrame == 0 && s.loopCount > 0) s.loopsCompleted++;
-                s.currentFrame    = nextFrame;
-                s.lastAdvanceTick = currentTick;
+                s.currentFrame   = nextFrame;
+                s.lastAdvanceMs  = currentMs;
 
                 if (!isInRange(playerPos, s)) continue;
                 MapState mapState = FilledMapItem.getMapState(s.mapId, client.world);
@@ -363,9 +390,13 @@ public class MapBannerDecoder {
         }
     }
 
+    // Use an axis-aligned box check matching the scanner's Box.expand(SCAN_RADIUS) query
+    // so tiles the scanner can decode are always within the animation range too.
     private static boolean isInRange(Vec3d playerPos, AnimatedMapState s) {
-        return playerPos.squaredDistanceTo(Vec3d.ofCenter(s.framePos))
-                <= SCAN_RADIUS * SCAN_RADIUS;
+        Vec3d fp = Vec3d.ofCenter(s.framePos);
+        return Math.abs(fp.x - playerPos.x) <= SCAN_RADIUS
+            && Math.abs(fp.y - playerPos.y) <= SCAN_RADIUS
+            && Math.abs(fp.z - playerPos.z) <= SCAN_RADIUS;
     }
 
     /**
@@ -500,8 +531,7 @@ public class MapBannerDecoder {
             AnimatedMapState animState = new AnimatedMapState(
                     mapId, frames, manifest.frameDelays, manifest.loopCount,
                     framePos, manifest.cols, manifest.rows,
-                    manifest.username, manifest.title,
-                    client.world.getTime());
+                    manifest.username, manifest.title);
             animatedMaps.put(mapId.id(), animState);
             claimedMaps.add(mapId.id()); // prevent scanner reset
         } catch (Exception e) {

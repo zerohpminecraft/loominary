@@ -253,7 +253,7 @@ public class SchematicExporter {
         return longs;
     }
 
-    // ── Carpet schematic ──────────────────────────────────────────────────
+    // ── Carpet schematics ─────────────────────────────────────────────────
 
     /**
      * Exports a carpet-hybrid schematic: a 128×{@code carpetRows}×1 region of
@@ -350,6 +350,136 @@ public class SchematicExporter {
         root.put("Regions", regions);
 
         // Write to schematics directory
+        Path dir = schematicsDir();
+        Files.createDirectories(dir);
+        Path path = dir.resolve(baseName + ".litematic");
+
+        try (OutputStream fos = Files.newOutputStream(path);
+             GZIPOutputStream gz = new GZIPOutputStream(fos);
+             DataOutputStream dos = new DataOutputStream(gz)) {
+            NbtIo.write(root, dos);
+        }
+
+        return path;
+    }
+
+    /**
+     * Exports a carpet staircase schematic for the shade channel.
+     *
+     * <p>Each (x, z) column contains a stack of same-color carpets from y=0 up to
+     * y={@code heights[x][z]}. The top carpet carries the data color; the carpets below
+     * are filler (same color, hidden by the one above). Carpet-on-carpet stacking means
+     * no separate support blocks are needed.
+     *
+     * <p><b>Placement note:</b> the terrain one block north of the schematic's north edge
+     * must be at the same y-level as the schematic origin (y=0) so that row 0 of the map
+     * renders at shade NORMAL. This is the same requirement as the flat carpet schematic.
+     *
+     * @param nibbles     16384-element nibble array (carpet color per pixel)
+     * @param carpetBytes bytes encoded in the carpet color channel (determines which
+     *                    pixels carry meaningful color; rest are white carpet)
+     * @param heights     per-pixel height map from {@link CarpetChannel#computeHeights};
+     *                    {@code heights[col][row]} ∈ [0, 127]
+     * @param baseName    schematic file base name (no extension)
+     */
+    public static Path exportCarpetStaircase(byte[] nibbles, int carpetBytes,
+            int[][] heights, String baseName) throws IOException {
+
+        // Region Y size = tallest stack + 1 (for y=0 carpet)
+        int maxHeight = 0;
+        for (int col = 0; col < 128; col++)
+            for (int row = 0; row < 128; row++)
+                if (heights[col][row] > maxHeight) maxHeight = heights[col][row];
+        int regionY = maxHeight + 1;
+
+        int nibblesUsed = Math.min(carpetBytes * 2, nibbles.length);
+
+        // Palette: 0=air, 1..16=carpets in DyeColor.ordinal() order
+        NbtList palette = new NbtList();
+        NbtCompound airEntry = new NbtCompound();
+        airEntry.putString("Name", "minecraft:air");
+        palette.add(airEntry);
+        for (DyeColor color : DyeColor.values()) {
+            NbtCompound e = new NbtCompound();
+            e.putString("Name", "minecraft:" + color.getName() + "_carpet");
+            palette.add(e);
+        }
+        int paletteSize = palette.size(); // 17
+        int bitsPerEntry = Math.max(2, 32 - Integer.numberOfLeadingZeros(paletteSize - 1)); // 5
+
+        // Block indices in YZX order: index = (y * 128 + z) * 128 + x
+        int totalVoxels = regionY * 128 * 128;
+        int[] blockIndices = new int[totalVoxels];
+        int totalCarpetBlocks = 0;
+
+        for (int y = 0; y < regionY; y++) {
+            for (int z = 0; z < 128; z++) {
+                for (int x = 0; x < 128; x++) {
+                    int nibbleIdx = z * 128 + x;
+                    int h = heights[x][z];
+                    int idx = (y * 128 + z) * 128 + x;
+                    if (y <= h) {
+                        // Data carpet at y==h; filler carpet at y<h uses white (nibble 0)
+                        // because only the top carpet is visible to the map renderer.
+                        int nibble = (y == h && nibbleIdx < nibblesUsed) ? nibbles[nibbleIdx] & 0xFF : 0;
+                        blockIndices[idx] = 1 + nibble;
+                        totalCarpetBlocks++;
+                    }
+                    // else: air (blockIndices[idx] stays 0)
+                }
+            }
+        }
+
+        long[] blockStates = packBlockIndices(blockIndices, bitsPerEntry);
+
+        // Build NBT root
+        NbtCompound root = new NbtCompound();
+        root.putInt("Version", LITEMATICA_VERSION);
+        root.putInt("SubVersion", LITEMATICA_SUBVERSION);
+        root.putInt("MinecraftDataVersion", MC_DATA_VERSION_1_21_4);
+
+        NbtCompound metadata = new NbtCompound();
+        metadata.putString("Name", baseName);
+        metadata.putString("Author", "Loominary");
+        metadata.putString("Description",
+                "Loominary carpet staircase — " + carpetBytes + " carpet bytes, "
+                + "max height " + maxHeight + ". "
+                + "Place on flat ground; terrain north of the schematic must be at the same level.");
+        metadata.putInt("RegionCount", 1);
+        long now = System.currentTimeMillis();
+        metadata.putLong("TimeCreated", now);
+        metadata.putLong("TimeModified", now);
+        metadata.putInt("TotalBlocks", totalCarpetBlocks);
+        metadata.putInt("TotalVolume", totalVoxels);
+
+        NbtCompound enclosingSize = new NbtCompound();
+        enclosingSize.putInt("x", 128);
+        enclosingSize.putInt("y", regionY);
+        enclosingSize.putInt("z", 128);
+        metadata.put("EnclosingSize", enclosingSize);
+        root.put("Metadata", metadata);
+
+        NbtCompound region = new NbtCompound();
+
+        NbtCompound position = new NbtCompound();
+        position.putInt("x", 0); position.putInt("y", 0); position.putInt("z", 0);
+        region.put("Position", position);
+
+        NbtCompound size = new NbtCompound();
+        size.putInt("x", 128); size.putInt("y", regionY); size.putInt("z", 128);
+        region.put("Size", size);
+
+        region.put("BlockStatePalette", palette);
+        region.putLongArray("BlockStates", blockStates);
+        region.put("TileEntities", new NbtList());
+        region.put("Entities", new NbtList());
+        region.put("PendingBlockTicks", new NbtList());
+        region.put("PendingFluidTicks", new NbtList());
+
+        NbtCompound regions = new NbtCompound();
+        regions.put(baseName, region);
+        root.put("Regions", regions);
+
         Path dir = schematicsDir();
         Files.createDirectories(dir);
         Path path = dir.resolve(baseName + ".litematic");

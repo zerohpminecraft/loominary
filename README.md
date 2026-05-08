@@ -4,14 +4,16 @@ A Fabric mod for Minecraft 1.21.4 that encodes images as map art and plays them 
 
 Loominary encodes image data into colored carpet blocks and named banners, then renders it client-side as custom map art. Place the carpet schematic, click the banner marker(s) with a map, and anyone running Loominary sees your image painted on the map — including animated GIFs. Without the mod, viewers see a normal map.
 
-This works on **any vanilla server**. The primary encoding mode uses carpet block colors as a data channel (8,192 bytes) supplemented by up to 62 named overflow banners, with a single LC manifest banner as the decoder trigger. This design was built for servers like 2b2t that impose strict limits on map banner markers (63 per map) — carpet mode delivers 10,457 compressed bytes within that limit, vs. 2,268 bytes that banner-only encoding could achieve at 63 banners.
+This works on **any vanilla server**. The primary encoding mode uses carpet block colors as a data channel (8,192 bytes) supplemented by a shade channel (up to 2,016 bytes via carpet height variation) and up to 62 named overflow banners carrying 84 bytes each (CJK-encoded), with a single LC/LS manifest banner as the decoder trigger. This design was built for servers like 2b2t that impose strict limits on map banner markers (63 per map).
 
 ## Features
 
-- **Carpet channel encoding** (default): 16 carpet colors encode 4-bit nibbles across 128×128 map positions — 8,192 bytes primary channel, up to 2,265 bytes overflow via named banners. Total: 10,457 compressed bytes per tile
+- **Carpet channel encoding** (default): 16 carpet colors encode 4-bit nibbles across 128×128 map positions — 8,192 bytes primary channel
+- **Shade channel** (LS format): carpet height variation encodes an additional 2,016 bytes via balanced 4-row height sequences; requires a staircase schematic instead of a flat platform
+- **CJK overflow banners**: named overflow banners carry 84 bytes each (14-bit CJK alphabet, 2.33× the base64 capacity). Combined capacity: 12,473 compressed bytes per tile
 - **Encode any image** into carpet + banner data (PNG, JPEG, GIF, BMP — anything `ImageIO` can read)
-- **Animated GIF import**: encode a GIF as multiple frames in a single payload; the decoder cycles frames on a tick timer with distance culling and multi-tile sync
-- **In-world pixel editor** (`/loominary edit`): live 128×128 canvas with paint, undo/redo, palette panel, eyedropper, brush size, fill bucket, rectangle selection, lasso, magic wand, per-region re-quantize from source, dither toggle, and a dither-strength brush with heat-map overlay
+- **Animated GIF import**: encode a GIF as multiple frames in a single payload; the decoder cycles frames on a wall-clock timer with distance culling and multi-tile sync
+- **In-world pixel editor** (`/loominary edit`): full-featured 128×128 canvas — see [EDITOR.md](EDITOR.md) for a complete guide
 - **Multi-tile murals**: split a large image across an N×M grid of maps for wall-sized art
 - **Steal existing map art** as a Loominary payload by looking at any framed map
 - **Perceptual color matching** using Oklab color space — better-looking results than RGB Euclidean distance, especially on gradients and skin tones
@@ -20,13 +22,13 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 - **Client-side rendering** with marker suppression — the banner pins disappear, leaving a clean image
 - **Workflow automation** at the anvil: stack-aware banner extraction, automatic renaming, automatic bundle storage
 - **Stuck-chunk recovery**: if the server permanently rejects a banner name the handler halts cleanly; `/loominary resalt` re-encodes the tile with a random nonce — same image, new chunk names, works for both carpet and banner tiles
-- **Two-pass dithering with adaptive edge detection**: Floyd-Steinberg error diffusion runs after palette pre-selection, with per-pixel strength controlled by an image-relative Otsu threshold — smooth gradients dither fully, sharp edges stay crisp, solid fills stay clean
+- **Two-pass dithering with adaptive edge detection**: Floyd-Steinberg error diffusion in Oklab space, with per-pixel strength controlled by an image-relative Otsu threshold — smooth gradients dither fully, sharp edges stay crisp, solid fills stay clean
 - **Multi-tile grid consistency**: dithering operates on the full grid image before splitting into tiles, eliminating colour and texture discontinuities at seams
 - **Color palette histogram**: `/loominary palette` shows a rarity distribution histogram and cumulative removal-cost table to guide reduction decisions
 - **Flexible palette reduction**: reduce by banner count or distinct colour count, on the active tile or all tiles at once
-- **Litematica schematic export**: carpet tiles auto-export a schematic on import (written directly to Litematica's `schematics/` folder); banner tiles export on demand with `/loominary export`
+- **Litematica schematic export**: carpet tiles auto-export a schematic on import; staircase schematics are auto-selected for tiles that use the shade channel; banner tiles export on demand with `/loominary export`
 - **Grid-aware preview**: `/loominary preview` discovers the full wall of framed maps from any frame and paints all tiles at once
-- **Embedded metadata**: every payload records the image title (auto-derived from filename), author username, grid position, and a CRC32 integrity check; animated payloads carry frame count, loop count, and per-frame delays
+- **Embedded metadata**: every payload records the image title, author username, grid position, and a CRC32 integrity check; animated payloads carry frame count, loop count, and per-frame delays
 - **Auto-title**: each import derives a title from the filename stem; steal uses `map_<id>`; `/loominary title` overrides and immediately re-encodes all existing tiles
 - **Persistent state** survives game restarts; pick up any unfinished batch
 - **Configurable hotkeys** for the most-used actions
@@ -42,7 +44,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 
 ## Installation
 
-1. Download `loominary-1.3.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
+1. Download `loominary-1.6.1.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
 2. Drop it into your `mods/` folder alongside Fabric API
 3. Launch the game
 
@@ -54,12 +56,12 @@ You'll see `[Loominary] Client-side mod initialized successfully!` in the log.
 
 1. Drop a PNG into `<gamedir>/loominary_data/`.
 2. Run `/loominary import <filename>`. Tab-completion works.
-3. Loominary tells you how many carpet rows and compressed bytes, and auto-exports the carpet schematic to Litematica's `schematics/` folder.
+3. Loominary tells you how many carpet rows and compressed bytes, and auto-exports the schematic to Litematica's `schematics/` folder. If the shade channel is used, a staircase schematic is written instead of a flat platform.
 4. Optionally run `/loominary preview` while looking at any framed map to see what your image will look like before committing.
-5. Make sure you have enough unnamed banners (any color) and empty bundles in your inventory for the LC manifest banner and any overflow banners. You need 1 XP level per banner.
-6. Walk to an anvil, open it, and let Loominary rename the LC banner (and any overflow banners) automatically.
-7. Place the carpet schematic using Litematica — a flat platform of colored carpet blocks on any flat surface, extending slightly north of the map boundary so all rows render at shade NORMAL.
-8. Place the LC banner (and any overflow banners) nearby.
+5. Make sure you have enough unnamed banners (any color) and empty bundles in your inventory for the LC/LS manifest banner and any overflow banners. You need 1 XP level per banner.
+6. Walk to an anvil, open it, and let Loominary rename the manifest banner (and any overflow banners) automatically.
+7. Place the carpet schematic using Litematica — flat carpet platform, or staircase if the schematic uses the shade channel. The terrain one block north of the schematic's north edge must be at the same y-level as the schematic origin.
+8. Place the manifest and overflow banners nearby.
 9. Hold the map you want to encode onto. Run `/loominary click`, then walk near your placed banners — the mod right-clicks each one automatically. Or right-click them manually.
 10. Place the map in an item frame. Anyone with Loominary installed and within 32 blocks will see your image.
 
@@ -67,7 +69,7 @@ You'll see `[Loominary] Client-side mod initialized successfully!` in the log.
 ```
 /loominary import <filename> banners
 ```
-This uses up to 63 named banners and ~2,268 bytes of capacity.
+This uses up to 63 named CJK-encoded banners and 5,292 bytes of capacity.
 
 ### Encoding an animated GIF
 
@@ -75,16 +77,18 @@ This uses up to 63 named banners and ~2,268 bytes of capacity.
 /loominary import animation.gif
 ```
 
-Loominary reads each GIF frame, coalesces partial-region updates, quantizes all frames against a shared palette, and encodes them into a single compressed payload. The decoder cycles frames in-world at the original GIF delays. Capacity: all frames must compress to ≤10,457 bytes total — simpler GIFs with fewer distinct colors compress much smaller.
+Loominary reads each GIF frame, coalesces partial-region updates, quantizes all frames against a shared palette, and encodes them into a single compressed payload. The decoder cycles frames in-world at the original GIF delays. All frames must compress within the tile's capacity — simpler GIFs with fewer distinct colors compress much smaller.
+
+To thin out a GIF that's too large:
+- `/loominary stride <n>` — keep every Nth frame (2 = half frame count)
+- `/loominary skip <n>` — drop every Nth frame (2 = drop half)
 
 ### Editing a map in-world
 
 1. Look at a framed map.
 2. Run `/loominary edit` (or press the bound hotkey).
 3. The editor opens with the map's pixel data as a 128×128 canvas.
-4. Tools: left-click paints, right-click eyedropper, `R` re-quantizes selection from source, `D` toggles dither, `T` dither-strength brush, `L` lasso, `W` magic wand, `E` eyedropper mode.
-5. For animated tiles: `Ctrl+[` / `Ctrl+]` navigate frames.
-6. On close, changes are saved back into the tile's chunks.
+4. See [EDITOR.md](EDITOR.md) for a full guide to all tools and controls.
 
 ### Stealing existing map art
 
@@ -121,21 +125,28 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 - `/loominary import <filename>` — Import an image from `loominary_data/` using carpet encoding (default). Carpet schematic auto-exported on import.
 - `/loominary import <filename> banners` — Import using legacy banner-only encoding.
-- `/loominary import <filename> [cols rows] [allshades] [dither]` — Import with grid and/or options. All work in both carpet and banner modes.
+- `/loominary import <filename> [cols rows] [allshades] [dither]` — Import with grid and/or options. Works in both carpet and banner modes.
 - `/loominary import steal` — Append the framed map at your crosshair as a new carpet tile.
 - `/loominary import steal banners` — Same, using legacy banner encoding.
 
 ### Inspecting state
 
 - `/loominary` — Equivalent to `/loominary status`.
-- `/loominary status` — Shows file, grid size, title, and per-tile progress. Carpet tiles show `[carpet]` tag.
-- `/loominary palette` — Shows distinct colors, banner count, and the rarest colors in the active tile.
+- `/loominary status` — Shows file, grid size, title, and per-tile progress. Carpet tiles show channel info (carpet rows, shade bytes if any).
+- `/loominary palette` — Shows distinct colors, banner count, and the rarest colors in the active tile with a frequency histogram.
 
 ### Tile navigation
 
 - `/loominary tile <n>` — Switch to tile `n`.
 - `/loominary tile next` — Switch to the next incomplete tile.
+- `/loominary tile prev` — Switch to the previous tile.
+- `/loominary tile pos` — Print the grid coordinates of the active tile.
 - `/loominary seek <n>` — Set the chunk index of the active tile (for resuming partway through).
+
+### GIF frame operations
+
+- `/loominary stride <n>` — Keep only every Nth frame of all animated tiles (e.g. `stride 2` halves the frame count).
+- `/loominary skip <n>` — Drop every Nth frame of all animated tiles (e.g. `skip 3` removes frames 3, 6, 9, …).
 
 ### Map manipulation
 
@@ -145,7 +156,7 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 ### Auto-clicking banners
 
-- `/loominary click` — Toggle auto-right-click mode. Hold your map, walk near your placed LC/overflow banners, and Loominary right-clicks each unregistered one every 5 ticks. Shows remaining count in the action bar; wire-box markers appear above each banner. Stops automatically when all banners are registered.
+- `/loominary click` — Toggle auto-right-click mode. Hold your map, walk near your placed LC/LS/overflow banners, and Loominary right-clicks each unregistered one every 5 ticks. Shows remaining count in the action bar; wire-box markers appear above each banner. Stops automatically when all banners are registered.
 - `/loominary click stop` — Stop auto-clicking.
 
 ### Metadata
@@ -167,7 +178,7 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 - `/loominary palette` — Shows color stats, rarity histogram, and cumulative removal-cost table.
 - `/loominary reduce` — Reduce the active tile to fit within capacity.
-- `/loominary reduce <n>` — Reduce the active tile to at most `n` banners (1–63 for carpet, 1–63 for banner mode).
+- `/loominary reduce <n>` — Reduce the active tile to at most `n` banners (1–63).
 - `/loominary reduce colors <n>` — Reduce the active tile to at most `n` distinct colors (1–248).
 - `/loominary reduce all` — Apply reduction to every tile in the batch.
 - `/loominary reduce all <n>` — Apply banner-count reduction to every tile with target `n`.
@@ -201,23 +212,27 @@ All are unbound by default.
 
 Loominary exploits a chain of Minecraft mechanics that aren't normally connected:
 
-**Carpet blocks encode data visually.** Minecraft has 16 carpet colors. Loominary maps them to nibble values (0–15) and writes pairs of nibbles into consecutive map pixels. A 128×128 map has 16,384 pixels — enough for 8,192 bytes of compressed data in the carpet channel alone. The key constraint is shade: carpets on a flat surface at the same elevation as the row to their north render at shade NORMAL (map byte = `base_id × 4 + 1`), giving a predictable and reversible encoding.
+**Carpet blocks encode data visually.** Minecraft has 16 carpet colors. Loominary maps them to nibble values (0–15) and writes pairs of nibbles into consecutive map pixels. A 128×128 map has 16,384 pixels — enough for 8,192 bytes of compressed data in the carpet channel alone. Carpets on a flat surface render at shade NORMAL (map byte = `base_id × 4 + 1`), giving a predictable and reversible encoding.
 
-**An LC manifest banner triggers the decoder.** After placing the carpet, the user clicks a single named LC banner with the map. The banner name encodes the total compressed size (`LC<NNNN>`) and optionally the first 44 base64 characters of overflow data. The decoder sees the LC decoration and knows to read the map's color array as carpet data rather than terrain.
+**Carpet height encodes a second channel (LS format).** When the flat carpet channel plus overflow banners can't hold the payload, Loominary also encodes data in the vertical arrangement of carpets. Heights {0, 1, 2} relative to the map's northward neighbor determine the shade byte (LOW, NORMAL, HIGH). Groups of 4 rows are encoded as one of 16 balanced height sequences (each starts and ends at height 1 so the pattern tiles correctly), giving 4 bits per group. The 128-column map has 31 four-row groups plus a 3-row tail, yielding 2,016 additional bytes. Tiles using this channel write an LS manifest banner instead of LC, and the schematic is a staircase rather than a flat platform.
 
-**Overflow banners carry the rest.** If the compressed payload exceeds 8,192 bytes, the remainder is split into up to 62 hex-indexed overflow banners (`00`–`3D`), each carrying 48 base64 characters (36 bytes). Combined with the LC banner's 33-byte payload, total overflow capacity is 2,265 bytes. Grand total: 10,457 compressed bytes per tile.
+**An LC/LS manifest banner triggers the decoder.** After placing the carpet, the user clicks a single named banner with the map. The name encodes the total compressed size and, for LS banners, the shade-channel byte count. The decoder uses this to know how many nibbles to read from the color array and how many shade bytes to extract.
 
-**Banner names store overflow data.** The anvil lets you rename a banner up to 50 characters, and that custom name persists in NBT. Loominary renames each overflow banner with a 2-character hex index followed by up to 48 characters of base64-encoded overflow data.
+**Overflow banners carry the remainder using a CJK alphabet.** If the compressed payload exceeds the carpet + shade channels, the remainder is CJK-encoded and split into up to 62 named overflow banners. Each banner carries a 2-character hex index followed by 48 CJK characters from the range U+4E00–U+8DFF (14 bits per character, 84 bytes per banner). Total overflow capacity: 62 × 84 = 5,208 bytes. Grand total per tile: **12,473 compressed bytes**.
 
-**Maps store banner-marker names.** When you right-click a banner with a map, the server records the banner's position, dye color, and custom name as a `MapDecoration` in the map's NBT. This decoration data syncs to clients.
+**The CJK alphabet was validated on 2b2t.** All code points in the U+4E00–U+9000 range were tested via automated item-rename probes and passed through 2b2t's filter unmodified. CJK Unified Ideographs have no canonical decomposition, so the server's NFC normalization pass is a no-op. The 14-bit alphabet gives 2.33× the payload capacity of base64 in the same 48-character banner slot.
 
-**The client renders maps from a `byte[16384]` color array.** Loominary intercepts maps whose banner markers include an LC decoration, reads the carpet nibbles from the map's existing color array, reassembles any overflow chunks in order, base64-decodes and zstd-decompresses the combined payload, and overwrites the client's local color array. The server is unaware.
+**Banner names store overflow data.** The anvil lets you rename a banner up to 50 characters. Loominary renames each overflow banner with a 2-character hex index followed by 48 CJK payload characters. The encoded bytes are preceded by a 2-byte big-endian length header so the decoder knows the exact compressed size regardless of how many trailing zero-padding bits are in the last character.
 
-**The encoding works in map-color space.** The image is quantized to Minecraft's map palette using Oklab perceptual distance, then the resulting `byte[16384]` is compressed. Spatial coherence in the quantized output makes zstd very effective — most images compress to 1,500–6,000 bytes. The 10,457-byte ceiling is almost never reached by typical mapart.
+**Maps store banner-marker names.** When you right-click a banner with a map, the server records the banner's custom name as a `MapDecoration` in the map's NBT. This decoration data syncs to clients.
 
-**Animated payloads concatenate frames.** For GIFs, all frames are stored back-to-back in the payload (`frame_count × 16,384` bytes) after the manifest header. Zstd exploits inter-frame repetition naturally. The decoder advances frames on a tick timer, culls distance, and syncs multi-tile murals so the full grid never shows mixed frames.
+**The client renders maps from a `byte[16384]` color array.** Loominary intercepts maps whose banner markers include an LC/LS decoration, reads the carpet nibbles and shade bytes from the map's existing color array, reassembles any overflow chunks in order, CJK-decodes and zstd-decompresses the combined payload, and overwrites the client's local color array. The server is unaware.
 
-**Payloads carry a versioned manifest.** Every payload begins with a small binary header recording the format version, grid position, author username, title, and a CRC32 of the image data. Animated payloads (manifest v3) additionally carry frame count, loop count, and per-frame delays. Old decoders find map colors at the `header_size` skip-pointer and render frame 0 as a static image.
+**The encoding works in map-color space.** The image is quantized to Minecraft's map palette using Oklab perceptual distance, then the resulting `byte[16384]` is compressed. Spatial coherence in the quantized output makes zstd very effective — most images compress to 1,500–6,000 bytes.
+
+**Animated payloads concatenate frames.** For GIFs, all frames are stored back-to-back in the payload after the manifest header. Zstd exploits inter-frame repetition naturally. The decoder advances frames on a wall-clock timer, culls by distance, and syncs multi-tile murals so the full grid never shows mixed frames.
+
+**Payloads carry a versioned manifest.** Every payload begins with a small binary header recording the format version, grid position, author username, title, and a CRC32 of the image data. Animated payloads additionally carry frame count, loop count, and per-frame delays. Old decoders find map colors at the `header_size` skip-pointer and render frame 0 as a static image.
 
 **Decorations are suppressed.** Once Loominary identifies a map as one of its own, it clears the decorations list in the client-side `MapState`, so the banner pin icons don't clutter the image.
 
@@ -225,7 +240,7 @@ Loominary exploits a chain of Minecraft mechanics that aren't normally connected
 
 ### Will this get me banned?
 
-Loominary renames banners (vanilla feature), right-clicks them with maps (vanilla feature), and reads map data the server sends (vanilla feature). Placing a carpet schematic is normal block placement. The image-rendering step happens entirely client-side. The anvil handler clicks quickly during renaming, and the auto-click feature right-clicks banners at a measured pace. On strict anti-cheat servers, watch for any warnings on first use.
+Loominary renames banners (vanilla feature), right-clicks them with maps (vanilla feature), and reads map data the server sends (vanilla feature). Placing a carpet schematic is normal block placement. The image-rendering step happens entirely client-side. On strict anti-cheat servers, watch for any warnings on first use.
 
 ### Other players don't see my image.
 
@@ -246,7 +261,7 @@ Minecraft's map palette has ~62 base colors with up to 4 brightness shades. Phot
 
 ### I keep getting "OVER BUDGET."
 
-Use `/loominary reduce` to merge the rarest colors into their nearest neighbors. You can also target a specific ceiling: `/loominary reduce 50`. Undo with `/loominary reduce undo`. Carpet mode has ~10,457 bytes of capacity; banner-only mode (legacy) is ~2,268 bytes at the 63-banner limit.
+Use `/loominary reduce` to merge the rarest colors into their nearest neighbors. You can also target a specific ceiling: `/loominary reduce 50`. Undo with `/loominary reduce undo`. Carpet mode has ~12,473 bytes of capacity; banner-only mode (legacy) has ~5,292 bytes at the 63-banner limit.
 
 ### What is the "legal palette" vs "all shades"?
 
@@ -260,25 +275,25 @@ Yes to all three. Loominary is fully client-side. Carpet mode works on any serve
 
 Every encoded payload includes the encoder's username and title in a small binary manifest. The title is auto-derived from the filename on import; you can override it with `/loominary title`. When another Loominary user decodes the map, this information is logged.
 
-### Why does carpet mode use an LC banner at all?
+### Why does carpet mode use an LC/LS banner at all?
 
-The LC banner is the decoder trigger — without it, Loominary has no way to distinguish a carpet-encoded map from normal terrain. The banner name also carries the total compressed size (so the decoder knows how many nibbles to read from the color array) and the first 33 bytes of overflow data. For most images the payload fits in the carpet channel and the LC banner is the only banner needed.
+The manifest banner is the decoder trigger — without it, Loominary has no way to distinguish a carpet-encoded map from normal terrain. The banner name also carries the total compressed size and (for LS tiles) the shade-channel byte count, plus the first bytes of overflow data. For most images the payload fits in the carpet channel and the manifest banner is the only banner needed.
 
 ### Why 63 banners?
 
-The hard limit of 63 banners per map was observed on 2b2t. Vanilla servers nominally allow 255 (two hex digits: `00`–`ff`), but the mod targets the more restrictive limit by default. The carpet channel was designed specifically to maximize payload within that constraint: instead of 63 × 36 bytes (≈2,268 bytes), carpet mode delivers 8,192 bytes from the carpet blocks plus 2,265 bytes of banner overflow = 10,457 bytes total.
+The hard limit of 63 banners per map was observed on 2b2t. Vanilla servers nominally allow 255, but the mod targets the more restrictive limit by default. Each overflow banner now carries 84 bytes (CJK encoding), so 63 banners at 84 bytes each = 5,292 bytes — 2.33× the 2,268 bytes that base64 delivered at the same banner count.
 
 ### What happens if I run out of XP, banners, or bundles mid-batch?
 
 The anvil handler pauses cleanly, logs what's missing, and resumes automatically when you restock.
 
+### Why is my carpet tile producing a staircase schematic?
+
+Your image compressed to more than 10,240 bytes (carpet + overflow limit), so Loominary activated the shade channel to carry extra data. The staircase encodes 2,016 additional bytes via carpet height variation. Place it the same way as a flat schematic — the terrain one block north of the schematic's north edge must be at the same y-level as the schematic origin so row 0 renders at shade NORMAL.
+
 ### How big is the state file?
 
 Tens of kilobytes for a typical batch; low single-digit megabytes for many large tiles. It lives at `<gamedir>/config/loominary_state.json` as readable JSON.
-
-### Will Loominary update for newer Minecraft versions?
-
-The mod targets specific Minecraft internals. Each major Minecraft version requires a port. 1.21.4 is the current target.
 
 ### The anvil handler says "Stuck — run /loominary resalt."
 

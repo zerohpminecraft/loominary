@@ -111,13 +111,38 @@ The color merge tool lets you collapse multiple palette entries into one. This i
 
 **How to use:**
 
-1. `Ctrl+click` one or more swatches in the palette panel to queue them as merge sources. Queued swatches are highlighted in orange. The palette header shows how many sources are queued.
+1. `Ctrl+click` one or more swatches in the palette panel **or pixels on the canvas** to queue them as merge sources. Queued swatches are highlighted in orange. The palette header shows how many sources are queued.
 2. Click a swatch (normal left-click) to set it as the target color.
 3. Press `C` to commit — every pixel using a source color is repainted with the target color. The merge is undoable.
 
 Press `Esc` to clear the merge-source queue without committing.
 
+**Merge scope (`V`):** Press `V` to cycle the commit scope:
+- **Frame** — merge only in the current frame (default)
+- **Tile** — merge across all frames of this tile simultaneously
+- **All tiles** — merge across every tile in the batch; other tiles are re-encoded immediately and undo state is saved for `/loominary reduce undo all`
+
+The current scope is shown in the guide panel and in the status bar (`[2 merge/tile]` etc.). Scopes that aren't applicable (e.g., Tile when the tile is single-frame) are hidden from the cycle.
+
 The merge tool is a quick alternative to `/loominary reduce` when you want precise control over which colors collapse together.
+
+---
+
+## Filter Tool (`P` / `Shift+P`)
+
+The filter tool applies a spatial image filter to the current frame in-place, then re-quantizes each pixel back to the nearest color already present in the tile. Because re-quantization is restricted to the existing palette, the banner/carpet count does not increase.
+
+**Controls:**
+- `Shift+P` — cycle the active filter type: Smooth → Median → Sharpen → Posterize
+- `P` — apply the active filter to the current frame (undoable with `Ctrl+Z`)
+
+**Filter types:**
+- **Smooth** — Gaussian blur, radius 1.0. Reduces noise and softens dithering.
+- **Median** — Edge-preserving median, radius 1. Removes isolated pixel noise without blurring edges.
+- **Sharpen** — Unsharp mask, amount 0.8. Clarifies soft edges.
+- **Posterize** — Reduces each channel to 4 discrete tone levels, creating flat color regions that compress better.
+
+The current filter type is shown in the guide panel. For more control (larger radius, all-frame or all-tile scope, and re-quantization to the full map palette rather than the existing tile palette), use `/loominary filter` from the command line instead.
 
 ---
 
@@ -143,7 +168,7 @@ When a dither mask exists and dither is on, `R` uses the mask's per-pixel streng
 - `Ctrl+Z` — Undo (up to 20 levels)
 - `Ctrl+Y` — Redo
 
-Every destructive operation (paint stroke, fill, lasso close, magic wand select + paint, re-quantize commit, color merge commit) snapshots the full 16,384-byte pixel array before modifying it. Memory cost: ~320 KB for 20 levels, which is negligible.
+Every destructive operation (paint stroke, fill, lasso close, magic wand select + paint, re-quantize commit, color merge commit, filter apply) snapshots **all frames** before modifying them. This means `Ctrl+Z` after a Tile-scope merge or a filter correctly reverts all frames, not just the active one. Memory cost scales with frame count — roughly 20 × frameCount × 16 KB per undo level; negligible for typical animated tiles.
 
 ---
 
@@ -254,9 +279,16 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 ### Color merge
 | Key | Action |
 |---|---|
-| `Ctrl+click` swatch | Add / remove from merge-source queue |
-| `C` | Commit merge (sources → active color) |
+| `Ctrl+click` swatch or canvas pixel | Add / remove color from merge-source queue |
+| `V` | Cycle merge scope: frame → tile → all tiles |
+| `C` | Commit merge (sources → active color, in current scope) |
 | `Esc` | Clear merge queue |
+
+### Filter
+| Key | Action |
+|---|---|
+| `Shift+P` | Cycle active filter type (smooth / median / sharpen / posterize) |
+| `P` | Apply active filter to current frame |
 
 ### Undo / redo
 | Key | Action |

@@ -24,8 +24,9 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 - **Stuck-chunk recovery**: if the server permanently rejects a banner name the handler halts cleanly; `/loominary resalt` re-encodes the tile with a random nonce — same image, new chunk names, works for both carpet and banner tiles
 - **Two-pass dithering with adaptive edge detection**: Floyd-Steinberg error diffusion in Oklab space, with per-pixel strength controlled by an image-relative Otsu threshold — smooth gradients dither fully, sharp edges stay crisp, solid fills stay clean
 - **Multi-tile grid consistency**: dithering operates on the full grid image before splitting into tiles, eliminating colour and texture discontinuities at seams
-- **Color palette histogram**: `/loominary palette` shows a rarity distribution histogram and cumulative removal-cost table to guide reduction decisions
-- **Flexible palette reduction**: reduce by banner count or distinct colour count, on the active tile or all tiles at once
+- **Color palette histogram**: `/loominary palette [all]` shows a rarity distribution histogram with sigmoid-adaptive bucket boundaries and cumulative removal-cost table; `palette all` covers every tile's frames together
+- **Flexible palette reduction**: reduce by banner count or distinct colour count, on the active tile or all tiles at once; three palette strategies (rarest, closest, weighted) control how colors are merged
+- **Image filters**: `/loominary filter smooth|median|sharpen|posterize [all]` applies spatial pre-processing in-place on the current tile state — no source file required, preserves skip/stride/edit work; also available in the editor with `P`
 - **Litematica schematic export**: carpet tiles auto-export a schematic on import; staircase schematics are auto-selected for tiles that use the shade channel; banner tiles export on demand with `/loominary export`
 - **Grid-aware preview**: `/loominary preview` discovers the full wall of framed maps from any frame and paints all tiles at once
 - **Embedded metadata**: every payload records the image title, author username, grid position, and a CRC32 integrity check; animated payloads carry frame count, loop count, and per-frame delays
@@ -44,7 +45,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 
 ## Installation
 
-1. Download `loominary-1.6.1.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
+1. Download `loominary-1.7.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
 2. Drop it into your `mods/` folder alongside Fabric API
 3. Launch the game
 
@@ -133,7 +134,8 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 - `/loominary` — Equivalent to `/loominary status`.
 - `/loominary status` — Shows file, grid size, title, and per-tile progress. Carpet tiles show channel info (carpet rows, shade bytes if any).
-- `/loominary palette` — Shows distinct colors, banner count, and the rarest colors in the active tile with a frequency histogram.
+- `/loominary palette` — Shows distinct colors (across all frames), budget, and a frequency histogram with adaptive sigmoid-based bucket boundaries.
+- `/loominary palette all` — Same analysis across every tile in the batch combined.
 
 ### Tile navigation
 
@@ -174,16 +176,33 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 - `/loominary dither all` — Re-encode every tile with seamless cross-tile dithering.
 - `/loominary dither [all] colors <n>` — Pre-select `n` colours globally before dithering (1–248).
 
+### Filters
+
+Filters apply **in-place** to the current tile state — they work even on stolen tiles or frames that have been thinned with `skip`/`stride`, and they don't reload from the source file.
+
+- `/loominary filter smooth [all] [radius <r>]` — Gaussian blur (default radius 1.5). Reduces high-frequency noise; effective before color reduction.
+- `/loominary filter median [all] [radius <r>]` — Edge-preserving median filter (default radius 1). Removes salt-and-pepper noise without blurring edges.
+- `/loominary filter sharpen [all] [amount <a>]` — Unsharp mask (default amount 0.8). Clarifies edges on clean or previously blurred images.
+- `/loominary filter posterize [all] <levels>` — Reduces each color channel to `levels` discrete tones (2–16), creating large flat-color bands that compress well.
+
+All filter commands re-quantize pixel colors back to the existing tile palette after filtering, so banner/carpet count does not increase.
+
 ### Palette reduction
 
-- `/loominary palette` — Shows color stats, rarity histogram, and cumulative removal-cost table.
+- `/loominary palette` — Shows distinct color count (across all frames), budget, and a sigmoid-adaptive rarity histogram.
+- `/loominary palette all` — Same analysis across all tiles combined.
 - `/loominary reduce` — Reduce the active tile to fit within capacity.
-- `/loominary reduce <n>` — Reduce the active tile to at most `n` banners (1–63).
-- `/loominary reduce colors <n>` — Reduce the active tile to at most `n` distinct colors (1–248).
+- `/loominary reduce <n>` — Reduce the active tile to at most `n` banners (1–63). Always uses rarest-first for predictable compression.
+- `/loominary reduce colors <n>` — Reduce the active tile to at most `n` distinct colors (1–248). Uses the active strategy.
 - `/loominary reduce all` — Apply reduction to every tile in the batch.
 - `/loominary reduce all <n>` — Apply banner-count reduction to every tile with target `n`.
 - `/loominary reduce all colors <n>` — Apply color-count reduction to every tile.
+- `/loominary reduce strategy <rarest|closest|weighted>` — Set the strategy used by color-count reduction:
+  - `rarest` (default) — removes least-frequent colors first; predictable, good for cleaning up isolated accent pixels
+  - `closest` — merges the globally closest color pair each step; targets clusters of similar-looking colors
+  - `weighted` — scores pairs by `dist²/(freqA+freqB)`; large clusters of similar colors are eliminated first, good for noisy compressed GIFs
 - `/loominary reduce undo` — Restore the active tile to its pre-reduction state.
+- `/loominary reduce undo all` — Restore every tile to its pre-reduction state.
 
 ### Export
 

@@ -14,9 +14,12 @@ import java.awt.AlphaComposite;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.awt.image.ConvolveOp;
+import java.awt.image.Kernel;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Iterator;
 
@@ -99,10 +102,17 @@ public class PngToMapColors {
     public static byte[][] convertTwoPassGrid(BufferedImage fullImage, boolean legalOnly,
                                                int targetColors, boolean dither,
                                                int cols, int rows) {
+        return convertTwoPassGrid(fullImage, legalOnly, targetColors, dither, cols, rows, null);
+    }
+
+    public static byte[][] convertTwoPassGrid(BufferedImage fullImage, boolean legalOnly,
+                                               int targetColors, boolean dither,
+                                               int cols, int rows, FilterParams filter) {
         int totalW = cols * MAP_SIZE;
         int totalH = rows * MAP_SIZE;
 
         BufferedImage scaled = scale(fullImage, totalW, totalH);
+        if (filter != null) scaled = applyFilter(scaled, filter);
         float[][] oklabLookup = buildOklabLookup();
 
         // Pass 1: nearest-neighbor quantization of the entire grid.
@@ -143,6 +153,190 @@ public class PngToMapColors {
         return convertTwoPassGrid(source, legalOnly, targetColors, dither, 1, 1)[0];
     }
 
+    // ── Reduction strategy ───────────────────────────────────────────────
+
+    /**
+     * Controls how the iterative palette reducer picks which color to eliminate next.
+     * <ul>
+     *   <li><b>RAREST</b> — removes the least-frequent color each step, merging it to its
+     *       perceptually nearest neighbor. Good for eliminating isolated accent pixels.</li>
+     *   <li><b>CLOSEST</b> — finds the globally closest pair of colors by Oklab distance and
+     *       merges the less-frequent into the more-frequent. Directly attacks clusters of
+     *       perceptually similar colors (e.g. many shades of gray).</li>
+     *   <li><b>WEIGHTED</b> — like CLOSEST but scores each pair as {@code dist²/(freqA+freqB)},
+     *       so large clusters of similar colors (high combined frequency, low distance) are
+     *       eliminated first. Best for noisy compressed images with dominant color bands.</li>
+     * </ul>
+     */
+    public enum Strategy { RAREST, CLOSEST, WEIGHTED }
+
+    // ── Image filters ────────────────────────────────────────────────────
+
+    /**
+     * Pre-quantization spatial filter applied to the scaled source image.
+     * {@code strength} interpretation depends on type:
+     * SMOOTH = Gaussian radius (px), MEDIAN = box radius (px),
+     * SHARPEN = unsharp amount (0–3), POSTERIZE = tone levels (2–16).
+     */
+    public record FilterParams(FilterType type, float strength) {
+        public enum FilterType { SMOOTH, MEDIAN, SHARPEN, POSTERIZE }
+        public static FilterParams smooth(float radius)  { return new FilterParams(FilterType.SMOOTH,    radius); }
+        public static FilterParams median(int radius)    { return new FilterParams(FilterType.MEDIAN,    radius); }
+        public static FilterParams sharpen(float amount) { return new FilterParams(FilterType.SHARPEN,   amount); }
+        public static FilterParams posterize(int levels) { return new FilterParams(FilterType.POSTERIZE, levels); }
+    }
+
+    /** Applies a pre-quantization filter to {@code img}. Returns a new BufferedImage. */
+    public static BufferedImage applyFilter(BufferedImage img, FilterParams params) {
+        BufferedImage src = ensureArgb(img);
+        return switch (params.type()) {
+            case SMOOTH    -> gaussianBlur(src, params.strength());
+            case MEDIAN    -> medianFilter(src, Math.max(1, (int) params.strength()));
+            case SHARPEN   -> sharpenUnsharpMask(src, params.strength());
+            case POSTERIZE -> posterize(src, Math.max(2, (int) params.strength()));
+        };
+    }
+
+    /**
+     * Applies a filter to each frame in-place. Each frame is reconstructed as a
+     * BufferedImage via the color lookup, filtered, then re-quantized to the union
+     * palette of all frames (no new colors are added).
+     */
+    public static void applyFilterToFrames(byte[][] frames, FilterParams filter) {
+        applyFilterToFrames(frames, filter, buildOklabLookup());
+    }
+
+    public static void applyFilterToFrames(byte[][] frames, FilterParams filter,
+                                            float[][] oklabLookup) {
+        boolean[] palette = new boolean[256];
+        for (byte[] f : frames) for (byte b : f) palette[b & 0xFF] = true;
+        palette[0] = false;
+        int[] colorLookup = buildColorLookup();
+        for (byte[] frame : frames) {
+            BufferedImage img = new BufferedImage(MAP_SIZE, MAP_SIZE, BufferedImage.TYPE_INT_ARGB);
+            for (int y = 0; y < MAP_SIZE; y++)
+                for (int x = 0; x < MAP_SIZE; x++) {
+                    int cb = frame[x + y * MAP_SIZE] & 0xFF;
+                    img.setRGB(x, y, cb == 0 ? 0 : 0xFF000000 | colorLookup[cb]);
+                }
+            BufferedImage filtered = applyFilter(img, filter);
+            for (int y = 0; y < MAP_SIZE; y++) {
+                for (int x = 0; x < MAP_SIZE; x++) {
+                    int idx = x + y * MAP_SIZE;
+                    if (frame[idx] == 0) continue;
+                    int argb = filtered.getRGB(x, y);
+                    if (((argb >>> 24) & 0xFF) < 128) { frame[idx] = 0; continue; }
+                    float[] ok = rgbToOklab(argb);
+                    float bestDist = Float.MAX_VALUE;
+                    int best = frame[idx] & 0xFF;
+                    for (int c = 1; c < 256; c++) {
+                        if (!palette[c] || oklabLookup[c] == null) continue;
+                        float dL = ok[0]-oklabLookup[c][0], da = ok[1]-oklabLookup[c][1],
+                              db = ok[2]-oklabLookup[c][2];
+                        float d = dL*dL + da*da + db*db;
+                        if (d < bestDist) { bestDist = d; best = c; }
+                    }
+                    frame[idx] = (byte) best;
+                }
+            }
+        }
+    }
+
+    private static BufferedImage ensureArgb(BufferedImage img) {
+        if (img.getType() == BufferedImage.TYPE_INT_ARGB) return img;
+        BufferedImage out = new BufferedImage(img.getWidth(), img.getHeight(),
+                BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = out.createGraphics();
+        g.drawImage(img, 0, 0, null);
+        g.dispose();
+        return out;
+    }
+
+    private static BufferedImage gaussianBlur(BufferedImage img, float radius) {
+        int size  = Math.max(3, ((int)(radius * 2 + 1)) | 1);
+        float sigma = Math.max(0.01f, radius * 0.5f);
+        int half = size / 2;
+        float[] data = new float[size * size];
+        float sum = 0;
+        for (int y = -half; y <= half; y++) {
+            for (int x = -half; x <= half; x++) {
+                float v = (float) Math.exp(-(x * x + y * y) / (2 * sigma * sigma));
+                data[(y + half) * size + (x + half)] = v;
+                sum += v;
+            }
+        }
+        for (int i = 0; i < data.length; i++) data[i] /= sum;
+        ConvolveOp op = new ConvolveOp(new Kernel(size, size, data), ConvolveOp.EDGE_NO_OP, null);
+        // ConvolveOp needs a destination image of the same type
+        BufferedImage dst = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        return op.filter(img, dst);
+    }
+
+    private static BufferedImage medianFilter(BufferedImage img, int radius) {
+        int w = img.getWidth(), h = img.getHeight();
+        int n = (2 * radius + 1) * (2 * radius + 1);
+        int[] rs = new int[n], gs = new int[n], bs = new int[n];
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int k = 0;
+                for (int dy = -radius; dy <= radius; dy++) {
+                    for (int dx = -radius; dx <= radius; dx++) {
+                        int px = Math.max(0, Math.min(w - 1, x + dx));
+                        int py = Math.max(0, Math.min(h - 1, y + dy));
+                        int rgb = img.getRGB(px, py);
+                        rs[k] = (rgb >> 16) & 0xFF;
+                        gs[k] = (rgb >>  8) & 0xFF;
+                        bs[k] =  rgb        & 0xFF;
+                        k++;
+                    }
+                }
+                Arrays.sort(rs, 0, n);
+                Arrays.sort(gs, 0, n);
+                Arrays.sort(bs, 0, n);
+                int alpha = (img.getRGB(x, y) >> 24) & 0xFF;
+                out.setRGB(x, y, (alpha << 24) | (rs[n/2] << 16) | (gs[n/2] << 8) | bs[n/2]);
+            }
+        }
+        return out;
+    }
+
+    private static BufferedImage sharpenUnsharpMask(BufferedImage img, float amount) {
+        BufferedImage blurred = gaussianBlur(img, 1.0f);
+        int w = img.getWidth(), h = img.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int o = img.getRGB(x, y), b = blurred.getRGB(x, y);
+                int a  = (o >> 24) & 0xFF;
+                int r  = clampByte(((o>>16)&0xFF) + (int)(amount * (((o>>16)&0xFF) - ((b>>16)&0xFF))));
+                int g  = clampByte(((o>> 8)&0xFF) + (int)(amount * (((o>> 8)&0xFF) - ((b>> 8)&0xFF))));
+                int bv = clampByte(( o     &0xFF) + (int)(amount * (( o     &0xFF) - ( b     &0xFF))));
+                out.setRGB(x, y, (a << 24) | (r << 16) | (g << 8) | bv);
+            }
+        }
+        return out;
+    }
+
+    private static BufferedImage posterize(BufferedImage img, int levels) {
+        float step = 255.0f / (levels - 1);
+        int w = img.getWidth(), h = img.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int rgb = img.getRGB(x, y);
+                int a = (rgb >> 24) & 0xFF;
+                int r = Math.round(Math.round(((rgb >> 16) & 0xFF) / step) * step);
+                int g = Math.round(Math.round(((rgb >>  8) & 0xFF) / step) * step);
+                int b = Math.round(Math.round(( rgb        & 0xFF) / step) * step);
+                out.setRGB(x, y, (a << 24) | (clampByte(r) << 16) | (clampByte(g) << 8) | clampByte(b));
+            }
+        }
+        return out;
+    }
+
+    private static int clampByte(int v) { return Math.max(0, Math.min(255, v)); }
+
     // ── FitResult ────────────────────────────────────────────────────────
 
     public static class FitResult {
@@ -166,24 +360,56 @@ public class PngToMapColors {
 
     public static FitResult reduceToFit(byte[] mapColors, byte[] prefix, int chunkSize, int maxChunks) {
         return reduceToFitCore(mapColors, prefix, maxChunks,
-                compressed -> chunksNeeded(compressed, chunkSize));
+                compressed -> chunksNeeded(compressed, chunkSize), Strategy.RAREST);
     }
 
     public static FitResult reduceToFit(byte[] mapColors, int chunkSize, int maxChunks) {
         return reduceToFit(mapColors, new byte[0], chunkSize, maxChunks);
     }
 
+    public static FitResult reduceToFit(byte[] mapColors, byte[] prefix, int chunkSize, int maxChunks,
+                                        Strategy strategy) {
+        return reduceToFitCore(mapColors, prefix, maxChunks,
+                compressed -> chunksNeeded(compressed, chunkSize), strategy, null);
+    }
+
+    public static FitResult reduceToFit(byte[] mapColors, byte[] prefix, int chunkSize, int maxChunks,
+                                        Strategy strategy, int[] normFreq) {
+        return reduceToFitCore(mapColors, prefix, maxChunks,
+                compressed -> chunksNeeded(compressed, chunkSize), strategy, normFreq);
+    }
+
     /** CJK-aware variant: measures banner budget using {@link CjkCodec#chunksNeeded}. */
     public static FitResult reduceToFitKJ(byte[] mapColors, byte[] prefix, int maxChunks) {
-        return reduceToFitCore(mapColors, prefix, maxChunks, CjkCodec::chunksNeeded);
+        return reduceToFitCore(mapColors, prefix, maxChunks, CjkCodec::chunksNeeded, Strategy.RAREST);
     }
 
     public static FitResult reduceToFitKJ(byte[] mapColors, int maxChunks) {
         return reduceToFitKJ(mapColors, new byte[0], maxChunks);
     }
 
+    public static FitResult reduceToFitKJ(byte[] mapColors, byte[] prefix, int maxChunks,
+                                          Strategy strategy) {
+        return reduceToFitCore(mapColors, prefix, maxChunks, CjkCodec::chunksNeeded, strategy, null);
+    }
+
+    public static FitResult reduceToFitKJ(byte[] mapColors, int maxChunks, Strategy strategy) {
+        return reduceToFitKJ(mapColors, new byte[0], maxChunks, strategy);
+    }
+
+    public static FitResult reduceToFitKJ(byte[] mapColors, byte[] prefix, int maxChunks,
+                                          Strategy strategy, int[] normFreq) {
+        return reduceToFitCore(mapColors, prefix, maxChunks, CjkCodec::chunksNeeded, strategy, normFreq);
+    }
+
     private static FitResult reduceToFitCore(byte[] mapColors, byte[] prefix, int maxChunks,
-            java.util.function.ToIntFunction<byte[]> chunkCounter) {
+            java.util.function.ToIntFunction<byte[]> chunkCounter, Strategy strategy) {
+        return reduceToFitCore(mapColors, prefix, maxChunks, chunkCounter, strategy, null);
+    }
+
+    private static FitResult reduceToFitCore(byte[] mapColors, byte[] prefix, int maxChunks,
+            java.util.function.ToIntFunction<byte[]> chunkCounter, Strategy strategy,
+            int[] normFreq) {
         float[][] oklabLookup = buildOklabLookup();
 
         int originalDistinct = countDistinct(mapColors);
@@ -197,21 +423,28 @@ public class PngToMapColors {
             int[] freq = new int[256];
             for (byte b : mapColors) freq[b & 0xFF]++;
 
-            int rarestColor = -1, rarestFreq = Integer.MAX_VALUE;
-            for (int c = 1; c < 256; c++) {
-                if (freq[c] > 0 && freq[c] < rarestFreq) { rarestFreq = freq[c]; rarestColor = c; }
+            int victim, survivor, victimFreq;
+            if (strategy == Strategy.RAREST) {
+                int rarestColor = -1, rarestFreq = Integer.MAX_VALUE;
+                for (int c = 1; c < 256; c++) {
+                    if (freq[c] > 0 && freq[c] < rarestFreq) { rarestFreq = freq[c]; rarestColor = c; }
+                }
+                if (rarestColor == -1) break;
+                int bestNeighbor = findNearestNeighbor(rarestColor, freq, oklabLookup);
+                if (bestNeighbor == rarestColor) break;
+                victim = rarestColor; survivor = bestNeighbor; victimFreq = rarestFreq;
+            } else {
+                int[] pair = findClosestPairForMerge(freq, oklabLookup, strategy, normFreq);
+                if (pair[0] == -1) break;
+                victim = pair[0]; survivor = pair[1]; victimFreq = freq[victim];
             }
-            if (rarestColor == -1) break;
 
-            int bestNeighbor = findNearestNeighbor(rarestColor, freq, oklabLookup);
-            if (bestNeighbor == rarestColor) break;
-
-            byte from = (byte) rarestColor, to = (byte) bestNeighbor;
+            byte from = (byte) victim, to = (byte) survivor;
             for (int i = 0; i < mapColors.length; i++) {
                 if (mapColors[i] == from) mapColors[i] = to;
             }
             colorsRemoved++;
-            pixelsAffected += rarestFreq;
+            pixelsAffected += victimFreq;
 
             compressed = compressCombined(prefix, mapColors);
             chunks = chunkCounter.applyAsInt(compressed);
@@ -224,15 +457,26 @@ public class PngToMapColors {
 
     public static FitResult reduceToColorCount(byte[] mapColors, byte[] prefix,
                                                int chunkSize, int targetColors) {
-        float[][] oklabLookup = buildOklabLookup();
-        int originalDistinct = countDistinct(mapColors);
-        int[] stats = reduceColorsInPlace(mapColors, targetColors, oklabLookup);
-        byte[] compressed = compressCombined(prefix, mapColors);
-        return new FitResult(mapColors, compressed, stats[0], originalDistinct, stats[1]);
+        return reduceToColorCount(mapColors, prefix, chunkSize, targetColors, Strategy.RAREST);
     }
 
     public static FitResult reduceToColorCount(byte[] mapColors, int chunkSize, int targetColors) {
-        return reduceToColorCount(mapColors, new byte[0], chunkSize, targetColors);
+        return reduceToColorCount(mapColors, new byte[0], chunkSize, targetColors, Strategy.RAREST);
+    }
+
+    public static FitResult reduceToColorCount(byte[] mapColors, byte[] prefix,
+                                               int chunkSize, int targetColors, Strategy strategy) {
+        return reduceToColorCount(mapColors, prefix, chunkSize, targetColors, strategy, null);
+    }
+
+    public static FitResult reduceToColorCount(byte[] mapColors, byte[] prefix,
+                                               int chunkSize, int targetColors, Strategy strategy,
+                                               int[] normFreq) {
+        float[][] oklabLookup = buildOklabLookup();
+        int originalDistinct = countDistinct(mapColors);
+        int[] stats = reduceColorsInPlace(mapColors, targetColors, oklabLookup, strategy, normFreq);
+        byte[] compressed = compressCombined(prefix, mapColors);
+        return new FitResult(mapColors, compressed, stats[0], originalDistinct, stats[1]);
     }
 
     // ── Shared core: in-place palette reduction ───────────────────────────
@@ -240,25 +484,86 @@ public class PngToMapColors {
     /** @return int[]{colorsRemoved, pixelsAffected} */
     private static int[] reduceColorsInPlace(byte[] mapColors, int targetColors,
                                               float[][] oklabLookup) {
+        return reduceColorsInPlace(mapColors, targetColors, oklabLookup, Strategy.RAREST, null);
+    }
+
+    /** @return int[]{colorsRemoved, pixelsAffected} */
+    private static int[] reduceColorsInPlace(byte[] mapColors, int targetColors,
+                                              float[][] oklabLookup, Strategy strategy) {
+        return reduceColorsInPlace(mapColors, targetColors, oklabLookup, strategy, null);
+    }
+
+    /**
+     * @param normFreq  for WEIGHTED on animated tiles: max-per-frame frequency per color
+     *                  (prevents cross-frame frequency inflation); null = use union frequency
+     * @return int[]{colorsRemoved, pixelsAffected}
+     */
+    private static int[] reduceColorsInPlace(byte[] mapColors, int targetColors,
+                                              float[][] oklabLookup, Strategy strategy,
+                                              int[] normFreq) {
         int colorsRemoved = 0, pixelsAffected = 0;
         while (countDistinct(mapColors) > targetColors) {
             int[] freq = new int[256];
             for (byte b : mapColors) freq[b & 0xFF]++;
-            int rarestColor = -1, rarestFreq = Integer.MAX_VALUE;
-            for (int c = 1; c < 256; c++) {
-                if (freq[c] > 0 && freq[c] < rarestFreq) { rarestFreq = freq[c]; rarestColor = c; }
+
+            int victim, survivor, victimFreq;
+            if (strategy == Strategy.RAREST) {
+                int rarestColor = -1, rarestFreq = Integer.MAX_VALUE;
+                for (int c = 1; c < 256; c++) {
+                    if (freq[c] > 0 && freq[c] < rarestFreq) { rarestFreq = freq[c]; rarestColor = c; }
+                }
+                if (rarestColor == -1) break;
+                int bestNeighbor = findNearestNeighbor(rarestColor, freq, oklabLookup);
+                if (bestNeighbor == rarestColor) break;
+                victim = rarestColor; survivor = bestNeighbor; victimFreq = rarestFreq;
+            } else {
+                int[] pair = findClosestPairForMerge(freq, oklabLookup, strategy, normFreq);
+                if (pair[0] == -1) break;
+                victim = pair[0]; survivor = pair[1]; victimFreq = freq[victim];
             }
-            if (rarestColor == -1) break;
-            int bestNeighbor = findNearestNeighbor(rarestColor, freq, oklabLookup);
-            if (bestNeighbor == rarestColor) break;
-            byte from = (byte) rarestColor, to = (byte) bestNeighbor;
+
+            byte from = (byte) victim, to = (byte) survivor;
             for (int i = 0; i < mapColors.length; i++) {
                 if (mapColors[i] == from) mapColors[i] = to;
             }
             colorsRemoved++;
-            pixelsAffected += rarestFreq;
+            pixelsAffected += victimFreq;
         }
         return new int[]{colorsRemoved, pixelsAffected};
+    }
+
+    /**
+     * Scans all pairs of active palette colors and returns {victim, survivor} for the
+     * pair with the lowest score. Victim (lower frequency) is merged into survivor.
+     * CLOSEST scores by raw Oklab distance². WEIGHTED divides by combined union
+     * frequency so large clusters of similar colors are eliminated first.
+     */
+    private static int[] findClosestPairForMerge(int[] freq, float[][] oklabLookup,
+                                                  Strategy strategy, int[] normFreq) {
+        int bestA = -1, bestB = -1;
+        float bestScore = Float.MAX_VALUE;
+        for (int a = 1; a < 256; a++) {
+            if (freq[a] == 0 || oklabLookup[a] == null) continue;
+            for (int b = a + 1; b < 256; b++) {
+                if (freq[b] == 0 || oklabLookup[b] == null) continue;
+                float dL = oklabLookup[a][0] - oklabLookup[b][0];
+                float da = oklabLookup[a][1] - oklabLookup[b][1];
+                float db = oklabLookup[a][2] - oklabLookup[b][2];
+                float distSq = dL*dL + da*da + db*db;
+                // Always use union frequency for the denominator. The normFreq
+                // parameter is kept for API compatibility but intentionally ignored:
+                // using per-frame-normalised frequencies changes the pair ordering in
+                // ways that produce worse results for typical animated content.
+                float score = (strategy == Strategy.WEIGHTED)
+                        ? distSq / (freq[a] + freq[b])
+                        : distSq;
+                if (score < bestScore) { bestScore = score; bestA = a; bestB = b; }
+            }
+        }
+        if (bestA == -1) return new int[]{-1, -1};
+        int victim   = (freq[bestA] <= freq[bestB]) ? bestA : bestB;
+        int survivor = (freq[bestA] <= freq[bestB]) ? bestB : bestA;
+        return new int[]{victim, survivor};
     }
 
     // ── Adaptive dithering: strength map ─────────────────────────────────
@@ -520,7 +825,7 @@ public class PngToMapColors {
         return rgb;
     }
 
-    static float[][] buildOklabLookup() {
+    public static float[][] buildOklabLookup() {
         float[][] oklab = new float[256][];
         for (int b = 1; b < 256; b++) {
             int colorId = (b >> 2) & 0x3F, shadeId = b & 0x3;
@@ -632,13 +937,19 @@ public class PngToMapColors {
      */
     public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
                                         boolean dither, int cols, int rows) throws IOException {
+        return convertGif(gifPath, legalOnly, targetColors, dither, cols, rows, null);
+    }
+
+    public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
+                                        boolean dither, int cols, int rows,
+                                        FilterParams filter) throws IOException {
         try (ImageInputStream iis = ImageIO.createImageInputStream(Files.newInputStream(gifPath))) {
             Iterator<ImageReader> readers = ImageIO.getImageReadersByMIMEType("image/gif");
             if (!readers.hasNext()) throw new IOException("No GIF image reader available");
             ImageReader reader = readers.next();
             try {
                 reader.setInput(iis, false);
-                return readGif(reader, legalOnly, targetColors, dither, cols, rows);
+                return readGif(reader, legalOnly, targetColors, dither, cols, rows, filter);
             } finally {
                 reader.dispose();
             }
@@ -647,6 +958,12 @@ public class PngToMapColors {
 
     private static GifResult readGif(ImageReader reader, boolean legalOnly, int targetColors,
                                       boolean dither, int cols, int rows) throws IOException {
+        return readGif(reader, legalOnly, targetColors, dither, cols, rows, null);
+    }
+
+    private static GifResult readGif(ImageReader reader, boolean legalOnly, int targetColors,
+                                      boolean dither, int cols, int rows,
+                                      FilterParams filter) throws IOException {
         // Screen dimensions from stream metadata (reliable; Java's GIF reader always provides it).
         int screenW = 0, screenH = 0;
         IIOMetadata streamMeta = reader.getStreamMetadata();
@@ -701,7 +1018,10 @@ public class PngToMapColors {
         int totalW = cols * MAP_SIZE;
         int totalH = rows * MAP_SIZE;
         BufferedImage[] scaled = new BufferedImage[numFrames];
-        for (int f = 0; f < numFrames; f++) scaled[f] = scale(coalesced[f], totalW, totalH);
+        for (int f = 0; f < numFrames; f++) {
+            scaled[f] = scale(coalesced[f], totalW, totalH);
+            if (filter != null) scaled[f] = applyFilter(scaled[f], filter);
+        }
 
         // Shared palette: pass 1 on the union of all frames.
         float[][] oklabLookup = buildOklabLookup();

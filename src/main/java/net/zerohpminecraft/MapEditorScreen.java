@@ -141,8 +141,14 @@ public class MapEditorScreen extends Screen {
     private int[]   allMapColors;
     private boolean paletteShowAll = false;
 
-    // Color-merge state: Ctrl+click swatches to build the source set, C to commit
+    // Color-merge state: Ctrl+click swatches or canvas pixels to build the source set, C to commit
     private final Set<Integer> mergeSources = new LinkedHashSet<>();
+    private enum MergeScope { FRAME, TILE, ALL_TILES }
+    private MergeScope mergeScope = MergeScope.FRAME;
+
+    // In-editor filter (Shift+P cycle type, P apply to current frame)
+    private static PngToMapColors.FilterParams.FilterType editorFilterType =
+            PngToMapColors.FilterParams.FilterType.SMOOTH;
 
     // Phase 6 — re-quantize from source (R key)
     private boolean   editorDither;
@@ -585,8 +591,25 @@ public class MapEditorScreen extends Screen {
         String ditherLbl = editorDither ? "§aD  §r§8dither:on" : "§8D  dither:off";
         ctx.drawTextWithShadow(textRenderer, Text.literal(ditherLbl), x, y, 0xFFFFFF); y += 9;
         ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
+        String filterName = editorFilterType.name().toLowerCase();
+        boolean nonDefaultFilter = editorFilterType != PngToMapColors.FilterParams.FilterType.SMOOTH;
+        ctx.drawTextWithShadow(textRenderer, Text.literal("§7Filter  §8[P]"), x, y, 0xFFFFFF); y += 9;
+        ctx.drawTextWithShadow(textRenderer,
+                Text.literal("§8Sh+P: [" + (nonDefaultFilter ? "§e" : "§8") + filterName + "§8]"),
+                x, y, 0xFFFFFF); y += 9;
+        ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§7Merge colors"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+clk: queue src"), x, y, 0xFFFFFF); y += 9;
+        MergeScope[] availScopes = availableMergeScopes();
+        if (availScopes.length > 1) {
+            String scopeLabel = switch (mergeScope) {
+                case FRAME     -> "§8frame";
+                case TILE      -> "§etile";
+                case ALL_TILES -> "§call tiles";
+            };
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal("§8V: scope [" + scopeLabel + "§8]"), x, y, 0xFFFFFF); y += 9;
+        }
         if (mergeSources.isEmpty()) {
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8C: commit merge"), x, y, 0xFFFFFF);
         } else {
@@ -804,8 +827,10 @@ public class MapEditorScreen extends Screen {
             String frameHint = totalFrames > 1
                     ? "  §e" + (activeFrame + 1) + "/" + totalFrames + " " + frameDelay + "ms§r §8Ctrl+[/]" : "";
             String minimapHint = PayloadState.tiles.size() > 1 ? "  §8[G]tiles" : "";
+            String scopeSuffix = mergeScope != MergeScope.FRAME
+                    ? (mergeScope == MergeScope.TILE ? "/tile" : "/all") : "";
             String mergeHint   = mergeSources.isEmpty() ? ""
-                    : "  §c[" + mergeSources.size() + " merge]§r §8C=commit";
+                    : "  §c[" + mergeSources.size() + " merge" + scopeSuffix + "]§r §8C=commit";
             left = "§8" + tileLabel + "  §r" + toolStr + undoHint + redoHint
                     + ditherHint + reqHint + selHint + frameHint + minimapHint + mergeHint;
         }
@@ -939,6 +964,15 @@ public class MapEditorScreen extends Screen {
         // ── Canvas ───────────────────────────────────────────────────────
         if (!inMapBounds(hoverMapX, hoverMapY))
             return super.mouseClicked(mouseX, mouseY, button);
+
+        // Ctrl+left-click on canvas: toggle color under cursor in merge-source set
+        if (button == 0 && hasControlDown()) {
+            int c = mapColors[hoverMapX + hoverMapY * MAP_SIZE] & 0xFF;
+            if (c != 0) {
+                if (!mergeSources.remove(c)) mergeSources.add(c);
+            }
+            return true;
+        }
 
         // Eyedropper: left-click picks colour and reverts to previous tool
         if (button == 0 && currentTool == Tool.EYEDROPPER) {
@@ -1157,9 +1191,37 @@ public class MapEditorScreen extends Screen {
         }
         if (keyCode == GLFW.GLFW_KEY_C) {
             if (mergeSources.isEmpty()) {
-                setStatusMsg("Ctrl+click palette swatches to queue colors for merging, then press C.");
+                setStatusMsg("Ctrl+click palette swatches or image pixels to queue colors for merging, then press C.");
             } else {
                 commitMerge();
+            }
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_V) {
+            MergeScope[] available = availableMergeScopes();
+            if (available.length > 1) {
+                int idx = 0;
+                for (int i = 0; i < available.length; i++) { if (available[i] == mergeScope) { idx = i; break; } }
+                mergeScope = available[(idx + 1) % available.length];
+                String label = switch (mergeScope) {
+                    case FRAME     -> "frame";
+                    case TILE      -> "tile (all frames)";
+                    case ALL_TILES -> "all tiles";
+                };
+                setStatusMsg("Merge scope: " + label);
+            }
+            return true;
+        }
+        if (keyCode == GLFW.GLFW_KEY_P) {
+            if (shift) {
+                PngToMapColors.FilterParams.FilterType[] types = PngToMapColors.FilterParams.FilterType.values();
+                int idx = 0;
+                for (int i = 0; i < types.length; i++) { if (types[i] == editorFilterType) { idx = i; break; } }
+                editorFilterType = types[(idx + 1) % types.length];
+                String name = editorFilterType.name().toLowerCase();
+                setStatusMsg("Filter: " + name + " (P to apply)");
+            } else {
+                applyEditorFilter();
             }
             return true;
         }
@@ -1403,31 +1465,174 @@ public class MapEditorScreen extends Screen {
 
     // ── Color merge ──────────────────────────────────────────────────────
 
+    private MergeScope[] availableMergeScopes() {
+        if (PayloadState.tiles.size() > 1) return MergeScope.values();
+        if (totalFrames > 1)              return new MergeScope[]{MergeScope.FRAME, MergeScope.TILE};
+        return new MergeScope[]{MergeScope.FRAME};
+    }
+
+    /** Applies the pending merge to one frame. Respects selMask only for the active frame. */
+    private int applyMergeToFrame(byte[] frame, boolean respectSel) {
+        int replaced = 0;
+        for (int i = 0; i < MAP_BYTES; i++) {
+            if (respectSel && selMask != null && !selMask[i]) continue;
+            if (mergeSources.contains(frame[i] & 0xFF)) {
+                frame[i] = (byte) activeColor;
+                replaced++;
+            }
+        }
+        return replaced;
+    }
+
     private void commitMerge() {
         if (mergeSources.isEmpty()) return;
-        // Exclude the replacement color itself from the source set (it's a no-op anyway,
-        // but excluding it keeps the "N sources replaced" count accurate).
+        // Exclude the replacement color from the source set — it's a no-op and
+        // would make the "N sources replaced" count inaccurate.
         mergeSources.remove(activeColor);
         if (mergeSources.isEmpty()) {
             setStatusMsg("All queued colors are already the target color.");
             return;
         }
         history.snapshot();
-        int replaced = 0;
-        for (int i = 0; i < MAP_BYTES; i++) {
-            if (selMask != null && !selMask[i]) continue;
-            if (mergeSources.contains(mapColors[i] & 0xFF)) {
-                mapColors[i] = (byte) activeColor;
-                replaced++;
+
+        switch (mergeScope) {
+            case FRAME -> {
+                int replaced = applyMergeToFrame(mapColors, true);
+                String sel = selMask != null ? " (in selection)" : "";
+                setStatusMsg(String.format("Merged %d color%s → idx %d: %d px replaced%s.",
+                        mergeSources.size(), mergeSources.size() == 1 ? "" : "s",
+                        activeColor, replaced, sel));
+            }
+            case TILE -> {
+                int total = 0;
+                for (byte[] frame : allFrames) total += applyMergeToFrame(frame, false);
+                setStatusMsg(String.format("Merged %d color%s → idx %d across %d frame%s: %d px replaced.",
+                        mergeSources.size(), mergeSources.size() == 1 ? "" : "s",
+                        activeColor, totalFrames, totalFrames == 1 ? "" : "s", total));
+            }
+            case ALL_TILES -> {
+                commitMergeAllTiles();
+                return; // commitMergeAllTiles handles dirty/rebuildTileColors/clear
+            }
+        }
+
+        dirty = true;
+        rebuildTileColors();
+        mergeSources.clear();
+    }
+
+    private void commitMergeAllTiles() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        String playerName = mc.player != null ? mc.player.getGameProfile().getName() : "Player";
+        int totalTiles = PayloadState.tiles.size();
+        int totalReplaced = 0;
+
+        // Capture undo state for all other tiles before modifying them
+        for (int i = 0; i < totalTiles; i++) {
+            if (i != tileIndex) LoominaryCommand.capturePreReductionState(i);
+        }
+
+        // Apply to current tile (all frames)
+        for (byte[] frame : allFrames) totalReplaced += applyMergeToFrame(frame, false);
+        dirty = true;
+
+        // Apply to all other tiles: decode → merge → re-encode
+        List<Integer> overBudget = new ArrayList<>();
+        for (int i = 0; i < totalTiles; i++) {
+            if (i == tileIndex) continue;
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            if (tile.chunks.isEmpty()) continue;
+            try {
+                byte[][] frames = LoominaryCommand.resolveAllFramesForTile(tile, tile.chunks);
+                int[] delays;
+                if (tile.frameDelays != null && !tile.frameDelays.isEmpty()) {
+                    delays = tile.frameDelays.stream().mapToInt(Integer::intValue).toArray();
+                } else {
+                    delays = new int[frames.length];
+                    Arrays.fill(delays, 100);
+                }
+                for (byte[] frame : frames) {
+                    for (int j = 0; j < MAP_BYTES; j++) {
+                        if (mergeSources.contains(frame[j] & 0xFF)) {
+                            frame[j] = (byte) activeColor;
+                            totalReplaced++;
+                        }
+                    }
+                }
+                LoominaryCommand.saveEditorChanges(frames, delays, i, playerName);
+                if (LoominaryCommand.isTileOverBudget(i)) overBudget.add(i + 1);
+            } catch (Exception e) {
+                setStatusMsg("Error on tile " + (i + 1) + ": " + e.getMessage());
+                mergeSources.clear();
+                rebuildTileColors();
+                return;
+            }
+        }
+
+        rebuildTileColors();
+        String budgetWarn = overBudget.isEmpty() ? ""
+                : " §cTiles " + overBudget + " over budget.";
+        setStatusMsg(String.format("Merged %d color%s → idx %d across all %d tiles: %d px replaced.%s "
+                + "§8/loominary reduce undo all to revert.",
+                mergeSources.size(), mergeSources.size() == 1 ? "" : "s",
+                activeColor, totalTiles, totalReplaced, budgetWarn));
+        mergeSources.clear();
+    }
+
+    // ── In-editor filter ────────────────────────────────────────────────
+
+    private void applyEditorFilter() {
+        PngToMapColors.FilterParams params = switch (editorFilterType) {
+            case SMOOTH    -> PngToMapColors.FilterParams.smooth(1.0f);
+            case MEDIAN    -> PngToMapColors.FilterParams.median(1);
+            case SHARPEN   -> PngToMapColors.FilterParams.sharpen(0.8f);
+            case POSTERIZE -> PngToMapColors.FilterParams.posterize(4);
+        };
+
+        // Build a BufferedImage from current frame's map color bytes via RGB lookup.
+        BufferedImage img = new BufferedImage(MAP_SIZE, MAP_SIZE, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < MAP_SIZE; y++) {
+            for (int x = 0; x < MAP_SIZE; x++) {
+                int cb = mapColors[x + y * MAP_SIZE] & 0xFF;
+                int argb = cb == 0 ? 0x00000000 : (0xFF000000 | colorLookup[cb]);
+                img.setRGB(x, y, argb);
+            }
+        }
+
+        BufferedImage filtered = PngToMapColors.applyFilter(img, params);
+
+        // Build the Oklab lookup for the current palette (tileColors only — avoids
+        // adding new colors that would increase banner count).
+        float[][] oklabLookup = PngToMapColors.buildOklabLookup();
+
+        history.snapshot();
+        for (int y = 0; y < MAP_SIZE; y++) {
+            for (int x = 0; x < MAP_SIZE; x++) {
+                int idx = x + y * MAP_SIZE;
+                if (mapColors[idx] == 0) continue;  // keep transparent
+                int rgb = filtered.getRGB(x, y);
+                if (((rgb >> 24) & 0xFF) < 128) { mapColors[idx] = 0; continue; }
+                // Find nearest color in the existing tile palette using Oklab distance.
+                float[] target = PngToMapColors.rgbToOklab(rgb);
+                int bestColor = mapColors[idx] & 0xFF;
+                float bestDist = Float.MAX_VALUE;
+                for (int c : tileColors) {
+                    if (c == 0 || oklabLookup[c] == null) continue;
+                    float dL = target[0]-oklabLookup[c][0], da = target[1]-oklabLookup[c][1],
+                          db = target[2]-oklabLookup[c][2];
+                    float d = dL*dL + da*da + db*db;
+                    if (d < bestDist) { bestDist = d; bestColor = c; }
+                }
+                mapColors[idx] = (byte) bestColor;
             }
         }
         dirty = true;
         rebuildTileColors();
-        String sel = selMask != null ? " (in selection)" : "";
-        setStatusMsg(String.format("Merged %d color%s → idx %d: %d pixel%s replaced%s.",
-                mergeSources.size(), mergeSources.size() == 1 ? "" : "s",
-                activeColor, replaced, replaced == 1 ? "" : "s", sel));
-        mergeSources.clear();
+        boolean weakInEditor = editorFilterType == PngToMapColors.FilterParams.FilterType.POSTERIZE
+                || editorFilterType == PngToMapColors.FilterParams.FilterType.SHARPEN;
+        String hint = weakInEditor ? " (use /loominary filter for full effect)" : "";
+        setStatusMsg(String.format("Applied %s to frame. Ctrl+Z to undo.%s",
+                editorFilterType.name().toLowerCase(), hint));
     }
 
     // ── Re-encode on close ───────────────────────────────────────────────
@@ -1533,31 +1738,42 @@ public class MapEditorScreen extends Screen {
     // ── EditHistory ──────────────────────────────────────────────────────
 
     private class EditHistory {
-        private final Deque<byte[]> undoStack = new ArrayDeque<>();
-        private final Deque<byte[]> redoStack = new ArrayDeque<>();
+        private final Deque<byte[][]> undoStack = new ArrayDeque<>();
+        private final Deque<byte[][]> redoStack = new ArrayDeque<>();
 
         void snapshot() {
             if (undoStack.size() >= UNDO_DEPTH) undoStack.removeLast();
-            undoStack.push(mapColors.clone());
+            undoStack.push(cloneAllFrames());
             redoStack.clear();
         }
 
         void undo() {
             if (undoStack.isEmpty()) return;
-            redoStack.push(mapColors.clone());
-            System.arraycopy(undoStack.pop(), 0, mapColors, 0, MAP_BYTES);
+            redoStack.push(cloneAllFrames());
+            restoreAllFrames(undoStack.pop());
             dirty = true; rebuildTileColors();
         }
 
         void redo() {
             if (redoStack.isEmpty()) return;
-            undoStack.push(mapColors.clone());
-            System.arraycopy(redoStack.pop(), 0, mapColors, 0, MAP_BYTES);
+            undoStack.push(cloneAllFrames());
+            restoreAllFrames(redoStack.pop());
             dirty = true; rebuildTileColors();
         }
 
         boolean canUndo() { return !undoStack.isEmpty(); }
         boolean canRedo() { return !redoStack.isEmpty(); }
         void clear() { undoStack.clear(); redoStack.clear(); }
+
+        private byte[][] cloneAllFrames() {
+            byte[][] snap = new byte[allFrames.length][];
+            for (int f = 0; f < allFrames.length; f++) snap[f] = allFrames[f].clone();
+            return snap;
+        }
+
+        private void restoreAllFrames(byte[][] snap) {
+            for (int f = 0; f < Math.min(snap.length, allFrames.length); f++)
+                System.arraycopy(snap[f], 0, allFrames[f], 0, MAP_BYTES);
+        }
     }
 }

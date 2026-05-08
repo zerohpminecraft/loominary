@@ -67,10 +67,16 @@ import java.util.concurrent.ThreadLocalRandom;
  * /loominary revert — restore a previewed map to its original
  * /loominary edit — open the map editor for the active tile
  * /loominary dither [all] [colors <n>] — re-encode from source with Floyd-Steinberg dithering
- * /loominary palette — color stats + rarity histogram for active tile
+ * /loominary filter smooth [all] [radius <r>]   — Gaussian blur applied in-place (default r=1.5)
+ * /loominary filter median [all] [radius <r>]   — edge-preserving median in-place (default r=1)
+ * /loominary filter sharpen [all] [amount <a>]  — unsharp mask in-place (default a=0.8)
+ * /loominary filter posterize [all] <levels>    — posterize tones in-place (2–16)
+ * /loominary palette [all] — color stats + rarity histogram for active tile (or all tiles)
  * /loominary reduce [all] [<n>] — reduce tile(s) to n banners (default 255)
  * /loominary reduce [all] colors <n> — reduce tile(s) to n distinct colors
+ * /loominary reduce strategy <rarest|closest|weighted> — set reduction algorithm
  * /loominary reduce undo — restore active tile to pre-reduction state
+ * /loominary reduce undo all — restore all tiles to pre-reduction state
  * /loominary click — toggle auto-right-click of banners while holding map
  * /loominary click stop — stop auto-clicking
  * /loominary export [name] — write a Litematica .litematic for active tile
@@ -375,6 +381,21 @@ public class LoominaryCommand {
         return MapBannerDecoder.reassemblePayload(new ArrayList<>(chunks));
     }
 
+    /**
+     * Returns the compressed byte count for a carpet tile directly from the stored
+     * base64 data. This is reliable for any payload size; reading from the LC banner
+     * name header only works up to 65535 bytes (4 hex digits) and silently truncates
+     * for large animated tiles.
+     */
+    private static int carpetCompressedBytes(PayloadState.TileData tile) {
+        if (tile.carpetCompressedB64 == null || tile.carpetCompressedB64.isEmpty()) return 0;
+        String b64 = tile.carpetCompressedB64;
+        int len = b64.length() * 3 / 4;
+        if (b64.endsWith("==")) len -= 2;
+        else if (b64.endsWith("=")) len -= 1;
+        return len;
+    }
+
     /** Strips the file extension from a filename (e.g. "myimage.png" → "myimage"). */
     private static String filenameStem(String filename) {
         int dot = filename.lastIndexOf('.');
@@ -447,6 +468,34 @@ public class LoominaryCommand {
     private static final Map<Integer, List<String>> preReductionChunks = new HashMap<>();
     /** Parallel to preReductionChunks — saves carpetCompressedB64 for carpet tiles. */
     private static final Map<Integer, String> preReductionCarpetB64 = new HashMap<>();
+
+    /** Active reduce strategy — persists for the session, defaults to RAREST. */
+    private static PngToMapColors.Strategy reduceStrategy = PngToMapColors.Strategy.RAREST;
+
+    /** Returns true if the tile's current encoded data exceeds its channel's budget. */
+    public static boolean isTileOverBudget(int tileIdx) {
+        if (tileIdx >= PayloadState.tiles.size()) return false;
+        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+        if (tile.carpetEncoded) {
+            if (tile.carpetCompressedB64 == null) return false;
+            return Base64.getDecoder().decode(tile.carpetCompressedB64).length
+                    > CarpetChannel.MAX_TOTAL_BYTES;
+        }
+        List<String> chunks = (tileIdx == PayloadState.activeTileIndex)
+                ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
+        return chunks.size() > MAX_CHUNKS;
+    }
+
+    /**
+     * Captures the current chunk state for a tile into the pre-reduction undo cache.
+     * Uses putIfAbsent so a second reduce on the same tile doesn't clobber the original.
+     */
+    public static void capturePreReductionState(int tileIdx) {
+        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+        preReductionChunks.putIfAbsent(tileIdx, new ArrayList<>(tile.chunks));
+        if (tile.carpetEncoded && tile.carpetCompressedB64 != null)
+            preReductionCarpetB64.putIfAbsent(tileIdx, tile.carpetCompressedB64);
+    }
 
     /**
      * True when the user explicitly called /loominary title; false when the title is
@@ -641,11 +690,25 @@ public class LoominaryCommand {
 
                             // ── palette / reduce ───────────────────────────────
                             .then(ClientCommandManager.literal("palette")
-                                    .executes(ctx -> palette(ctx.getSource())))
+                                    .executes(ctx -> palette(ctx.getSource(), false))
+                                    .then(ClientCommandManager.literal("all")
+                                            .executes(ctx -> palette(ctx.getSource(), true))))
                             .then(ClientCommandManager.literal("reduce")
                                     .executes(ctx -> reduceOne(ctx.getSource(), 255))
                                     .then(ClientCommandManager.literal("undo")
-                                            .executes(ctx -> reduceUndo(ctx.getSource())))
+                                            .executes(ctx -> reduceUndo(ctx.getSource()))
+                                            .then(ClientCommandManager.literal("all")
+                                                    .executes(ctx -> reduceUndoAll(ctx.getSource()))))
+                                    .then(ClientCommandManager.literal("strategy")
+                                            .then(ClientCommandManager.literal("rarest")
+                                                    .executes(ctx -> setReduceStrategy(ctx.getSource(),
+                                                            PngToMapColors.Strategy.RAREST)))
+                                            .then(ClientCommandManager.literal("closest")
+                                                    .executes(ctx -> setReduceStrategy(ctx.getSource(),
+                                                            PngToMapColors.Strategy.CLOSEST)))
+                                            .then(ClientCommandManager.literal("weighted")
+                                                    .executes(ctx -> setReduceStrategy(ctx.getSource(),
+                                                            PngToMapColors.Strategy.WEIGHTED))))
                                     .then(ClientCommandManager.literal("all")
                                             .executes(ctx -> reduceAll(ctx.getSource(), 255))
                                             .then(ClientCommandManager.literal("colors")
@@ -712,6 +775,59 @@ public class LoominaryCommand {
                                             .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
                                                     .executes(ctx -> dither(ctx.getSource(), false,
                                                             IntegerArgumentType.getInteger(ctx, "n"))))))
+
+                            // ── filter ─────────────────────────────────────────
+                            .then(ClientCommandManager.literal("filter")
+                                    .then(ClientCommandManager.literal("smooth")
+                                            .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                    PngToMapColors.FilterParams.smooth(1.5f), false))
+                                            .then(ClientCommandManager.literal("all")
+                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                            PngToMapColors.FilterParams.smooth(1.5f), true))
+                                                    .then(ClientCommandManager.literal("radius")
+                                                            .then(ClientCommandManager.argument("r", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.5f, 5f))
+                                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                                            PngToMapColors.FilterParams.smooth(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "r")), true)))))
+                                            .then(ClientCommandManager.literal("radius")
+                                                    .then(ClientCommandManager.argument("r", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.5f, 5f))
+                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                                    PngToMapColors.FilterParams.smooth(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "r")), false)))))
+                                    .then(ClientCommandManager.literal("median")
+                                            .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                    PngToMapColors.FilterParams.median(1), false))
+                                            .then(ClientCommandManager.literal("all")
+                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                            PngToMapColors.FilterParams.median(1), true))
+                                                    .then(ClientCommandManager.literal("radius")
+                                                            .then(ClientCommandManager.argument("r", IntegerArgumentType.integer(1, 3))
+                                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                                            PngToMapColors.FilterParams.median(IntegerArgumentType.getInteger(ctx, "r")), true)))))
+                                            .then(ClientCommandManager.literal("radius")
+                                                    .then(ClientCommandManager.argument("r", IntegerArgumentType.integer(1, 3))
+                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                                    PngToMapColors.FilterParams.median(IntegerArgumentType.getInteger(ctx, "r")), false)))))
+                                    .then(ClientCommandManager.literal("sharpen")
+                                            .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                    PngToMapColors.FilterParams.sharpen(0.8f), false))
+                                            .then(ClientCommandManager.literal("all")
+                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                            PngToMapColors.FilterParams.sharpen(0.8f), true))
+                                                    .then(ClientCommandManager.literal("amount")
+                                                            .then(ClientCommandManager.argument("a", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.1f, 3f))
+                                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                                            PngToMapColors.FilterParams.sharpen(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "a")), true)))))
+                                            .then(ClientCommandManager.literal("amount")
+                                                    .then(ClientCommandManager.argument("a", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.1f, 3f))
+                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                                    PngToMapColors.FilterParams.sharpen(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "a")), false)))))
+                                    .then(ClientCommandManager.literal("posterize")
+                                            .then(ClientCommandManager.literal("all")
+                                                    .then(ClientCommandManager.argument("levels", IntegerArgumentType.integer(2, 16))
+                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                                    PngToMapColors.FilterParams.posterize(IntegerArgumentType.getInteger(ctx, "levels")), true))))
+                                            .then(ClientCommandManager.argument("levels", IntegerArgumentType.integer(2, 16))
+                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
+                                                            PngToMapColors.FilterParams.posterize(IntegerArgumentType.getInteger(ctx, "levels")), false)))))
 
                             // ── resalt ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("resalt")
@@ -1318,8 +1434,7 @@ public class LoominaryCommand {
                                 columns, rows, finalTileCount, finalTileCount == 1 ? "" : "s", modeTag)));
                         for (int i = 0; i < finalTiles.size(); i++) {
                             PayloadState.TileData tile = finalTiles.get(i);
-                            String lcName = tile.chunks.isEmpty() ? "" : tile.chunks.get(0);
-                            int totalBytes = lcName.length() >= 6 ? Integer.parseInt(lcName.substring(2, 6), 16) : 0;
+                            int totalBytes = carpetCompressedBytes(tile);
                             boolean overBudget = totalBytes > CarpetChannel.MAX_TOTAL_BYTES;
                             int cb = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
                             int sb = Math.min(totalBytes - cb, CarpetChannel.MAX_SHADE_BYTES);
@@ -1416,8 +1531,6 @@ public class LoominaryCommand {
                 CarpetEncoding enc = buildCarpetEncoding(manifestBytes, allFramesBytes);
                 String tileNote = null;
                 if (enc.compressed().length > CarpetChannel.MAX_TOTAL_BYTES) {
-                    tileNote = String.format("OVER BUDGET: %d bytes (max %d)",
-                            enc.compressed().length, CarpetChannel.MAX_TOTAL_BYTES);
                     anyOverflow = true;
                 }
 
@@ -1471,8 +1584,7 @@ public class LoominaryCommand {
                     for (int i = 0; i < finalTiles.size(); i++) {
                         PayloadState.TileData tile = finalTiles.get(i);
                         int overflowBanners = tile.chunks.size() - 1;
-                        String lcName = tile.chunks.isEmpty() ? "" : tile.chunks.get(0);
-                        int totalBytes = lcName.length() >= 6 ? Integer.parseInt(lcName.substring(2, 6), 16) : 0;
+                        int totalBytes = carpetCompressedBytes(tile);
                         boolean overBudget = totalBytes > CarpetChannel.MAX_TOTAL_BYTES;
                         int carpetRows = (Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES) * 2 + 127) / 128;
                         String budgetTag = overBudget
@@ -1481,8 +1593,6 @@ public class LoominaryCommand {
                                 "§7  %s: §f%d carpet rows, %d overflow banner%s §7(%d bytes)%s",
                                 PayloadState.tileLabel(i), carpetRows, overflowBanners,
                                 overflowBanners == 1 ? "" : "s", totalBytes, budgetTag)));
-                        if (finalNotes.get(i) != null)
-                            source.sendFeedback(Text.literal("§e    ↳ " + finalNotes.get(i)));
                     }
                     source.sendFeedback(Text.literal("§aSchematics written to schematics/:"));
                     for (Path p : finalSchematics) source.sendFeedback(Text.literal("§7  " + p.getFileName()));
@@ -1726,9 +1836,7 @@ public class LoominaryCommand {
             if (tile.carpetEncoded) {
                 List<String> chunks = (i == PayloadState.activeTileIndex)
                         ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
-                String lcName = chunks.isEmpty() ? "" : chunks.get(0);
-                int compressedBytes = lcName.length() >= 6
-                        ? Integer.parseInt(lcName.substring(2, 6), 16) : 0;
+                int compressedBytes = carpetCompressedBytes(tile);
                 int overflowBanners = chunks.size() - 1;
                 boolean overBudget = compressedBytes > CarpetChannel.MAX_TOTAL_BYTES;
                 if (overBudget) {
@@ -2025,7 +2133,7 @@ public class LoominaryCommand {
     // "reduce undo" can restore the active tile.
     // ════════════════════════════════════════════════════════════════════
 
-    private static int palette(FabricClientCommandSource source) {
+    private static int palette(FabricClientCommandSource source, boolean all) {
         if (PayloadState.tiles.isEmpty()) {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
@@ -2036,16 +2144,89 @@ public class LoominaryCommand {
         }
 
         try {
-            byte[] mapColors = resolveMapColors();
+            // ── Build the union and collect budget info ──────────────────────
+            final byte[] union;
+            final int fc;
+            final String header;
+            final String budgetLine;
+
+            if (!all) {
+                int tileIdx = PayloadState.activeTileIndex;
+                PayloadState.TileData tileData = PayloadState.tiles.get(tileIdx);
+                byte[][] frames = resolveAllFramesForTile(tileData, PayloadState.ACTIVE_CHUNKS);
+                fc = frames.length;
+                union = mergeFrames(frames);
+                header = PayloadState.tileLabel(tileIdx);
+
+                int bannerCount = PayloadState.ACTIVE_CHUNKS.size();
+                if (tileData.carpetEncoded) {
+                    int cb = carpetCompressedBytes(tileData);
+                    boolean over = cb > CarpetChannel.MAX_TOTAL_BYTES;
+                    budgetLine = String.format("§7Compressed:      §f%d §7/ §f%d bytes%s",
+                            cb, CarpetChannel.MAX_TOTAL_BYTES,
+                            over ? " §c(OVER BUDGET by " + (cb - CarpetChannel.MAX_TOTAL_BYTES) + ")" : " §a✓");
+                } else {
+                    budgetLine = String.format("§7Banners needed:  §f%d §7/ §f%d%s",
+                            bannerCount, MAX_CHUNKS,
+                            bannerCount > MAX_CHUNKS
+                                    ? " §c(OVER BUDGET by " + (bannerCount - MAX_CHUNKS) + ")" : " §a✓");
+                }
+            } else {
+                PayloadState.syncToActiveTile();
+                int totalFrames = 0;
+                int overBudgetCount = 0;
+                int totalChunks = 0;
+                long totalCompressedBytes = 0;
+                boolean anyCarpet = false;
+                List<byte[]> allFramesList = new ArrayList<>();
+
+                for (int i = 0; i < PayloadState.tiles.size(); i++) {
+                    PayloadState.TileData td = PayloadState.tiles.get(i);
+                    List<String> chunks = (i == PayloadState.activeTileIndex)
+                            ? PayloadState.ACTIVE_CHUNKS : td.chunks;
+                    if (chunks.isEmpty()) continue;
+                    byte[][] tileFrames = resolveAllFramesForTile(td, chunks);
+                    for (byte[] f : tileFrames) allFramesList.add(f);
+                    totalFrames += tileFrames.length;
+                    if (td.carpetEncoded) {
+                        anyCarpet = true;
+                        int cb = carpetCompressedBytes(td);
+                        totalCompressedBytes += cb;
+                        if (cb > CarpetChannel.MAX_TOTAL_BYTES) overBudgetCount++;
+                    } else {
+                        totalChunks += chunks.size();
+                        if (chunks.size() > MAX_CHUNKS) overBudgetCount++;
+                    }
+                }
+
+                byte[] combined = new byte[allFramesList.size() * MAP_BYTES];
+                for (int i = 0; i < allFramesList.size(); i++)
+                    System.arraycopy(allFramesList.get(i), 0, combined, i * MAP_BYTES, MAP_BYTES);
+                union = combined;
+                fc = totalFrames;
+
+                int tileCount = PayloadState.tiles.size();
+                header = String.format("all tiles (%d tile%s, %d frame%s)",
+                        tileCount, tileCount == 1 ? "" : "s",
+                        totalFrames, totalFrames == 1 ? "" : "s");
+
+                if (anyCarpet) {
+                    budgetLine = String.format("§7Compressed:      §f%d §7bytes total%s",
+                            totalCompressedBytes,
+                            overBudgetCount > 0 ? " §c(" + overBudgetCount + " tile" + (overBudgetCount == 1 ? "" : "s") + " OVER BUDGET)" : " §a✓");
+                } else {
+                    budgetLine = String.format("§7Banners needed:  §f%d §7total%s",
+                            totalChunks,
+                            overBudgetCount > 0 ? " §c(" + overBudgetCount + " tile" + (overBudgetCount == 1 ? "" : "s") + " OVER BUDGET)" : " §a✓");
+                }
+            }
 
             int[] freq = new int[256];
-            for (byte b : mapColors)
-                freq[b & 0xFF]++;
+            for (byte b : union) freq[b & 0xFF]++;
 
-            int distinctColors = PngToMapColors.countDistinct(mapColors);
-            int bannerCount = PayloadState.ACTIVE_CHUNKS.size();
+            int distinctColors = PngToMapColors.countDistinct(union);
+            int totalPixels = MAP_BYTES * fc;
 
-            int[] colorRgb = PngToMapColors.buildColorLookup();
             List<int[]> colorsByFreq = new ArrayList<>();
             for (int c = 1; c < 256; c++) {
                 if (freq[c] > 0)
@@ -2053,81 +2234,90 @@ public class LoominaryCommand {
             }
             colorsByFreq.sort((a, b) -> Integer.compare(a[1], b[1]));
 
+            source.sendFeedback(Text.literal("§6=== Palette: " + header + " ==="));
+            String frameNote = fc > 1 ? String.format(" §8(across %d frames)", fc) : "";
             source.sendFeedback(Text.literal(String.format(
-                    "§6=== Palette: %s ===",
-                    PayloadState.tileLabel(PayloadState.activeTileIndex))));
-            source.sendFeedback(Text.literal(String.format(
-                    "§7Distinct colors: §f%d", distinctColors)));
-            source.sendFeedback(Text.literal(String.format(
-                    "§7Banners needed:  §f%d §7/ §f%d%s",
-                    bannerCount, MAX_CHUNKS,
-                    bannerCount > MAX_CHUNKS
-                            ? " §c(OVER BUDGET by " + (bannerCount - MAX_CHUNKS) + ")"
-                            : " §a✓")));
+                    "§7Distinct colors: §f%d%s", distinctColors, frameNote)));
+            source.sendFeedback(Text.literal(budgetLine));
 
-            if (preReductionChunks.containsKey(PayloadState.activeTileIndex)) {
+            if (!all && preReductionChunks.containsKey(PayloadState.activeTileIndex)) {
                 source.sendFeedback(Text.literal("§7Reduction:       §eactive §7(undo available)"));
             }
 
-            // ── Rarity distribution histogram ──────────────────────────────
-            int[] bucketBounds  = {1, 5, 20, 100, Integer.MAX_VALUE};
-            String[] bucketLbls = {"    1px", " 2- 5px", " 6-20px", "21-100px", "  101+px"};
-            int[] bucketColors  = new int[5];
-            int[] bucketPixels  = new int[5];
-            for (int c = 1; c < 256; c++) {
-                if (freq[c] == 0) continue;
-                for (int b = 0; b < bucketBounds.length; b++) {
-                    if (freq[c] <= bucketBounds[b]) {
-                        bucketColors[b]++;
-                        bucketPixels[b] += freq[c];
-                        break;
-                    }
+            // ── Rarity distribution histogram (sigmoid-based bucket boundaries) ───
+            // Compute 4 thresholds by mapping logistic quantiles at 20/40/60/80%
+            // through the log-normal distribution of frequencies.  This adapts the
+            // bucket boundaries to the actual range of the data rather than using
+            // hard-coded pixel counts that become meaningless for multi-frame tiles.
+            {
+                double sumL = 0, sumL2 = 0;
+                for (int[] e : colorsByFreq) {
+                    double l = Math.log(Math.max(1, e[1]));
+                    sumL += l; sumL2 += l * l;
                 }
-            }
-            int maxBucket = 0;
-            for (int cnt : bucketColors) maxBucket = Math.max(maxBucket, cnt);
+                int nC = colorsByFreq.size();
+                double mL = sumL / nC;
+                double sL = Math.sqrt(Math.max(1e-12, sumL2 / nC - mL * mL));
 
-            source.sendFeedback(Text.literal("§7Color rarity distribution:"));
-            final int BAR_WIDTH = 16;
-            for (int b = 0; b < 5; b++) {
-                if (bucketColors[b] == 0) continue;
-                int bars = maxBucket > 0
-                        ? Math.max(1, bucketColors[b] * BAR_WIDTH / maxBucket) : 0;
-                String bar = "§a" + "█".repeat(bars) + "§8" + "░".repeat(BAR_WIDTH - bars);
-                source.sendFeedback(Text.literal(String.format(
-                        "§7 %s §f%3d §7colors  %s §7%.1f%%",
-                        bucketLbls[b], bucketColors[b], bar, 100.0 * bucketPixels[b] / MAP_BYTES)));
+                // logit(p) = log(p/(1-p)) at p = 0.2, 0.4, 0.6, 0.8
+                double[] logits = {-1.3863, -0.4055, 0.4055, 1.3863};
+                int[] th = new int[logits.length];
+                for (int i = 0; i < logits.length; i++)
+                    th[i] = Math.max(1, (int) Math.round(Math.exp(mL + sL * logits[i])));
+                // Ensure strictly increasing
+                for (int i = 1; i < th.length; i++)
+                    th[i] = Math.max(th[i], th[i - 1] + 1);
+
+                int nb = th.length + 1;
+                int[] bc = new int[nb], bp = new int[nb];
+                for (int[] e : colorsByFreq) {
+                    int bk = nb - 1;
+                    for (int i = 0; i < th.length; i++) if (e[1] <= th[i]) { bk = i; break; }
+                    bc[bk]++; bp[bk] += e[1];
+                }
+
+                String[] lbls = new String[nb];
+                lbls[0] = "1-" + th[0] + "px";
+                for (int i = 1; i < th.length; i++)
+                    lbls[i] = (th[i - 1] + 1) + "-" + th[i] + "px";
+                lbls[nb - 1] = (th[th.length - 1] + 1) + "+px";
+
+                int maxLbl = 0;
+                for (String l : lbls) maxLbl = Math.max(maxLbl, l.length());
+                int maxBucket = 0;
+                for (int v : bc) maxBucket = Math.max(maxBucket, v);
+
+                source.sendFeedback(Text.literal("§7Color rarity distribution:"));
+                final int BAR_WIDTH = 16;
+                for (int b = 0; b < nb; b++) {
+                    if (bc[b] == 0) continue;
+                    int bars = maxBucket > 0 ? Math.max(1, bc[b] * BAR_WIDTH / maxBucket) : 0;
+                    String bar = "§a" + "█".repeat(bars) + "§8" + "░".repeat(BAR_WIDTH - bars);
+                    String lbl = String.format("%" + maxLbl + "s", lbls[b]);
+                    source.sendFeedback(Text.literal(String.format(
+                            "§7 %s §f%3d §7colors  %s §7%.1f%%",
+                            lbl, bc[b], bar, 100.0 * bp[b] / totalPixels)));
+                }
             }
 
             // ── Cumulative removal cost at fixed thresholds ────────────────
             if (distinctColors > 2) {
                 int[] thresholds = {5, 10, 20, 50};
-                source.sendFeedback(Text.literal("§7Removal cost (rarest-first):"));
+                String costLabel = all ? "§7Removal cost (rarest-first, per frame across all tiles):"
+                        : fc > 1 ? "§7Removal cost (rarest-first, per frame):" : "§7Removal cost (rarest-first):";
+                source.sendFeedback(Text.literal(costLabel));
                 int cumPixels = 0, threshIdx = 0;
                 for (int i = 0; i < colorsByFreq.size() - 1 && threshIdx < thresholds.length; i++) {
                     if (thresholds[threshIdx] >= distinctColors) break;
                     cumPixels += colorsByFreq.get(i)[1];
                     if (i + 1 == thresholds[threshIdx]) {
                         source.sendFeedback(Text.literal(String.format(
-                                "§7  remove %2d: §f%5d §7px (§f%.1f%%§7 of tile)",
-                                thresholds[threshIdx], cumPixels,
-                                100.0 * cumPixels / MAP_BYTES)));
+                                "§7  remove %2d: §f%5d §7px (§f%.1f%%§7 of frame)",
+                                thresholds[threshIdx], cumPixels / fc,
+                                100.0 * cumPixels / totalPixels)));
                         threshIdx++;
                     }
                 }
-            }
-
-            // ── Rarest individual colors ───────────────────────────────────
-            int showCount = Math.min(10, colorsByFreq.size());
-            source.sendFeedback(Text.literal(String.format(
-                    "§7Rarest %d colors:", showCount)));
-            for (int i = 0; i < showCount; i++) {
-                int[] entry = colorsByFreq.get(i);
-                int rgb = colorRgb[entry[0]];
-                String hex = String.format("#%06X", rgb & 0xFFFFFF);
-                double pct = 100.0 * entry[1] / MAP_BYTES;
-                source.sendFeedback(Text.literal(String.format(
-                        "§7  %s §8— §f%d px §7(%.1f%%)", hex, entry[1], pct)));
             }
             return 1;
         } catch (Exception e) {
@@ -2230,7 +2420,10 @@ public class LoominaryCommand {
         final int flags                = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
 
         importInProgress = true;
-        source.sendFeedback(Text.literal("§7Reducing " + PayloadState.tileLabel(tileIdx) + "..."));
+        String bannerTag = reduceStrategy == PngToMapColors.Strategy.RAREST ? "rarest"
+                : "rarest §8(banner target; use 'colors' for " + reduceStrategy.name().toLowerCase() + ")";
+        source.sendFeedback(Text.literal("§7Reducing " + PayloadState.tileLabel(tileIdx)
+                + " §8[" + bannerTag + "]§7..."));
 
         MinecraftClient client = MinecraftClient.getInstance();
         Thread t = new Thread(() -> {
@@ -2241,11 +2434,13 @@ public class LoominaryCommand {
                 int[] delays = tileDelays(tileSnap, fc);
                 byte[] prefix = buildReduceManifest(tileIdx, 0L, playerName, flags, fc, delays);
 
-                // Carpet budget is measured in base64 chunk capacity (MAX_CHUNKS_CARPET × 36 bytes ≈ 12,473);
-                // banner-only tiles use the CJK budget (MAX_CHUNKS × 84 bytes).
+                // Banner-count targeting always uses RAREST: the selected strategy answers
+                // "which colors look similar?" while RAREST answers "which merge saves the
+                // most banners?" — CLOSEST/WEIGHTED can merge common colors in one step,
+                // dropping the banner count far below the target unpredictably.
                 PngToMapColors.FitResult fit = isCarpet
-                        ? PngToMapColors.reduceToFit(union, prefix, CHUNK_SIZE, MAX_CHUNKS_CARPET)
-                        : PngToMapColors.reduceToFitKJ(union, prefix, effectiveTarget);
+                        ? PngToMapColors.reduceToFit(union, prefix, CHUNK_SIZE, MAX_CHUNKS_CARPET, PngToMapColors.Strategy.RAREST, null)
+                        : PngToMapColors.reduceToFitKJ(union, prefix, effectiveTarget, PngToMapColors.Strategy.RAREST, null);
 
                 long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
@@ -2325,7 +2520,8 @@ public class LoominaryCommand {
         final int flags                = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
 
         importInProgress = true;
-        source.sendFeedback(Text.literal("§7Reducing " + PayloadState.tileLabel(tileIdx) + "..."));
+        source.sendFeedback(Text.literal("§7Reducing " + PayloadState.tileLabel(tileIdx)
+                + " §8[" + reduceStrategy.name().toLowerCase() + "]§7..."));
 
         MinecraftClient client = MinecraftClient.getInstance();
         Thread t = new Thread(() -> {
@@ -2350,8 +2546,9 @@ public class LoominaryCommand {
                 int[] delays  = tileDelays(tileSnap, fc);
                 byte[] prefix = buildReduceManifest(tileIdx, 0L, playerName, flags, fc, delays);
 
+                int[] normFreq = buildNormFreq(frames, fc, reduceStrategy);
                 PngToMapColors.FitResult fit = PngToMapColors.reduceToColorCount(
-                        union, prefix, CHUNK_SIZE, targetColors);
+                        union, prefix, CHUNK_SIZE, targetColors, reduceStrategy, normFreq);
 
                 long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
@@ -2439,7 +2636,9 @@ public class LoominaryCommand {
         }
 
         importInProgress = true;
-        source.sendFeedback(Text.literal("§7Reducing all tiles..."));
+        String allBannerTag = reduceStrategy == PngToMapColors.Strategy.RAREST ? "rarest"
+                : "rarest §8(banner target; use 'colors' for " + reduceStrategy.name().toLowerCase() + ")";
+        source.sendFeedback(Text.literal("§7Reducing all tiles §8[" + allBannerTag + "]§7..."));
 
         // Per-tile results: null = skipped, non-null = [manifest, mapColors, fc, note]
         record TileResult(byte[] manifest, byte[] mapColors, int fc, String note) {}
@@ -2463,9 +2662,10 @@ public class LoominaryCommand {
                     byte[] union = mergeFrames(frames);
                     int[] delays = tileDelays(tileSnap, fc);
                     byte[] prefix = buildReduceManifest(i, 0L, playerName, flags, fc, delays);
+                    // Banner-count targeting always uses RAREST (see reduceOne for rationale).
                     PngToMapColors.FitResult fit = tileSnap.carpetEncoded
-                            ? PngToMapColors.reduceToFit(union, prefix, CHUNK_SIZE, tileTarget)
-                            : PngToMapColors.reduceToFitKJ(union, prefix, tileTarget);
+                            ? PngToMapColors.reduceToFit(union, prefix, CHUNK_SIZE, tileTarget, PngToMapColors.Strategy.RAREST, null)
+                            : PngToMapColors.reduceToFitKJ(union, prefix, tileTarget, PngToMapColors.Strategy.RAREST, null);
                     long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
                     int oldSz = oldSizes.get(i);
@@ -2533,7 +2733,8 @@ public class LoominaryCommand {
                             "§7%d tile%s reduced. Total: %d colors merged, %d pixels affected.",
                             finalReduced, finalReduced == 1 ? "" : "s", finalColors, finalPixels)));
                     source.sendFeedback(Text.literal(
-                            "§7Use §f/loominary tile <n>§7 + §f/loominary reduce undo§7 to restore individual tiles."));
+                            "§7Use §f/loominary reduce undo all§7 to restore all tiles, or "
+                            + "§f/loominary tile <n>§7 + §f/loominary reduce undo§7 for one tile."));
                 } finally {
                     importInProgress = false;
                 }
@@ -2572,7 +2773,7 @@ public class LoominaryCommand {
         }
 
         importInProgress = true;
-        source.sendFeedback(Text.literal("§7Reducing all tiles (by color count)..."));
+        source.sendFeedback(Text.literal("§7Reducing all tiles §8[" + reduceStrategy.name().toLowerCase() + "]§7..."));
 
         record TileResult(byte[] manifest, byte[] mapColors, int fc,
                           int origColors, int newColors, String noteExtra) {}
@@ -2594,8 +2795,9 @@ public class LoominaryCommand {
                     if (current <= targetColors) { results.add(null); continue; }
                     int[] delays  = tileDelays(tileSnap, fc);
                     byte[] prefix = buildReduceManifest(i, 0L, playerName, flags, fc, delays);
+                    int[] normFreq = buildNormFreq(frames, fc, reduceStrategy);
                     PngToMapColors.FitResult fit = PngToMapColors.reduceToColorCount(
-                            union, prefix, CHUNK_SIZE, targetColors);
+                            union, prefix, CHUNK_SIZE, targetColors, reduceStrategy, normFreq);
                     long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
                     results.add(new TileResult(manifest, fit.mapColors, fc,
@@ -2658,7 +2860,8 @@ public class LoominaryCommand {
                             "§7%d tile%s reduced. Total: %d colors merged, %d pixels affected.",
                             finalReduced, finalReduced == 1 ? "" : "s", finalColors, finalPixels)));
                     source.sendFeedback(Text.literal(
-                            "§7Use §f/loominary tile <n>§7 + §f/loominary reduce undo§7 to restore individual tiles."));
+                            "§7Use §f/loominary reduce undo all§7 to restore all tiles, or "
+                            + "§f/loominary tile <n>§7 + §f/loominary reduce undo§7 for one tile."));
                 } finally {
                     importInProgress = false;
                 }
@@ -2666,6 +2869,72 @@ public class LoominaryCommand {
         });
         t.setDaemon(true);
         t.start();
+        return 1;
+    }
+
+    /**
+     * For WEIGHTED strategy on animated tiles: compute max per-frame frequency for each
+     * color byte. This prevents union frequency inflation (a color in all N frames has
+     * N× the union freq of a frame-specific color) from distorting WEIGHTED scoring.
+     * Returns null for single-frame tiles or non-WEIGHTED strategies.
+     */
+    private static int[] buildNormFreq(byte[][] frames, int fc, PngToMapColors.Strategy strategy) {
+        if (strategy != PngToMapColors.Strategy.WEIGHTED || fc <= 1) return null;
+        int[] normFreq = new int[256];
+        for (byte[] frame : frames) {
+            int[] ff = new int[256];
+            for (byte b : frame) ff[b & 0xFF]++;
+            for (int c = 1; c < 256; c++)
+                normFreq[c] = Math.max(normFreq[c], ff[c]);
+        }
+        return normFreq;
+    }
+
+    private static int setReduceStrategy(FabricClientCommandSource source,
+                                          PngToMapColors.Strategy strategy) {
+        reduceStrategy = strategy;
+        String name = switch (strategy) {
+            case RAREST   -> "rarest";
+            case CLOSEST  -> "closest";
+            case WEIGHTED -> "weighted";
+        };
+        String desc = switch (strategy) {
+            case RAREST   -> "removes the least-frequent color each step, merging it to its nearest neighbor";
+            case CLOSEST  -> "merges the globally closest color pair each step — targets similar-color clusters";
+            case WEIGHTED -> "scores pairs by dist²/(freq_a+freq_b) — large similar-color clusters are eliminated first";
+        };
+        source.sendFeedback(Text.literal("§aReduce strategy: §f" + name));
+        source.sendFeedback(Text.literal("§7" + desc));
+        return 1;
+    }
+
+    private static int reduceUndoAll(FabricClientCommandSource source) {
+        if (preReductionChunks.isEmpty()) {
+            source.sendError(Text.literal("§cNothing to undo — no tiles have a saved pre-reduction state."));
+            return 0;
+        }
+        List<Integer> tileIndices = new ArrayList<>(preReductionChunks.keySet());
+        int restored = 0;
+        for (int tileIdx : tileIndices) {
+            List<String> saved = preReductionChunks.remove(tileIdx);
+            if (saved == null || tileIdx >= PayloadState.tiles.size()) continue;
+            PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+            String savedB64 = preReductionCarpetB64.remove(tileIdx);
+            if (tile.carpetEncoded && savedB64 != null) tile.carpetCompressedB64 = savedB64;
+            tile.chunks.clear();
+            tile.chunks.addAll(saved);
+            tile.currentIndex = 0;
+            if (tileIdx == PayloadState.activeTileIndex) {
+                PayloadState.ACTIVE_CHUNKS.clear();
+                PayloadState.ACTIVE_CHUNKS.addAll(saved);
+                PayloadState.activeChunkIndex = 0;
+            }
+            restored++;
+        }
+        PayloadState.save();
+        source.sendFeedback(Text.literal(String.format(
+                "§aRestored %d tile%s to pre-reduction state.",
+                restored, restored == 1 ? "" : "s")));
         return 1;
     }
 
@@ -3092,6 +3361,104 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cFailed to decode tile: " + e.getMessage()));
             return 0;
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // filter <smooth|median|sharpen|posterize> [all] [param]
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * Applies a filter to every frame of the current tile(s) in-place.
+     * Decodes the existing encoded state, applies the spatial filter to each frame's
+     * pixel data (via color-lookup reconstruction → filter → re-quantize to existing
+     * palette), then re-encodes. Works on any tile regardless of source availability,
+     * preserving skip/stride/reduce work the user has already done.
+     */
+    private static int filterInPlace(FabricClientCommandSource source,
+                                     PngToMapColors.FilterParams filter, boolean all) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+
+        if (importInProgress) {
+            source.sendError(Text.literal("§cA long operation is already in progress."));
+            return 0;
+        }
+
+        String filterTag = switch (filter.type()) {
+            case SMOOTH    -> String.format("smooth r=%.1f", filter.strength());
+            case MEDIAN    -> String.format("median r=%d",   (int) filter.strength());
+            case SHARPEN   -> String.format("sharpen a=%.1f", filter.strength());
+            case POSTERIZE -> String.format("posterize %d",  (int) filter.strength());
+        };
+
+        PayloadState.syncToActiveTile();
+        String playerName = source.getPlayer().getGameProfile().getName();
+        int first = all ? 0 : PayloadState.activeTileIndex;
+        int last  = all ? PayloadState.tiles.size() - 1 : PayloadState.activeTileIndex;
+
+        // Snapshot current state before going async; capture undo for affected tiles.
+        List<List<String>> allChunks = new ArrayList<>();
+        List<PayloadState.TileData> allSnaps = new ArrayList<>();
+        for (int i = 0; i < PayloadState.tiles.size(); i++) {
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            allChunks.add(new ArrayList<>(i == PayloadState.activeTileIndex
+                    ? PayloadState.ACTIVE_CHUNKS : tile.chunks));
+            allSnaps.add(snapshotTile(tile));
+            if (i >= first && i <= last) capturePreReductionState(i);
+        }
+
+        importInProgress = true;
+        source.sendFeedback(Text.literal(String.format("§7Applying §f%s§7 filter to %s...",
+                filterTag, all ? "all tiles" : PayloadState.tileLabel(PayloadState.activeTileIndex))));
+
+        record FR(byte[][] frames, int[] delays) {}
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        Thread t = new Thread(() -> {
+            float[][] oklabLookup = PngToMapColors.buildOklabLookup();
+            List<FR> results = new ArrayList<>();
+
+            for (int i = 0; i < PayloadState.tiles.size(); i++) {
+                if (i < first || i > last) { results.add(null); continue; }
+                try {
+                    byte[][] frames = resolveAllFramesForTile(allSnaps.get(i), allChunks.get(i));
+                    int[] delays = tileDelays(allSnaps.get(i), frames.length);
+                    PngToMapColors.applyFilterToFrames(frames, filter, oklabLookup);
+                    results.add(new FR(frames, delays));
+                } catch (Exception e) {
+                    results.add(null);
+                }
+            }
+
+            client.execute(() -> {
+                try {
+                    int saved = 0;
+                    for (int i = 0; i < results.size(); i++) {
+                        FR r = results.get(i);
+                        if (r == null) continue;
+                        saveEditorChanges(r.frames(), r.delays(), i, playerName);
+                        int fc = r.frames().length;
+                        int colors = PngToMapColors.countDistinct(r.frames()[0]);
+                        source.sendFeedback(Text.literal(String.format("§7  %s: §f%d color%s, %d frame%s",
+                                PayloadState.tileLabel(i), colors, colors == 1 ? "" : "s",
+                                fc, fc == 1 ? "" : "s")));
+                        saved++;
+                    }
+                    PayloadState.syncFromActiveTile();
+                    source.sendFeedback(Text.literal(String.format(
+                            "§6=== Filter [%s] applied to %d tile%s ===",
+                            filterTag, saved, saved == 1 ? "" : "s")));
+                    source.sendFeedback(Text.literal(
+                            "§7Use §f/loominary preview§7 to inspect. "
+                            + "§f/loominary reduce undo§7 reverts."));
+                } finally { importInProgress = false; }
+            });
+        });
+        t.setDaemon(true);
+        t.start();
+        return 1;
     }
 
     // ════════════════════════════════════════════════════════════════════

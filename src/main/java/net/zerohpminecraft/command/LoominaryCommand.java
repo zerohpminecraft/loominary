@@ -137,9 +137,6 @@ public class LoominaryCommand {
 
         byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
         int total = compressed.length;
-        if (total > CarpetChannel.MAX_TOTAL_BYTES)
-            throw new IllegalStateException("Carpet payload over budget: "
-                    + total + " > " + CarpetChannel.MAX_TOTAL_BYTES);
 
         int carpetBytes = Math.min(total, CarpetChannel.MAX_CARPET_BYTES);
         // Use the shade channel only when the flat LC+overflow scheme can't hold the payload.

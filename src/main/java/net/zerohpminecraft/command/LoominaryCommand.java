@@ -137,6 +137,9 @@ public class LoominaryCommand {
 
         byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
         int total = compressed.length;
+        if (total > CarpetChannel.MAX_TOTAL_BYTES)
+            throw new IllegalStateException("Carpet payload over budget: "
+                    + total + " > " + CarpetChannel.MAX_TOTAL_BYTES);
 
         int carpetBytes = Math.min(total, CarpetChannel.MAX_CARPET_BYTES);
         // Use the shade channel only when the flat LC+overflow scheme can't hold the payload.
@@ -2241,8 +2244,11 @@ public class LoominaryCommand {
                 int[] delays = tileDelays(tileSnap, fc);
                 byte[] prefix = buildReduceManifest(tileIdx, 0L, playerName, flags, fc, delays);
 
-                PngToMapColors.FitResult fit = PngToMapColors.reduceToFitKJ(
-                        union, prefix, effectiveTarget);
+                // Carpet budget is measured in base64 chunk capacity (MAX_CHUNKS_CARPET × 36 bytes ≈ 12,473);
+                // banner-only tiles use the CJK budget (MAX_CHUNKS × 84 bytes).
+                PngToMapColors.FitResult fit = isCarpet
+                        ? PngToMapColors.reduceToFit(union, prefix, CHUNK_SIZE, MAX_CHUNKS_CARPET)
+                        : PngToMapColors.reduceToFitKJ(union, prefix, effectiveTarget);
 
                 long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
@@ -2460,8 +2466,9 @@ public class LoominaryCommand {
                     byte[] union = mergeFrames(frames);
                     int[] delays = tileDelays(tileSnap, fc);
                     byte[] prefix = buildReduceManifest(i, 0L, playerName, flags, fc, delays);
-                    PngToMapColors.FitResult fit = PngToMapColors.reduceToFitKJ(
-                            union, prefix, tileTarget);
+                    PngToMapColors.FitResult fit = tileSnap.carpetEncoded
+                            ? PngToMapColors.reduceToFit(union, prefix, CHUNK_SIZE, tileTarget)
+                            : PngToMapColors.reduceToFitKJ(union, prefix, tileTarget);
                     long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
                     int oldSz = oldSizes.get(i);

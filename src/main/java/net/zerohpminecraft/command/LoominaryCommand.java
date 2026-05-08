@@ -22,7 +22,6 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
-import net.zerohpminecraft.AlphabetTestHandler;
 import net.zerohpminecraft.AnvilAutoFillHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.CarpetChannel;
@@ -695,13 +694,6 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("name", StringArgumentType.string())
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
-
-                            // ── alphabettest ───────────────────────────────────
-                            .then(ClientCommandManager.literal("alphabettest")
-                                    .executes(ctx -> alphabetTest(ctx.getSource(), 6))
-                                    .then(ClientCommandManager.argument("wait", IntegerArgumentType.integer(2, 40))
-                                            .executes(ctx -> alphabetTest(ctx.getSource(),
-                                                    IntegerArgumentType.getInteger(ctx, "wait")))))
 
                             // ── edit ───────────────────────────────────────────
                             .then(ClientCommandManager.literal("edit")
@@ -3070,19 +3062,6 @@ public class LoominaryCommand {
 
     // ════════════════════════════════════════════════════════════════════
     // edit
-    // ════════════════════════════════════════════════════════════════════
-    // alphabettest
-    // ════════════════════════════════════════════════════════════════════
-
-    private static int alphabetTest(FabricClientCommandSource source, int wait) {
-        if (AlphabetTestHandler.isActive()) {
-            AlphabetTestHandler.stop(MinecraftClient.getInstance());
-            return 1;
-        }
-        AlphabetTestHandler.start(MinecraftClient.getInstance(), wait);
-        return 1;
-    }
-
     // ════════════════════════════════════════════════════════════════════
 
     private static int edit(FabricClientCommandSource source) {

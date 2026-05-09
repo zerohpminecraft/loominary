@@ -31,9 +31,10 @@ public class CarpetChannel {
     public static final int MAX_CARPET_BYTES  = MAP_PIXELS / 2;       // 8192
     /** Shade channel capacity: 31 four-row groups + 1 three-row tail, 128 cols. */
     public static final int MAX_SHADE_BYTES   = 31 * 128 * 4 / 8 + 128 * 2 / 8; // 2016
-    public static final int MAX_OVERFLOW_BYTES = 33 + 62 * 36;        // 2265
+    /** CJK overflow capacity: 62 banners × 84 bytes − 2 bytes for CjkCodec length header. */
+    public static final int MAX_OVERFLOW_BYTES = 62 * 84 - 2;          // 5206
     public static final int MAX_TOTAL_BYTES   =
-            MAX_CARPET_BYTES + MAX_SHADE_BYTES + MAX_OVERFLOW_BYTES;   // 12473
+            MAX_CARPET_BYTES + MAX_SHADE_BYTES + MAX_OVERFLOW_BYTES;   // 15414
 
     /** Base64 chars in the LC banner's overflow payload slot (no shade channel). */
     public static final int LC_PAYLOAD_CHARS = 44; // 33 bytes

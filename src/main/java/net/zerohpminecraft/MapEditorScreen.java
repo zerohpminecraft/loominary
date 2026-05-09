@@ -20,8 +20,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Deque;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -163,6 +165,10 @@ public class MapEditorScreen extends Screen {
     private float    ditherStrength = 1.0f;
     private boolean  showMask       = false;
 
+    // Compression heatmap: [H] toggle — red=rarest color, blue=most-frequent
+    private boolean       heatmapMode = false;
+    private final int[]   heatLut     = new int[256]; // ARGB per color byte, rebuilt with palette
+
     // Temporary status message (errors / hints; expires after 3 s)
     private String statusMsg       = null;
     private long   statusMsgExpiry = 0;
@@ -216,7 +222,7 @@ public class MapEditorScreen extends Screen {
         scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE,
                 Math.min(canvasW, canvasH) / MAP_SIZE));
         centerMap();
-        tileColors   = computeTileColors();
+        rebuildTileColors();
         allMapColors = computeAllMapColors();
         if (tileColors.length > 0) activeColor = tileColors[0];
     }
@@ -271,7 +277,7 @@ public class MapEditorScreen extends Screen {
                 boolean showPrev = usePreview
                         && (previewSelMask == null || previewSelMask[idx]);
                 int cb   = (showPrev ? previewColors : mapColors)[idx] & 0xFF;
-                int argb = cb == 0 ? COL_TRANSPARENT : (0xFF000000 | colorLookup[cb]);
+                int argb = cb == 0 ? COL_TRANSPARENT : (heatmapMode ? heatLut[cb] : (0xFF000000 | colorLookup[cb]));
                 int sx = (int)(translateX + px * scale);
                 int sy = (int)(translateY + py * scale);
                 ctx.fill(sx, sy, sx + scale, sy + scale, argb);
@@ -435,9 +441,12 @@ public class MapEditorScreen extends Screen {
         ctx.fill(panelX, 0, width, panelH, COL_PANEL_BG);
         ctx.fill(panelX, 0, panelX + 1, panelH, COL_PANEL_SEP);
 
-        String paletteHeader = mergeSources.isEmpty()
-                ? "§7PALETTE"
-                : "§7PALETTE §c[" + mergeSources.size() + " merge src" + (mergeSources.size() == 1 ? "" : "s") + "]";
+        StringBuilder phBuilder = new StringBuilder("§7PALETTE");
+        if (heatmapMode) phBuilder.append(" §c[HEAT]");
+        if (!mergeSources.isEmpty())
+            phBuilder.append(" §c[").append(mergeSources.size())
+                    .append(" merge src").append(mergeSources.size() == 1 ? "" : "s").append("]");
+        String paletteHeader = phBuilder.toString();
         ctx.drawTextWithShadow(textRenderer, Text.literal(paletteHeader), panelX + 4, 3, 0xFFFFFF);
         ctx.fill(panelX, 13, width, 14, COL_PANEL_SEP);
 
@@ -590,6 +599,8 @@ public class MapEditorScreen extends Screen {
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8R  requantize"), x, y, 0xFFFFFF); y += 9;
         String ditherLbl = editorDither ? "§aD  §r§8dither:on" : "§8D  dither:off";
         ctx.drawTextWithShadow(textRenderer, Text.literal(ditherLbl), x, y, 0xFFFFFF); y += 9;
+        String heatLbl = heatmapMode ? "§cH  §r§8heat:on" : "§8H  heat:off";
+        ctx.drawTextWithShadow(textRenderer, Text.literal(heatLbl), x, y, 0xFFFFFF); y += 9;
         ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
         String filterName = editorFilterType.name().toLowerCase();
         boolean nonDefaultFilter = editorFilterType != PngToMapColors.FilterParams.FilterType.SMOOTH;
@@ -1184,6 +1195,13 @@ public class MapEditorScreen extends Screen {
         if (keyCode == GLFW.GLFW_KEY_D) { editorDither = !editorDither; return true; }
         if (keyCode == GLFW.GLFW_KEY_R) { applyRequantize(); return true; }
         if (keyCode == GLFW.GLFW_KEY_M) { showMask = !showMask; return true; }
+        if (keyCode == GLFW.GLFW_KEY_H) {
+            heatmapMode = !heatmapMode;
+            setStatusMsg(heatmapMode
+                    ? "Heatmap on: §cred§r=rarest (costly), §9blue§r=most-frequent (cheap). [H] to toggle."
+                    : "Heatmap off.");
+            return true;
+        }
         if (keyCode == GLFW.GLFW_KEY_G) {
             showMinimap = !showMinimap;
             if (showMinimap && thumbnails == null) computeMinimapThumbnails();
@@ -1651,24 +1669,41 @@ public class MapEditorScreen extends Screen {
     private int[] computeTileColors() {
         int[] freq = new int[256];
         for (byte b : mapColors) freq[b & 0xFF]++;
-        List<int[]> entries = new ArrayList<>();
+
+        // Group colors by ramp (same base color id = c >> 2). Within each group,
+        // order shades 0→3 (lightest to darkest) for a visual gradient. Order groups
+        // by their rarest member's frequency ascending so removal candidates appear first.
+        Map<Integer, List<Integer>> rampGroups = new java.util.LinkedHashMap<>();
         for (int c = 1; c < 256; c++) {
-            if (freq[c] > 0) entries.add(new int[]{c, freq[c]});
+            if (freq[c] > 0) rampGroups.computeIfAbsent(c >> 2, k -> new ArrayList<>()).add(c);
         }
-        entries.sort((a, b) -> b[1] - a[1]);
+        // Sort groups: ascending by minimum frequency in the group (rarest group first).
+        List<Map.Entry<Integer, List<Integer>>> groupList = new ArrayList<>(rampGroups.entrySet());
+        groupList.sort((ga, gb) -> {
+            int minA = ga.getValue().stream().mapToInt(c -> freq[c]).min().orElse(0);
+            int minB = gb.getValue().stream().mapToInt(c -> freq[c]).min().orElse(0);
+            return Integer.compare(minA, minB);
+        });
+        // Within each group, sort shades in ascending order (shade = c & 3, 0=light→3=dark).
+        for (Map.Entry<Integer, List<Integer>> e : groupList)
+            e.getValue().sort(Comparator.comparingInt(c -> c & 3));
 
         boolean hasTransparent = freq[0] > 0;
         int offset = hasTransparent ? 1 : 0;
-        int sz = entries.size() + offset;
+        List<int[]> ordered = new ArrayList<>();
+        for (Map.Entry<Integer, List<Integer>> e : groupList)
+            for (int c : e.getValue()) ordered.add(new int[]{c, freq[c]});
+
+        int sz = ordered.size() + offset;
         int[] out   = new int[sz];
         int[] freqs = new int[sz];
         if (hasTransparent) { out[0] = 0; freqs[0] = freq[0]; }
-        for (int i = 0; i < entries.size(); i++) {
-            out[offset + i]   = entries.get(i)[0];
-            freqs[offset + i] = entries.get(i)[1];
+        for (int i = 0; i < ordered.size(); i++) {
+            out[offset + i]   = ordered.get(i)[0];
+            freqs[offset + i] = ordered.get(i)[1];
         }
         tileColorFreqs = freqs;
-        maxTileFreq = entries.isEmpty() ? 0 : entries.get(0)[1];
+        maxTileFreq = ordered.stream().mapToInt(e -> e[1]).max().orElse(0);
         return out;
     }
 
@@ -1681,7 +1716,38 @@ public class MapEditorScreen extends Screen {
         return all.stream().mapToInt(Integer::intValue).toArray();
     }
 
-    private void rebuildTileColors() { tileColors = computeTileColors(); }
+    private void rebuildTileColors() { tileColors = computeTileColors(); rebuildHeatLut(); }
+
+    /** Rebuild the per-color heat LUT from the current frame's frequency distribution. */
+    private void rebuildHeatLut() {
+        int[] f = new int[256];
+        for (byte b : mapColors) f[b & 0xFF]++;
+        List<Integer> colors = new ArrayList<>();
+        for (int c = 1; c < 256; c++) if (f[c] > 0) colors.add(c);
+        colors.sort(Comparator.comparingInt(c -> f[c])); // ascending = rarest first
+        int n = colors.size();
+        for (int i = 0; i < n; i++) heatLut[colors.get(i)] = heatColor(i, n);
+    }
+
+    /** rank=0 → red (rarest/costly), rank=total-1 → blue (most-frequent/cheap). */
+    private static int heatColor(int rank, int total) {
+        if (total <= 1) return 0xFFFF2020;
+        return 0xFF000000 | hslToRgb(240f * rank / (total - 1), 0.9f, 0.55f);
+    }
+
+    private static int hslToRgb(float h, float s, float l) {
+        float c = (1f - Math.abs(2f * l - 1f)) * s;
+        float x = c * (1f - Math.abs((h / 60f) % 2f - 1f));
+        float m = l - c / 2f;
+        float r, g, b;
+        if      (h < 60f)  { r = c; g = x; b = 0; }
+        else if (h < 120f) { r = x; g = c; b = 0; }
+        else if (h < 180f) { r = 0; g = c; b = x; }
+        else if (h < 240f) { r = 0; g = x; b = c; }
+        else if (h < 300f) { r = x; g = 0; b = c; }
+        else               { r = c; g = 0; b = x; }
+        return ((int)((r + m) * 255) << 16) | ((int)((g + m) * 255) << 8) | (int)((b + m) * 255);
+    }
 
     // ── Coordinate helpers ────────────────────────────────────────────────
 

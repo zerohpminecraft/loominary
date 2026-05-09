@@ -160,32 +160,17 @@ public class LoominaryCommand {
             heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
         }
 
-        // Build overflow base64 string from bytes beyond carpet + shade channels
-        String overflowB64 = "";
+        // Manifest banner carries only the size header; all overflow goes to CJK hex banners.
+        String lcName = shadeBytes > 0
+                ? String.format("LS%04X%04X", total, shadeBytes)
+                : String.format("LC%04X",     total);
+
+        // Overflow → CJK-encoded hex-indexed banners 00..3D (84 bytes each)
+        List<String> hexChunks = new ArrayList<>();
         if (total > overflowStart) {
             byte[] overflow = new byte[total - overflowStart];
             System.arraycopy(compressed, overflowStart, overflow, 0, overflow.length);
-            overflowB64 = Base64.getEncoder().encodeToString(overflow);
-        }
-
-        // LS<4-hex-total><4-hex-shade>[<40-b64>] when shade channel is used;
-        // LC<4-hex-total>[<44-b64>] for carpet-only tiles (old format, old decoders work).
-        int payloadChars = shadeBytes > 0 ? CarpetChannel.LS_PAYLOAD_CHARS : CarpetChannel.LC_PAYLOAD_CHARS;
-        String bannerPayload = overflowB64.isEmpty() ? ""
-                : overflowB64.substring(0, Math.min(payloadChars, overflowB64.length()));
-        String lcName = shadeBytes > 0
-                ? String.format("LS%04X%04X", total, shadeBytes) + bannerPayload
-                : String.format("LC%04X",     total)              + bannerPayload;
-
-        // Remaining overflow → hex-indexed banners 00..3D
-        List<String> hexChunks = new ArrayList<>();
-        if (overflowB64.length() > payloadChars) {
-            String rest = overflowB64.substring(payloadChars);
-            int idx = 0;
-            for (int pos = 0; pos < rest.length(); pos += CHUNK_SIZE) {
-                hexChunks.add(String.format("%02x", idx++)
-                        + rest.substring(pos, Math.min(pos + CHUNK_SIZE, rest.length())));
-            }
+            hexChunks = CjkCodec.buildChunks(overflow);
         }
 
         return new CarpetEncoding(compressed, carpetBytes, shadeBytes, nibbles, heights, lcName, hexChunks);
@@ -198,23 +183,14 @@ public class LoominaryCommand {
     private static List<String> rebuildCarpetChunks(
             byte[] compressed, int total, int carpetBytes, int shadeBytes) {
         int overflowStart = carpetBytes + shadeBytes;
-        String overflowB64 = total > overflowStart
-                ? Base64.getEncoder().encodeToString(
-                        Arrays.copyOfRange(compressed, overflowStart, total))
-                : "";
-        int payloadChars = shadeBytes > 0 ? CarpetChannel.LS_PAYLOAD_CHARS : CarpetChannel.LC_PAYLOAD_CHARS;
-        String bannerPayload = overflowB64.isEmpty() ? ""
-                : overflowB64.substring(0, Math.min(payloadChars, overflowB64.length()));
         String mainBanner = shadeBytes > 0
-                ? String.format("LS%04X%04X", total, shadeBytes) + bannerPayload
-                : String.format("LC%04X",     total)              + bannerPayload;
+                ? String.format("LS%04X%04X", total, shadeBytes)
+                : String.format("LC%04X",     total);
         List<String> chunks = new ArrayList<>();
         chunks.add(mainBanner);
-        if (overflowB64.length() > payloadChars) {
-            String rest = overflowB64.substring(payloadChars);
-            int idx = 0;
-            for (int pos = 0; pos < rest.length(); pos += CHUNK_SIZE)
-                chunks.add(String.format("%02x", idx++) + rest.substring(pos, Math.min(pos + CHUNK_SIZE, rest.length())));
+        if (total > overflowStart) {
+            chunks.addAll(CjkCodec.buildChunks(
+                    Arrays.copyOfRange(compressed, overflowStart, total)));
         }
         return chunks;
     }
@@ -2149,6 +2125,7 @@ public class LoominaryCommand {
             final int fc;
             final String header;
             final String budgetLine;
+            List<Integer> perTileColors = null;
 
             if (!all) {
                 int tileIdx = PayloadState.activeTileIndex;
@@ -2209,6 +2186,16 @@ public class LoominaryCommand {
                 header = String.format("all tiles (%d tile%s, %d frame%s)",
                         tileCount, tileCount == 1 ? "" : "s",
                         totalFrames, totalFrames == 1 ? "" : "s");
+                // Collect per-tile distinct color counts for the palette display
+                perTileColors = new ArrayList<>();
+                for (int i = 0; i < PayloadState.tiles.size(); i++) {
+                    PayloadState.TileData td2 = PayloadState.tiles.get(i);
+                    List<String> ch2 = (i == PayloadState.activeTileIndex)
+                            ? PayloadState.ACTIVE_CHUNKS : td2.chunks;
+                    if (ch2.isEmpty()) { perTileColors.add(0); continue; }
+                    byte[][] tf2 = resolveAllFramesForTile(td2, ch2);
+                    perTileColors.add(PngToMapColors.countDistinct(mergeFrames(tf2)));
+                }
 
                 if (anyCarpet) {
                     budgetLine = String.format("§7Compressed:      §f%d §7bytes total%s",
@@ -2225,7 +2212,7 @@ public class LoominaryCommand {
             for (byte b : union) freq[b & 0xFF]++;
 
             int distinctColors = PngToMapColors.countDistinct(union);
-            int totalPixels = MAP_BYTES * fc;
+            int totalPixels = union.length - freq[0]; // exclude empty (color-0) pixels so percentages sum to 100%
 
             List<int[]> colorsByFreq = new ArrayList<>();
             for (int c = 1; c < 256; c++) {
@@ -2238,6 +2225,15 @@ public class LoominaryCommand {
             String frameNote = fc > 1 ? String.format(" §8(across %d frames)", fc) : "";
             source.sendFeedback(Text.literal(String.format(
                     "§7Distinct colors: §f%d%s", distinctColors, frameNote)));
+            if (all && perTileColors != null) {
+                int maxPerTile = 0;
+                for (int n : perTileColors) if (n > maxPerTile) maxPerTile = n;
+                StringBuilder sb = new StringBuilder(String.format(
+                        "§7Per-tile colors:  §fmax=%d §8(reduce all operates per-tile)§r\n", maxPerTile));
+                for (int i = 0; i < perTileColors.size(); i++)
+                    sb.append(String.format("§7  %s: §f%d\n", PayloadState.tileLabel(i), perTileColors.get(i)));
+                source.sendFeedback(Text.literal(sb.toString().stripTrailing()));
+            }
             source.sendFeedback(Text.literal(budgetLine));
 
             if (!all && preReductionChunks.containsKey(PayloadState.activeTileIndex)) {
@@ -2300,22 +2296,60 @@ public class LoominaryCommand {
                 }
             }
 
-            // ── Cumulative removal cost at fixed thresholds ────────────────
+            // ── Removal cost simulation — all three strategies ─────────────
             if (distinctColors > 2) {
-                int[] thresholds = {5, 10, 20, 50};
-                String costLabel = all ? "§7Removal cost (rarest-first, per frame across all tiles):"
-                        : fc > 1 ? "§7Removal cost (rarest-first, per frame):" : "§7Removal cost (rarest-first):";
-                source.sendFeedback(Text.literal(costLabel));
-                int cumPixels = 0, threshIdx = 0;
-                for (int i = 0; i < colorsByFreq.size() - 1 && threshIdx < thresholds.length; i++) {
-                    if (thresholds[threshIdx] >= distinctColors) break;
-                    cumPixels += colorsByFreq.get(i)[1];
-                    if (i + 1 == thresholds[threshIdx]) {
+                // Dynamic thresholds: every 5 steps up to distinctColors-2, capped at 40.
+                int maxRemove = Math.min(distinctColors - 2, 40);
+                int step = maxRemove <= 10 ? 1 : 5;
+                List<Integer> threshList = new ArrayList<>();
+                for (int t = step; t <= maxRemove; t += step) threshList.add(t);
+                int[] thresholds = threshList.stream().mapToInt(Integer::intValue).toArray();
+
+                // Per-color row membership for scatter tracking.
+                int totalRows = union.length / 128;
+                boolean[][] colorInRow = new boolean[256][totalRows];
+                for (int p = 0; p < union.length; p++) {
+                    int c = union[p] & 0xFF;
+                    if (c > 0) colorInRow[c][p / 128] = true;
+                }
+
+                float[][] oklab  = PngToMapColors.buildOklabLookup();
+                int       baseSize = PngToMapColors.estimateCompressedSize(union);
+
+                String colHdr = all ? "pixels/fr · Δcolor · rows/fr · est.Δbytes"
+                                    : "pixels · Δcolor · rows · est.Δbytes";
+                source.sendFeedback(Text.literal("§7Removal cost — §8" + colHdr + "§7:"));
+
+                PngToMapColors.Strategy[] strategies = {
+                    PngToMapColors.Strategy.RAREST,
+                    PngToMapColors.Strategy.CLOSEST,
+                    PngToMapColors.Strategy.WEIGHTED
+                };
+                String[][] stratMeta = {
+                    {"rarest",   "picks rarest color, merges to nearest neighbor"},
+                    {"closest",  "merges the most perceptually similar pair"},
+                    {"weighted", "similar pairs weighted by combined frequency"}
+                };
+
+                for (int si = 0; si < strategies.length; si++) {
+                    List<int[]> rows = runReductionSim(
+                            union, freq, colorInRow, totalRows,
+                            oklab, colorsByFreq, strategies[si], baseSize, thresholds);
+                    if (rows.isEmpty()) continue;
+                    source.sendFeedback(Text.literal(String.format(
+                            "§8── §f%s §8— %s", stratMeta[si][0], stratMeta[si][1])));
+                    for (int[] row : rows) {
+                        int   removed = row[0], cumPx = row[1];
+                        float dist    = row[2] / 1000f;
+                        int   cumR    = row[3], savedB = row[4];
+                        String rowStr = all
+                                ? String.format("%drow/fr", cumR / Math.max(1, fc))
+                                : String.format("%drows", cumR);
                         source.sendFeedback(Text.literal(String.format(
-                                "§7  remove %2d: §f%5d §7px (§f%.1f%%§7 of frame)",
-                                thresholds[threshIdx], cumPixels / fc,
-                                100.0 * cumPixels / totalPixels)));
-                        threshIdx++;
+                                "§7  remove %2d: §f%4d§7px (§f%.1f%%§7)  Δ≤§f%.2f  §7%s  §f~%+dB",
+                                removed, cumPx / fc,
+                                100.0 * cumPx / totalPixels,
+                                dist, rowStr, -savedB)));
                     }
                 }
             }
@@ -2333,6 +2367,93 @@ public class LoominaryCommand {
         for (int f = 0; f < frames.length; f++)
             System.arraycopy(frames[f], 0, union, f * MAP_BYTES, MAP_BYTES);
         return union;
+    }
+
+    /**
+     * Simulates palette reduction under one strategy and returns one result row per
+     * threshold. Each row is {threshold, cumPixels, maxDistMillis, cumRows, savedBytes}.
+     * RAREST iterates the pre-sorted colorsByFreq list. CLOSEST/WEIGHTED scan all
+     * active pairs at each step (O(N²) per step, fine for N≤256).
+     */
+    private static List<int[]> runReductionSim(
+            byte[] union, int[] origFreq, boolean[][] colorInRow, int totalRows,
+            float[][] oklab, List<int[]> sortedRarest,
+            PngToMapColors.Strategy strategy, int baseSize, int[] thresholds) {
+
+        byte[] simUnion = union.clone();
+        int[]  simFreq  = Arrays.copyOf(origFreq, 256);
+        simFreq[0] = 0;
+
+        float     maxDist   = 0f;
+        boolean[] rowsSeen  = new boolean[totalRows];
+        int       cumRows   = 0, cumPixels = 0, simRemoved = 0, threshIdx = 0;
+        int       rarestIdx = 0; // cursor into sortedRarest for RAREST strategy
+
+        List<int[]> results = new ArrayList<>();
+        int maxThresh = thresholds[thresholds.length - 1];
+
+        while (simRemoved < maxThresh && threshIdx < thresholds.length) {
+            int victim = -1, survivor = -1;
+            float distSq = 0f;
+
+            if (strategy == PngToMapColors.Strategy.RAREST) {
+                // Advance past already-removed entries.
+                while (rarestIdx < sortedRarest.size() - 1
+                        && simFreq[sortedRarest.get(rarestIdx)[0]] == 0) rarestIdx++;
+                if (rarestIdx >= sortedRarest.size() - 1) break;
+                victim = sortedRarest.get(rarestIdx++)[0];
+                float[] vOk = oklab[victim];
+                if (vOk == null) { simFreq[victim] = 0; simRemoved++; continue; }
+                float best = Float.MAX_VALUE;
+                for (int c = 1; c < 256; c++) {
+                    if (c == victim || simFreq[c] == 0 || oklab[c] == null) continue;
+                    float dL = vOk[0]-oklab[c][0], da = vOk[1]-oklab[c][1], db = vOk[2]-oklab[c][2];
+                    float d2 = dL*dL + da*da + db*db;
+                    if (d2 < best) { best = d2; survivor = c; }
+                }
+                if (survivor == -1) { simFreq[victim] = 0; simRemoved++; continue; }
+                distSq = best;
+            } else {
+                // CLOSEST / WEIGHTED: scan all active pairs.
+                float best = Float.MAX_VALUE;
+                for (int a = 1; a < 256; a++) {
+                    if (simFreq[a] == 0 || oklab[a] == null) continue;
+                    for (int b = a + 1; b < 256; b++) {
+                        if (simFreq[b] == 0 || oklab[b] == null) continue;
+                        float dL = oklab[a][0]-oklab[b][0], da = oklab[a][1]-oklab[b][1],
+                              db = oklab[a][2]-oklab[b][2];
+                        float d2 = dL*dL + da*da + db*db;
+                        float score = (strategy == PngToMapColors.Strategy.WEIGHTED)
+                                ? d2 / (simFreq[a] + simFreq[b]) : d2;
+                        if (score < best) {
+                            best = score;
+                            distSq = d2;
+                            if (simFreq[a] <= simFreq[b]) { victim = a; survivor = b; }
+                            else                          { victim = b; survivor = a; }
+                        }
+                    }
+                }
+                if (victim == -1) break;
+            }
+
+            maxDist    = Math.max(maxDist, (float) Math.sqrt(distSq));
+            cumPixels += simFreq[victim];
+            for (int r = 0; r < totalRows; r++)
+                if (colorInRow[victim][r] && !rowsSeen[r]) { rowsSeen[r] = true; cumRows++; }
+
+            byte fromB = (byte) victim, toB = (byte) survivor;
+            for (int p = 0; p < simUnion.length; p++) if (simUnion[p] == fromB) simUnion[p] = toB;
+            simFreq[survivor] += simFreq[victim];
+            simFreq[victim]    = 0;
+            simRemoved++;
+
+            if (simRemoved == thresholds[threshIdx]) {
+                int savedB = baseSize - PngToMapColors.estimateCompressedSize(simUnion);
+                results.add(new int[]{simRemoved, cumPixels, (int)(maxDist * 1000), cumRows, savedB});
+                threshIdx++;
+            }
+        }
+        return results;
     }
 
     /** Returns the stored per-frame delays for a tile, padded/truncated to frameCount. */

@@ -15,6 +15,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.zerohpminecraft.CjkCodec;
 import net.zerohpminecraft.mixin.MapStateAccessor;
 
 import java.util.ArrayList;
@@ -247,9 +248,18 @@ public class MapBannerDecoder {
                 }
                 overflowNames.sort(Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
 
-                StringBuilder b64 = new StringBuilder(lcPayload);
-                for (String s : overflowNames) b64.append(s.substring(2));
-                overflowData = Base64.getDecoder().decode(b64.toString());
+                // CJK overflow (new format): first hex banner's payload starts with a CJK char.
+                // Base64 overflow (legacy format): manifest payload + banner payloads as ASCII.
+                boolean cjkOverflow = !overflowNames.isEmpty()
+                        && overflowNames.get(0).length() > 2
+                        && overflowNames.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
+                if (cjkOverflow) {
+                    overflowData = CjkCodec.assembleChunks(overflowNames);
+                } else {
+                    StringBuilder b64 = new StringBuilder(lcPayload);
+                    for (String s : overflowNames) b64.append(s.substring(2));
+                    overflowData = Base64.getDecoder().decode(b64.toString());
+                }
             }
 
             byte[] compressed = new byte[carpetBytes + shadeData.length + overflowData.length];

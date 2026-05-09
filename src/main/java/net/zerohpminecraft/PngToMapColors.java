@@ -809,6 +809,11 @@ public class PngToMapColors {
         return Zstd.compress(combined, Zstd.maxCompressionLevel());
     }
 
+    /** Fast size-only estimate for palette analysis (level 3, not for encoding). */
+    public static int estimateCompressedSize(byte[] data) {
+        return Zstd.compress(data, 3).length;
+    }
+
     // ── Color-space helpers ───────────────────────────────────────────────
 
     public static int[] buildColorLookup() {

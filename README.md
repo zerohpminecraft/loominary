@@ -10,7 +10,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 
 - **Carpet channel encoding** (default): 16 carpet colors encode 4-bit nibbles across 128×128 map positions — 8,192 bytes primary channel
 - **Shade channel** (LS format): carpet height variation encodes an additional 2,016 bytes via balanced 4-row height sequences; requires a staircase schematic instead of a flat platform
-- **CJK overflow banners**: named overflow banners carry 84 bytes each (14-bit CJK alphabet, 2.33× the base64 capacity). Combined capacity: 12,473 compressed bytes per tile
+- **CJK overflow banners**: named overflow banners carry 84 bytes each (14-bit CJK alphabet, 2.33× the base64 capacity). Combined capacity: 15,414 compressed bytes per tile
 - **Encode any image** into carpet + banner data (PNG, JPEG, GIF, BMP — anything `ImageIO` can read)
 - **Animated GIF import**: encode a GIF as multiple frames in a single payload; the decoder cycles frames on a wall-clock timer with distance culling and multi-tile sync
 - **In-world pixel editor** (`/loominary edit`): full-featured 128×128 canvas — see [EDITOR.md](EDITOR.md) for a complete guide
@@ -45,7 +45,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 
 ## Installation
 
-1. Download `loominary-1.7.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
+1. Download `loominary-1.8.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
 2. Drop it into your `mods/` folder alongside Fabric API
 3. Launch the game
 
@@ -237,7 +237,7 @@ Loominary exploits a chain of Minecraft mechanics that aren't normally connected
 
 **An LC/LS manifest banner triggers the decoder.** After placing the carpet, the user clicks a single named banner with the map. The name encodes the total compressed size and, for LS banners, the shade-channel byte count. The decoder uses this to know how many nibbles to read from the color array and how many shade bytes to extract.
 
-**Overflow banners carry the remainder using a CJK alphabet.** If the compressed payload exceeds the carpet + shade channels, the remainder is CJK-encoded and split into up to 62 named overflow banners. Each banner carries a 2-character hex index followed by 48 CJK characters from the range U+4E00–U+8DFF (14 bits per character, 84 bytes per banner). Total overflow capacity: 62 × 84 = 5,208 bytes. Grand total per tile: **12,473 compressed bytes**.
+**Overflow banners carry the remainder using a CJK alphabet.** If the compressed payload exceeds the carpet + shade channels, the remainder is CJK-encoded and split into up to 62 named overflow banners. Each banner carries a 2-character hex index followed by 48 CJK characters from the range U+4E00–U+8DFF (14 bits per character, 84 bytes per banner). Total overflow capacity: 62 × 84 − 2 = 5,206 bytes (the −2 is the codec's internal length header). Grand total per tile: **15,414 compressed bytes**.
 
 **The CJK alphabet was validated on 2b2t.** All code points in the U+4E00–U+9000 range were tested via automated item-rename probes and passed through 2b2t's filter unmodified. CJK Unified Ideographs have no canonical decomposition, so the server's NFC normalization pass is a no-op. The 14-bit alphabet gives 2.33× the payload capacity of base64 in the same 48-character banner slot.
 
@@ -280,7 +280,7 @@ Minecraft's map palette has ~62 base colors with up to 4 brightness shades. Phot
 
 ### I keep getting "OVER BUDGET."
 
-Use `/loominary reduce` to merge the rarest colors into their nearest neighbors. You can also target a specific ceiling: `/loominary reduce 50`. Undo with `/loominary reduce undo`. Carpet mode has ~12,473 bytes of capacity; banner-only mode (legacy) has ~5,292 bytes at the 63-banner limit.
+Use `/loominary reduce` to merge the rarest colors into their nearest neighbors. You can also target a specific ceiling: `/loominary reduce 50`. Undo with `/loominary reduce undo`. Carpet mode has ~15,414 bytes of capacity; banner-only mode (legacy) has ~5,292 bytes at the 63-banner limit.
 
 ### What is the "legal palette" vs "all shades"?
 

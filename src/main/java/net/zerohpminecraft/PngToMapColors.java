@@ -170,6 +170,8 @@ public class PngToMapColors {
      */
     public enum Strategy { RAREST, CLOSEST, WEIGHTED }
 
+    public enum DitherAlgo { NONE, FLOYD_STEINBERG, ATKINSON, BAYER_4X4 }
+
     // ── Image filters ────────────────────────────────────────────────────
 
     /**
@@ -696,6 +698,13 @@ public class PngToMapColors {
     static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
                                           float[][] oklabLookup, float[] ditherStrength,
                                           int width, int height) {
+        return renderDithered(scaled, palette, oklabLookup, ditherStrength, width, height, 1.0f);
+    }
+
+    /** Floyd-Steinberg with {@code diffuseAmount} scaling total error spread (1.0 = full, 0.5 = half). */
+    static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, float[] ditherStrength,
+                                          int width, int height, float diffuseAmount) {
         byte[] out = new byte[width * height];
 
         float[] errCur = new float[width * 3];
@@ -725,7 +734,7 @@ public class PngToMapColors {
                 float eL = L - cl[0], ea = a - cl[1], eb = b - cl[2];
 
                 float errMagSq = eL * eL + ea * ea + eb * eb;
-                float s = (errMagSq > ERROR_FLOOR_SQ) ? ditherStrength[x + y * width] : 0f;
+                float s = (errMagSq > ERROR_FLOOR_SQ) ? ditherStrength[x + y * width] * diffuseAmount : 0f;
 
                 if (s > 0f) {
                     float seL = eL * s, sea = ea * s, seb = eb * s;
@@ -734,6 +743,76 @@ public class PngToMapColors {
                     errNxt[ei]+=seL*(5f/16f); errNxt[ei+1]+=sea*(5f/16f); errNxt[ei+2]+=seb*(5f/16f);
                     if (x + 1 < width)  { int ri=(x+1)*3; errNxt[ri]+=seL*(1f/16f); errNxt[ri+1]+=sea*(1f/16f); errNxt[ri+2]+=seb*(1f/16f); }
                 }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Atkinson dithering: diffuses 6/8 of the error across 6 neighbors (right×2, below-left,
+     * below, below-right, two-below). The discarded 2/8 preserves highlights better than FS.
+     */
+    static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height) {
+        byte[] out     = new byte[width * height];
+        float[] errCur  = new float[width * 3];
+        float[] errNxt  = new float[width * 3];
+        float[] errNxt2 = new float[width * 3];
+
+        for (int y = 0; y < height; y++) {
+            float[] tmp = errCur; errCur = errNxt; errNxt = errNxt2; errNxt2 = tmp;
+            Arrays.fill(errNxt2, 0f);
+
+            for (int x = 0; x < width; x++) {
+                int argb = scaled.getRGB(x, y);
+                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
+
+                float[] src = rgbToOklab(argb);
+                int ei = x * 3;
+                float L = src[0] + errCur[ei    ];
+                float a = src[1] + errCur[ei + 1];
+                float b = src[2] + errCur[ei + 2];
+
+                byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup);
+                out[x + y * width] = chosen;
+
+                float[] cl = oklabLookup[chosen & 0xFF];
+                float seL = (L - cl[0]) / 8f, sea = (a - cl[1]) / 8f, seb = (b - cl[2]) / 8f;
+
+                if (x + 1 < width) { int ri=(x+1)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
+                if (x + 2 < width) { int ri=(x+2)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
+                if (x - 1 >= 0)    { int li=(x-1)*3; errNxt[li]+=seL; errNxt[li+1]+=sea; errNxt[li+2]+=seb; }
+                errNxt[ei]+=seL; errNxt[ei+1]+=sea; errNxt[ei+2]+=seb;
+                if (x + 1 < width) { int ri=(x+1)*3; errNxt[ri]+=seL; errNxt[ri+1]+=sea; errNxt[ri+2]+=seb; }
+                errNxt2[ei]+=seL; errNxt2[ei+1]+=sea; errNxt2[ei+2]+=seb;
+            }
+        }
+        return out;
+    }
+
+    private static final int[][] BAYER_MATRIX_4X4 = {
+        { 0,  8,  2, 10},
+        {12,  4, 14,  6},
+        { 3, 11,  1,  9},
+        {15,  7, 13,  5}
+    };
+    // OKLab offset scale: max threshold = ±½ × BAYER_SCALE per component
+    private static final float BAYER_SCALE = 0.08f;
+
+    /** Bayer 4×4 ordered dithering: deterministic, no error propagation. */
+    static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height) {
+        byte[] out = new byte[width * height];
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int argb = scaled.getRGB(x, y);
+                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
+
+                float[] src = rgbToOklab(argb);
+                float t = (BAYER_MATRIX_4X4[y & 3][x & 3] + 0.5f) / 16.0f - 0.5f;
+                float offset = t * BAYER_SCALE;
+                out[x + y * width] = findClosestInPalette(
+                        src[0] + offset, src[1] + offset, src[2] + offset, palette, oklabLookup);
             }
         }
         return out;
@@ -786,7 +865,7 @@ public class PngToMapColors {
         return palette;
     }
 
-    private static byte findClosestInPalette(float L, float a, float b,
+    static byte findClosestInPalette(float L, float a, float b,
                                               boolean[] palette, float[][] oklabLookup) {
         float bestDist = Float.MAX_VALUE;
         byte bestByte  = 0;

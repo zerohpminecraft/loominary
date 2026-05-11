@@ -153,7 +153,10 @@ public class MapEditorScreen extends Screen {
             PngToMapColors.FilterParams.FilterType.SMOOTH;
 
     // Phase 6 — re-quantize from source (R key)
-    private boolean   editorDither;
+    private PngToMapColors.DitherAlgo editorDitherAlgo;
+    private float     fsErrorStrength    = 1.0f;   // FS error diffusion amount (0.1–1.0)
+    private boolean   requantizeTilePalette = false; // restrict R to colors already in tile
+    private BufferedImage cachedRequantizeSrc = null; // source image cached for live preview refresh
     private boolean   inPreview       = false;
     private byte[]    previewColors   = null;
     private boolean[] previewSelMask  = null;  // null = whole tile
@@ -192,7 +195,9 @@ public class MapEditorScreen extends Screen {
         this.tileIndex    = tileIndex;
         this.tileLabel    = tileLabel;
         this.colorLookup  = PngToMapColors.buildColorLookup();
-        this.editorDither = PayloadState.dither;
+        this.editorDitherAlgo = PayloadState.dither
+                ? PngToMapColors.DitherAlgo.FLOYD_STEINBERG
+                : PngToMapColors.DitherAlgo.NONE;
         // Load per-frame delays from tile state
         this.frameDelayMs = new int[frames.length];
         if (!PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size()) {
@@ -536,9 +541,9 @@ public class MapEditorScreen extends Screen {
             }
             case FILL -> {
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal(String.format("§7tol:§f%.2f", fillTolerance)), x, y, 0xFFFFFF); y += 9;
+                        Text.literal(String.format("§7tol:§f%.3f", fillTolerance)), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal("§8= -  sh+scroll"), x, y, 0xFFFFFF); y += 9;
+                        Text.literal("§8= - sh+sc §7ctrl:fine"), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
                         Text.literal("§8rt-click: pick col"), x, y, 0xFFFFFF); y += 9;
             }
@@ -574,9 +579,9 @@ public class MapEditorScreen extends Screen {
             }
             case MAGIC_WAND -> {
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal(String.format("§7tol:§f%.2f", fillTolerance)), x, y, 0xFFFFFF); y += 9;
+                        Text.literal(String.format("§7tol:§f%.3f", fillTolerance)), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal("§8= -  sh+scroll"), x, y, 0xFFFFFF); y += 9;
+                        Text.literal("§8= - sh+sc §7ctrl:fine"), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
                         Text.literal("§8click: flood sel"), x, y, 0xFFFFFF); y += 9;
             }
@@ -597,8 +602,23 @@ public class MapEditorScreen extends Screen {
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+Z  undo"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+Y  redo"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8R  requantize"), x, y, 0xFFFFFF); y += 9;
-        String ditherLbl = editorDither ? "§aD  §r§8dither:on" : "§8D  dither:off";
-        ctx.drawTextWithShadow(textRenderer, Text.literal(ditherLbl), x, y, 0xFFFFFF); y += 9;
+        String algoName = switch (editorDitherAlgo) {
+            case NONE           -> "§8none";
+            case FLOYD_STEINBERG -> "§aFS§r";
+            case ATKINSON       -> "§aAtkinson§r";
+            case BAYER_4X4      -> "§aBayer4§r";
+        };
+        ctx.drawTextWithShadow(textRenderer,
+                Text.literal("§8D  algo:" + algoName), x, y, 0xFFFFFF); y += 9;
+        if (editorDitherAlgo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG) {
+            String errLbl = inPreview ? "§7sh+sc" : "§8(in preview)";
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal(String.format("§7FS err:§f%.1f %s", fsErrorStrength, errLbl)),
+                    x, y, 0xFFFFFF); y += 9;
+        }
+        String palLbl = requantizeTilePalette ? "§atile§r" : "§8full";
+        ctx.drawTextWithShadow(textRenderer,
+                Text.literal("§8Sh+R  pal:" + palLbl), x, y, 0xFFFFFF); y += 9;
         String heatLbl = heatmapMode ? "§cH  §r§8heat:on" : "§8H  heat:off";
         ctx.drawTextWithShadow(textRenderer, Text.literal(heatLbl), x, y, 0xFFFFFF); y += 9;
         ctx.fill(0, y, GUIDE_W, y + 1, COL_PANEL_SEP); y += 3;
@@ -788,16 +808,17 @@ public class MapEditorScreen extends Screen {
         }
 
         history.clear();
-        inPreview      = false;
-        previewColors  = null;
-        previewSelMask = null;
-        selMask        = null;
-        lassoPoints    = null;
-        ditherMask     = null;
-        useCustomMask  = false;
+        inPreview          = false;
+        previewColors      = null;
+        previewSelMask     = null;
+        cachedRequantizeSrc = null;
+        selMask            = null;
+        lassoPoints        = null;
+        ditherMask         = null;
+        useCustomMask      = false;
         mergeSources.clear();
-        thumbnails     = null;  // force thumbnail recompute
-        showMinimap    = false;
+        thumbnails         = null;  // force thumbnail recompute
+        showMinimap        = false;
 
         rebuildTileColors();
         setStatusMsg("Switched to " + tileLabel);
@@ -821,16 +842,21 @@ public class MapEditorScreen extends Screen {
         } else {
             String toolStr = switch (currentTool) {
                 case BRUSH        -> String.format("§a[B]Brush§r r:%d §8Sh+sc/[]", brushRadius);
-                case FILL         -> String.format("§a[F]Fill§r tol:%.2f §8Sh+sc", fillTolerance);
+                case FILL         -> String.format("§a[F]Fill§r tol:%.3f §8Sh+sc/Ct+fine", fillTolerance);
                 case SELECT       -> "§a[S]Rect-sel§r §8Ctrl+A  Ctrl+D";
                 case EYEDROPPER   -> "§a[E]Eyedrop§r";
                 case DITHER_BRUSH -> String.format("§a[T]Dither§r s:%.1f §8Sh+sc  [M]mask", ditherStrength);
                 case LASSO        -> "§a[L]Lasso§r §8drag";
-                case MAGIC_WAND   -> String.format("§a[W]Wand§r tol:%.2f §8Sh+sc", fillTolerance);
+                case MAGIC_WAND   -> String.format("§a[W]Wand§r tol:%.3f §8Sh+sc/Ct+fine", fillTolerance);
             };
             String undoHint  = history.canUndo() ? " §8Ctrl+Z" : "";
             String redoHint  = history.canRedo() ? " §8Ctrl+Y" : "";
-            String ditherHint = "  " + (editorDither ? "§a[D]dither§r" : "§8[D]dither");
+            String ditherHint = "  " + switch (editorDitherAlgo) {
+                case NONE            -> "§8[D]none";
+                case FLOYD_STEINBERG -> "§a[D]FS§r";
+                case ATKINSON        -> "§a[D]atk§r";
+                case BAYER_4X4       -> "§a[D]bayer§r";
+            };
             String reqHint   = PayloadState.currentSourceFilename != null ? "  §8[R]req" : "";
             String selHint   = selMask != null ? "  §e[sel]§r" : "";
             int frameDelay = frameDelayMs != null && activeFrame < frameDelayMs.length
@@ -866,7 +892,15 @@ public class MapEditorScreen extends Screen {
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY,
                                   double hAmt, double vAmt) {
-        if (inPreview) return true;
+        // In preview: Shift+scroll adjusts FS error diffusion strength and live-refreshes
+        if (inPreview) {
+            if (hasShiftDown() && editorDitherAlgo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG) {
+                fsErrorStrength = Math.round(Math.max(0.1f, Math.min(1.0f,
+                        fsErrorStrength + (float) Math.signum(vAmt) * 0.1f)) * 10) / 10f;
+                refreshRequantizePreview();
+            }
+            return true;
+        }
         if (mouseX < GUIDE_W || mouseX >= width - PANEL_W) return false;
 
         if (hasShiftDown()) {
@@ -880,9 +914,11 @@ public class MapEditorScreen extends Screen {
                     ditherStrength = Math.round(ditherStrength * 10) / 10f;
                 }
                 case FILL, MAGIC_WAND -> {
-                    fillTolerance = Math.max(0f, Math.min(0.5f,
-                            fillTolerance + (float) Math.signum(vAmt) * 0.025f));
-                    fillTolerance = Math.round(fillTolerance * 40) / 40f;
+                    boolean fine  = hasControlDown();
+                    float tStep   = fine ? 0.005f : 0.025f;
+                    int   tScale  = fine ? 200    : 40;
+                    fillTolerance = Math.round(Math.max(0f, Math.min(0.5f,
+                            fillTolerance + (float) Math.signum(vAmt) * tStep)) * tScale) / (float) tScale;
                 }
                 default -> {}
             }
@@ -1107,13 +1143,21 @@ public class MapEditorScreen extends Screen {
         boolean ctrl  = hasControlDown();
         boolean shift = hasShiftDown();
 
-        // Preview mode is modal — only Enter/Y/Esc act
+        // Preview mode is modal — only Enter/Y/Esc/D/Shift+R act
         if (inPreview) {
             if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER
                     || keyCode == GLFW.GLFW_KEY_Y) {
                 commitPreview();
             } else if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
-                inPreview = false; previewColors = null; previewSelMask = null;
+                inPreview = false; previewColors = null; previewSelMask = null; cachedRequantizeSrc = null;
+            } else if (keyCode == GLFW.GLFW_KEY_D) {
+                cycleEditorDither();
+                refreshRequantizePreview();
+            } else if (keyCode == GLFW.GLFW_KEY_R && shift) {
+                requantizeTilePalette = !requantizeTilePalette;
+                String pal = requantizeTilePalette ? "tile palette" : "full palette";
+                setStatusMsg("Requantize palette: " + pal);
+                refreshRequantizePreview();
             }
             return true;
         }
@@ -1192,7 +1236,7 @@ public class MapEditorScreen extends Screen {
         }
 
         // Mode toggles (no prevTool update)
-        if (keyCode == GLFW.GLFW_KEY_D) { editorDither = !editorDither; return true; }
+        if (keyCode == GLFW.GLFW_KEY_D) { cycleEditorDither(); return true; }
         if (keyCode == GLFW.GLFW_KEY_R) { applyRequantize(); return true; }
         if (keyCode == GLFW.GLFW_KEY_M) { showMask = !showMask; return true; }
         if (keyCode == GLFW.GLFW_KEY_H) {
@@ -1254,13 +1298,15 @@ public class MapEditorScreen extends Screen {
             brushRadius = Math.min(MAX_BRUSH, brushRadius + 1); return true;
         }
 
-        // Fill / magic-wand tolerance via = and -
+        // Fill / magic-wand tolerance via = and - (Ctrl = fine 0.005 step, plain = coarse 0.025)
         if ((currentTool == Tool.FILL || currentTool == Tool.MAGIC_WAND)) {
+            float tolStep  = ctrl ? 0.005f : 0.025f;
+            int   tolScale = ctrl ? 200    : 40;
             if (keyCode == GLFW.GLFW_KEY_EQUAL) {
-                fillTolerance = Math.round(Math.min(0.5f, fillTolerance+0.025f)*40)/40f; return true;
+                fillTolerance = Math.round(Math.min(0.5f, fillTolerance + tolStep) * tolScale) / (float) tolScale; return true;
             }
             if (keyCode == GLFW.GLFW_KEY_MINUS) {
-                fillTolerance = Math.round(Math.max(0f, fillTolerance-0.025f)*40)/40f;  return true;
+                fillTolerance = Math.round(Math.max(0f,   fillTolerance - tolStep) * tolScale) / (float) tolScale; return true;
             }
         }
 
@@ -1408,38 +1454,52 @@ public class MapEditorScreen extends Screen {
             setStatusMsg("Source not found: loominary_data/" + fname); return;
         }
         try {
-            BufferedImage src = ImageIO.read(sourcePath.toFile());
-            if (src == null) { setStatusMsg("Could not decode source image"); return; }
-
-            byte[] fullTile;
-            if (editorDither && useCustomMask && ditherMask != null) {
-                fullTile = requantizeWithCustomMask(src);
-            } else {
-                byte[][] tiles = PngToMapColors.convertTwoPassGrid(
-                        src, !PayloadState.allShades, 0, editorDither,
-                        PayloadState.gridColumns, PayloadState.gridRows);
-                fullTile = tiles[tileIndex];
-            }
-
-            byte[] preview = mapColors.clone();
-            boolean[] pMask = null;
-            if (selMask != null) {
-                pMask = selMask.clone();
-                for (int i = 0; i < MAP_BYTES; i++)
-                    if (selMask[i]) preview[i] = fullTile[i];
-            } else {
-                System.arraycopy(fullTile, 0, preview, 0, MAP_BYTES);
-            }
-            previewColors  = preview;
-            previewSelMask = pMask;
-            inPreview      = true;
+            cachedRequantizeSrc = ImageIO.read(sourcePath.toFile());
+            if (cachedRequantizeSrc == null) { setStatusMsg("Could not decode source image"); return; }
+            inPreview = true;
+            computeRequantizePreview();
         } catch (IOException e) {
             setStatusMsg("Re-quantize failed: " + e.getMessage());
         }
     }
 
-    /** Custom-mask path: scales source, extracts this tile, runs two-pass with the painted mask. */
-    private byte[] requantizeWithCustomMask(BufferedImage src) {
+    private void refreshRequantizePreview() {
+        if (!inPreview || cachedRequantizeSrc == null) return;
+        computeRequantizePreview();
+    }
+
+    private void computeRequantizePreview() {
+        byte[] fullTile = computeRequantizeTile(cachedRequantizeSrc);
+        byte[] preview  = mapColors.clone();
+        boolean[] pMask = null;
+        if (selMask != null) {
+            pMask = selMask.clone();
+            for (int i = 0; i < MAP_BYTES; i++)
+                if (selMask[i]) preview[i] = fullTile[i];
+        } else {
+            System.arraycopy(fullTile, 0, preview, 0, MAP_BYTES);
+        }
+        previewColors  = preview;
+        previewSelMask = pMask;
+    }
+
+    private byte[] computeRequantizeTile(BufferedImage src) {
+        boolean legalOnly = !PayloadState.allShades;
+        PngToMapColors.DitherAlgo algo = editorDitherAlgo;
+
+        // Custom-mask FS: per-tile path with painted dither mask and fsErrorStrength
+        if (algo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && useCustomMask && ditherMask != null) {
+            return requantizePerTile(src, ditherMask, fsErrorStrength);
+        }
+
+        // Standard cross-tile FS: uses Otsu strength map and cross-seam propagation
+        if (algo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && !requantizeTilePalette) {
+            byte[][] tiles = PngToMapColors.convertTwoPassGrid(
+                    src, legalOnly, 0, true, PayloadState.gridColumns, PayloadState.gridRows);
+            return tiles[tileIndex];
+        }
+
+        // Per-tile path for NONE, ATKINSON, BAYER_4X4, and FS+tile-palette
         int totalW = PayloadState.gridColumns * MAP_SIZE;
         int totalH = PayloadState.gridRows * MAP_SIZE;
         BufferedImage scaledFull = PngToMapColors.scale(src, totalW, totalH);
@@ -1448,15 +1508,61 @@ public class MapEditorScreen extends Screen {
         BufferedImage tileImg = scaledFull.getSubimage(
                 tileCol * MAP_SIZE, tileRow * MAP_SIZE, MAP_SIZE, MAP_SIZE);
         float[][] oklabLookup = PngToMapColors.buildOklabLookup();
-        // Pass 1: nearest-neighbor to establish the palette
+
+        // Pass 1: nearest-color to establish source-derived palette
         byte[] firstPass = new byte[MAP_BYTES];
-        boolean legalOnly = !PayloadState.allShades;
         for (int y = 0; y < MAP_SIZE; y++)
             for (int x = 0; x < MAP_SIZE; x++)
                 firstPass[x + y * MAP_SIZE] = PngToMapColors.findClosestMapColorByte(
                         tileImg.getRGB(x, y), legalOnly, oklabLookup);
-        boolean[] palette = PngToMapColors.buildPalette(firstPass);
-        return PngToMapColors.renderDithered(tileImg, palette, oklabLookup, ditherMask, MAP_SIZE, MAP_SIZE);
+
+        boolean[] palette = requantizeTilePalette
+                ? PngToMapColors.buildPalette(mapColors)
+                : PngToMapColors.buildPalette(firstPass);
+
+        return switch (algo) {
+            case NONE -> {
+                if (!requantizeTilePalette) yield firstPass;
+                // Re-map each source pixel to nearest in tile palette
+                byte[] out = new byte[MAP_BYTES];
+                for (int y = 0; y < MAP_SIZE; y++)
+                    for (int x = 0; x < MAP_SIZE; x++) {
+                        float[] lab = PngToMapColors.rgbToOklab(tileImg.getRGB(x, y));
+                        out[x + y * MAP_SIZE] = PngToMapColors.findClosestInPalette(
+                                lab[0], lab[1], lab[2], palette, oklabLookup);
+                    }
+                yield out;
+            }
+            case FLOYD_STEINBERG -> {
+                float[] flat = new float[MAP_BYTES];
+                Arrays.fill(flat, 1.0f);
+                yield PngToMapColors.renderDithered(tileImg, palette, oklabLookup, flat, MAP_SIZE, MAP_SIZE, fsErrorStrength);
+            }
+            case ATKINSON -> PngToMapColors.renderAtkinson(tileImg, palette, oklabLookup, MAP_SIZE, MAP_SIZE);
+            case BAYER_4X4 -> PngToMapColors.renderBayer4x4(tileImg, palette, oklabLookup, MAP_SIZE, MAP_SIZE);
+        };
+    }
+
+    /** Per-tile FS path with explicit dither-strength array and error diffusion scalar. */
+    private byte[] requantizePerTile(BufferedImage src, float[] strengthMap, float diffuseAmount) {
+        int totalW = PayloadState.gridColumns * MAP_SIZE;
+        int totalH = PayloadState.gridRows * MAP_SIZE;
+        BufferedImage scaledFull = PngToMapColors.scale(src, totalW, totalH);
+        int tileCol = PayloadState.tileCol(tileIndex);
+        int tileRow = PayloadState.tileRow(tileIndex);
+        BufferedImage tileImg = scaledFull.getSubimage(
+                tileCol * MAP_SIZE, tileRow * MAP_SIZE, MAP_SIZE, MAP_SIZE);
+        float[][] oklabLookup = PngToMapColors.buildOklabLookup();
+        boolean legalOnly = !PayloadState.allShades;
+        byte[] firstPass = new byte[MAP_BYTES];
+        for (int y = 0; y < MAP_SIZE; y++)
+            for (int x = 0; x < MAP_SIZE; x++)
+                firstPass[x + y * MAP_SIZE] = PngToMapColors.findClosestMapColorByte(
+                        tileImg.getRGB(x, y), legalOnly, oklabLookup);
+        boolean[] palette = requantizeTilePalette
+                ? PngToMapColors.buildPalette(mapColors)
+                : PngToMapColors.buildPalette(firstPass);
+        return PngToMapColors.renderDithered(tileImg, palette, oklabLookup, strengthMap, MAP_SIZE, MAP_SIZE, diffuseAmount);
     }
 
     private void commitPreview() {
@@ -1465,7 +1571,19 @@ public class MapEditorScreen extends Screen {
         System.arraycopy(previewColors, 0, mapColors, 0, MAP_BYTES);
         dirty = true;
         rebuildTileColors();
-        inPreview = false; previewColors = null; previewSelMask = null;
+        inPreview = false; previewColors = null; previewSelMask = null; cachedRequantizeSrc = null;
+    }
+
+    private void cycleEditorDither() {
+        PngToMapColors.DitherAlgo[] values = PngToMapColors.DitherAlgo.values();
+        editorDitherAlgo = values[(editorDitherAlgo.ordinal() + 1) % values.length];
+        String name = switch (editorDitherAlgo) {
+            case NONE -> "none";
+            case FLOYD_STEINBERG -> "Floyd-Steinberg";
+            case ATKINSON -> "Atkinson";
+            case BAYER_4X4 -> "Bayer 4×4";
+        };
+        setStatusMsg("Dither: " + name);
     }
 
     private void setStatusMsg(String msg) {
@@ -1523,10 +1641,11 @@ public class MapEditorScreen extends Screen {
             }
             case TILE -> {
                 int total = 0;
-                for (byte[] frame : allFrames) total += applyMergeToFrame(frame, false);
-                setStatusMsg(String.format("Merged %d color%s → idx %d across %d frame%s: %d px replaced.",
+                for (byte[] frame : allFrames) total += applyMergeToFrame(frame, true);
+                String tileSel = selMask != null ? " (in selection)" : "";
+                setStatusMsg(String.format("Merged %d color%s → idx %d across %d frame%s: %d px replaced%s.",
                         mergeSources.size(), mergeSources.size() == 1 ? "" : "s",
-                        activeColor, totalFrames, totalFrames == 1 ? "" : "s", total));
+                        activeColor, totalFrames, totalFrames == 1 ? "" : "s", total, tileSel));
             }
             case ALL_TILES -> {
                 commitMergeAllTiles();
@@ -1550,8 +1669,8 @@ public class MapEditorScreen extends Screen {
             if (i != tileIndex) LoominaryCommand.capturePreReductionState(i);
         }
 
-        // Apply to current tile (all frames)
-        for (byte[] frame : allFrames) totalReplaced += applyMergeToFrame(frame, false);
+        // Apply to current tile (all frames) — respect active selection
+        for (byte[] frame : allFrames) totalReplaced += applyMergeToFrame(frame, true);
         dirty = true;
 
         // Apply to all other tiles: decode → merge → re-encode
@@ -1770,7 +1889,7 @@ public class MapEditorScreen extends Screen {
         activeFrame = newFrame;
         mapColors   = allFrames[newFrame];
         history.clear();
-        inPreview = false; previewColors = null; previewSelMask = null;
+        inPreview = false; previewColors = null; previewSelMask = null; cachedRequantizeSrc = null;
         rebuildTileColors();
     }
 
@@ -1795,7 +1914,7 @@ public class MapEditorScreen extends Screen {
         activeFrame  = Math.min(activeFrame, totalFrames - 1);
         mapColors    = allFrames[activeFrame];
         history.clear();
-        inPreview = false; previewColors = null; previewSelMask = null;
+        inPreview = false; previewColors = null; previewSelMask = null; cachedRequantizeSrc = null;
         rebuildTileColors();
         dirty = true;
         setStatusMsg("Dropped frame " + (drop + 1) + ". " + totalFrames + " frame" + (totalFrames == 1 ? "" : "s") + " remaining.");

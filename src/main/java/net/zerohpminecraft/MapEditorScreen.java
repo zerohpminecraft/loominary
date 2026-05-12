@@ -82,7 +82,8 @@ public class MapEditorScreen extends Screen {
     private static final int COL_STATUS_BG   = 0xFF121212;
     private static final int COL_STATUS_SEP  = 0xFF444444;
     private static final int COL_MAP_BORDER  = 0xFFAAAAAA;
-    private static final int COL_TRANSPARENT = 0xFF111122;
+    private static final int COL_TRANS_A     = 0xFFAAAAAA; // checkerboard light (transparent pixels)
+    private static final int COL_TRANS_B     = 0xFF555555; // checkerboard dark  (transparent pixels)
     private static final int COL_RING        = 0xFFFFFFFF;
     private static final int COL_HOVER_RING  = 0xFF888888;
     private static final int COL_MERGE_RING  = 0xFFFF7722;  // orange — merge source
@@ -156,7 +157,8 @@ public class MapEditorScreen extends Screen {
     private PngToMapColors.DitherAlgo editorDitherAlgo;
     private float     fsErrorStrength    = 1.0f;   // FS error diffusion amount (0.1–1.0)
     private boolean   requantizeTilePalette = false; // restrict R to colors already in tile
-    private BufferedImage cachedRequantizeSrc = null; // source image cached for live preview refresh
+    private BufferedImage cachedRequantizeSrc  = null; // source image cached for live preview refresh
+    private BufferedImage[] cachedGifFrames   = null; // all coalesced GIF frames for the active source
     private PngToMapColors.MatchMetric matchMetric = PngToMapColors.MatchMetric.OKLAB;
 
     // In-editor color reduction (K = one step, Shift+K = cycle strategy)
@@ -310,7 +312,8 @@ public class MapEditorScreen extends Screen {
                 boolean showPrev = usePreview
                         && (previewSelMask == null || previewSelMask[idx]);
                 int cb   = (showPrev ? previewColors : mapColors)[idx] & 0xFF;
-                int argb = cb == 0 ? COL_TRANSPARENT : (heatmapMode ? heatLut[cb] : (0xFF000000 | colorLookup[cb]));
+                int argb = cb == 0 ? ((px + py) % 2 == 0 ? COL_TRANS_A : COL_TRANS_B)
+                        : (heatmapMode ? heatLut[cb] : (0xFF000000 | colorLookup[cb]));
                 int sx = (int)(translateX + px * scale);
                 int sy = (int)(translateY + py * scale);
                 ctx.fill(sx, sy, sx + scale, sy + scale, argb);
@@ -347,7 +350,7 @@ public class MapEditorScreen extends Screen {
         switch (currentTool) {
             case BRUSH -> {
                 int activeRgb = activeColor == 0
-                        ? (COL_TRANSPARENT & 0xFFFFFF) : colorLookup[activeColor];
+                        ? (COL_TRANS_A & 0xFFFFFF) : colorLookup[activeColor];
                 int overlay = (activeRgb & 0x00FFFFFF) | 0x99000000;
                 int r2 = brushRadius * brushRadius;
                 for (int dy = -brushRadius; dy <= brushRadius; dy++) {
@@ -496,7 +499,7 @@ public class MapEditorScreen extends Screen {
         ctx.fill(panelX, 22, width, 23, COL_PANEL_SEP);
 
         int activeRgb = activeColor == 0
-                ? (COL_TRANSPARENT & 0xFFFFFF) : colorLookup[activeColor];
+                ? (COL_TRANS_A & 0xFFFFFF) : colorLookup[activeColor];
         int asx = panelX + 4, asy = 26;
         ctx.fill(asx-1, asy-1, asx+ACTIVE_SWATCH_SZ+1, asy+ACTIVE_SWATCH_SZ+1, COL_RING);
         ctx.fill(asx, asy, asx+ACTIVE_SWATCH_SZ, asy+ACTIVE_SWATCH_SZ, 0xFF000000|activeRgb);
@@ -522,7 +525,7 @@ public class MapEditorScreen extends Screen {
             if (swy + SWATCH_SZ > panelH) break;
 
             int c   = palette[i];
-            int rgb = c == 0 ? (COL_TRANSPARENT & 0xFFFFFF) : colorLookup[c];
+            int rgb = c == 0 ? (COL_TRANS_A & 0xFFFFFF) : colorLookup[c];
             boolean isActive  = (c == activeColor);
             boolean isMerge   = mergeSources.contains(c);
             boolean isHovered = mouseX >= swx && mouseX < swx+SWATCH_SZ
@@ -735,6 +738,7 @@ public class MapEditorScreen extends Screen {
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8.  delay +10ms"), x, y, 0xFFFFFF); y += 9;
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8Del  drop frame"), x, y, 0xFFFFFF); y += 9;
             if (gifAnimated) {
+                ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ins  insert src frame"), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer, Text.literal("§8Sh+[/]  R source"), x, y, 0xFFFFFF);
             }
         }
@@ -830,7 +834,8 @@ public class MapEditorScreen extends Screen {
                 for (int py = 0; py < THUMB_SZ; py++) {
                     for (int px = 0; px < THUMB_SZ; px++) {
                         int cb   = thumb[px + py * THUMB_SZ] & 0xFF;
-                        int argb = cb == 0 ? COL_TRANSPARENT : (0xFF000000 | colorLookup[cb]);
+                        int argb = cb == 0 ? ((px + py) % 2 == 0 ? COL_TRANS_A : COL_TRANS_B)
+                                : (0xFF000000 | colorLookup[cb]);
                         ctx.fill(tx + px, ty + py, tx + px + 1, ty + py + 1, argb);
                     }
                 }
@@ -887,6 +892,7 @@ public class MapEditorScreen extends Screen {
         previewColors      = null;
         previewSelMask     = null;
         cachedRequantizeSrc = null;
+        cachedGifFrames    = null;
         selMask            = null;
         lassoPoints        = null;
         ditherMask         = null;
@@ -1240,6 +1246,22 @@ public class MapEditorScreen extends Screen {
             } else if (keyCode == GLFW.GLFW_KEY_K) {
                 if (shift) cycleReductionStrategy();
                 else applyColorReduction();
+            } else if (shift && totalFrames > 1 && PayloadState.currentSourceFilename != null
+                    && PayloadState.currentSourceFilename.toLowerCase().endsWith(".gif")) {
+                int maxSrc = gifSourceFrameCount > 0 ? gifSourceFrameCount - 1 : requantizeSourceFrame + 32;
+                if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET) {
+                    requantizeSourceFrame = Math.max(0, requantizeSourceFrame - 1);
+                    updateCachedSrcFromGifFrames();
+                    refreshRequantizePreview();
+                    setStatusMsg("R source: GIF frame " + (requantizeSourceFrame + 1)
+                            + (gifSourceFrameCount > 0 ? "/" + gifSourceFrameCount : ""));
+                } else if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) {
+                    requantizeSourceFrame = Math.min(maxSrc, requantizeSourceFrame + 1);
+                    updateCachedSrcFromGifFrames();
+                    refreshRequantizePreview();
+                    setStatusMsg("R source: GIF frame " + (requantizeSourceFrame + 1)
+                            + (gifSourceFrameCount > 0 ? "/" + gifSourceFrameCount : ""));
+                }
             }
             return true;
         }
@@ -1297,6 +1319,12 @@ public class MapEditorScreen extends Screen {
         // Drop current frame (Delete) — blocked if only one frame
         if (keyCode == GLFW.GLFW_KEY_DELETE && totalFrames > 1) {
             dropCurrentFrame(); return true;
+        }
+        // Insert a frame from the current GIF source frame (animated GIF tiles only)
+        if (keyCode == GLFW.GLFW_KEY_INSERT && totalFrames > 1
+                && PayloadState.currentSourceFilename != null
+                && PayloadState.currentSourceFilename.toLowerCase().endsWith(".gif")) {
+            insertFrameFromSource(); return true;
         }
 
         if (ctrl && keyCode == GLFW.GLFW_KEY_A) {
@@ -1382,14 +1410,16 @@ public class MapEditorScreen extends Screen {
             int maxSrc = gifSourceFrameCount > 0 ? gifSourceFrameCount - 1 : requantizeSourceFrame + 32;
             if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET) {
                 requantizeSourceFrame = Math.max(0, requantizeSourceFrame - 1);
-                cachedRequantizeSrc = null; // invalidate so next R reloads
+                updateCachedSrcFromGifFrames();
+                if (inPreview) refreshRequantizePreview();
                 setStatusMsg("R source: GIF frame " + (requantizeSourceFrame + 1)
                         + (gifSourceFrameCount > 0 ? "/" + gifSourceFrameCount : ""));
                 return true;
             }
             if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) {
                 requantizeSourceFrame = Math.min(maxSrc, requantizeSourceFrame + 1);
-                cachedRequantizeSrc = null;
+                updateCachedSrcFromGifFrames();
+                if (inPreview) refreshRequantizePreview();
                 setStatusMsg("R source: GIF frame " + (requantizeSourceFrame + 1)
                         + (gifSourceFrameCount > 0 ? "/" + gifSourceFrameCount : ""));
                 return true;
@@ -1563,11 +1593,11 @@ public class MapEditorScreen extends Screen {
         }
         try {
             if (totalFrames > 1 && fname.toLowerCase().endsWith(".gif")) {
-                // Load the specific coalesced GIF frame that this editor frame came from.
-                // requantizeSourceFrame tracks provenance through stride/skip and can be
-                // overridden manually with Shift+[ / Shift+].
-                BufferedImage[] gifFrames = PngToMapColors.coalesceGifFrames(sourcePath);
-                cachedRequantizeSrc = gifFrames[Math.min(requantizeSourceFrame, gifFrames.length - 1)];
+                // Lazily load all coalesced GIF frames so Shift+[/] can switch source
+                // frames without a disk round-trip.
+                if (cachedGifFrames == null)
+                    cachedGifFrames = PngToMapColors.coalesceGifFrames(sourcePath);
+                cachedRequantizeSrc = cachedGifFrames[Math.min(requantizeSourceFrame, cachedGifFrames.length - 1)];
             } else {
                 cachedRequantizeSrc = ImageIO.read(sourcePath.toFile());
             }
@@ -2100,6 +2130,68 @@ public class MapEditorScreen extends Screen {
                 requantizeSourceFrame = src.get(newFrame);
         }
         rebuildTileColors();
+    }
+
+    /** Updates cachedRequantizeSrc from cachedGifFrames at the current requantizeSourceFrame. */
+    private void updateCachedSrcFromGifFrames() {
+        if (cachedGifFrames != null)
+            cachedRequantizeSrc = cachedGifFrames[Math.min(requantizeSourceFrame, cachedGifFrames.length - 1)];
+        else
+            cachedRequantizeSrc = null;
+    }
+
+    /**
+     * Inserts a new frame after activeFrame, derived from cachedGifFrames[requantizeSourceFrame].
+     * Loads cachedGifFrames from disk if not yet cached.
+     */
+    private void insertFrameFromSource() {
+        String fname = PayloadState.currentSourceFilename;
+        if (fname == null) return;
+        Path sourcePath = FabricLoader.getInstance().getGameDir()
+                .resolve("loominary_data").resolve(fname);
+        try {
+            if (cachedGifFrames == null)
+                cachedGifFrames = PngToMapColors.coalesceGifFrames(sourcePath);
+            BufferedImage src = cachedGifFrames[Math.min(requantizeSourceFrame, cachedGifFrames.length - 1)];
+            byte[] newFrame = computeRequantizeTile(src);
+
+            int insertAt = activeFrame + 1;
+            byte[][] newFrames  = new byte[totalFrames + 1][];
+            int[]    newDelays  = new int[totalFrames + 1];
+            List<Integer> oldSrc = (!PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size())
+                    ? PayloadState.tiles.get(tileIndex).frameSourceIndices : null;
+            List<Integer> newSrc = (oldSrc != null) ? new ArrayList<>() : null;
+
+            for (int i = 0; i < insertAt; i++) {
+                newFrames[i] = allFrames[i];
+                newDelays[i] = frameDelayMs[i];
+                if (newSrc != null) newSrc.add(oldSrc.get(i));
+            }
+            newFrames[insertAt] = newFrame;
+            newDelays[insertAt] = frameDelayMs[activeFrame];
+            if (newSrc != null) newSrc.add(requantizeSourceFrame);
+            for (int i = insertAt; i < totalFrames; i++) {
+                newFrames[i + 1] = allFrames[i];
+                newDelays[i + 1] = frameDelayMs[i];
+                if (newSrc != null) newSrc.add(oldSrc.get(i));
+            }
+
+            allFrames    = newFrames;
+            frameDelayMs = newDelays;
+            totalFrames  = newFrames.length;
+            activeFrame  = insertAt;
+            mapColors    = allFrames[activeFrame];
+            if (newSrc != null && !PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size())
+                PayloadState.tiles.get(tileIndex).frameSourceIndices = newSrc;
+            history.clear();
+            inPreview = false; previewColors = null; previewSelMask = null;
+            rebuildTileColors();
+            dirty = true;
+            setStatusMsg("Inserted frame " + (insertAt + 1) + " from GIF frame "
+                    + (requantizeSourceFrame + 1) + ". " + totalFrames + " frames total.");
+        } catch (IOException e) {
+            setStatusMsg("Insert failed: " + e.getMessage());
+        }
     }
 
     private void dropCurrentFrame() {

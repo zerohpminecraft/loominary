@@ -176,6 +176,8 @@ When a dither mask exists and dither is on, `R` uses the mask's per-pixel streng
 
 **Dither toggle (`D`):** Toggle Floyd-Steinberg dithering on or off for re-quantize. The current state is shown in the status bar (`§aDITHER` when active).
 
+**Source frame (animated GIF tiles):** The editor tracks which original GIF frame each editor frame came from, even after `/loominary stride` or `/loominary skip` has thinned the sequence. Re-quantize always pulls from the correct source frame automatically. If you want to manually override — for example to re-derive frame 3 from GIF frame 7 — use `Shift+[` / `Shift+]` to step the source frame index. The status bar shows `R source: GIF frame N of M` while stepping. If a re-quantize preview is already active, stepping the source frame live-updates the preview so you can see the result before committing. Press `Insert` to insert the re-quantized frame as a new frame after the current one without entering preview mode.
+
 ---
 
 ## Undo / Redo
@@ -209,6 +211,9 @@ When editing an animated tile (imported from a GIF, or assembled from multiple f
 | Decrease frame delay | `,` (−10 ms; Shift+`,` = −100 ms) |
 | Increase frame delay | `.` (+10 ms; Shift+`.` = +100 ms) |
 | Delete current frame | `Delete` (blocked if only one frame remains) |
+| Insert frame from GIF source | `Insert` (animated GIF tiles only — inserts a frame after the current one, derived from the current R source frame) |
+| R source: previous GIF frame | `Shift+[` (animated GIF tiles — overrides which source frame `R` reads; also live-updates the re-quantize preview if active) |
+| R source: next GIF frame | `Shift+]` (animated GIF tiles only) |
 
 The status bar shows `Frame N/M` and the current frame's delay in milliseconds.
 
@@ -330,6 +335,9 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 | `Shift+,` | Decrease current frame delay by 100 ms |
 | `Shift+.` | Increase current frame delay by 100 ms |
 | `Delete` | Drop current frame (blocked if only one frame) |
+| `Insert` | Insert frame after current, derived from R source frame (animated GIF tiles only) |
+| `Shift+[` | R source: previous GIF frame (animated GIF tiles only; live-updates preview) |
+| `Shift+]` | R source: next GIF frame (animated GIF tiles only; live-updates preview) |
 
 ---
 

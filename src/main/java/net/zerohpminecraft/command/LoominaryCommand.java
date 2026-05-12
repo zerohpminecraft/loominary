@@ -3925,39 +3925,72 @@ public class LoominaryCommand {
             return 0;
         }
 
-        int tileIdx = PayloadState.activeTileIndex;
-        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-        boolean isAnimated = tile.frameCount > 1;
+        // Flush the active tile's working set to TileData before reading any tile.
+        PayloadState.syncToActiveTile();
+
+        int cols      = PayloadState.gridColumns;
+        int rows      = PayloadState.gridRows;
+        int totalTiles = PayloadState.tiles.size();
+        int gridW     = cols * 128;
+        int gridH     = rows * 128;
 
         try {
-            byte[][] frames = resolveAllFramesForTile(tile, PayloadState.ACTIVE_CHUNKS);
+            // Resolve every tile's frames.
+            byte[][][] tileFrames = new byte[totalTiles][][];
+            for (int ti = 0; ti < totalTiles; ti++) {
+                PayloadState.TileData td = PayloadState.tiles.get(ti);
+                List<String> chunks = (ti == PayloadState.activeTileIndex)
+                        ? PayloadState.ACTIVE_CHUNKS : td.chunks;
+                tileFrames[ti] = resolveAllFramesForTile(td, chunks);
+            }
+
+            // All tiles in a mural should have the same frame count; take the max.
+            int maxFrames = 1;
+            for (byte[][] tf : tileFrames) maxFrames = Math.max(maxFrames, tf.length);
+            boolean isAnimated = maxFrames > 1;
+
+            // Stitch each frame across the grid.
+            byte[][] stitched = new byte[maxFrames][gridW * gridH];
+            for (int f = 0; f < maxFrames; f++) {
+                for (int ti = 0; ti < totalTiles; ti++) {
+                    int tc  = PayloadState.tileCol(ti);
+                    int tr  = PayloadState.tileRow(ti);
+                    byte[] src = tileFrames[ti][Math.min(f, tileFrames[ti].length - 1)];
+                    for (int py = 0; py < 128; py++) {
+                        System.arraycopy(src, py * 128,
+                                stitched[f], (tr * 128 + py) * gridW + tc * 128, 128);
+                    }
+                }
+            }
 
             Path exportDir = MinecraftClient.getInstance().runDirectory.toPath()
                     .resolve("loominary_exports");
             Files.createDirectories(exportDir);
-
             String stem = PayloadState.currentSourceFilename != null
                     ? filenameStem(PayloadState.currentSourceFilename) : "export";
-            String tileSuffix = PayloadState.totalTiles() > 1
-                    ? "_tile" + tileIdx : "";
 
-            if (!isAnimated || frames.length == 1) {
-                // Static PNG export
-                BufferedImage img = mapColorsToImage(frames[0]);
-                String outName = stem + tileSuffix + ".png";
-                Path outPath = exportDir.resolve(outName);
-                ImageIO.write(img, "PNG", outPath.toFile());
+            if (!isAnimated) {
+                BufferedImage img = mapColorsToImage(stitched[0], gridW, gridH);
+                String outName = stem + ".png";
+                ImageIO.write(img, "PNG", exportDir.resolve(outName).toFile());
                 source.sendFeedback(Text.literal("§aExported image: §f" + outName));
             } else {
-                // Animated GIF export
-                int[] delays = tile.frameDelays != null
-                        ? tile.frameDelays.stream().mapToInt(Integer::intValue).toArray()
-                        : new int[]{100};
-                String outName = stem + tileSuffix + ".gif";
-                Path outPath = exportDir.resolve(outName);
-                writeAnimatedGif(frames, delays, outPath);
+                // Collect delays from the first tile that has per-frame delay data.
+                int[] delays = new int[maxFrames];
+                Arrays.fill(delays, 100);
+                for (int ti = 0; ti < totalTiles; ti++) {
+                    List<Integer> fd = PayloadState.tiles.get(ti).frameDelays;
+                    if (fd != null && !fd.isEmpty()) {
+                        for (int f = 0; f < maxFrames; f++)
+                            delays[f] = fd.get(Math.min(f, fd.size() - 1));
+                        break;
+                    }
+                }
+                String outName = stem + ".gif";
+                writeAnimatedGif(stitched, gridW, gridH, delays, exportDir.resolve(outName));
                 source.sendFeedback(Text.literal(String.format(
-                        "§aExported animated GIF: §f%s §7(%d frames)", outName, frames.length)));
+                        "§aExported animated GIF: §f%s §7(%d frames, %dx%d)",
+                        outName, maxFrames, gridW, gridH)));
             }
             return 1;
         } catch (Exception e) {
@@ -3966,28 +3999,33 @@ public class LoominaryCommand {
         }
     }
 
-    /** Converts a 128×128 map-color byte array to an RGB BufferedImage. */
-    private static BufferedImage mapColorsToImage(byte[] mapColors) {
-        BufferedImage img = new BufferedImage(128, 128, BufferedImage.TYPE_INT_RGB);
+    /**
+     * Converts a map-color byte array to an ARGB BufferedImage.
+     * Map color byte 0 (void/empty) is exported as fully transparent.
+     */
+    private static BufferedImage mapColorsToImage(byte[] mapColors, int w, int h) {
         int[] colorLookup = PngToMapColors.buildColorLookup();
-        for (int i = 0; i < 128 * 128; i++) {
+        BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        for (int i = 0; i < w * h; i++) {
             int b = mapColors[i] & 0xFF;
-            img.setRGB(i % 128, i / 128, 0xFF000000 | colorLookup[b]);
+            int argb = (b == 0) ? 0x00000000 : (0xFF000000 | colorLookup[b]);
+            img.setRGB(i % w, i / w, argb);
         }
         return img;
     }
 
     /** Writes frames as a looping animated GIF with per-frame delays (in ms). */
-    private static void writeAnimatedGif(byte[][] frames, int[] delaysMs, Path path)
+    private static void writeAnimatedGif(byte[][] frames, int w, int h, int[] delaysMs, Path path)
             throws IOException {
-        // Build a global IndexColorModel from all distinct map color bytes across all frames.
+        // Build a global IndexColorModel from all map color bytes used across all frames.
+        // Palette index 0 is reserved for map byte 0 (void/transparent).
         int[] colorLookup = PngToMapColors.buildColorLookup();
         boolean[] used = new boolean[256];
         for (byte[] frame : frames) for (byte b : frame) used[b & 0xFF] = true;
 
-        int[] mapByteToIdx = new int[256];
+        int[] mapByteToIdx = new int[256]; // default 0 = transparent index
         byte[] palR = new byte[256], palG = new byte[256], palB = new byte[256];
-        int palSize = 1; // index 0 = black placeholder
+        int palSize = 1;
         for (int b = 1; b < 256; b++) {
             if (!used[b]) continue;
             int rgb = colorLookup[b];
@@ -3997,18 +4035,18 @@ public class LoominaryCommand {
             palB[palSize] = (byte)( rgb         & 0xFF);
             palSize++;
         }
-        IndexColorModel icm = new IndexColorModel(8, palSize, palR, palG, palB);
+        // Index 0 = transparent.
+        IndexColorModel icm = new IndexColorModel(8, palSize, palR, palG, palB, 0);
 
         ImageWriter writer = javax.imageio.ImageIO.getImageWritersByFormatName("gif").next();
         try (ImageOutputStream ios = javax.imageio.ImageIO.createImageOutputStream(path.toFile())) {
             writer.setOutput(ios);
             writer.prepareWriteSequence(null);
             for (int f = 0; f < frames.length; f++) {
-                // Build indexed frame directly from map color bytes — no quantization loss.
-                BufferedImage indexed = new BufferedImage(128, 128,
+                BufferedImage indexed = new BufferedImage(w, h,
                         BufferedImage.TYPE_BYTE_INDEXED, icm);
                 byte[] raster = ((DataBufferByte) indexed.getRaster().getDataBuffer()).getData();
-                for (int i = 0; i < 128 * 128; i++)
+                for (int i = 0; i < w * h; i++)
                     raster[i] = (byte) mapByteToIdx[frames[f][i] & 0xFF];
 
                 IIOMetadata meta = writer.getDefaultImageMetadata(
@@ -4022,7 +4060,7 @@ public class LoominaryCommand {
                 gce.setAttribute("delayTime", String.valueOf(delayCentiseconds));
                 gce.setAttribute("disposalMethod", "restoreToBackgroundColor");
                 gce.setAttribute("userInputFlag", "FALSE");
-                gce.setAttribute("transparentColorFlag", "FALSE");
+                gce.setAttribute("transparentColorFlag", "TRUE");
                 gce.setAttribute("transparentColorIndex", "0");
 
                 if (f == 0) {

@@ -48,7 +48,7 @@ Still missing:
 **Shipped v1.10.0.** When a selection is active, re-quantize only considers colors present in the selection as candidates, and single-step reduction only merges from colors present in the selection.
 
 ### ~~GIF requantize frame awareness~~
-**Shipped v1.10.0.** The editor's re-quantize tool (`R`) now correctly uses the active animation frame as the source rather than always reading frame 0. Uses `PngToMapColors.coalesceGifFrames()` extracted for reuse.
+**Shipped v1.10.0; enhanced v1.11.0.** The editor's re-quantize tool (`R`) now correctly uses the active animation frame as the source rather than always reading frame 0. Uses `PngToMapColors.coalesceGifFrames()` extracted for reuse. v1.11.0 adds full frame provenance tracking: after `/loominary stride` or `/loominary skip` thins the GIF, each editor frame remembers which original GIF frame it came from. `R` always pulls the correct source frame automatically. `Shift+[` / `Shift+]` lets users override the source frame manually.
 
 ### ~~Auto-right-click of banners with map~~
 **Shipped.** `/loominary click` (toggle). Player walks near banners while holding the map; handler scans a ±5-block cube every 5 ticks, computes face-aware `BlockHitResult`, calls `interactionManager.interactBlock`. Auto-stops when all banners are registered.

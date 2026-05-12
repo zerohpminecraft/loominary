@@ -32,6 +32,24 @@ Still missing:
 ### ~~CJK overflow banner encoding~~
 **Shipped v1.6.0.** Banner overflow encoding switched from base64 (6 bits/char, 36 bytes/banner) to a 14-bit CJK alphabet (U+4E00–U+8DFF, 84 bytes/banner) — 2.33× improvement. Validated on 2b2t via automated rename probes; all tested code points in the range passed unmodified. Format: 2-byte big-endian length header prepended before bit-packing; discriminated from old base64 chunks by a single char-range check (`≥ U+4E00`). Old base64 banners decode correctly on new clients.
 
+### ~~Carpet overflow also CJK-encoded~~
+**Shipped v1.8.0.** Carpet overflow banners (the hex-indexed banners beyond the carpet+shade channel) were migrated to the same CJK encoding used by banner tiles. Grand total capacity: 15,414 compressed bytes per tile.
+
+### ~~Named save/load state~~
+**Shipped v1.10.0.** `/loominary save [name]` and `/loominary load <name>`. Every import auto-saves to `loominary_saves/<stem>_NNN.json` with a monotonic counter. `PayloadState.saveToFile/loadFromFile` serialize the full batch state. Tab-completion lists existing saves.
+
+### ~~Image export~~
+**Shipped v1.10.0.** `/loominary export image` renders the active tile as a PNG (static) or looping animated GIF (animated) to `loominary_exports/`. GIF export builds an `IndexColorModel` from the exact map color bytes — no quantization loss.
+
+### ~~Editor color reduction (K key + budget badge)~~
+**Shipped v1.10.0.** `K` merges one palette step using the active strategy; `Shift+K` cycles strategies. A budget badge in the palette header shows compressed bytes vs. capacity (or banner count vs. 63) and turns red when over budget.
+
+### ~~Selection-aware editor filters and reduction~~
+**Shipped v1.10.0.** When a selection is active, re-quantize only considers colors present in the selection as candidates, and single-step reduction only merges from colors present in the selection.
+
+### ~~GIF requantize frame awareness~~
+**Shipped v1.10.0.** The editor's re-quantize tool (`R`) now correctly uses the active animation frame as the source rather than always reading frame 0. Uses `PngToMapColors.coalesceGifFrames()` extracted for reuse.
+
 ### ~~Auto-right-click of banners with map~~
 **Shipped.** `/loominary click` (toggle). Player walks near banners while holding the map; handler scans a ±5-block cube every 5 ticks, computes face-aware `BlockHitResult`, calls `interactionManager.interactBlock`. Auto-stops when all banners are registered.
 
@@ -74,9 +92,6 @@ Each animated frame should have its own `float[16384]` dither mask. Currently th
 
 ### Per-frame undo in animated editor
 The undo stack currently clears on frame switch. A `Deque<byte[]>[]` (one deque per frame) would fix this. The single shared stack is functional but loses history when switching frames.
-
-### Carpet overflow also CJK-encoded
-The LC/LS manifest banner's embedded overflow payload and the hex-indexed overflow banners in the carpet path still use base64. Upgrading them to CJK would add ~22% more capacity on the overflow side (2,265 → ~4,870 bytes). Requires new `LK`/`LZ` manifest prefixes so old decoders can gracefully skip; flag as "further upgrade available" in a comment.
 
 ### Hotkey for export
 Add a key binding for `/loominary export`. One-line addition.

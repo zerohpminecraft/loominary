@@ -27,7 +27,9 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 - **Color palette histogram**: `/loominary palette [all]` shows a rarity distribution histogram with sigmoid-adaptive bucket boundaries and cumulative removal-cost table; `palette all` covers every tile's frames together
 - **Flexible palette reduction**: reduce by banner count or distinct colour count, on the active tile or all tiles at once; three palette strategies (rarest, closest, weighted) control how colors are merged
 - **Image filters**: `/loominary filter smooth|median|sharpen|posterize [all]` applies spatial pre-processing in-place on the current tile state — no source file required, preserves skip/stride/edit work; also available in the editor with `P`
-- **Litematica schematic export**: carpet tiles auto-export a schematic on import; staircase schematics are auto-selected for tiles that use the shade channel; banner tiles export on demand with `/loominary export`
+- **Named save/load**: `/loominary save [name]` saves the full batch state to `loominary_saves/`; every import auto-saves with a monotonic counter. `/loominary load <name>` restores any save, replacing the current state. Tab-completion lists existing saves
+- **Image export**: `/loominary export image` renders the active tile as a lossless PNG (static) or looping animated GIF to `loominary_exports/`
+- **Litematica schematic export**: `/loominary export` (or `/loominary export <name>`) writes a Litematica `.litematic` for the active tile — flat or staircase depending on the tile's channels; on demand only (no longer automatic on import)
 - **Grid-aware preview**: `/loominary preview` discovers the full wall of framed maps from any frame and paints all tiles at once
 - **Embedded metadata**: every payload records the image title, author username, grid position, and a CRC32 integrity check; animated payloads carry frame count, loop count, and per-frame delays
 - **Auto-title**: each import derives a title from the filename stem; steal uses `map_<id>`; `/loominary title` overrides and immediately re-encodes all existing tiles
@@ -45,7 +47,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 
 ## Installation
 
-1. Download `loominary-1.8.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
+1. Download `loominary-1.10.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
 2. Drop it into your `mods/` folder alongside Fabric API
 3. Launch the game
 
@@ -57,7 +59,7 @@ You'll see `[Loominary] Client-side mod initialized successfully!` in the log.
 
 1. Drop a PNG into `<gamedir>/loominary_data/`.
 2. Run `/loominary import <filename>`. Tab-completion works.
-3. Loominary tells you how many carpet rows and compressed bytes, and auto-exports the schematic to Litematica's `schematics/` folder. If the shade channel is used, a staircase schematic is written instead of a flat platform.
+3. Loominary tells you how many carpet rows and compressed bytes, and auto-saves the state to `loominary_saves/`. When you're ready to build, run `/loominary export` to write the Litematica schematic. A staircase schematic is automatically chosen if the tile uses the shade channel.
 4. Optionally run `/loominary preview` while looking at any framed map to see what your image will look like before committing.
 5. Make sure you have enough unnamed banners (any color) and empty bundles in your inventory for the LC/LS manifest banner and any overflow banners. You need 1 XP level per banner.
 6. Walk to an anvil, open it, and let Loominary rename the manifest banner (and any overflow banners) automatically.
@@ -116,7 +118,7 @@ This produces 8 tiles arranged in a 4-column, 2-row grid. Each tile is its own 1
 /loominary title My Map Art
 ```
 
-The title is auto-derived from the filename on each import (e.g. `landscape.png` → `landscape`). Setting a title explicitly overrides this and immediately re-encodes all tiles in the current batch with the new title embedded. For carpet tiles you'll need to re-export the schematic after changing the title. Clear it with `/loominary title` (no argument).
+The title is auto-derived from the filename on each import (e.g. `landscape.png` → `landscape`). Setting a title explicitly overrides this and immediately re-encodes all tiles in the current batch with the new title embedded. For carpet tiles run `/loominary export` after changing the title to get an updated schematic. Clear it with `/loominary title` (no argument).
 
 ## Commands
 
@@ -124,7 +126,7 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 ### Importing payloads
 
-- `/loominary import <filename>` — Import an image from `loominary_data/` using carpet encoding (default). Carpet schematic auto-exported on import.
+- `/loominary import <filename>` — Import an image from `loominary_data/` using carpet encoding (default). State is auto-saved to `loominary_saves/` on import.
 - `/loominary import <filename> banners` — Import using legacy banner-only encoding.
 - `/loominary import <filename> [cols rows] [allshades] [dither]` — Import with grid and/or options. Works in both carpet and banner modes.
 - `/loominary import steal` — Append the framed map at your crosshair as a new carpet tile.
@@ -166,6 +168,12 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 - `/loominary title <text>` — Set the title. Immediately re-encodes all tiles in the current batch with the new title. Warns if carpet schematics need re-export.
 - `/loominary title` — Clear the title (reverts to auto-derive from filename on next import).
 
+### Save / load state
+
+- `/loominary save` — Auto-save current batch to `loominary_saves/<stem>_NNN.json` (monotonic counter per source filename).
+- `/loominary save <name>` — Save with an explicit name.
+- `/loominary load <name>` — Load a named save, replacing the current state. Tab-completes existing saves.
+
 ### Recovery
 
 - `/loominary resalt` — Re-encode the active tile with a random nonce, producing new chunk names for the same image. Works for both carpet and banner tiles. Use this when the anvil handler shows "Stuck — run /loominary resalt."
@@ -206,8 +214,9 @@ All filter commands re-quantize pixel colors back to the existing tile palette a
 
 ### Export
 
-- `/loominary export` — Carpet tiles: re-export the carpet schematic (useful after `/loominary title`). Banner tiles: write a Litematica `.litematic` schematic. Both go to Litematica's `schematics/` folder.
+- `/loominary export` — Write a Litematica `.litematic` for the active tile. Carpet tiles get a flat or staircase schematic depending on their channel usage. Banner tiles get a banner-layout schematic. Both go to Litematica's `schematics/` folder.
 - `/loominary export <name>` — Write with a custom filename.
+- `/loominary export image` — Export the active tile as a PNG (static tiles) or looping animated GIF (animated tiles) to `loominary_exports/`. Pixel colors are rendered from the map palette exactly — no re-quantization.
 
 ### Cleanup
 

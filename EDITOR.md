@@ -99,6 +99,8 @@ The dither mask overrides the automatic Otsu-threshold map when you press `R` �
 
 The right side of the editor shows the colors currently in use in the tile, sorted by frequency (most common first). Click a swatch to set it as the active paint color.
 
+**Budget badge:** The palette panel header shows current budget usage — compressed bytes vs. the 15,414-byte ceiling for carpet tiles, or banner count vs. 63 for banner tiles. The display turns red when over budget. It updates whenever you make a change that would affect compressed size.
+
 **"All colors" toggle:** Below the palette, a checkbox expands the list to show all ~186 legal map colors (or ~248 with `allshades`). Useful for painting colors not yet present in the tile.
 
 **Frequency tooltip:** Hover over a swatch to see the map-color byte index and how many pixels use that color.
@@ -128,9 +130,22 @@ The merge tool is a quick alternative to `/loominary reduce` when you want preci
 
 ---
 
+## Color Reduction (`K` / `Shift+K`)
+
+Single-step palette reduction directly in the editor. Each press of `K` merges one color into its nearest neighbor — the same mechanism as `/loominary reduce`, but one step at a time so you can watch the effect live.
+
+- `K` — Remove the rarest (or closest, or weighted-closest) color from the palette and remap every pixel using it to its nearest surviving color. If a selection is active, only colors present in the selection are candidates for merging.
+- `Shift+K` — Cycle the active reduction strategy: **Rarest → Closest → Weighted**.
+
+The current strategy is shown in the guide panel. The budget badge in the palette header updates after each step, so you can drive the tile under budget one merge at a time. Undoable with `Ctrl+Z`.
+
+---
+
 ## Filter Tool (`P` / `Shift+P`)
 
 The filter tool applies a spatial image filter to the current frame in-place, then re-quantizes each pixel back to the nearest color already present in the tile. Because re-quantization is restricted to the existing palette, the banner/carpet count does not increase.
+
+**Selection scope:** If a selection is active, the re-quantization step after filtering only considers colors present within the selection as match candidates. This prevents the filter from pulling in colors from outside the region you're working on.
 
 **Controls:**
 - `Shift+P` — cycle the active filter type: Smooth → Median → Sharpen → Posterize
@@ -148,7 +163,7 @@ The current filter type is shown in the guide panel. For more control (larger ra
 
 ## Re-Quantize (`R`)
 
-Re-quantizes the selection (or the whole tile if nothing is selected) from the original source image. This re-derives the best possible color mapping for the selected region, optionally with dithering.
+Re-quantizes the selection (or the whole tile if nothing is selected) from the original source image. This re-derives the best possible color mapping for the selected region, optionally with dithering. When a selection is active, the candidate palette for re-quantization is restricted to colors already present within the selection — so dithering can't introduce colors from outside the selected area.
 
 **Steps:**
 1. Optionally make a selection with Select, Lasso, or Magic Wand.
@@ -289,6 +304,12 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 |---|---|
 | `Shift+P` | Cycle active filter type (smooth / median / sharpen / posterize) |
 | `P` | Apply active filter to current frame |
+
+### Color reduction
+| Key | Action |
+|---|---|
+| `K` | Merge one color step (rarest/closest/weighted — whichever strategy is active) |
+| `Shift+K` | Cycle reduction strategy: Rarest → Closest → Weighted |
 
 ### Undo / redo
 | Key | Action |

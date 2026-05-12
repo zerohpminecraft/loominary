@@ -56,6 +56,12 @@ public class PayloadState {
         public int nonce = 0;          // 0 = v1 encoding; non-zero = v2+ with this nonce
         public int frameCount = 1;     // 1 = static; >1 = animated (FLAG_ANIMATED set)
         public List<Integer> frameDelays = null; // null → single global 100ms default
+        /**
+         * Maps each editor frame index to the original GIF frame index it came from.
+         * Null means a 1-to-1 mapping (never had stride/skip applied, or not a GIF).
+         * Updated by stride/skip so requantize always targets the right source frame.
+         */
+        public List<Integer> frameSourceIndices = null;
         /** True when this tile uses the carpet-hybrid encoding (carpet platform + optional overflow banners). */
         public boolean carpetEncoded = false;
         /**

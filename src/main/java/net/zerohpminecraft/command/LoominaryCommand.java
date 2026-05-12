@@ -1270,6 +1270,8 @@ public class LoominaryCommand {
                     tile.frameCount = frameCount;
                     tile.frameDelays = new ArrayList<>();
                     for (int d : rawDelays) tile.frameDelays.add(d);
+                    tile.frameSourceIndices = new ArrayList<>();
+                    for (int f = 0; f < frameCount; f++) tile.frameSourceIndices.add(f);
                     newTiles.add(tile);
                     tileNotes.add(note);
                     totalBannersNeeded += chunks.size();
@@ -1582,6 +1584,8 @@ public class LoominaryCommand {
                 tile.frameCount = frameCount;
                 tile.frameDelays = new ArrayList<>();
                 for (int d : rawDelays) tile.frameDelays.add(d);
+                tile.frameSourceIndices = new ArrayList<>();
+                for (int f = 0; f < frameCount; f++) tile.frameSourceIndices.add(f);
                 newTiles.add(tile);
                 tileNotes.add(tileNote);
             }
@@ -3321,7 +3325,7 @@ public class LoominaryCommand {
                 "§7Applying %s %d to all %d animated tile%s...",
                 isStride ? "stride" : "skip", n, animatedCount, animatedCount == 1 ? "" : "s")));
 
-        record FS(byte[][] frames, int[] delays) {}
+        record FS(byte[][] frames, int[] delays, List<Integer> sourceIndices) {}
 
         MinecraftClient client = MinecraftClient.getInstance();
         Thread t = new Thread(() -> {
@@ -3333,19 +3337,27 @@ public class LoominaryCommand {
                 try {
                     byte[][] frames = resolveAllFramesForTile(snap, allChunks.get(i));
                     int[] delays = tileDelays(snap, frames.length);
+                    // Build the source-index list for this tile: use existing provenance or 1:1
+                    List<Integer> srcIdx = new ArrayList<>();
+                    for (int f = 0; f < frames.length; f++) {
+                        srcIdx.add(snap.frameSourceIndices != null && f < snap.frameSourceIndices.size()
+                                ? snap.frameSourceIndices.get(f) : f);
+                    }
                     FS r;
                     if (isStride) {
                         int kept = (frames.length + n - 1) / n;
                         byte[][] kf = new byte[kept][];
                         int[]    kd = new int[kept];
+                        List<Integer> ki = new ArrayList<>(kept);
                         for (int j = 0; j < kept; j++) {
                             int src = j * n;
                             kf[j] = frames[src];
+                            ki.add(srcIdx.get(src));
                             int acc = 0;
                             for (int k = src; k < Math.min(src + n, frames.length); k++) acc += delays[k];
                             kd[j] = acc;
                         }
-                        r = new FS(kf, kd);
+                        r = new FS(kf, kd, ki);
                     } else {
                         int keptCount = 0;
                         for (int j = 0; j < frames.length; j++)
@@ -3353,6 +3365,7 @@ public class LoominaryCommand {
                         if (keptCount == 0) keptCount = 1;
                         byte[][] kf = new byte[keptCount][];
                         int[]    kd = new int[keptCount];
+                        List<Integer> ki = new ArrayList<>(keptCount);
                         int dst = 0, pending = 0;
                         for (int j = 0; j < frames.length; j++) {
                             if ((j + 1) % n == 0) {
@@ -3360,12 +3373,15 @@ public class LoominaryCommand {
                             } else {
                                 kf[dst] = frames[j];
                                 kd[dst] = delays[j] + pending;
+                                ki.add(srcIdx.get(j));
                                 pending = 0;
                                 dst++;
                             }
                         }
                         if (pending > 0 && dst > 0) kd[dst - 1] += pending;
-                        r = new FS(kf, kd);
+                        // If everything was dropped (only-frame case), keep first
+                        if (ki.isEmpty()) ki.add(srcIdx.get(0));
+                        r = new FS(kf, kd, ki);
                     }
                     results.add(r);
                 } catch (Exception e) {
@@ -3380,8 +3396,11 @@ public class LoominaryCommand {
                         FS r = results.get(i);
                         if (r == null) continue;
                         saveEditorChanges(r.frames(), r.delays(), i, playerName);
+                        // Update provenance after saveEditorChanges re-encodes the tile.
+                        PayloadState.tiles.get(i).frameSourceIndices = r.sourceIndices();
                         saved++;
                     }
+                    PayloadState.save();
                     source.sendFeedback(Text.literal(String.format(
                             "§a%s %d applied to %d tile%s.",
                             isStride ? "Stride" : "Skip", n, saved, saved == 1 ? "" : "s")));

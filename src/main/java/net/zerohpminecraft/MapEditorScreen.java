@@ -162,6 +162,13 @@ public class MapEditorScreen extends Screen {
     // In-editor color reduction (K = one step, Shift+K = cycle strategy)
     private static PngToMapColors.Strategy editorReductionStrategy = PngToMapColors.Strategy.RAREST;
 
+    // Requantize source frame — the GIF frame index passed to coalesceGifFrames().
+    // Derived from tile.frameSourceIndices[activeFrame] when provenance exists;
+    // can be overridden manually with Shift+[ / Shift+].
+    private int requantizeSourceFrame = 0;
+    // Total original GIF frames (max(frameSourceIndices)+1); -1 when unknown.
+    private int gifSourceFrameCount   = -1;
+
     // Budget badge cache (recomputed in rebuildTileColors)
     private int  cachedDistinctCount = 0;
     private int  cachedBudgetUsed    = 0;
@@ -212,7 +219,8 @@ public class MapEditorScreen extends Screen {
         // Load per-frame delays from tile state
         this.frameDelayMs = new int[frames.length];
         if (!PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size()) {
-            List<Integer> stored = PayloadState.tiles.get(tileIndex).frameDelays;
+            PayloadState.TileData tile = PayloadState.tiles.get(tileIndex);
+            List<Integer> stored = tile.frameDelays;
             if (stored != null && !stored.isEmpty()) {
                 for (int i = 0; i < frames.length; i++) {
                     // pad with last stored delay if tile had fewer entries (e.g. after drop)
@@ -220,6 +228,15 @@ public class MapEditorScreen extends Screen {
                 }
             } else {
                 Arrays.fill(frameDelayMs, 100);
+            }
+            // Initialize requantize source frame from provenance.
+            if (tile.frameSourceIndices != null && !tile.frameSourceIndices.isEmpty()) {
+                requantizeSourceFrame = tile.frameSourceIndices.get(0);
+                gifSourceFrameCount   = tile.frameSourceIndices.stream()
+                        .mapToInt(Integer::intValue).max().orElse(0) + 1;
+            } else {
+                requantizeSourceFrame = 0;
+                gifSourceFrameCount   = -1;
             }
         } else {
             Arrays.fill(frameDelayMs, 100);
@@ -624,7 +641,20 @@ public class MapEditorScreen extends Screen {
         // Global shortcuts
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+Z  undo"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+Y  redo"), x, y, 0xFFFFFF); y += 9;
-        ctx.drawTextWithShadow(textRenderer, Text.literal("§8R  requantize"), x, y, 0xFFFFFF); y += 9;
+        // Show requantize source frame when tile is an animated GIF (may differ from active frame)
+        boolean gifAnimated = totalFrames > 1 && PayloadState.currentSourceFilename != null
+                && PayloadState.currentSourceFilename.toLowerCase().endsWith(".gif");
+        if (gifAnimated) {
+            String srcLabel = gifSourceFrameCount > 0
+                    ? (requantizeSourceFrame + 1) + "/" + gifSourceFrameCount
+                    : String.valueOf(requantizeSourceFrame + 1);
+            boolean mismatch = requantizeSourceFrame != activeFrame;
+            String rSrcLine = (mismatch ? "§e" : "§8") + "R  src:frm" + srcLabel
+                    + (mismatch ? " §8Sh+[/]" : " §8Sh+[/]");
+            ctx.drawTextWithShadow(textRenderer, Text.literal(rSrcLine), x, y, 0xFFFFFF); y += 9;
+        } else {
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8R  requantize"), x, y, 0xFFFFFF); y += 9;
+        }
         String algoName = switch (editorDitherAlgo) {
             case NONE           -> "§8none";
             case FLOYD_STEINBERG -> "§aFS§r";
@@ -703,7 +733,10 @@ public class MapEditorScreen extends Screen {
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+]  next"), x, y, 0xFFFFFF); y += 9;
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8,  delay -10ms"), x, y, 0xFFFFFF); y += 9;
             ctx.drawTextWithShadow(textRenderer, Text.literal("§8.  delay +10ms"), x, y, 0xFFFFFF); y += 9;
-            ctx.drawTextWithShadow(textRenderer, Text.literal("§8Del  drop frame"), x, y, 0xFFFFFF);
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8Del  drop frame"), x, y, 0xFFFFFF); y += 9;
+            if (gifAnimated) {
+                ctx.drawTextWithShadow(textRenderer, Text.literal("§8Sh+[/]  R source"), x, y, 0xFFFFFF);
+            }
         }
         if (PayloadState.tiles.size() > 1) {
             y += 9;
@@ -1343,12 +1376,32 @@ public class MapEditorScreen extends Screen {
             return true;
         }
 
+        // Shift+[ / Shift+] — step requantize source frame independently (GIF tiles only)
+        if (!ctrl && shift && totalFrames > 1 && PayloadState.currentSourceFilename != null
+                && PayloadState.currentSourceFilename.toLowerCase().endsWith(".gif")) {
+            int maxSrc = gifSourceFrameCount > 0 ? gifSourceFrameCount - 1 : requantizeSourceFrame + 32;
+            if (keyCode == GLFW.GLFW_KEY_LEFT_BRACKET) {
+                requantizeSourceFrame = Math.max(0, requantizeSourceFrame - 1);
+                cachedRequantizeSrc = null; // invalidate so next R reloads
+                setStatusMsg("R source: GIF frame " + (requantizeSourceFrame + 1)
+                        + (gifSourceFrameCount > 0 ? "/" + gifSourceFrameCount : ""));
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) {
+                requantizeSourceFrame = Math.min(maxSrc, requantizeSourceFrame + 1);
+                cachedRequantizeSrc = null;
+                setStatusMsg("R source: GIF frame " + (requantizeSourceFrame + 1)
+                        + (gifSourceFrameCount > 0 ? "/" + gifSourceFrameCount : ""));
+                return true;
+            }
+        }
+
         // Brush / dither-brush radius via [ ] (not when Ctrl held — that nav frames/tiles)
-        if (!ctrl && keyCode == GLFW.GLFW_KEY_LEFT_BRACKET
+        if (!ctrl && !shift && keyCode == GLFW.GLFW_KEY_LEFT_BRACKET
                 && (currentTool == Tool.BRUSH || currentTool == Tool.DITHER_BRUSH)) {
             brushRadius = Math.max(0, brushRadius - 1); return true;
         }
-        if (!ctrl && keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET
+        if (!ctrl && !shift && keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET
                 && (currentTool == Tool.BRUSH || currentTool == Tool.DITHER_BRUSH)) {
             brushRadius = Math.min(MAX_BRUSH, brushRadius + 1); return true;
         }
@@ -1510,10 +1563,11 @@ public class MapEditorScreen extends Screen {
         }
         try {
             if (totalFrames > 1 && fname.toLowerCase().endsWith(".gif")) {
-                // For animated tiles, load the specific coalesced frame from the source GIF
-                // so requantize targets the correct animation frame, not always frame 0.
+                // Load the specific coalesced GIF frame that this editor frame came from.
+                // requantizeSourceFrame tracks provenance through stride/skip and can be
+                // overridden manually with Shift+[ / Shift+].
                 BufferedImage[] gifFrames = PngToMapColors.coalesceGifFrames(sourcePath);
-                cachedRequantizeSrc = gifFrames[Math.min(activeFrame, gifFrames.length - 1)];
+                cachedRequantizeSrc = gifFrames[Math.min(requantizeSourceFrame, gifFrames.length - 1)];
             } else {
                 cachedRequantizeSrc = ImageIO.read(sourcePath.toFile());
             }
@@ -2039,6 +2093,12 @@ public class MapEditorScreen extends Screen {
         mapColors   = allFrames[newFrame];
         history.clear();
         inPreview = false; previewColors = null; previewSelMask = null; cachedRequantizeSrc = null;
+        // Sync requantize source frame from provenance for this new editor frame.
+        if (!PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size()) {
+            List<Integer> src = PayloadState.tiles.get(tileIndex).frameSourceIndices;
+            if (src != null && newFrame < src.size())
+                requantizeSourceFrame = src.get(newFrame);
+        }
         rebuildTileColors();
     }
 
@@ -2050,11 +2110,16 @@ public class MapEditorScreen extends Screen {
         int drop = activeFrame;
         byte[][] newFrames = new byte[totalFrames - 1][];
         int[] newDelays = new int[totalFrames - 1];
+        // Prune provenance list in parallel with frame list.
+        List<Integer> oldSrc = (!PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size())
+                ? PayloadState.tiles.get(tileIndex).frameSourceIndices : null;
+        List<Integer> newSrc = (oldSrc != null) ? new ArrayList<>() : null;
         int dst = 0;
         for (int i = 0; i < totalFrames; i++) {
             if (i == drop) continue;
             newFrames[dst] = allFrames[i];
             newDelays[dst] = frameDelayMs != null && i < frameDelayMs.length ? frameDelayMs[i] : 100;
+            if (newSrc != null) newSrc.add(oldSrc.get(Math.min(i, oldSrc.size() - 1)));
             dst++;
         }
         allFrames    = newFrames;
@@ -2062,6 +2127,10 @@ public class MapEditorScreen extends Screen {
         totalFrames  = newFrames.length;
         activeFrame  = Math.min(activeFrame, totalFrames - 1);
         mapColors    = allFrames[activeFrame];
+        if (newSrc != null && !PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size()) {
+            PayloadState.tiles.get(tileIndex).frameSourceIndices = newSrc;
+            requantizeSourceFrame = newSrc.get(Math.min(activeFrame, newSrc.size() - 1));
+        }
         history.clear();
         inPreview = false; previewColors = null; previewSelMask = null; cachedRequantizeSrc = null;
         rebuildTileColors();

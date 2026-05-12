@@ -172,6 +172,19 @@ public class PngToMapColors {
 
     public enum DitherAlgo { NONE, FLOYD_STEINBERG, ATKINSON, BAYER_4X4 }
 
+    /**
+     * Distance metric used by nearest-color matching during requantize.
+     * OKLAB   — standard perceptual Euclidean (default)
+     * CHROMA_FIRST — 4× weight on a,b chroma components (saturates palette use)
+     * LUMA_FIRST   — 4× weight on L luma (preserves luminosity over hue)
+     * HUE_ONLY     — angular hue distance in OKLab a-b plane; achromatic inputs fall back to OKLab
+     * RGB          — sRGB Euclidean (matches what most color pickers display)
+     */
+    public enum MatchMetric { OKLAB, CHROMA_FIRST, LUMA_FIRST, HUE_ONLY, RGB }
+
+    // Squared OKLab chroma threshold below which a color is considered achromatic
+    private static final float ACHROMATIC_SQ = 0.04f * 0.04f;
+
     // ── Image filters ────────────────────────────────────────────────────
 
     /**
@@ -453,6 +466,93 @@ public class PngToMapColors {
         }
 
         return new FitResult(mapColors, compressed, colorsRemoved, originalDistinct, pixelsAffected);
+    }
+
+    // ── Reduction: single-step (editor) ─────────────────────────────────
+
+    /**
+     * Removes one color using the given strategy, optionally scoped to a selection mask.
+     * When {@code selMask} is non-null, frequency is computed from selected pixels only
+     * and the remap is applied only within the selection — so both victim and survivor
+     * are guaranteed to exist inside the selection.
+     *
+     * @return int[]{distinctBefore, distinctAfter, pixelsAffected}
+     */
+    public static int[] reduceOneStep(byte[] mapColors, boolean[] selMask,
+                                       float[][] oklabLookup, Strategy strategy) {
+        int[] freq = new int[256];
+        if (selMask != null) {
+            for (int i = 0; i < mapColors.length; i++)
+                if (selMask[i]) freq[mapColors[i] & 0xFF]++;
+        } else {
+            for (byte b : mapColors) freq[b & 0xFF]++;
+        }
+        freq[0] = 0;
+
+        int distinctBefore = 0;
+        for (int c = 1; c < 256; c++) if (freq[c] > 0) distinctBefore++;
+        if (distinctBefore <= 1) return new int[]{distinctBefore, distinctBefore, 0};
+
+        int victim, survivor, victimFreq;
+        if (strategy == Strategy.RAREST) {
+            int rarestColor = -1, rarestFreq = Integer.MAX_VALUE;
+            for (int c = 1; c < 256; c++) {
+                if (freq[c] > 0 && freq[c] < rarestFreq) { rarestFreq = freq[c]; rarestColor = c; }
+            }
+            if (rarestColor == -1) return new int[]{distinctBefore, distinctBefore, 0};
+            float[] target = oklabLookup[rarestColor];
+            if (target == null) return new int[]{distinctBefore, distinctBefore, 0};
+            float bestDist = Float.MAX_VALUE;
+            int bestNeighbor = -1;
+            for (int c = 1; c < 256; c++) {
+                if (c == rarestColor || freq[c] == 0 || oklabLookup[c] == null) continue;
+                float dL = target[0]-oklabLookup[c][0], da = target[1]-oklabLookup[c][1], db = target[2]-oklabLookup[c][2];
+                float d = dL*dL + da*da + db*db;
+                if (d < bestDist) { bestDist = d; bestNeighbor = c; }
+            }
+            if (bestNeighbor == -1) return new int[]{distinctBefore, distinctBefore, 0};
+            victim = rarestColor; survivor = bestNeighbor; victimFreq = rarestFreq;
+        } else {
+            int bestA = -1, bestB = -1;
+            float bestScore = Float.MAX_VALUE;
+            for (int a = 1; a < 256; a++) {
+                if (freq[a] == 0 || oklabLookup[a] == null) continue;
+                for (int b = a + 1; b < 256; b++) {
+                    if (freq[b] == 0 || oklabLookup[b] == null) continue;
+                    float dL = oklabLookup[a][0] - oklabLookup[b][0];
+                    float da = oklabLookup[a][1] - oklabLookup[b][1];
+                    float db = oklabLookup[a][2] - oklabLookup[b][2];
+                    float distSq = dL*dL + da*da + db*db;
+                    float score = (strategy == Strategy.WEIGHTED)
+                            ? distSq / (freq[a] + freq[b]) : distSq;
+                    if (score < bestScore) { bestScore = score; bestA = a; bestB = b; }
+                }
+            }
+            if (bestA == -1) return new int[]{distinctBefore, distinctBefore, 0};
+            victim   = (freq[bestA] <= freq[bestB]) ? bestA : bestB;
+            survivor = (freq[bestA] <= freq[bestB]) ? bestB : bestA;
+            victimFreq = freq[victim];
+        }
+
+        byte from = (byte) victim, to = (byte) survivor;
+        if (selMask != null) {
+            for (int i = 0; i < mapColors.length; i++)
+                if (selMask[i] && mapColors[i] == from) mapColors[i] = to;
+        } else {
+            for (int i = 0; i < mapColors.length; i++)
+                if (mapColors[i] == from) mapColors[i] = to;
+        }
+
+        int[] freqAfter = new int[256];
+        if (selMask != null) {
+            for (int i = 0; i < mapColors.length; i++)
+                if (selMask[i]) freqAfter[mapColors[i] & 0xFF]++;
+        } else {
+            for (byte b : mapColors) freqAfter[b & 0xFF]++;
+        }
+        int distinctAfter = 0;
+        for (int c = 1; c < 256; c++) if (freqAfter[c] > 0) distinctAfter++;
+        return new int[]{distinctBefore, distinctAfter, victimFreq};
     }
 
     // ── Reduction: color-count target ────────────────────────────────────
@@ -748,6 +848,45 @@ public class PngToMapColors {
         return out;
     }
 
+    static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, float[] ditherStrength,
+                                          int width, int height, float diffuseAmount,
+                                          MatchMetric metric, float[][] rgbLookup) {
+        if (metric == MatchMetric.OKLAB)
+            return renderDithered(scaled, palette, oklabLookup, ditherStrength, width, height, diffuseAmount);
+        float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
+        byte[] out = new byte[width * height];
+        float[] errCur = new float[width * 3];
+        float[] errNxt = new float[width * 3];
+        for (int y = 0; y < height; y++) {
+            float[] tmp = errCur; errCur = errNxt; errNxt = tmp;
+            java.util.Arrays.fill(errNxt, 0f);
+            for (int x = 0; x < width; x++) {
+                int argb = scaled.getRGB(x, y);
+                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
+                float[] src = rgbToOklab(argb);
+                int ei = x * 3;
+                float L = src[0] + errCur[ei    ];
+                float a = src[1] + errCur[ei + 1];
+                float b = src[2] + errCur[ei + 2];
+                byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup, metric, rgbLookup, palHues);
+                out[x + y * width] = chosen;
+                float[] cl = oklabLookup[chosen & 0xFF];
+                float eL = L - cl[0], ea = a - cl[1], eb = b - cl[2];
+                float errMagSq = eL * eL + ea * ea + eb * eb;
+                float s = (errMagSq > ERROR_FLOOR_SQ) ? ditherStrength[x + y * width] * diffuseAmount : 0f;
+                if (s > 0f) {
+                    float seL = eL * s, sea = ea * s, seb = eb * s;
+                    if (x + 1 < width)  { int ri=(x+1)*3; errCur[ri]+=seL*(7f/16f); errCur[ri+1]+=sea*(7f/16f); errCur[ri+2]+=seb*(7f/16f); }
+                    if (x - 1 >= 0)     { int li=(x-1)*3; errNxt[li]+=seL*(3f/16f); errNxt[li+1]+=sea*(3f/16f); errNxt[li+2]+=seb*(3f/16f); }
+                    errNxt[ei]+=seL*(5f/16f); errNxt[ei+1]+=sea*(5f/16f); errNxt[ei+2]+=seb*(5f/16f);
+                    if (x + 1 < width)  { int ri=(x+1)*3; errNxt[ri]+=seL*(1f/16f); errNxt[ri+1]+=sea*(1f/16f); errNxt[ri+2]+=seb*(1f/16f); }
+                }
+            }
+        }
+        return out;
+    }
+
     /**
      * Atkinson dithering: diffuses 6/8 of the error across 6 neighbors (right×2, below-left,
      * below, below-right, two-below). The discarded 2/8 preserves highlights better than FS.
@@ -790,6 +929,41 @@ public class PngToMapColors {
         return out;
     }
 
+    static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height,
+                                          MatchMetric metric, float[][] rgbLookup) {
+        if (metric == MatchMetric.OKLAB) return renderAtkinson(scaled, palette, oklabLookup, width, height);
+        float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
+        byte[] out     = new byte[width * height];
+        float[] errCur  = new float[width * 3];
+        float[] errNxt  = new float[width * 3];
+        float[] errNxt2 = new float[width * 3];
+        for (int y = 0; y < height; y++) {
+            float[] tmp = errCur; errCur = errNxt; errNxt = errNxt2; errNxt2 = tmp;
+            Arrays.fill(errNxt2, 0f);
+            for (int x = 0; x < width; x++) {
+                int argb = scaled.getRGB(x, y);
+                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
+                float[] src = rgbToOklab(argb);
+                int ei = x * 3;
+                float L = src[0] + errCur[ei    ];
+                float a = src[1] + errCur[ei + 1];
+                float b = src[2] + errCur[ei + 2];
+                byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup, metric, rgbLookup, palHues);
+                out[x + y * width] = chosen;
+                float[] cl = oklabLookup[chosen & 0xFF];
+                float seL = (L - cl[0]) / 8f, sea = (a - cl[1]) / 8f, seb = (b - cl[2]) / 8f;
+                if (x + 1 < width) { int ri=(x+1)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
+                if (x + 2 < width) { int ri=(x+2)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
+                if (x - 1 >= 0)    { int li=(x-1)*3; errNxt[li]+=seL; errNxt[li+1]+=sea; errNxt[li+2]+=seb; }
+                errNxt[ei]+=seL; errNxt[ei+1]+=sea; errNxt[ei+2]+=seb;
+                if (x + 1 < width) { int ri=(x+1)*3; errNxt[ri]+=seL; errNxt[ri+1]+=sea; errNxt[ri+2]+=seb; }
+                errNxt2[ei]+=seL; errNxt2[ei+1]+=sea; errNxt2[ei+2]+=seb;
+            }
+        }
+        return out;
+    }
+
     private static final int[][] BAYER_MATRIX_4X4 = {
         { 0,  8,  2, 10},
         {12,  4, 14,  6},
@@ -813,6 +987,27 @@ public class PngToMapColors {
                 float offset = t * BAYER_SCALE;
                 out[x + y * width] = findClosestInPalette(
                         src[0] + offset, src[1] + offset, src[2] + offset, palette, oklabLookup);
+            }
+        }
+        return out;
+    }
+
+    static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height,
+                                          MatchMetric metric, float[][] rgbLookup) {
+        if (metric == MatchMetric.OKLAB) return renderBayer4x4(scaled, palette, oklabLookup, width, height);
+        float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
+        byte[] out = new byte[width * height];
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                int argb = scaled.getRGB(x, y);
+                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
+                float[] src = rgbToOklab(argb);
+                float t = (BAYER_MATRIX_4X4[y & 3][x & 3] + 0.5f) / 16.0f - 0.5f;
+                float offset = t * BAYER_SCALE;
+                out[x + y * width] = findClosestInPalette(
+                        src[0] + offset, src[1] + offset, src[2] + offset,
+                        palette, oklabLookup, metric, rgbLookup, palHues);
             }
         }
         return out;
@@ -878,6 +1073,52 @@ public class PngToMapColors {
         return bestByte;
     }
 
+    static byte findClosestInPalette(float L, float a, float b,
+                                              boolean[] palette, float[][] oklabLookup,
+                                              MatchMetric metric, float[][] rgbLookup, float[] palHues) {
+        if (metric == MatchMetric.OKLAB) return findClosestInPalette(L, a, b, palette, oklabLookup);
+        float bestDist = Float.MAX_VALUE;
+        byte bestByte  = 0;
+        float inputChromaSq = a * a + b * b;
+        float inputHue = (metric == MatchMetric.HUE_ONLY) ? (float) Math.atan2(b, a) : 0f;
+        float[] inputRgb = (metric == MatchMetric.RGB) ? oklabToLinearRgb(L, a, b) : null;
+        for (int c = 1; c < 256; c++) {
+            if (!palette[c] || oklabLookup[c] == null) continue;
+            float dL = L - oklabLookup[c][0], da = a - oklabLookup[c][1], db = b - oklabLookup[c][2];
+            float dist = switch (metric) {
+                case OKLAB -> dL * dL + da * da + db * db; // unreachable but exhaustive
+                case CHROMA_FIRST -> dL * dL + 4f * da * da + 4f * db * db;
+                case LUMA_FIRST   -> 4f * dL * dL + da * da + db * db;
+                case HUE_ONLY -> {
+                    float ca = oklabLookup[c][1], cb = oklabLookup[c][2];
+                    float palChromaSq = ca * ca + cb * cb;
+                    if (inputChromaSq < ACHROMATIC_SQ) {
+                        yield dL * dL + da * da + db * db;
+                    } else if (palChromaSq < ACHROMATIC_SQ) {
+                        yield 2.01f;
+                    } else {
+                        float ph = (palHues != null) ? palHues[c] : (float) Math.atan2(cb, ca);
+                        float hDiff = inputHue - ph;
+                        if (hDiff >  (float) Math.PI) hDiff -= (float) (2 * Math.PI);
+                        if (hDiff < -(float) Math.PI) hDiff += (float) (2 * Math.PI);
+                        yield 1.0f - (float) Math.cos(hDiff);
+                    }
+                }
+                case RGB -> {
+                    if (rgbLookup == null || rgbLookup[c] == null || inputRgb == null) {
+                        yield dL * dL + da * da + db * db;
+                    }
+                    float dr = inputRgb[0] - rgbLookup[c][0];
+                    float dg = inputRgb[1] - rgbLookup[c][1];
+                    float db2 = inputRgb[2] - rgbLookup[c][2];
+                    yield dr * dr + dg * dg + db2 * db2;
+                }
+            };
+            if (dist < bestDist) { bestDist = dist; bestByte = (byte) c; }
+        }
+        return bestByte;
+    }
+
     // ── Compression helpers ───────────────────────────────────────────────
 
     private static byte[] compressCombined(byte[] prefix, byte[] data) {
@@ -923,6 +1164,30 @@ public class PngToMapColors {
         return oklab;
     }
 
+    static float[][] buildLinearRgbLookup() {
+        float[][] out = new float[256][];
+        int[] srgb = buildColorLookup();
+        for (int b = 1; b < 256; b++) {
+            if (srgb[b] == 0) continue;
+            int rgb = srgb[b];
+            out[b] = new float[]{
+                srgbToLinear(((rgb >> 16) & 0xFF) / 255f),
+                srgbToLinear(((rgb >>  8) & 0xFF) / 255f),
+                srgbToLinear(( rgb        & 0xFF) / 255f)
+            };
+        }
+        return out;
+    }
+
+    static float[] buildPaletteHues(boolean[] palette, float[][] oklabLookup) {
+        float[] hues = new float[256];
+        for (int c = 1; c < 256; c++) {
+            if (!palette[c] || oklabLookup[c] == null) continue;
+            hues[c] = (float) Math.atan2(oklabLookup[c][2], oklabLookup[c][1]);
+        }
+        return hues;
+    }
+
     static float[] rgbToOklab(int rgb) {
         float r  = srgbToLinear(((rgb >> 16) & 0xFF) / 255f);
         float g  = srgbToLinear(((rgb >>  8) & 0xFF) / 255f);
@@ -945,6 +1210,18 @@ public class PngToMapColors {
 
     static float srgbToLinear(float c) {
         return c <= 0.04045f ? c / 12.92f : (float) Math.pow((c + 0.055f) / 1.055f, 2.4);
+    }
+
+    static float[] oklabToLinearRgb(float L, float a, float b) {
+        float l_ = L + 0.3963377774f * a + 0.2158037573f * b;
+        float m_ = L - 0.1055613458f * a - 0.0638541728f * b;
+        float s_ = L - 0.0894841775f * a - 1.2914855480f * b;
+        float l = l_ * l_ * l_; float m = m_ * m_ * m_; float s = s_ * s_ * s_;
+        return new float[]{
+            +4.0767416621f * l - 3.3077115913f * m + 0.2309699292f * s,
+            -1.2684380046f * l + 2.6097574011f * m - 0.3413193965f * s,
+            -0.0041960863f * l - 0.7034186147f * m + 1.7076147010f * s
+        };
     }
 
     // ── Utility ───────────────────────────────────────────────────────────
@@ -1022,6 +1299,63 @@ public class PngToMapColors {
     public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
                                         boolean dither, int cols, int rows) throws IOException {
         return convertGif(gifPath, legalOnly, targetColors, dither, cols, rows, null);
+    }
+
+    /**
+     * Reads a GIF and returns its frames as coalesced ARGB images at the GIF's native resolution.
+     * Disposal methods (restoreToBackground, restoreToPrevious) are handled correctly.
+     * Use this to get a specific frame for per-frame requantize in the editor.
+     */
+    public static BufferedImage[] coalesceGifFrames(Path gifPath) throws IOException {
+        try (ImageInputStream iis = ImageIO.createImageInputStream(Files.newInputStream(gifPath))) {
+            Iterator<ImageReader> readers = ImageIO.getImageReadersByMIMEType("image/gif");
+            if (!readers.hasNext()) throw new IOException("No GIF image reader available");
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(iis, false);
+                int screenW = 0, screenH = 0;
+                IIOMetadata streamMeta = reader.getStreamMetadata();
+                if (streamMeta != null) {
+                    Node root = streamMeta.getAsTree("javax_imageio_gif_stream_1.0");
+                    for (Node c = root.getFirstChild(); c != null; c = c.getNextSibling()) {
+                        if ("LogicalScreenDescriptor".equals(c.getNodeName())) {
+                            NamedNodeMap a = c.getAttributes();
+                            screenW = intAttr(a, "logicalScreenWidth", 0);
+                            screenH = intAttr(a, "logicalScreenHeight", 0);
+                        }
+                    }
+                }
+                if (screenW <= 0 || screenH <= 0)
+                    throw new IOException("Could not read GIF logical screen dimensions");
+                int numFrames = reader.getNumImages(true);
+                if (numFrames <= 0) throw new IOException("GIF has no frames");
+
+                BufferedImage canvas = new BufferedImage(screenW, screenH, BufferedImage.TYPE_INT_ARGB);
+                BufferedImage prevCanvas = null;
+                BufferedImage[] coalesced = new BufferedImage[numFrames];
+                for (int f = 0; f < numFrames; f++) {
+                    BufferedImage subframe = reader.read(f);
+                    GifFrameInfo info = parseGifFrameMeta(reader.getImageMetadata(f));
+                    if ("restoreToPrevious".equals(info.disposal())) prevCanvas = deepCopy(canvas);
+                    Graphics2D g = canvas.createGraphics();
+                    g.drawImage(subframe, info.left(), info.top(), null);
+                    g.dispose();
+                    coalesced[f] = deepCopy(canvas);
+                    if ("restoreToBackground".equals(info.disposal())) {
+                        Graphics2D gc = canvas.createGraphics();
+                        gc.setComposite(AlphaComposite.getInstance(AlphaComposite.CLEAR));
+                        gc.fillRect(info.left(), info.top(), subframe.getWidth(), subframe.getHeight());
+                        gc.dispose();
+                    } else if ("restoreToPrevious".equals(info.disposal()) && prevCanvas != null) {
+                        canvas = prevCanvas;
+                        prevCanvas = null;
+                    }
+                }
+                return coalesced;
+            } finally {
+                reader.dispose();
+            }
+        }
     }
 
     public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,

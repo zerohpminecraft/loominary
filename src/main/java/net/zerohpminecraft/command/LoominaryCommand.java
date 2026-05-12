@@ -31,10 +31,18 @@ import net.zerohpminecraft.PayloadState;
 import net.zerohpminecraft.PngToMapColors;
 import net.zerohpminecraft.SchematicExporter;
 
+import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
+import javax.imageio.ImageTypeSpecifier;
+import javax.imageio.ImageWriter;
+import javax.imageio.metadata.IIOMetadata;
+import javax.imageio.metadata.IIOMetadataNode;
+import javax.imageio.stream.ImageOutputStream;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferByte;
+import java.awt.image.IndexColorModel;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -507,6 +515,51 @@ public class LoominaryCommand {
         return builder.buildFuture();
     };
 
+    private static final SuggestionProvider<FabricClientCommandSource> SAVE_NAME_SUGGESTIONS = (ctx, builder) -> {
+        Path dir = savesDir();
+        if (Files.isDirectory(dir)) {
+            try (var stream = Files.list(dir)) {
+                List<String> names = stream
+                        .filter(p -> p.getFileName().toString().endsWith(".json"))
+                        .map(p -> { String n = p.getFileName().toString(); return n.substring(0, n.length() - 5); })
+                        .sorted()
+                        .toList();
+                return CommandSource.suggestMatching(names, builder);
+            } catch (IOException ignored) {
+            }
+        }
+        return builder.buildFuture();
+    };
+
+    private static Path savesDir() {
+        return MinecraftClient.getInstance().runDirectory.toPath().resolve("loominary_saves");
+    }
+
+    /** Returns the next monotonic counter for saves named {@code <stem>_NNN.json}. */
+    private static int nextSaveCounter(String stem) {
+        Path dir = savesDir();
+        if (!Files.isDirectory(dir)) return 1;
+        int max = 0;
+        try (var stream = Files.list(dir)) {
+            for (Path p : (Iterable<Path>) stream::iterator) {
+                String name = p.getFileName().toString();
+                if (!name.endsWith(".json") || !name.startsWith(stem + "_")) continue;
+                String suffix = name.substring(stem.length() + 1, name.length() - 5);
+                try { max = Math.max(max, Integer.parseInt(suffix)); } catch (NumberFormatException ignored) {}
+            }
+        } catch (IOException ignored) {}
+        return max + 1;
+    }
+
+    /** Writes an auto-save for a file import and reports the save name to the player. */
+    private static void triggerAutoSave(String filename, FabricClientCommandSource source) {
+        String stem = filenameStem(filename);
+        int n = nextSaveCounter(stem);
+        String saveName = String.format("%s_%03d", stem, n);
+        PayloadState.saveToFile(savesDir().resolve(saveName + ".json"));
+        source.sendFeedback(Text.literal("§7Saved as: §f" + saveName));
+    }
+
     public static void register() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
             dispatcher.register(
@@ -727,9 +780,25 @@ public class LoominaryCommand {
                                             .executes(ctx -> applySkipTile(ctx.getSource(),
                                                     IntegerArgumentType.getInteger(ctx, "n")))))
 
+                            // ── save ───────────────────────────────────────────
+                            .then(ClientCommandManager.literal("save")
+                                    .executes(ctx -> saveState(ctx.getSource(), null))
+                                    .then(ClientCommandManager.argument("name", StringArgumentType.string())
+                                            .executes(ctx -> saveState(ctx.getSource(),
+                                                    StringArgumentType.getString(ctx, "name")))))
+
+                            // ── load ───────────────────────────────────────────
+                            .then(ClientCommandManager.literal("load")
+                                    .then(ClientCommandManager.argument("name", StringArgumentType.string())
+                                            .suggests(SAVE_NAME_SUGGESTIONS)
+                                            .executes(ctx -> loadState(ctx.getSource(),
+                                                    StringArgumentType.getString(ctx, "name")))))
+
                             // ── export ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("export")
                                     .executes(ctx -> exportSchematic(ctx.getSource(), null))
+                                    .then(ClientCommandManager.literal("image")
+                                            .executes(ctx -> exportImage(ctx.getSource())))
                                     .then(ClientCommandManager.argument("name", StringArgumentType.string())
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
@@ -1093,6 +1162,7 @@ public class LoominaryCommand {
                         PayloadState.activeTileIndex = 0;
                         PayloadState.syncFromActiveTile();
                         PayloadState.save();
+                        triggerAutoSave(filename, source);
 
                         String modeTag = (allShades ? "all shades" : "legal palette")
                                 + (dither ? ", dithered" : "");
@@ -1240,6 +1310,7 @@ public class LoominaryCommand {
                         PayloadState.activeTileIndex = 0;
                         PayloadState.syncFromActiveTile();
                         PayloadState.save();
+                        triggerAutoSave(filename, source);
 
                         String modeTag = (allShades ? "all shades" : "legal palette")
                                 + (dither ? ", dithered" : "") + ", animated";
@@ -1343,7 +1414,6 @@ public class LoominaryCommand {
 
                 List<PayloadState.TileData> newTiles = new ArrayList<>();
                 List<String> tileNotes = new ArrayList<>();
-                List<Path> schematicPaths = new ArrayList<>();
 
                 for (int tileIdx = 0; tileIdx < totalTiles; tileIdx++) {
                     int col = tileIdx % columns;
@@ -1370,9 +1440,6 @@ public class LoominaryCommand {
                         note = String.format("reduced %d→%d colors to fit",
                                 fit.originalDistinctColors, fit.originalDistinctColors - fit.colorsRemoved);
                     }
-                    String schName = SchematicExporter.resolveSchematicName(
-                            capturedTitle != null ? capturedTitle + (totalTiles > 1 ? "_tile" + tileIdx : "") : null);
-                    schematicPaths.add(exportCarpetSchematic(enc, schName));
                     PayloadState.TileData tile = new PayloadState.TileData();
                     tile.chunks.addAll(enc.allChunks());
                     tile.currentIndex = 0;
@@ -1384,7 +1451,6 @@ public class LoominaryCommand {
 
                 final List<PayloadState.TileData> finalTiles = newTiles;
                 final List<String> finalNotes = tileNotes;
-                final List<Path> finalSchematics = schematicPaths;
                 final int finalTileCount = totalTiles;
 
                 client.execute(() -> {
@@ -1401,6 +1467,7 @@ public class LoominaryCommand {
                         PayloadState.activeTileIndex = 0;
                         PayloadState.syncFromActiveTile();
                         PayloadState.save();
+                        triggerAutoSave(filename, source);
 
                         String modeTag = "carpet, " + (allShades ? "all shades" : "legal palette")
                                 + (dither ? ", dithered" : "");
@@ -1425,9 +1492,6 @@ public class LoominaryCommand {
                             if (finalNotes.get(i) != null) line += " §e(" + finalNotes.get(i) + ")";
                             source.sendFeedback(Text.literal(line));
                         }
-                        source.sendFeedback(Text.literal("§aSchematics written to schematics/:"));
-                        for (Path p : finalSchematics)
-                            source.sendFeedback(Text.literal("§7  " + p.getFileName()));
                         int maxOverflow = finalTiles.stream().mapToInt(ti -> ti.chunks.size() - 1).max().orElse(0);
                         if (maxOverflow > 0)
                             source.sendFeedback(Text.literal(String.format(
@@ -1435,6 +1499,7 @@ public class LoominaryCommand {
                                     maxOverflow, maxOverflow == 1 ? "" : "s")));
                         else
                             source.sendFeedback(Text.literal("§aNo overflow banners needed — just place the carpet schematic and scan with your map!"));
+                        source.sendFeedback(Text.literal("§7Run §f/loominary export§7 when ready to generate the schematic."));
                     } finally {
                         importInProgress = false;
                     }
@@ -1485,7 +1550,6 @@ public class LoominaryCommand {
 
             int totalTiles = columns * rows;
             List<PayloadState.TileData> newTiles = new ArrayList<>();
-            List<Path> schematicPaths = new ArrayList<>();
             List<String> tileNotes = new ArrayList<>();
             boolean anyOverflow = false;
 
@@ -1510,10 +1574,6 @@ public class LoominaryCommand {
                     anyOverflow = true;
                 }
 
-                String schName = SchematicExporter.resolveSchematicName(
-                        capturedTitle + (totalTiles > 1 ? "_tile" + tileIdx : ""));
-                schematicPaths.add(exportCarpetSchematic(enc, schName));
-
                 PayloadState.TileData tile = new PayloadState.TileData();
                 tile.chunks.addAll(enc.allChunks());
                 tile.currentIndex = 0;
@@ -1527,7 +1587,6 @@ public class LoominaryCommand {
             }
 
             final List<PayloadState.TileData> finalTiles = newTiles;
-            final List<Path> finalSchematics = schematicPaths;
             final List<String> finalNotes = tileNotes;
             final int finalTileCount = totalTiles;
             final int finalFrameCount = frameCount;
@@ -1550,6 +1609,7 @@ public class LoominaryCommand {
                     PayloadState.activeTileIndex = 0;
                     PayloadState.syncFromActiveTile();
                     PayloadState.save();
+                    triggerAutoSave(filename, source);
 
                     String modeTag = "carpet, " + (allShades ? "all shades" : "legal palette")
                             + (dither ? ", dithered" : "") + ", animated";
@@ -1570,8 +1630,6 @@ public class LoominaryCommand {
                                 PayloadState.tileLabel(i), carpetRows, overflowBanners,
                                 overflowBanners == 1 ? "" : "s", totalBytes, budgetTag)));
                     }
-                    source.sendFeedback(Text.literal("§aSchematics written to schematics/:"));
-                    for (Path p : finalSchematics) source.sendFeedback(Text.literal("§7  " + p.getFileName()));
                     String delayDesc = finalUniform
                             ? finalManifestDelays[0] + "ms/frame"
                             : "variable (" + finalRawDelays[0] + "–"
@@ -1589,6 +1647,7 @@ public class LoominaryCommand {
                         else
                             source.sendFeedback(Text.literal("§aNo overflow banners needed — just place the carpet schematic and scan with your map!"));
                     }
+                    source.sendFeedback(Text.literal("§7Run §f/loominary export§7 when ready to generate the schematic."));
                 } finally {
                     importInProgress = false;
                 }
@@ -1726,24 +1785,14 @@ public class LoominaryCommand {
         int totalBytes = enc.compressed().length;
         int carpetRows = (enc.carpetBytes() * 2 + 127) / 128;
 
-        try {
-            String schematicName = SchematicExporter.resolveSchematicName(
-                    PayloadState.currentTitle + (PayloadState.tiles.size() > 1 ? "_tile" + tileIdx : ""));
-            Path schPath = exportCarpetSchematic(enc, schematicName);
-            PayloadState.save();
-            String msg = String.format(
-                    "§aStole map id=%d at %s → %s [carpet, %d rows, %d compressed bytes].",
-                    fm.mapId.id(), maskedPos(fm.frame.getBlockPos()),
-                    PayloadState.tileLabel(tileIdx), carpetRows, totalBytes);
-            if (note != null) msg += " §e(" + note + ")";
-            source.sendFeedback(Text.literal(msg));
-            source.sendFeedback(Text.literal("§7Schematic: " + schPath.getFileName()));
-        } catch (IOException e) {
-            PayloadState.save();
-            source.sendFeedback(Text.literal(String.format(
-                    "§aStole map id=%d → %s [carpet]. §eSchematic export failed: %s",
-                    fm.mapId.id(), PayloadState.tileLabel(tileIdx), e.getMessage())));
-        }
+        PayloadState.save();
+        String msg = String.format(
+                "§aStole map id=%d at %s → %s [carpet, %d rows, %d compressed bytes].",
+                fm.mapId.id(), maskedPos(fm.frame.getBlockPos()),
+                PayloadState.tileLabel(tileIdx), carpetRows, totalBytes);
+        if (note != null) msg += " §e(" + note + ")";
+        source.sendFeedback(Text.literal(msg));
+        source.sendFeedback(Text.literal("§7Run §f/loominary export§7 when ready to generate the schematic."));
 
         if (overflowBanners > 0) {
             source.sendFeedback(Text.literal(String.format(
@@ -3795,6 +3844,194 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cResalt failed: " + e.getMessage()));
             return 0;
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // save [name] / load <name>
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int saveState(FabricClientCommandSource source, String nameArg) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch to save."));
+            return 0;
+        }
+        try {
+            Files.createDirectories(savesDir());
+            Path path;
+            String saveName;
+            if (nameArg != null && !nameArg.isBlank()) {
+                saveName = nameArg;
+                path = savesDir().resolve(saveName + ".json");
+            } else {
+                String stem = PayloadState.currentSourceFilename != null
+                        ? filenameStem(PayloadState.currentSourceFilename) : "save";
+                int n = nextSaveCounter(stem);
+                saveName = String.format("%s_%03d", stem, n);
+                path = savesDir().resolve(saveName + ".json");
+            }
+            PayloadState.saveToFile(path);
+            source.sendFeedback(Text.literal("§aSaved as: §f" + saveName));
+            return 1;
+        } catch (IOException e) {
+            source.sendError(Text.literal("§cSave failed: " + e.getMessage()));
+            return 0;
+        }
+    }
+
+    private static int loadState(FabricClientCommandSource source, String name) {
+        Path path = savesDir().resolve(name.endsWith(".json") ? name : name + ".json");
+        if (!Files.exists(path)) {
+            source.sendError(Text.literal("§cSave not found: " + name));
+            return 0;
+        }
+        try {
+            String summary = PayloadState.loadFromFile(path);
+            PayloadState.save();
+            source.sendFeedback(Text.literal("§aLoaded: §f" + summary));
+            source.sendFeedback(Text.literal("§7Active: " + PayloadState.tileLabel(PayloadState.activeTileIndex)));
+            return 1;
+        } catch (IOException e) {
+            source.sendError(Text.literal("§cLoad failed: " + e.getMessage()));
+            return 0;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // export image
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int exportImage(FabricClientCommandSource source) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+
+        int tileIdx = PayloadState.activeTileIndex;
+        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+        boolean isAnimated = tile.frameCount > 1;
+
+        try {
+            byte[][] frames = resolveAllFramesForTile(tile, PayloadState.ACTIVE_CHUNKS);
+
+            Path exportDir = MinecraftClient.getInstance().runDirectory.toPath()
+                    .resolve("loominary_exports");
+            Files.createDirectories(exportDir);
+
+            String stem = PayloadState.currentSourceFilename != null
+                    ? filenameStem(PayloadState.currentSourceFilename) : "export";
+            String tileSuffix = PayloadState.totalTiles() > 1
+                    ? "_tile" + tileIdx : "";
+
+            if (!isAnimated || frames.length == 1) {
+                // Static PNG export
+                BufferedImage img = mapColorsToImage(frames[0]);
+                String outName = stem + tileSuffix + ".png";
+                Path outPath = exportDir.resolve(outName);
+                ImageIO.write(img, "PNG", outPath.toFile());
+                source.sendFeedback(Text.literal("§aExported image: §f" + outName));
+            } else {
+                // Animated GIF export
+                int[] delays = tile.frameDelays != null
+                        ? tile.frameDelays.stream().mapToInt(Integer::intValue).toArray()
+                        : new int[]{100};
+                String outName = stem + tileSuffix + ".gif";
+                Path outPath = exportDir.resolve(outName);
+                writeAnimatedGif(frames, delays, outPath);
+                source.sendFeedback(Text.literal(String.format(
+                        "§aExported animated GIF: §f%s §7(%d frames)", outName, frames.length)));
+            }
+            return 1;
+        } catch (Exception e) {
+            source.sendError(Text.literal("§cImage export failed: " + e.getMessage()));
+            return 0;
+        }
+    }
+
+    /** Converts a 128×128 map-color byte array to an RGB BufferedImage. */
+    private static BufferedImage mapColorsToImage(byte[] mapColors) {
+        BufferedImage img = new BufferedImage(128, 128, BufferedImage.TYPE_INT_RGB);
+        int[] colorLookup = PngToMapColors.buildColorLookup();
+        for (int i = 0; i < 128 * 128; i++) {
+            int b = mapColors[i] & 0xFF;
+            img.setRGB(i % 128, i / 128, 0xFF000000 | colorLookup[b]);
+        }
+        return img;
+    }
+
+    /** Writes frames as a looping animated GIF with per-frame delays (in ms). */
+    private static void writeAnimatedGif(byte[][] frames, int[] delaysMs, Path path)
+            throws IOException {
+        // Build a global IndexColorModel from all distinct map color bytes across all frames.
+        int[] colorLookup = PngToMapColors.buildColorLookup();
+        boolean[] used = new boolean[256];
+        for (byte[] frame : frames) for (byte b : frame) used[b & 0xFF] = true;
+
+        int[] mapByteToIdx = new int[256];
+        byte[] palR = new byte[256], palG = new byte[256], palB = new byte[256];
+        int palSize = 1; // index 0 = black placeholder
+        for (int b = 1; b < 256; b++) {
+            if (!used[b]) continue;
+            int rgb = colorLookup[b];
+            mapByteToIdx[b] = palSize;
+            palR[palSize] = (byte)((rgb >> 16) & 0xFF);
+            palG[palSize] = (byte)((rgb >>  8) & 0xFF);
+            palB[palSize] = (byte)( rgb         & 0xFF);
+            palSize++;
+        }
+        IndexColorModel icm = new IndexColorModel(8, palSize, palR, palG, palB);
+
+        ImageWriter writer = javax.imageio.ImageIO.getImageWritersByFormatName("gif").next();
+        try (ImageOutputStream ios = javax.imageio.ImageIO.createImageOutputStream(path.toFile())) {
+            writer.setOutput(ios);
+            writer.prepareWriteSequence(null);
+            for (int f = 0; f < frames.length; f++) {
+                // Build indexed frame directly from map color bytes — no quantization loss.
+                BufferedImage indexed = new BufferedImage(128, 128,
+                        BufferedImage.TYPE_BYTE_INDEXED, icm);
+                byte[] raster = ((DataBufferByte) indexed.getRaster().getDataBuffer()).getData();
+                for (int i = 0; i < 128 * 128; i++)
+                    raster[i] = (byte) mapByteToIdx[frames[f][i] & 0xFF];
+
+                IIOMetadata meta = writer.getDefaultImageMetadata(
+                        ImageTypeSpecifier.createFromRenderedImage(indexed), null);
+                String formatName = meta.getNativeMetadataFormatName();
+                IIOMetadataNode root = (IIOMetadataNode) meta.getAsTree(formatName);
+
+                IIOMetadataNode gce = getOrCreateChild(root, "GraphicControlExtension");
+                int delayCentiseconds = Math.max(1,
+                        (f < delaysMs.length ? delaysMs[f] : delaysMs[delaysMs.length - 1]) / 10);
+                gce.setAttribute("delayTime", String.valueOf(delayCentiseconds));
+                gce.setAttribute("disposalMethod", "restoreToBackgroundColor");
+                gce.setAttribute("userInputFlag", "FALSE");
+                gce.setAttribute("transparentColorFlag", "FALSE");
+                gce.setAttribute("transparentColorIndex", "0");
+
+                if (f == 0) {
+                    IIOMetadataNode appExts = getOrCreateChild(root, "ApplicationExtensions");
+                    IIOMetadataNode appExt = new IIOMetadataNode("ApplicationExtension");
+                    appExt.setAttribute("applicationID", "NETSCAPE");
+                    appExt.setAttribute("authenticationCode", "2.0");
+                    appExt.setUserObject(new byte[]{0x1, 0x0, 0x0}); // loop forever
+                    appExts.appendChild(appExt);
+                }
+
+                meta.setFromTree(formatName, root);
+                writer.writeToSequence(new IIOImage(indexed, null, meta), null);
+            }
+            writer.endWriteSequence();
+        } finally {
+            writer.dispose();
+        }
+    }
+
+    private static IIOMetadataNode getOrCreateChild(IIOMetadataNode parent, String name) {
+        for (int i = 0; i < parent.getLength(); i++) {
+            if (parent.item(i).getNodeName().equals(name))
+                return (IIOMetadataNode) parent.item(i);
+        }
+        IIOMetadataNode child = new IIOMetadataNode(name);
+        parent.appendChild(child);
+        return child;
     }
 
     // ════════════════════════════════════════════════════════════════════

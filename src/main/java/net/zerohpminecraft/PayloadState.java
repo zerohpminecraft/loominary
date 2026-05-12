@@ -134,6 +134,51 @@ public class PayloadState {
         return FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);
     }
 
+    /** Serializes current state to an arbitrary path (used by the named-save system). */
+    public static void saveToFile(Path path) {
+        syncToActiveTile();
+        try {
+            Files.createDirectories(path.getParent());
+            Snapshot snap = new Snapshot();
+            snap.sourceFilename = currentSourceFilename;
+            snap.columns = gridColumns;
+            snap.rows = gridRows;
+            snap.activeTileIndex = activeTileIndex;
+            snap.tiles = new ArrayList<>(tiles);
+            snap.allShades = allShades;
+            snap.dither = dither;
+            snap.title = currentTitle;
+            Files.writeString(path, GSON.toJson(snap));
+        } catch (IOException e) {
+            System.err.println(TAG + " Failed to save to " + path.getFileName() + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Loads state from an arbitrary path, replacing the current state entirely.
+     * @return a human-readable summary for feedback ("myimage.png (2×1 grid, 2 tiles)")
+     * @throws IOException if the file cannot be read or is corrupt
+     */
+    public static String loadFromFile(Path path) throws IOException {
+        String json = Files.readString(path);
+        Snapshot snap = GSON.fromJson(json, Snapshot.class);
+        if (snap == null || snap.tiles == null || snap.tiles.isEmpty())
+            throw new IOException("Save file empty or corrupt.");
+        currentSourceFilename = snap.sourceFilename;
+        gridColumns = snap.columns > 0 ? snap.columns : 1;
+        gridRows = snap.rows > 0 ? snap.rows : 1;
+        activeTileIndex = Math.max(0, Math.min(snap.activeTileIndex, snap.tiles.size() - 1));
+        allShades = snap.allShades;
+        dither = snap.dither;
+        currentTitle = snap.title;
+        tiles.clear();
+        tiles.addAll(snap.tiles);
+        syncFromActiveTile();
+        String src = snap.sourceFilename != null ? snap.sourceFilename : "<unknown>";
+        return src + " (" + gridColumns + "×" + gridRows + " grid, "
+                + tiles.size() + " tile" + (tiles.size() == 1 ? "" : "s") + ")";
+    }
+
     public static void save() {
         syncToActiveTile();
         try {

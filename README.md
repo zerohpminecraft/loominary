@@ -47,7 +47,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 
 ## Installation
 
-1. Download `loominary-1.10.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
+1. Download `loominary-1.12.0.jar` from the [releases page](https://github.com/zerohpminecraft/loominary/releases)
 2. Drop it into your `mods/` folder alongside Fabric API
 3. Launch the game
 

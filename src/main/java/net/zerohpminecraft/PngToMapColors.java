@@ -848,7 +848,7 @@ public class PngToMapColors {
         return out;
     }
 
-    static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
+    public static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
                                           float[][] oklabLookup, float[] ditherStrength,
                                           int width, int height, float diffuseAmount,
                                           MatchMetric metric, float[][] rgbLookup) {
@@ -929,7 +929,7 @@ public class PngToMapColors {
         return out;
     }
 
-    static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
+    public static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
                                           float[][] oklabLookup, int width, int height,
                                           MatchMetric metric, float[][] rgbLookup) {
         if (metric == MatchMetric.OKLAB) return renderAtkinson(scaled, palette, oklabLookup, width, height);
@@ -992,7 +992,7 @@ public class PngToMapColors {
         return out;
     }
 
-    static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
+    public static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
                                           float[][] oklabLookup, int width, int height,
                                           MatchMetric metric, float[][] rgbLookup) {
         if (metric == MatchMetric.OKLAB) return renderBayer4x4(scaled, palette, oklabLookup, width, height);
@@ -1036,7 +1036,7 @@ public class PngToMapColors {
 
     // ── Scaling ───────────────────────────────────────────────────────────
 
-    static BufferedImage scale(BufferedImage source, int targetW, int targetH) {
+    public static BufferedImage scale(BufferedImage source, int targetW, int targetH) {
         if (source.getWidth() == targetW && source.getHeight() == targetH
                 && source.getType() == BufferedImage.TYPE_INT_ARGB) {
             return source;
@@ -1054,7 +1054,7 @@ public class PngToMapColors {
 
     // ── Palette helpers ───────────────────────────────────────────────────
 
-    static boolean[] buildPalette(byte[] mapColors) {
+    public static boolean[] buildPalette(byte[] mapColors) {
         boolean[] palette = new boolean[256];
         for (byte b : mapColors) palette[b & 0xFF] = true;
         return palette;
@@ -1073,7 +1073,7 @@ public class PngToMapColors {
         return bestByte;
     }
 
-    static byte findClosestInPalette(float L, float a, float b,
+    public static byte findClosestInPalette(float L, float a, float b,
                                               boolean[] palette, float[][] oklabLookup,
                                               MatchMetric metric, float[][] rgbLookup, float[] palHues) {
         if (metric == MatchMetric.OKLAB) return findClosestInPalette(L, a, b, palette, oklabLookup);
@@ -1164,7 +1164,7 @@ public class PngToMapColors {
         return oklab;
     }
 
-    static float[][] buildLinearRgbLookup() {
+    public static float[][] buildLinearRgbLookup() {
         float[][] out = new float[256][];
         int[] srgb = buildColorLookup();
         for (int b = 1; b < 256; b++) {
@@ -1179,7 +1179,7 @@ public class PngToMapColors {
         return out;
     }
 
-    static float[] buildPaletteHues(boolean[] palette, float[][] oklabLookup) {
+    public static float[] buildPaletteHues(boolean[] palette, float[][] oklabLookup) {
         float[] hues = new float[256];
         for (int c = 1; c < 256; c++) {
             if (!palette[c] || oklabLookup[c] == null) continue;
@@ -1188,7 +1188,7 @@ public class PngToMapColors {
         return hues;
     }
 
-    static float[] rgbToOklab(int rgb) {
+    public static float[] rgbToOklab(int rgb) {
         float r  = srgbToLinear(((rgb >> 16) & 0xFF) / 255f);
         float g  = srgbToLinear(((rgb >>  8) & 0xFF) / 255f);
         float bl = srgbToLinear(( rgb        & 0xFF) / 255f);
@@ -1239,7 +1239,7 @@ public class PngToMapColors {
         return (base64.length() + chunkSize - 1) / chunkSize;
     }
 
-    static byte findClosestMapColorByte(int argb, boolean legalOnly,
+    public static byte findClosestMapColorByte(int argb, boolean legalOnly,
                                                  float[][] oklabLookup) {
         if (((argb >>> 24) & 0xFF) < 128) return 0;
         float[] target = rgbToOklab(argb);

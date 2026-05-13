@@ -53,6 +53,8 @@ public class PayloadManifest {
     public static final int FLAG_ALL_SHADES = 0x01;
     /** Set when the payload contains multiple animation frames. */
     public static final int FLAG_ANIMATED   = 0x02;
+    /** Set when the tile participates in cross-tile payload redistribution (mux pooling). */
+    public static final int FLAG_MUX        = 0x04;
 
     public final int manifestVersion;
     /** Total bytes consumed by this header; map colors begin at this offset. */
@@ -108,6 +110,10 @@ public class PayloadManifest {
 
     public boolean animated() {
         return (flags & FLAG_ANIMATED) != 0;
+    }
+
+    public boolean muxed() {
+        return (flags & FLAG_MUX) != 0;
     }
 
     // ── CRC helper ───────────────────────────────────────────────────────

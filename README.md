@@ -128,7 +128,7 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 
 - `/loominary import <filename>` — Import an image from `loominary_data/` using carpet encoding (default). State is auto-saved to `loominary_saves/` on import.
 - `/loominary import <filename> banners` — Import using legacy banner-only encoding.
-- `/loominary import <filename> [cols rows] [allshades] [dither]` — Import with grid and/or options. Works in both carpet and banner modes.
+- `/loominary import <filename> [cols rows] [allshades] [dither] [linked]` — Import with grid and/or options. Add `linked` for shared-dictionary multi-tile animated GIFs (FLAG_LINKED).
 - `/loominary import steal` — Append the framed map at your crosshair as a new carpet tile.
 - `/loominary import steal banners` — Same, using legacy banner encoding.
 
@@ -223,6 +223,8 @@ All filter commands re-quantize pixel colors back to the existing tile palette a
 - `/loominary clear` — Clear in-memory state and delete the saved state file.
 - `/loominary clear memory` — Clear only in-memory state.
 - `/loominary clear disk` — Delete only the saved state file.
+- `/loominary link` — Convert current batch to linked (FLAG_LINKED) shared-dictionary mode.
+- `/loominary unlink` — Convert back to regular mode (allowed even if over per-tile budget).
 
 ## Hotkeys
 

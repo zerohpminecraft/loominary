@@ -70,6 +70,16 @@ public class PayloadState {
          * physical carpet platform being scanned.  Typically 2–14 KB as base64 per tile.
          */
         public String carpetCompressedB64 = null;
+        /** True when this tile participates in mux pooling (FLAG_MUX). */
+        public boolean muxed = false;
+        /** True when this tile is a mux receiver (its overflow payload is hosted by donor tiles). */
+        public boolean muxReceiver = false;
+        /**
+         * Physical carpet cargo bytes (base64) after mux: ownSeg for receivers,
+         * ownFrame+guestBytes for donors. Null when not muxed or mux was cleared.
+         * {@code carpetCompressedB64} always holds the full logical payload regardless.
+         */
+        public String muxCargoB64 = null;
     }
 
     private static class Snapshot {

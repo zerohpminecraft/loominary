@@ -54,14 +54,15 @@ public class MapEditorScreen extends Screen {
     private static final int MAP_SIZE        = PngToMapColors.MAP_SIZE;
     private static final int MAP_BYTES       = MAP_SIZE * MAP_SIZE;
     private static final int STATUS_H        = 14;
-    private static final int PANEL_W         = 80;
+    private static final int PANEL_W         = 160;
+    private static final int SCROLL_W        = 6;
     private static final int GUIDE_W         = 100;
     private static final int SWATCH_SZ       = 12;
     private static final int SWATCH_GAP      = 4;   // extra 2px used for frequency bar
     private static final int SWATCH_STRIDE   = SWATCH_SZ + SWATCH_GAP;
     private static final int PANEL_MARGIN    = 2;
-    private static final int SWATCHES_PER_ROW = (PANEL_W - PANEL_MARGIN * 2) / SWATCH_STRIDE;
-    private static final int SWATCHES_START_Y = 79;
+    private static final int SWATCHES_PER_ROW = (PANEL_W - PANEL_MARGIN * 2 - SCROLL_W) / SWATCH_STRIDE;
+    private static final int SWATCHES_START_Y = 84;
     private static final int ACTIVE_SWATCH_SZ = 20;
     private static final int CHUNK_SIZE      = 48;
     private static final int MIN_SCALE       = 1;
@@ -135,6 +136,15 @@ public class MapEditorScreen extends Screen {
     // Lasso (Phase 8)
     private List<int[]> lassoPoints = null;
 
+    // Magic wand drag-extend + hover preview
+    private boolean   wandDragging         = false;
+    private boolean[] wandPreview          = null;
+    private int       wandPreviewX         = -1, wandPreviewY = -1;
+    private float     wandPreviewTolerance = -1f;
+
+    // Palette swatch hover highlight (-1 = none)
+    private int paletteHoverColor = -1;
+
     private final EditHistory history = new EditHistory();
 
     // Palette panel
@@ -142,7 +152,9 @@ public class MapEditorScreen extends Screen {
     private int[]   tileColorFreqs = new int[0];  // parallel to tileColors: pixel count per color
     private int     maxTileFreq    = 0;
     private int[]   allMapColors;
-    private boolean paletteShowAll = false;
+    private enum PaletteMode { TILE, ALL, SEL }
+    private PaletteMode paletteMode    = PaletteMode.TILE;
+    private int         paletteScrollRow = 0;
 
     // Color-merge state: Ctrl+click swatches or canvas pixels to build the source set, C to commit
     private final Set<Integer> mergeSources = new LinkedHashSet<>();
@@ -284,14 +296,31 @@ public class MapEditorScreen extends Screen {
             hoverMapX = hoverMapY = -1;
         }
 
+        // Update wand hover preview (cached by position)
+        if (!inPreview && currentTool == Tool.MAGIC_WAND && !wandDragging
+                && inMapBounds(hoverMapX, hoverMapY)) {
+            if (wandPreviewX != hoverMapX || wandPreviewY != hoverMapY
+                    || wandPreviewTolerance != fillTolerance) {
+                wandPreview          = computeWandRegion(hoverMapX, hoverMapY);
+                wandPreviewX         = hoverMapX;
+                wandPreviewY         = hoverMapY;
+                wandPreviewTolerance = fillTolerance;
+            }
+        } else if (currentTool != Tool.MAGIC_WAND || inPreview) {
+            wandPreview  = null;
+            wandPreviewX = -1; wandPreviewY = -1;
+        }
+
         ctx.fill(0, 0, width, height, COL_BG);
         renderMap(ctx);
         renderDitherMaskOverlay(ctx);
         renderToolOverlay(ctx);
+        renderWandPreview(ctx);
         renderSelectionOverlay(ctx);
         renderLassoPath(ctx);
         renderMapBorder(ctx);
         renderPalettePanel(ctx, mouseX, mouseY);
+        renderPaletteHoverOverlay(ctx);
         renderStatusBar(ctx);
         renderGuidePanel(ctx);
         if (showMinimap) renderMinimap(ctx, mouseX, mouseY);
@@ -482,8 +511,7 @@ public class MapEditorScreen extends Screen {
         if (!mergeSources.isEmpty())
             phBuilder.append(" §c[").append(mergeSources.size())
                     .append(" merge src").append(mergeSources.size() == 1 ? "" : "s").append("]");
-        String paletteHeader = phBuilder.toString();
-        ctx.drawTextWithShadow(textRenderer, Text.literal(paletteHeader), panelX + 4, 3, 0xFFFFFF);
+        ctx.drawTextWithShadow(textRenderer, Text.literal(phBuilder.toString()), panelX + 4, 3, 0xFFFFFF);
 
         // Budget / color count badge
         String budgetColor = (cachedBudgetUsed > cachedBudgetMax) ? "§c" : "§a";
@@ -498,48 +526,177 @@ public class MapEditorScreen extends Screen {
         ctx.drawTextWithShadow(textRenderer, Text.literal(badgeLine), panelX + 4, 12, 0xFFFFFF);
         ctx.fill(panelX, 22, width, 23, COL_PANEL_SEP);
 
-        int activeRgb = activeColor == 0
-                ? (COL_TRANS_A & 0xFFFFFF) : colorLookup[activeColor];
+        // ── Active swatch ──────────────────────────────────────────────
         int asx = panelX + 4, asy = 26;
         ctx.fill(asx-1, asy-1, asx+ACTIVE_SWATCH_SZ+1, asy+ACTIVE_SWATCH_SZ+1, COL_RING);
-        ctx.fill(asx, asy, asx+ACTIVE_SWATCH_SZ, asy+ACTIVE_SWATCH_SZ, 0xFF000000|activeRgb);
+        if (activeColor == 0) {
+            for (int ty = 0; ty < ACTIVE_SWATCH_SZ; ty += 2)
+                for (int tx = 0; tx < ACTIVE_SWATCH_SZ; tx += 2) {
+                    int col = (((tx / 2) + (ty / 2)) & 1) == 0 ? COL_TRANS_A : COL_TRANS_B;
+                    ctx.fill(asx + tx, asy + ty, asx + tx + 2, asy + ty + 2, col);
+                }
+        } else {
+            ctx.fill(asx, asy, asx+ACTIVE_SWATCH_SZ, asy+ACTIVE_SWATCH_SZ,
+                    0xFF000000 | colorLookup[activeColor]);
+        }
         String hexStr = activeColor == 0
-                ? "trans" : String.format("#%06X", activeRgb & 0xFFFFFF);
+                ? "trans" : String.format("#%06X", colorLookup[activeColor] & 0xFFFFFF);
         ctx.drawTextWithShadow(textRenderer, Text.literal("§7" + hexStr), panelX+28, 28, 0xFFFFFF);
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8idx:"+activeColor), panelX+28, 37, 0xFFFFFF);
 
         ctx.fill(panelX, 50, width, 51, COL_PANEL_SEP);
 
+        // ── Show: tabs (Tile | All | Sel) ─────────────────────────────
         ctx.drawTextWithShadow(textRenderer, Text.literal("§7Show: "), panelX+4, 54, 0xFFFFFF);
         ctx.drawTextWithShadow(textRenderer,
-                Text.literal(paletteShowAll ? "§eTile§r" : "§7All"),
+                Text.literal(paletteMode == PaletteMode.TILE ? "§eTile" : "§7Tile"),
                 panelX+40, 54, 0xFFFFFF);
+        ctx.drawTextWithShadow(textRenderer, Text.literal("§8|"), panelX+62, 54, 0xFFFFFF);
+        ctx.drawTextWithShadow(textRenderer,
+                Text.literal(paletteMode == PaletteMode.ALL ? "§eAll" : "§7All"),
+                panelX+68, 54, 0xFFFFFF);
+        if (selMask != null) {
+            ctx.drawTextWithShadow(textRenderer, Text.literal("§8|"), panelX+84, 54, 0xFFFFFF);
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal(paletteMode == PaletteMode.SEL ? "§eSel" : "§7Sel"),
+                    panelX+90, 54, 0xFFFFFF);
+        }
 
         ctx.fill(panelX, 66, width, 67, COL_PANEL_SEP);
 
-        int[] palette = paletteShowAll ? allMapColors : tileColors;
+        // ── Dedicated transparency row ─────────────────────────────────
+        boolean tileHasTrans = tileColors.length > 0 && tileColors[0] == 0;
+        boolean showTransRow = paletteMode == PaletteMode.TILE ? tileHasTrans
+                : paletteMode == PaletteMode.ALL || hasTransInSel();
+        int tsx = panelX + 4, tsy = 69;
+        // Checkerboard swatch
+        boolean transActive  = (activeColor == 0);
+        boolean transHovered = (mouseX >= tsx && mouseX < tsx + SWATCH_SZ
+                             && mouseY >= tsy && mouseY < tsy + SWATCH_SZ);
+        if (transActive || transHovered)
+            ctx.fill(tsx-1, tsy-1, tsx+SWATCH_SZ+1, tsy+SWATCH_SZ+1,
+                    transActive ? COL_RING : COL_HOVER_RING);
+        for (int ty = 0; ty < SWATCH_SZ; ty += 2)
+            for (int tx = 0; tx < SWATCH_SZ; tx += 2) {
+                int col = (((tx / 2) + (ty / 2)) & 1) == 0 ? COL_TRANS_A : COL_TRANS_B;
+                ctx.fill(tsx + tx, tsy + ty, tsx + tx + 2, tsy + ty + 2, col);
+            }
+        String transLabel = showTransRow ? "§7trans" : "§8trans";
+        ctx.drawTextWithShadow(textRenderer, Text.literal(transLabel), panelX+20, tsy+2, 0xFFFFFF);
+        // Frequency bar for transparency (TILE mode)
+        if (tileHasTrans && paletteMode == PaletteMode.TILE && maxTileFreq > 0) {
+            int barW = Math.max(1, SWATCH_SZ * tileColorFreqs[0] / maxTileFreq);
+            ctx.fill(tsx, tsy + SWATCH_SZ + 1, tsx + barW, tsy + SWATCH_SZ + 3, 0xFF2A6644);
+        }
+
+        ctx.fill(panelX, 82, width, 83, COL_PANEL_SEP);
+
+        // ── Swatch grid ────────────────────────────────────────────────
+        int[] palette = activePaletteColors();
+
+        // Compute sel freqs inline if in SEL mode
+        int[] selFreqs = null; int maxSelFreq = 0;
+        if (paletteMode == PaletteMode.SEL && selMask != null) {
+            selFreqs = new int[256];
+            for (int i = 0; i < MAP_BYTES; i++)
+                if (selMask[i]) selFreqs[mapColors[i] & 0xFF]++;
+            for (int f : selFreqs) if (f > maxSelFreq) maxSelFreq = f;
+        }
+
+        int totalRows    = (palette.length + SWATCHES_PER_ROW - 1) / SWATCHES_PER_ROW;
+        int visibleRows  = (panelH - SWATCHES_START_Y) / SWATCH_STRIDE;
+        paletteScrollRow = Math.max(0, Math.min(paletteScrollRow,
+                Math.max(0, totalRows - visibleRows)));
+
+        int hoveredSwatchColor = transHovered ? 0 : -1;
         for (int i = 0; i < palette.length; i++) {
-            int row = i / SWATCHES_PER_ROW, col = i % SWATCHES_PER_ROW;
+            int absRow = i / SWATCHES_PER_ROW;
+            int visRow = absRow - paletteScrollRow;
+            if (visRow < 0) continue;
+            int col = i % SWATCHES_PER_ROW;
             int swx = panelX + PANEL_MARGIN + col * SWATCH_STRIDE;
-            int swy = SWATCHES_START_Y + row * SWATCH_STRIDE;
+            int swy = SWATCHES_START_Y + visRow * SWATCH_STRIDE;
             if (swy + SWATCH_SZ > panelH) break;
 
-            int c   = palette[i];
-            int rgb = c == 0 ? (COL_TRANS_A & 0xFFFFFF) : colorLookup[c];
+            int c = palette[i];
             boolean isActive  = (c == activeColor);
             boolean isMerge   = mergeSources.contains(c);
             boolean isHovered = mouseX >= swx && mouseX < swx+SWATCH_SZ
                              && mouseY >= swy && mouseY < swy+SWATCH_SZ;
+            if (isHovered) hoveredSwatchColor = c;
             int ringCol = isMerge ? COL_MERGE_RING : (isActive ? COL_RING : COL_HOVER_RING);
             if (isActive || isHovered || isMerge)
                 ctx.fill(swx-1, swy-1, swx+SWATCH_SZ+1, swy+SWATCH_SZ+1, ringCol);
-            ctx.fill(swx, swy, swx+SWATCH_SZ, swy+SWATCH_SZ, 0xFF000000|rgb);
+            ctx.fill(swx, swy, swx+SWATCH_SZ, swy+SWATCH_SZ, 0xFF000000 | colorLookup[c]);
 
-            // Frequency bar: 2px strip in the gap below the swatch (tile-color mode only)
-            if (!paletteShowAll && i < tileColorFreqs.length && maxTileFreq > 0) {
-                int barW = Math.max(1, SWATCH_SZ * tileColorFreqs[i] / maxTileFreq);
+            // Frequency bar below swatch
+            if (paletteMode == PaletteMode.TILE) {
+                int fi = indexOf(tileColors, c);
+                if (fi >= 0 && fi < tileColorFreqs.length && maxTileFreq > 0) {
+                    int barW = Math.max(1, SWATCH_SZ * tileColorFreqs[fi] / maxTileFreq);
+                    ctx.fill(swx, swy + SWATCH_SZ + 1, swx + barW, swy + SWATCH_SZ + 3, 0xFF2A6644);
+                }
+            } else if (paletteMode == PaletteMode.SEL && selFreqs != null && maxSelFreq > 0) {
+                int barW = Math.max(1, SWATCH_SZ * selFreqs[c] / maxSelFreq);
                 ctx.fill(swx, swy + SWATCH_SZ + 1, swx + barW, swy + SWATCH_SZ + 3, 0xFF2A6644);
             }
+        }
+        paletteHoverColor = hoveredSwatchColor;
+
+        // ── Scrollbar ──────────────────────────────────────────────────
+        if (totalRows > visibleRows) {
+            int scrollX = width - SCROLL_W;
+            int trackY  = SWATCHES_START_Y;
+            int trackH  = panelH - SWATCHES_START_Y;
+            ctx.fill(scrollX, trackY, scrollX + SCROLL_W, trackY + trackH, 0xFF222222);
+            int thumbH = Math.max(4, trackH * visibleRows / totalRows);
+            int thumbY = trackY + (trackH - thumbH) * paletteScrollRow
+                    / Math.max(1, totalRows - visibleRows);
+            ctx.fill(scrollX + 1, thumbY, scrollX + SCROLL_W - 1, thumbY + thumbH, 0xFF666666);
+        }
+    }
+
+    private boolean hasTransInSel() {
+        if (selMask == null) return false;
+        for (int i = 0; i < MAP_BYTES; i++)
+            if (selMask[i] && (mapColors[i] & 0xFF) == 0) return true;
+        return false;
+    }
+
+    private int[] activePaletteColors() {
+        int[] raw = switch (paletteMode) {
+            case TILE -> tileColors;
+            case ALL  -> allMapColors;
+            case SEL  -> selColors();
+        };
+        // Transparent (index 0) is shown in its own dedicated row — exclude from grid
+        if (raw.length > 0 && raw[0] == 0) return Arrays.copyOfRange(raw, 1, raw.length);
+        return raw;
+    }
+
+    private int[] selColors() {
+        if (selMask == null) return new int[0];
+        boolean[] inSel = new boolean[256];
+        for (int i = 0; i < MAP_BYTES; i++)
+            if (selMask[i]) inSel[mapColors[i] & 0xFF] = true;
+        List<Integer> result = new ArrayList<>();
+        for (int c = 1; c < 256; c++) if (inSel[c]) result.add(c);
+        return result.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    private static int indexOf(int[] arr, int val) {
+        for (int i = 0; i < arr.length; i++) if (arr[i] == val) return i;
+        return -1;
+    }
+
+    private void setSelMask(boolean[] newMask) {
+        selMask = newMask;
+        if (newMask != null) {
+            paletteMode = PaletteMode.SEL;
+            paletteScrollRow = 0;
+        } else if (paletteMode == PaletteMode.SEL) {
+            paletteMode = PaletteMode.TILE;
+            paletteScrollRow = 0;
         }
     }
 
@@ -900,6 +1057,12 @@ public class MapEditorScreen extends Screen {
         mergeSources.clear();
         thumbnails         = null;  // force thumbnail recompute
         showMinimap        = false;
+        paletteMode        = PaletteMode.TILE;
+        paletteScrollRow   = 0;
+        wandDragging         = false;
+        wandPreview          = null;
+        wandPreviewX         = -1; wandPreviewY = -1;
+        wandPreviewTolerance = -1f;
 
         rebuildTileColors();
         setStatusMsg("Switched to " + tileLabel);
@@ -982,7 +1145,19 @@ public class MapEditorScreen extends Screen {
             }
             return true;
         }
-        if (mouseX < GUIDE_W || mouseX >= width - PANEL_W) return false;
+        if (mouseX < GUIDE_W) return false;
+        if (mouseX >= width - PANEL_W) {
+            if (mouseY >= SWATCHES_START_Y) {
+                int[] palette = activePaletteColors();
+                int totalRows   = (palette.length + SWATCHES_PER_ROW - 1) / SWATCHES_PER_ROW;
+                int visibleRows = (height - STATUS_H - SWATCHES_START_Y) / SWATCH_STRIDE;
+                if (totalRows > visibleRows) {
+                    paletteScrollRow = Math.max(0, Math.min(totalRows - visibleRows,
+                            paletteScrollRow - (int) Math.signum(vAmt)));
+                }
+            }
+            return true;
+        }
 
         if (hasShiftDown()) {
             switch (currentTool) {
@@ -1064,20 +1239,29 @@ public class MapEditorScreen extends Screen {
         // ── Palette panel ────────────────────────────────────────────────
         if (mouseX >= panelX) {
             int relX = (int) mouseX - panelX, relY = (int) mouseY;
-            if (relY >= 53 && relY < 66 && relX >= 40) {
-                paletteShowAll = !paletteShowAll;
+            // Show: tabs row
+            if (relY >= 53 && relY < 66) {
+                if (relX >= 38 && relX < 64) { paletteMode = PaletteMode.TILE; paletteScrollRow = 0; return true; }
+                if (relX >= 64 && relX < 86) { paletteMode = PaletteMode.ALL;  paletteScrollRow = 0; return true; }
+                if (relX >= 86 && selMask != null) { paletteMode = PaletteMode.SEL; paletteScrollRow = 0; return true; }
                 return true;
             }
+            // Transparency dedicated row
+            if (relY >= 68 && relY < 82 && relX >= 2 && relX < 2 + SWATCH_SZ + 18) {
+                activeColor = 0;
+                return true;
+            }
+            // Swatch grid
             if (relY >= SWATCHES_START_Y) {
-                int[] palette = paletteShowAll ? allMapColors : tileColors;
-                int row = (relY - SWATCHES_START_Y) / SWATCH_STRIDE;
-                int col = (relX - PANEL_MARGIN) / SWATCH_STRIDE;
+                int[] palette = activePaletteColors();
+                int visRow = (relY - SWATCHES_START_Y) / SWATCH_STRIDE;
+                int absRow = visRow + paletteScrollRow;
+                int col    = (relX - PANEL_MARGIN) / SWATCH_STRIDE;
                 if (col >= 0 && col < SWATCHES_PER_ROW) {
-                    int idx = row * SWATCHES_PER_ROW + col;
+                    int idx = absRow * SWATCHES_PER_ROW + col;
                     if (idx < palette.length) {
                         int c = palette[idx];
                         if (button == 0 && hasControlDown()) {
-                            // Ctrl+click: toggle color in merge-source set
                             if (!mergeSources.remove(c)) mergeSources.add(c);
                         } else {
                             activeColor = c;
@@ -1136,7 +1320,11 @@ public class MapEditorScreen extends Screen {
                     lassoPoints = new ArrayList<>();
                     lassoPoints.add(new int[]{hoverMapX, hoverMapY});
                 }
-                case MAGIC_WAND -> applyMagicWand(hoverMapX, hoverMapY);
+                case MAGIC_WAND -> {
+                    selMask = null;  // start fresh; will be set by addWandRegionAt
+                    addWandRegionAt(hoverMapX, hoverMapY);
+                    wandDragging = true;
+                }
                 case BRUSH -> {
                     if (selMask != null && !selMask[hoverMapX + hoverMapY * MAP_SIZE])
                         return true;
@@ -1166,8 +1354,12 @@ public class MapEditorScreen extends Screen {
             if (stroking) { stroking = false; rebuildTileColors(); }
             if (selecting) {
                 selecting = false;
-                // Single click with no drag → deselect
-                if (hoverMapX == dragOriginX && hoverMapY == dragOriginY) selMask = null;
+                // Single click with no drag → deselect; otherwise commit via setSelMask
+                setSelMask(hoverMapX == dragOriginX && hoverMapY == dragOriginY ? null : selMask);
+            }
+            if (wandDragging) {
+                wandDragging = false;
+                setSelMask(selMask);  // trigger palette mode switch now that drag is done
             }
             if (button == 0 && lassoPoints != null) commitLasso();
         }
@@ -1190,6 +1382,10 @@ public class MapEditorScreen extends Screen {
                     for (int px = 0; px < MAP_SIZE; px++)
                         selMask[px + py * MAP_SIZE] =
                                 (px >= x1 && px <= x2 && py >= y1 && py <= y2);
+                return true;
+            }
+            if (wandDragging && inMapBounds(hoverMapX, hoverMapY)) {
+                addWandRegionAt(hoverMapX, hoverMapY);
                 return true;
             }
             if (stroking && currentTool == Tool.BRUSH && inMapBounds(hoverMapX, hoverMapY)) {
@@ -1270,7 +1466,7 @@ public class MapEditorScreen extends Screen {
         if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
             if (!mergeSources.isEmpty()) { mergeSources.clear(); return true; }
             if (lassoPoints != null) { lassoPoints = null; return true; }
-            if (selMask != null)     { selMask = null;     return true; }
+            if (selMask != null)     { setSelMask(null);   return true; }
             // fall through to super → close()
         }
 
@@ -1328,9 +1524,9 @@ public class MapEditorScreen extends Screen {
         }
 
         if (ctrl && keyCode == GLFW.GLFW_KEY_A) {
-            selMask = new boolean[MAP_BYTES]; Arrays.fill(selMask, true); return true;
+            boolean[] all = new boolean[MAP_BYTES]; Arrays.fill(all, true); setSelMask(all); return true;
         }
-        if (ctrl && keyCode == GLFW.GLFW_KEY_D) { selMask = null; return true; }
+        if (ctrl && keyCode == GLFW.GLFW_KEY_D) { setSelMask(null); return true; }
 
         // Tool keys — track prevTool for eyedropper revert
         if (keyCode == GLFW.GLFW_KEY_B) { setTool(Tool.BRUSH);        return true; }
@@ -1522,10 +1718,10 @@ public class MapEditorScreen extends Screen {
         }
     }
 
-    private void applyMagicWand(int startX, int startY) {
+    private boolean[] computeWandRegion(int startX, int startY) {
         int target = mapColors[startX + startY * MAP_SIZE] & 0xFF;
         float[] targetOklab = fillTolerance > 0f ? getMapColorOklab(target) : null;
-        boolean[] newMask = new boolean[MAP_BYTES];
+        boolean[] mask    = new boolean[MAP_BYTES];
         boolean[] visited = new boolean[MAP_BYTES];
         Deque<int[]> queue = new ArrayDeque<>();
         queue.push(new int[]{startX, startY});
@@ -1537,13 +1733,51 @@ public class MapEditorScreen extends Screen {
             if (visited[idx]) continue;
             visited[idx] = true;
             if (!colorMatches(mapColors[idx] & 0xFF, target, targetOklab)) continue;
-            newMask[idx] = true;
-            queue.push(new int[]{x+1, y});
-            queue.push(new int[]{x-1, y});
-            queue.push(new int[]{x, y+1});
-            queue.push(new int[]{x, y-1});
+            mask[idx] = true;
+            queue.push(new int[]{x+1, y}); queue.push(new int[]{x-1, y});
+            queue.push(new int[]{x, y+1}); queue.push(new int[]{x, y-1});
         }
-        selMask = newMask;
+        return mask;
+    }
+
+    /** Flood-fills from (x,y) and ORs the result into selMask (used while wand-dragging). */
+    private void addWandRegionAt(int x, int y) {
+        if (!inMapBounds(x, y)) return;
+        if (selMask != null && selMask[x + y * MAP_SIZE]) return; // already covered
+        boolean[] region = computeWandRegion(x, y);
+        if (selMask == null) selMask = new boolean[MAP_BYTES];
+        for (int i = 0; i < MAP_BYTES; i++) if (region[i]) selMask[i] = true;
+    }
+
+    private void renderWandPreview(DrawContext ctx) {
+        if (wandPreview == null || wandDragging) return;
+        int canvasH = height - STATUS_H;
+        for (int py = 0; py < MAP_SIZE; py++) {
+            for (int px = 0; px < MAP_SIZE; px++) {
+                int idx = px + py * MAP_SIZE;
+                if (!wandPreview[idx]) continue;
+                if (selMask != null && selMask[idx]) continue; // already selected
+                int sx = (int)(translateX + px * scale);
+                int sy = (int)(translateY + py * scale);
+                if (sx >= width - PANEL_W || sy >= canvasH || sx + scale <= GUIDE_W || sy + scale <= 0) continue;
+                ctx.fill(sx, sy, sx + scale, sy + scale, 0x500088FF); // translucent blue
+            }
+        }
+    }
+
+    private void renderPaletteHoverOverlay(DrawContext ctx) {
+        if (paletteHoverColor < 0) return;
+        int canvasH = height - STATUS_H;
+        byte target = (byte) paletteHoverColor;
+        for (int py = 0; py < MAP_SIZE; py++) {
+            for (int px = 0; px < MAP_SIZE; px++) {
+                if (mapColors[px + py * MAP_SIZE] != target) continue;
+                int sx = (int)(translateX + px * scale);
+                int sy = (int)(translateY + py * scale);
+                if (sx >= width - PANEL_W || sy >= canvasH || sx + scale <= GUIDE_W || sy + scale <= 0) continue;
+                ctx.fill(sx, sy, sx + scale, sy + scale, 0x60FFFFFF); // translucent white flash
+            }
+        }
     }
 
     private void commitLasso() {
@@ -1560,7 +1794,7 @@ public class MapEditorScreen extends Screen {
         for (int py = 0; py < MAP_SIZE; py++)
             for (int px = 0; px < MAP_SIZE; px++)
                 newMask[px + py * MAP_SIZE] = path.contains(px + 0.5, py + 0.5);
-        selMask = newMask;
+        setSelMask(newMask);
         lassoPoints = null;
     }
 

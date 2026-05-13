@@ -139,6 +139,36 @@ public class LoominaryCommand {
     }
 
     /**
+     * Encodes already-compressed bytes into the carpet+shade+overflow channels.
+     * Does not re-compress — takes raw zstd-compressed bytes and produces the
+     * LC/LS banner name, nibble array, heights, and hex overflow chunks.
+     * Used by both the normal import path and the mux post-pass.
+     */
+    private static CarpetEncoding encodeCarpetFromCompressed(byte[] compressed) {
+        int total = compressed.length;
+        int carpetBytes = Math.min(total, CarpetChannel.MAX_CARPET_BYTES);
+        int shadeBytes = total > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES
+                ? Math.min(total - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
+        int overflowStart = carpetBytes + shadeBytes;
+        byte[] nibbles = CarpetChannel.encodeNibbles(compressed, carpetBytes);
+        int[][] heights = null;
+        if (shadeBytes > 0) {
+            byte[] shadeData = new byte[shadeBytes];
+            System.arraycopy(compressed, carpetBytes, shadeData, 0, shadeBytes);
+            heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
+        }
+        String lcName = shadeBytes > 0
+                ? String.format("LS%04X%04X", total, shadeBytes)
+                : String.format("LC%04X",     total);
+        List<String> hexChunks = new ArrayList<>();
+        if (total > overflowStart) {
+            byte[] overflow = Arrays.copyOfRange(compressed, overflowStart, total);
+            hexChunks = CjkCodec.buildChunks(overflow);
+        }
+        return new CarpetEncoding(compressed, carpetBytes, shadeBytes, nibbles, heights, lcName, hexChunks);
+    }
+
+    /**
      * Builds a carpet-hybrid encoding for the given manifest + map-color payload.
      *
      * @throws IllegalStateException if the compressed payload exceeds the maximum
@@ -148,40 +178,8 @@ public class LoominaryCommand {
         byte[] combined = new byte[manifestBytes.length + mapColors.length];
         System.arraycopy(manifestBytes, 0, combined, 0, manifestBytes.length);
         System.arraycopy(mapColors, 0, combined, manifestBytes.length, mapColors.length);
-
         byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
-        int total = compressed.length;
-
-        int carpetBytes = Math.min(total, CarpetChannel.MAX_CARPET_BYTES);
-        // Use the shade channel only when the flat LC+overflow scheme can't hold the payload.
-        // This keeps encoding simple for the common case; staircase is only built when necessary.
-        int shadeBytes = total > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES
-                ? Math.min(total - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
-        int overflowStart = carpetBytes + shadeBytes;
-
-        byte[] nibbles = CarpetChannel.encodeNibbles(compressed, carpetBytes);
-
-        int[][] heights = null;
-        if (shadeBytes > 0) {
-            byte[] shadeData = new byte[shadeBytes];
-            System.arraycopy(compressed, carpetBytes, shadeData, 0, shadeBytes);
-            heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
-        }
-
-        // Manifest banner carries only the size header; all overflow goes to CJK hex banners.
-        String lcName = shadeBytes > 0
-                ? String.format("LS%04X%04X", total, shadeBytes)
-                : String.format("LC%04X",     total);
-
-        // Overflow → CJK-encoded hex-indexed banners 00..3D (84 bytes each)
-        List<String> hexChunks = new ArrayList<>();
-        if (total > overflowStart) {
-            byte[] overflow = new byte[total - overflowStart];
-            System.arraycopy(compressed, overflowStart, overflow, 0, overflow.length);
-            hexChunks = CjkCodec.buildChunks(overflow);
-        }
-
-        return new CarpetEncoding(compressed, carpetBytes, shadeBytes, nibbles, heights, lcName, hexChunks);
+        return encodeCarpetFromCompressed(compressed);
     }
 
     /**
@@ -315,7 +313,20 @@ public class LoominaryCommand {
                 tile.frameDelays = null;
             }
             saveTileData(tileIdx, manifest, payloadBytes);
+
+            // Editing any tile invalidates the mux allocation across the whole batch.
+            boolean hadMux = PayloadState.tiles.stream().anyMatch(t -> t.muxCargoB64 != null);
+            PayloadState.tiles.forEach(t -> { t.muxed = false; t.muxReceiver = false; t.muxCargoB64 = null; });
             PayloadState.save();
+
+            if (hadMux) {
+                MinecraftClient mc = MinecraftClient.getInstance();
+                if (mc.player != null) {
+                    mc.player.sendMessage(Text.literal(
+                            "§eMux state cleared — run §f/loominary mux§e again after reducing over-budget tiles."),
+                            false);
+                }
+            }
 
             // Warn in chat if the saved result is still over budget.
             if (tile.carpetEncoded && tile.carpetCompressedB64 != null) {
@@ -372,12 +383,162 @@ public class LoominaryCommand {
      * for large animated tiles.
      */
     private static int carpetCompressedBytes(PayloadState.TileData tile) {
-        if (tile.carpetCompressedB64 == null || tile.carpetCompressedB64.isEmpty()) return 0;
-        String b64 = tile.carpetCompressedB64;
+        String b64 = tile.muxCargoB64 != null ? tile.muxCargoB64 : tile.carpetCompressedB64;
+        if (b64 == null || b64.isEmpty()) return 0;
         int len = b64.length() * 3 / 4;
         if (b64.endsWith("==")) len -= 2;
         else if (b64.endsWith("=")) len -= 1;
         return len;
+    }
+
+    /**
+     * Post-pass after carpet import: redistributes overflow bytes from over-budget tiles
+     * into spare carpet capacity on under-budget donor tiles.
+     *
+     * <p>Wire format:
+     * <ul>
+     *   <li>Receiver tile chunks: {@code LR<col:2><row:2><ownLen:4><total:8>} banner + hex overflow
+     *       banners for any bytes of the own segment that spill past carpet+shade.</li>
+     *   <li>Donor tile chunks: normal LC/LS + hex overflow, then appended
+     *       {@code MG<seqIdx:2><ownLen:4><tCol:2><tRow:2><tOffset:8><tLen:4>} banners (one per
+     *       guest segment hosted).</li>
+     * </ul>
+     *
+     * @return number of over-budget tiles that could not be redistributed (0 = fully resolved)
+     */
+    private static int poolMuxTiles(List<PayloadState.TileData> tiles, int columns, int rows) {
+        // Reset every tile to its plain (non-mux) chunk encoding so this run starts clean.
+        // Clears stale MG/LR banners from any previous mux application.
+        for (PayloadState.TileData tile : tiles) {
+            if (!tile.carpetEncoded || tile.carpetCompressedB64 == null) continue;
+            CarpetEncoding enc = encodeCarpetFromCompressed(
+                    Base64.getDecoder().decode(tile.carpetCompressedB64));
+            tile.chunks.clear();
+            tile.chunks.addAll(enc.allChunks());
+            tile.muxed = false;
+            tile.muxReceiver = false;
+            tile.muxCargoB64 = null;
+        }
+
+        // Decode compressed payloads for all tiles.
+        List<byte[]> payloads = new ArrayList<>();
+        for (PayloadState.TileData t : tiles)
+            payloads.add(t.carpetCompressedB64 != null
+                    ? Base64.getDecoder().decode(t.carpetCompressedB64)
+                    : new byte[0]);
+
+        // Identify receiver tiles (over budget).
+        List<Integer> receivers = new ArrayList<>();
+        for (int i = 0; i < tiles.size(); i++)
+            if (payloads.get(i).length > CarpetChannel.MAX_TOTAL_BYTES) receivers.add(i);
+        if (receivers.isEmpty()) return 0;
+
+        // Running cargo size per tile (starts at each tile's own payload size).
+        int[] cargoSize = new int[tiles.size()];
+        for (int i = 0; i < tiles.size(); i++) cargoSize[i] = payloads.get(i).length;
+
+        // Per-donor: accumulated guest segment metadata and bytes.
+        // guestMeta[d][g] = {targetTileIdx, targetOffsetInPayload, segLen}
+        @SuppressWarnings("unchecked")
+        List<int[]>[] guestMeta = new List[tiles.size()];
+        @SuppressWarnings("unchecked")
+        List<byte[]>[] guestData = new List[tiles.size()];
+        for (int i = 0; i < tiles.size(); i++) {
+            guestMeta[i] = new ArrayList<>();
+            guestData[i] = new ArrayList<>();
+        }
+
+        // Greedily distribute each receiver's overflow to donors.
+        // If a receiver can't be fully allocated, roll back its partial allocations and skip it.
+        int unresolved = 0;
+        for (int rIdx : receivers) {
+            byte[] payload = payloads.get(rIdx);
+            int pos = CarpetChannel.MAX_TOTAL_BYTES; // own segment = [0..MAX-1]
+            boolean fits = true;
+            while (pos < payload.length) {
+                int bestDonor = -1, bestSpare = 0;
+                for (int d = 0; d < tiles.size(); d++) {
+                    if (tiles.get(d).muxReceiver) continue;
+                    int mgAfter = guestMeta[d].size() + 1; // MG count if we accept one more guest
+                    if (mgAfter >= MAX_CHUNKS) continue;   // 1 LC + 0 overflow + MAX_CHUNKS MG exceeds limit
+                    int spare = Math.max(0,
+                            CarpetChannel.MAX_TOTAL_BYTES - mgAfter * 84 - cargoSize[d]);
+                    if (spare > bestSpare) { bestSpare = spare; bestDonor = d; }
+                }
+                if (bestDonor < 0) { fits = false; break; }
+                int take = Math.min(bestSpare, payload.length - pos);
+                guestMeta[bestDonor].add(new int[]{rIdx, pos, take});
+                guestData[bestDonor].add(Arrays.copyOfRange(payload, pos, pos + take));
+                cargoSize[bestDonor] += take;
+                pos += take;
+            }
+            if (!fits) {
+                // Roll back all allocations made for this receiver.
+                final int rIdxFinal = rIdx;
+                for (int d = 0; d < tiles.size(); d++) {
+                    for (int g = guestMeta[d].size() - 1; g >= 0; g--) {
+                        if (guestMeta[d].get(g)[0] == rIdxFinal) {
+                            cargoSize[d] -= guestMeta[d].get(g)[2];
+                            guestMeta[d].remove(g);
+                            guestData[d].remove(g);
+                        }
+                    }
+                }
+                unresolved++;
+                continue; // leave this receiver's tile unchanged
+            }
+            tiles.get(rIdx).muxReceiver = true;
+            tiles.get(rIdx).muxed = true;
+        }
+
+        // Rebuild successfully-resolved receiver tiles: own segment with LR banner.
+        for (int rIdx : receivers) {
+            if (!tiles.get(rIdx).muxReceiver) continue; // skipped (unresolved)
+            PayloadState.TileData tile = tiles.get(rIdx);
+            byte[] payload = payloads.get(rIdx);
+            int ownLen = CarpetChannel.MAX_TOTAL_BYTES;
+            byte[] ownSeg = Arrays.copyOfRange(payload, 0, ownLen);
+            CarpetEncoding enc = encodeCarpetFromCompressed(ownSeg);
+            int col = rIdx % columns, row = rIdx / columns;
+            List<String> chunks = new ArrayList<>();
+            chunks.add(String.format("LR%02X%02X%04X%08X", col, row, ownLen, payload.length));
+            chunks.addAll(enc.hexChunks());
+            tile.chunks.clear();
+            tile.chunks.addAll(chunks);
+            tile.muxCargoB64 = Base64.getEncoder().encodeToString(ownSeg);
+            // carpetCompressedB64 left unchanged — still the full logical payload
+        }
+
+        // Rebuild donor tiles: combined cargo + MG descriptor banners.
+        for (int dIdx = 0; dIdx < tiles.size(); dIdx++) {
+            if (guestMeta[dIdx].isEmpty()) continue;
+            PayloadState.TileData tile = tiles.get(dIdx);
+            byte[] ownFrame = payloads.get(dIdx);
+            // Build cargo: own zstd frame followed by guest bytes in allocation order.
+            int totalLen = ownFrame.length;
+            for (byte[] g : guestData[dIdx]) totalLen += g.length;
+            byte[] cargo = new byte[totalLen];
+            System.arraycopy(ownFrame, 0, cargo, 0, ownFrame.length);
+            int pos = ownFrame.length;
+            for (byte[] g : guestData[dIdx]) {
+                System.arraycopy(g, 0, cargo, pos, g.length);
+                pos += g.length;
+            }
+            CarpetEncoding enc = encodeCarpetFromCompressed(cargo);
+            // MG<seqIdx:2><ownLen:4><tCol:2><tRow:2><tOffset:8><tLen:4>
+            List<String> chunks = new ArrayList<>(enc.allChunks());
+            for (int g = 0; g < guestMeta[dIdx].size(); g++) {
+                int[] m = guestMeta[dIdx].get(g);
+                chunks.add(String.format("MG%02X%04X%02X%02X%08X%04X",
+                        g, ownFrame.length, m[0] % columns, m[0] / columns, m[1], m[2]));
+            }
+            tile.chunks.clear();
+            tile.chunks.addAll(chunks);
+            tile.muxCargoB64 = Base64.getEncoder().encodeToString(cargo);
+            // carpetCompressedB64 left unchanged — still the full logical payload
+            tile.muxed = true;
+        }
+        return unresolved;
     }
 
     /** Strips the file extension from a filename (e.g. "myimage.png" → "myimage"). */
@@ -455,6 +616,11 @@ public class LoominaryCommand {
 
     /** Active reduce strategy — persists for the session, defaults to RAREST. */
     private static PngToMapColors.Strategy reduceStrategy = PngToMapColors.Strategy.RAREST;
+
+    /** Color metric used by /loominary requantize. */
+    private static PngToMapColors.MatchMetric requantizeMetric = PngToMapColors.MatchMetric.OKLAB;
+    /** Dither algorithm used by /loominary requantize. */
+    private static PngToMapColors.DitherAlgo requantizeDitherAlgo = PngToMapColors.DitherAlgo.NONE;
 
     /** Returns true if the tile's current encoded data exceeds its channel's budget. */
     public static boolean isTileOverBudget(int tileIdx) {
@@ -588,6 +754,18 @@ public class LoominaryCommand {
                                                     .then(ClientCommandManager.literal("dither")
                                                             .executes(ctx -> importFileCarpet(ctx.getSource(),
                                                                     StringArgumentType.getString(ctx, "filename"), 1, 1, true, true))))
+                                            .then(ClientCommandManager.literal("mux")
+                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "filename"), 1, 1, false, false, true))
+                                                    .then(ClientCommandManager.literal("dither")
+                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                    StringArgumentType.getString(ctx, "filename"), 1, 1, false, true, true)))
+                                                    .then(ClientCommandManager.literal("allshades")
+                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                    StringArgumentType.getString(ctx, "filename"), 1, 1, true, false, true))
+                                                            .then(ClientCommandManager.literal("dither")
+                                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                            StringArgumentType.getString(ctx, "filename"), 1, 1, true, true, true)))))
                                             // Default (carpet) + grid
                                             .then(ClientCommandManager
                                                     .argument("columns", IntegerArgumentType.integer(1, 16))
@@ -611,7 +789,27 @@ public class LoominaryCommand {
                                                                             .executes(ctx -> importFileCarpet(ctx.getSource(),
                                                                                     StringArgumentType.getString(ctx, "filename"),
                                                                                     IntegerArgumentType.getInteger(ctx, "columns"),
-                                                                                    IntegerArgumentType.getInteger(ctx, "rows"), true, true))))))
+                                                                                    IntegerArgumentType.getInteger(ctx, "rows"), true, true))))
+                                                            .then(ClientCommandManager.literal("mux")
+                                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                            StringArgumentType.getString(ctx, "filename"),
+                                                                            IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                            IntegerArgumentType.getInteger(ctx, "rows"), false, false, true))
+                                                                    .then(ClientCommandManager.literal("dither")
+                                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                    StringArgumentType.getString(ctx, "filename"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "rows"), false, true, true)))
+                                                                    .then(ClientCommandManager.literal("allshades")
+                                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                    StringArgumentType.getString(ctx, "filename"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "rows"), true, false, true))
+                                                                            .then(ClientCommandManager.literal("dither")
+                                                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                            StringArgumentType.getString(ctx, "filename"),
+                                                                                            IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                            IntegerArgumentType.getInteger(ctx, "rows"), true, true, true)))))))
                                             // Back-compat alias: "carpet" keyword
                                             .then(ClientCommandManager.literal("carpet")
                                                     .executes(ctx -> importFileCarpet(ctx.getSource(),
@@ -625,6 +823,18 @@ public class LoominaryCommand {
                                                             .then(ClientCommandManager.literal("dither")
                                                                     .executes(ctx -> importFileCarpet(ctx.getSource(),
                                                                             StringArgumentType.getString(ctx, "filename"), 1, 1, true, true))))
+                                                    .then(ClientCommandManager.literal("mux")
+                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                    StringArgumentType.getString(ctx, "filename"), 1, 1, false, false, true))
+                                                            .then(ClientCommandManager.literal("dither")
+                                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                            StringArgumentType.getString(ctx, "filename"), 1, 1, false, true, true)))
+                                                            .then(ClientCommandManager.literal("allshades")
+                                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                            StringArgumentType.getString(ctx, "filename"), 1, 1, true, false, true))
+                                                                    .then(ClientCommandManager.literal("dither")
+                                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                    StringArgumentType.getString(ctx, "filename"), 1, 1, true, true, true)))))
                                                     .then(ClientCommandManager
                                                             .argument("columns", IntegerArgumentType.integer(1, 16))
                                                             .then(ClientCommandManager
@@ -647,7 +857,27 @@ public class LoominaryCommand {
                                                                                     .executes(ctx -> importFileCarpet(ctx.getSource(),
                                                                                             StringArgumentType.getString(ctx, "filename"),
                                                                                             IntegerArgumentType.getInteger(ctx, "columns"),
-                                                                                            IntegerArgumentType.getInteger(ctx, "rows"), true, true)))))))
+                                                                                            IntegerArgumentType.getInteger(ctx, "rows"), true, true))))
+                                                                    .then(ClientCommandManager.literal("mux")
+                                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                    StringArgumentType.getString(ctx, "filename"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "rows"), false, false, true))
+                                                                            .then(ClientCommandManager.literal("dither")
+                                                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                            StringArgumentType.getString(ctx, "filename"),
+                                                                                            IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                            IntegerArgumentType.getInteger(ctx, "rows"), false, true, true)))
+                                                                            .then(ClientCommandManager.literal("allshades")
+                                                                                    .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                            StringArgumentType.getString(ctx, "filename"),
+                                                                                            IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                            IntegerArgumentType.getInteger(ctx, "rows"), true, false, true))
+                                                                                    .then(ClientCommandManager.literal("dither")
+                                                                                            .executes(ctx -> importFileCarpet(ctx.getSource(),
+                                                                                                    StringArgumentType.getString(ctx, "filename"),
+                                                                                                    IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                                    IntegerArgumentType.getInteger(ctx, "rows"), true, true, true))))))))
                                             // Explicit legacy: "banners" keyword
                                             .then(ClientCommandManager.literal("banners")
                                                     .executes(ctx -> importFile(ctx.getSource(),
@@ -877,6 +1107,36 @@ public class LoominaryCommand {
                             // ── resalt ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("resalt")
                                     .executes(ctx -> resalt(ctx.getSource())))
+
+                            // ── requantize ─────────────────────────────────────
+                            .then(ClientCommandManager.literal("requantize")
+                                    .executes(ctx -> requantizeAll(ctx.getSource(), false))
+                                    .then(ClientCommandManager.literal("preserve-transparent")
+                                            .executes(ctx -> requantizeAll(ctx.getSource(), true)))
+                                    .then(ClientCommandManager.literal("metric")
+                                            .then(ClientCommandManager.literal("oklab")
+                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.OKLAB)))
+                                            .then(ClientCommandManager.literal("chroma")
+                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.CHROMA_FIRST)))
+                                            .then(ClientCommandManager.literal("luma")
+                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.LUMA_FIRST)))
+                                            .then(ClientCommandManager.literal("hue")
+                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.HUE_ONLY)))
+                                            .then(ClientCommandManager.literal("rgb")
+                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.RGB))))
+                                    .then(ClientCommandManager.literal("dither")
+                                            .then(ClientCommandManager.literal("none")
+                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.NONE)))
+                                            .then(ClientCommandManager.literal("fs")
+                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.FLOYD_STEINBERG)))
+                                            .then(ClientCommandManager.literal("atkinson")
+                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.ATKINSON)))
+                                            .then(ClientCommandManager.literal("bayer")
+                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.BAYER_4X4)))))
+
+                            // ── mux ────────────────────────────────────────────
+                            .then(ClientCommandManager.literal("mux")
+                                    .executes(ctx -> applyMux(ctx.getSource())))
 
                             // ── clear ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("clear")
@@ -1358,8 +1618,13 @@ public class LoominaryCommand {
 
     private static int importFileCarpet(FabricClientCommandSource source,
             String filename, int columns, int rows, boolean allShades, boolean dither) {
+        return importFileCarpet(source, filename, columns, rows, allShades, dither, false);
+    }
+
+    private static int importFileCarpet(FabricClientCommandSource source,
+            String filename, int columns, int rows, boolean allShades, boolean dither, boolean mux) {
         if (filename.isEmpty()) {
-            source.sendError(Text.literal("§cUsage: /loominary import <filename> carpet [cols] [rows] [allshades] [dither]"));
+            source.sendError(Text.literal("§cUsage: /loominary import <filename> carpet [cols] [rows] [mux] [allshades] [dither]"));
             return 0;
         }
         if (importInProgress) {
@@ -1376,7 +1641,7 @@ public class LoominaryCommand {
         if (!titleIsUserSet) PayloadState.currentTitle = filenameStem(filename);
 
         if (filename.toLowerCase().endsWith(".gif")) {
-            return importGifCarpet(source, filename, filePath, columns, rows, allShades, dither);
+            return importGifCarpet(source, filename, filePath, columns, rows, allShades, dither, mux);
         }
 
         final BufferedImage img;
@@ -1451,9 +1716,20 @@ public class LoominaryCommand {
                     tileNotes.add(note);
                 }
 
+                // Mux post-pass: redistribute overflow to spare capacity on under-budget tiles.
+                boolean muxApplied = false, muxSuccess = true;
+                boolean anyOverBudgetStatic = newTiles.stream().anyMatch(
+                        tile2 -> carpetCompressedBytes(tile2) > CarpetChannel.MAX_TOTAL_BYTES);
+                if (mux && anyOverBudgetStatic) {
+                    muxApplied = true;
+                    muxSuccess = poolMuxTiles(newTiles, columns, rows) == 0;
+                }
+
                 final List<PayloadState.TileData> finalTiles = newTiles;
                 final List<String> finalNotes = tileNotes;
                 final int finalTileCount = totalTiles;
+                final boolean finalMuxApplied = muxApplied;
+                final boolean finalMuxSuccess = muxSuccess;
 
                 client.execute(() -> {
                     try {
@@ -1472,7 +1748,8 @@ public class LoominaryCommand {
                         triggerAutoSave(filename, source);
 
                         String modeTag = "carpet, " + (allShades ? "all shades" : "legal palette")
-                                + (dither ? ", dithered" : "");
+                                + (dither ? ", dithered" : "")
+                                + (finalMuxApplied && finalMuxSuccess ? ", mux" : "");
                         source.sendFeedback(Text.literal(String.format(
                                 "§aLoaded %s (%dx%d) as %dx%d grid (%d tile%s) §7[%s]",
                                 filename, img.getWidth(), img.getHeight(),
@@ -1487,12 +1764,18 @@ public class LoominaryCommand {
                             String channelInfo = sb > 0
                                     ? carpetRows + " carpet rows (staircase) + " + sb + " shade bytes"
                                     : carpetRows + " carpet rows";
-                            String line = String.format("§7  %s: §f%s, %d overflow banner%s §7(%d bytes)%s",
+                            String muxTag = tile.muxReceiver ? " §d[mux receiver]"
+                                    : tile.muxed ? " §d[mux donor]" : "";
+                            String line = String.format("§7  %s: §f%s, %d overflow banner%s §7(%d bytes)%s%s",
                                     PayloadState.tileLabel(i), channelInfo, tile.chunks.size() - 1,
                                     tile.chunks.size() == 2 ? "" : "s", totalBytes,
-                                    overBudget ? " §c[OVER BUDGET]" : "");
+                                    overBudget ? " §c[OVER BUDGET]" : "", muxTag);
                             if (finalNotes.get(i) != null) line += " §e(" + finalNotes.get(i) + ")";
                             source.sendFeedback(Text.literal(line));
+                        }
+                        if (finalMuxApplied && !finalMuxSuccess) {
+                            source.sendFeedback(Text.literal(
+                                    "§c⚠ Mux pooling could not fit all overflow — some tiles still over budget."));
                         }
                         int maxOverflow = finalTiles.stream().mapToInt(ti -> ti.chunks.size() - 1).max().orElse(0);
                         if (maxOverflow > 0)
@@ -1528,6 +1811,11 @@ public class LoominaryCommand {
 
     private static int importGifCarpet(FabricClientCommandSource source, String filename,
             Path filePath, int columns, int rows, boolean allShades, boolean dither) {
+        return importGifCarpet(source, filename, filePath, columns, rows, allShades, dither, false);
+    }
+
+    private static int importGifCarpet(FabricClientCommandSource source, String filename,
+            Path filePath, int columns, int rows, boolean allShades, boolean dither, boolean mux) {
         // title + importInProgress already set by importFileCarpet caller
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
@@ -1590,6 +1878,16 @@ public class LoominaryCommand {
                 tileNotes.add(tileNote);
             }
 
+            // Mux post-pass: redistribute overflow to spare capacity on under-budget tiles.
+            boolean muxApplied = false, muxSuccess = true;
+            if (mux && anyOverflow) {
+                muxApplied = true;
+                muxSuccess = poolMuxTiles(newTiles, columns, rows) == 0;
+                // Recompute anyOverflow after pooling.
+                anyOverflow = newTiles.stream().anyMatch(
+                        tile2 -> carpetCompressedBytes(tile2) > CarpetChannel.MAX_TOTAL_BYTES);
+            }
+
             final List<PayloadState.TileData> finalTiles = newTiles;
             final List<String> finalNotes = tileNotes;
             final int finalTileCount = totalTiles;
@@ -1598,6 +1896,8 @@ public class LoominaryCommand {
             final boolean finalUniform = uniformDelay;
             final int[] finalManifestDelays = manifestDelays;
             final int[] finalRawDelays = rawDelays;
+            final boolean finalMuxApplied = muxApplied;
+            final boolean finalMuxSuccess = muxSuccess;
 
             client.execute(() -> {
                 try {
@@ -1616,7 +1916,9 @@ public class LoominaryCommand {
                     triggerAutoSave(filename, source);
 
                     String modeTag = "carpet, " + (allShades ? "all shades" : "legal palette")
-                            + (dither ? ", dithered" : "") + ", animated";
+                            + (dither ? ", dithered" : "")
+                            + (finalMuxApplied && finalMuxSuccess ? ", mux" : "")
+                            + ", animated";
                     source.sendFeedback(Text.literal(String.format(
                             "§aLoaded %s as %dx%d grid (%d tile%s, §e%d frame%s§a) §7[%s]",
                             filename, columns, rows, finalTileCount, finalTileCount == 1 ? "" : "s",
@@ -1629,16 +1931,22 @@ public class LoominaryCommand {
                         int carpetRows = (Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES) * 2 + 127) / 128;
                         String budgetTag = overBudget
                                 ? String.format(" §c[OVER BUDGET by %d bytes]", totalBytes - CarpetChannel.MAX_TOTAL_BYTES) : "";
+                        String muxTag = tile.muxReceiver ? " §d[mux receiver]"
+                                : tile.muxed ? " §d[mux donor]" : "";
                         source.sendFeedback(Text.literal(String.format(
-                                "§7  %s: §f%d carpet rows, %d overflow banner%s §7(%d bytes)%s",
+                                "§7  %s: §f%d carpet rows, %d overflow banner%s §7(%d bytes)%s%s",
                                 PayloadState.tileLabel(i), carpetRows, overflowBanners,
-                                overflowBanners == 1 ? "" : "s", totalBytes, budgetTag)));
+                                overflowBanners == 1 ? "" : "s", totalBytes, budgetTag, muxTag)));
                     }
                     String delayDesc = finalUniform
                             ? finalManifestDelays[0] + "ms/frame"
                             : "variable (" + finalRawDelays[0] + "–"
                                     + java.util.Arrays.stream(finalRawDelays).max().getAsInt() + "ms)";
                     source.sendFeedback(Text.literal("§7Delay: " + delayDesc));
+                    if (finalMuxApplied && !finalMuxSuccess) {
+                        source.sendFeedback(Text.literal(
+                                "§c⚠ Mux pooling could not fit all overflow — some tiles still over budget."));
+                    }
                     if (finalAnyOverflow) {
                         source.sendFeedback(Text.literal(
                                 "§e⚠ Some tiles are over budget — use §f/loominary reduce§e or §f/loominary edit§e before placing."));
@@ -1867,7 +2175,7 @@ public class LoominaryCommand {
                         ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
                 int compressedBytes = carpetCompressedBytes(tile);
                 int overflowBanners = chunks.size() - 1;
-                boolean overBudget = compressedBytes > CarpetChannel.MAX_TOTAL_BYTES;
+                boolean overBudget = !tile.muxed && compressedBytes > CarpetChannel.MAX_TOTAL_BYTES;
                 if (overBudget) {
                     budgetStr = String.format(" §c[%d bytes, %d overflow — OVER BUDGET by %d]",
                             compressedBytes, overflowBanners,
@@ -1886,8 +2194,10 @@ public class LoominaryCommand {
                 }
             }
 
-            source.sendFeedback(Text.literal(String.format("  %s: %s%s",
-                    PayloadState.tileLabel(i), statusStr, budgetStr)));
+            String muxTag = tile.muxReceiver ? " §d[mux receiver]"
+                    : tile.muxed ? " §d[mux donor]" : "";
+            source.sendFeedback(Text.literal(String.format("  %s: %s%s%s",
+                    PayloadState.tileLabel(i), statusStr, budgetStr, muxTag)));
         }
 
         boolean anyCarpet = PayloadState.tiles.stream().anyMatch(t -> t.carpetEncoded);
@@ -1897,9 +2207,9 @@ public class LoominaryCommand {
             List<String> chunks = (i == PayloadState.activeTileIndex)
                     ? PayloadState.ACTIVE_CHUNKS : t.chunks;
             if (t.carpetEncoded) {
-                String lc = chunks.isEmpty() ? "" : chunks.get(0);
-                int bytes = lc.length() >= 6 ? Integer.parseInt(lc.substring(2, 6), 16) : 0;
-                if (bytes > CarpetChannel.MAX_TOTAL_BYTES) { anyOverBudget = true; break; }
+                if (!t.muxed && carpetCompressedBytes(t) > CarpetChannel.MAX_TOTAL_BYTES) {
+                    anyOverBudget = true; break;
+                }
             } else if (chunks.size() > MAX_CHUNKS) {
                 anyOverBudget = true; break;
             }
@@ -3423,103 +3733,122 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
         }
-        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
-            source.sendError(Text.literal("§cActive tile has no chunks."));
-            return 0;
+        // Block export if any carpet tile is still over budget.
+        PayloadState.syncToActiveTile();
+        for (PayloadState.TileData t : PayloadState.tiles) {
+            if (t.carpetEncoded && carpetCompressedBytes(t) > CarpetChannel.MAX_TOTAL_BYTES) {
+                source.sendError(Text.literal(
+                        "§cCan't export: one or more tiles are over budget. "
+                        + "Use §f/loominary reduce§c or §f/loominary mux§c first."));
+                PayloadState.syncFromActiveTile();
+                return 0;
+            }
         }
 
-        int tileIdx = PayloadState.activeTileIndex;
-        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-
+        boolean multiTile = PayloadState.totalTiles() > 1;
+        int exported = 0;
         try {
-            // Resolve the schematic base name.
-            String name = (nameArg != null && !nameArg.isEmpty()) ? nameArg
+            // Resolve base name once; per-tile suffix appended below in multi-tile mode.
+            String baseName = (nameArg != null && !nameArg.isEmpty()) ? nameArg
                     : SchematicExporter.resolveSchematicName(
-                            PayloadState.currentTitle != null ? PayloadState.currentTitle
-                                    + (PayloadState.totalTiles() > 1 ? "_tile" + tileIdx : "")
-                                    : null);
+                            PayloadState.currentTitle != null ? PayloadState.currentTitle : null);
 
-            if (tile.carpetEncoded) {
-                // Re-export the carpet schematic from stored compressed data.
-                if (tile.carpetCompressedB64 == null) {
-                    source.sendError(Text.literal("§cCarpet tile has no stored data — re-import."));
-                    return 0;
-                }
-                byte[] compressed = Base64.getDecoder().decode(tile.carpetCompressedB64);
-                int totalBytes = compressed.length;
-                int carpetBytes = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
-                int shadeBytes  = totalBytes > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES
-                        ? Math.min(totalBytes - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
-                byte[] nibbles = CarpetChannel.encodeNibbles(compressed, carpetBytes);
+            for (int tileIdx = 0; tileIdx < PayloadState.tiles.size(); tileIdx++) {
+                PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+                if (tile.chunks.isEmpty()) continue;
 
-                Path output;
-                if (shadeBytes > 0) {
-                    byte[] shadeData = new byte[shadeBytes];
-                    System.arraycopy(compressed, carpetBytes, shadeData, 0, shadeBytes);
-                    int[][] heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
-                    output = SchematicExporter.exportCarpetStaircase(nibbles, carpetBytes, heights, name);
-                } else {
-                    output = SchematicExporter.exportCarpetTile(nibbles, carpetBytes, name);
-                }
+                String name = multiTile ? baseName + "_tile" + tileIdx : baseName;
 
-                // Migrate old LC banner names to LS if the tile now uses the shade channel.
-                // This happens when state was saved before LS support was added.
-                boolean migrated = false;
-                String firstChunk = tile.chunks.isEmpty() ? "" : tile.chunks.get(0);
-                if (shadeBytes > 0 && firstChunk.startsWith("LC")) {
-                    List<String> newChunks = rebuildCarpetChunks(compressed, totalBytes, carpetBytes, shadeBytes);
-                    tile.chunks.clear();
-                    tile.chunks.addAll(newChunks);
-                    tile.currentIndex = 0;
-                    if (tileIdx == PayloadState.activeTileIndex) PayloadState.syncFromActiveTile();
-                    PayloadState.save();
-                    migrated = true;
-                }
+                if (tile.carpetEncoded) {
+                    if (tile.carpetCompressedB64 == null) {
+                        source.sendError(Text.literal("§c" + PayloadState.tileLabel(tileIdx)
+                                + ": no stored data — re-import."));
+                        continue;
+                    }
+                    String exportB64 = tile.muxCargoB64 != null ? tile.muxCargoB64 : tile.carpetCompressedB64;
+                    byte[] compressed = Base64.getDecoder().decode(exportB64);
+                    int totalBytes = compressed.length;
+                    int carpetBytes = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
+                    int shadeBytes  = totalBytes > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES
+                            ? Math.min(totalBytes - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
+                    byte[] nibbles = CarpetChannel.encodeNibbles(compressed, carpetBytes);
 
-                int carpetRows = shadeBytes > 0 ? 128 : (carpetBytes * 2 + 127) / 128;
-                int overflowBanners = tile.chunks.size() - 1;
+                    Path output;
+                    if (shadeBytes > 0) {
+                        byte[] shadeData = new byte[shadeBytes];
+                        System.arraycopy(compressed, carpetBytes, shadeData, 0, shadeBytes);
+                        int[][] heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
+                        output = SchematicExporter.exportCarpetStaircase(nibbles, carpetBytes, heights, name);
+                    } else {
+                        output = SchematicExporter.exportCarpetTile(nibbles, carpetBytes, name);
+                    }
 
-                source.sendFeedback(Text.literal(String.format(
-                        "§aExported §f%s §a(%s, %d compressed bytes):",
-                        name + ".litematic",
-                        shadeBytes > 0
-                                ? carpetRows + " carpet rows × 128 (staircase, " + shadeBytes + " shade bytes)"
-                                : carpetRows + " carpet rows × 128",
-                        totalBytes)));
-                source.sendFeedback(Text.literal("§7  " + output.getFileName()));
-                if (migrated)
-                    source.sendFeedback(Text.literal(
-                            "§eBanner names updated from LC → LS format. Rename fresh banners at the anvil."));
-                if (overflowBanners > 0)
+                    // Migrate old LC banner names to LS if the tile now uses the shade channel.
+                    boolean migrated = false;
+                    String firstChunk = tile.chunks.isEmpty() ? "" : tile.chunks.get(0);
+                    if (shadeBytes > 0 && firstChunk.startsWith("LC")) {
+                        List<String> newChunks = rebuildCarpetChunks(compressed, totalBytes, carpetBytes, shadeBytes);
+                        tile.chunks.clear();
+                        tile.chunks.addAll(newChunks);
+                        tile.currentIndex = 0;
+                        if (tileIdx == PayloadState.activeTileIndex) PayloadState.syncFromActiveTile();
+                        PayloadState.save();
+                        migrated = true;
+                    }
+
+                    int carpetRows = shadeBytes > 0 ? 128 : (carpetBytes * 2 + 127) / 128;
+                    int overflowBanners = tile.chunks.size() - 1;
+
                     source.sendFeedback(Text.literal(String.format(
-                            "§7  + %d overflow banner%s still needed (rename at anvil).",
-                            overflowBanners, overflowBanners == 1 ? "" : "s")));
-                return 1;
+                            "§aExported §f%s §a(%s, %d bytes):",
+                            name + ".litematic",
+                            shadeBytes > 0
+                                    ? carpetRows + " carpet rows × 128 (staircase, " + shadeBytes + " shade bytes)"
+                                    : carpetRows + " carpet rows × 128",
+                            totalBytes)));
+                    source.sendFeedback(Text.literal("§7  " + output.getFileName()));
+                    if (migrated)
+                        source.sendFeedback(Text.literal(
+                                "§eBanner names updated from LC → LS format. Rename fresh banners at the anvil."));
+                    if (overflowBanners > 0)
+                        source.sendFeedback(Text.literal(String.format(
+                                "§7  + %d overflow banner%s still needed (rename at anvil).",
+                                overflowBanners, overflowBanners == 1 ? "" : "s")));
+                } else {
+                    // Legacy banner schematic.
+                    int count = tile.chunks.size();
+                    String description = String.format(
+                            "Loominary tile %d (col %d, row %d) — %d named banners.",
+                            tileIdx, PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx), count);
+                    Path output = SchematicExporter.exportTile(new ArrayList<>(tile.chunks), name, description);
+                    int gridH = (count + 15) / 16;
+                    source.sendFeedback(Text.literal(String.format(
+                            "§aExported §f%s §a(%d banners, 16×%d grid):",
+                            name + ".litematic", count, gridH)));
+                    source.sendFeedback(Text.literal("§7  " + output.getFileName()));
+                    source.sendFeedback(Text.literal(
+                            "§7Each ghost banner's custom name shows which renamed banner to place there."));
+                }
+                exported++;
             }
-
-            // Legacy banner schematic.
-            int count = PayloadState.ACTIVE_CHUNKS.size();
-            String description = String.format(
-                    "Loominary tile %d (col %d, row %d) — %d named banners.",
-                    tileIdx, PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx), count);
-
-            Path output = SchematicExporter.exportTile(
-                    new ArrayList<>(PayloadState.ACTIVE_CHUNKS), name, description);
-
-            int gridH = (count + 15) / 16;
-            source.sendFeedback(Text.literal(String.format(
-                    "§aExported §f%s §a(%d banners, 16×%d grid):",
-                    name + ".litematic", count, gridH)));
-            source.sendFeedback(Text.literal("§7  " + output.getFileName()));
-            source.sendFeedback(Text.literal(
-                    "§7Each ghost banner's custom name shows which renamed banner to place there."));
-            return 1;
-
         } catch (IOException e) {
             source.sendError(Text.literal("§cExport failed: " + e.getMessage()));
             e.printStackTrace();
+            PayloadState.syncFromActiveTile();
             return 0;
         }
+
+        PayloadState.syncFromActiveTile();
+
+        if (exported == 0) {
+            source.sendError(Text.literal("§cNo tiles with data to export."));
+            return 0;
+        }
+        if (multiTile) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§7%d/%d tiles exported.", exported, PayloadState.totalTiles())));
+        }
+        return 1;
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -3800,6 +4129,311 @@ public class LoominaryCommand {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // mux
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int applyMux(FabricClientCommandSource source) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+        boolean allCarpet = PayloadState.tiles.stream().allMatch(t -> t.carpetEncoded);
+        if (!allCarpet) {
+            source.sendError(Text.literal(
+                    "§cAll tiles must be carpet-encoded. Re-import with the §fcarpet§c keyword."));
+            return 0;
+        }
+        PayloadState.syncToActiveTile();
+        // Block if mux was previously applied successfully (muxCargoB64 written on success).
+        boolean priorSuccess = PayloadState.tiles.stream()
+                .anyMatch(t -> t.muxCargoB64 != null);
+        if (priorSuccess) {
+            source.sendError(Text.literal(
+                    "§cMux was already applied successfully. Re-import to start fresh."));
+            return 0;
+        }
+        // Reset stale flags from any prior failed run (muxCargoB64 is never written on failure).
+        PayloadState.tiles.forEach(t -> { t.muxed = false; t.muxReceiver = false; t.muxCargoB64 = null; });
+
+        boolean anyOverBudget = PayloadState.tiles.stream()
+                .anyMatch(t -> carpetCompressedBytes(t) > CarpetChannel.MAX_TOTAL_BYTES);
+        if (!anyOverBudget) {
+            source.sendFeedback(Text.literal("§eNo tiles are over budget — mux not needed."));
+            return 1;
+        }
+        source.sendFeedback(Text.literal(
+                "§7Applying mux pooling across " + PayloadState.tiles.size() + " tiles…"));
+        int unresolved = poolMuxTiles(PayloadState.tiles,
+                PayloadState.gridColumns, PayloadState.gridRows);
+        PayloadState.syncFromActiveTile();
+        PayloadState.save();
+        for (int i = 0; i < PayloadState.tiles.size(); i++) {
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            int totalBytes = carpetCompressedBytes(tile);
+            boolean overBudget = totalBytes > CarpetChannel.MAX_TOTAL_BYTES;
+            String muxTag = tile.muxReceiver ? " §d[mux receiver]"
+                    : tile.muxed ? " §d[mux donor]" : "";
+            String budgetTag = overBudget
+                    ? String.format(" §c[OVER BUDGET by %d — reduce further]",
+                            totalBytes - CarpetChannel.MAX_TOTAL_BYTES)
+                    : "";
+            source.sendFeedback(Text.literal(String.format(
+                    "  %s: §8%d bytes%s%s",
+                    PayloadState.tileLabel(i), totalBytes, muxTag, budgetTag)));
+        }
+        int donePlacements = PayloadState.tiles.stream().mapToInt(t -> t.currentIndex).sum();
+        if (donePlacements > 0) {
+            source.sendFeedback(Text.literal(
+                    "§e⚠ Some chunks were already placed — names changed. "
+                    + "Discard already-placed chunks before continuing."));
+        }
+        if (unresolved > 0) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§e%d tile%s still over budget — reduce those tiles, then run §f/loominary mux§e again.",
+                    unresolved, unresolved == 1 ? "" : "s")));
+        } else {
+            source.sendFeedback(Text.literal(
+                    "§aMux applied — run §f/loominary export§a to regenerate schematics for all tiles."));
+        }
+        return 1;
+    }
+
+    // requantize
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int setRequantizeMetric(FabricClientCommandSource source,
+            PngToMapColors.MatchMetric metric) {
+        requantizeMetric = metric;
+        String name = switch (metric) {
+            case OKLAB        -> "OKLab (perceptual)";
+            case CHROMA_FIRST -> "Chroma-first";
+            case LUMA_FIRST   -> "Luma-first";
+            case HUE_ONLY     -> "Hue-only";
+            case RGB          -> "Linear RGB";
+        };
+        source.sendFeedback(Text.literal("§7Requantize metric: §f" + name
+                + "§7 — run §f/loominary requantize§7 to apply."));
+        return 1;
+    }
+
+    private static int setRequantizeDither(FabricClientCommandSource source,
+            PngToMapColors.DitherAlgo algo) {
+        requantizeDitherAlgo = algo;
+        String name = switch (algo) {
+            case NONE            -> "none";
+            case FLOYD_STEINBERG -> "Floyd-Steinberg";
+            case ATKINSON        -> "Atkinson";
+            case BAYER_4X4       -> "Bayer 4×4";
+        };
+        source.sendFeedback(Text.literal("§7Requantize dither: §f" + name
+                + "§7 — run §f/loominary requantize§7 to apply."));
+        return 1;
+    }
+
+    private static int requantizeAll(FabricClientCommandSource source, boolean preserveTransparent) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch."));
+            return 0;
+        }
+        if (PayloadState.currentSourceFilename == null) {
+            source.sendError(Text.literal(
+                    "§cNo source file on record — requantize requires the original source image."));
+            return 0;
+        }
+        MinecraftClient client = MinecraftClient.getInstance();
+        Path filePath = client.runDirectory.toPath()
+                .resolve("loominary_data").resolve(PayloadState.currentSourceFilename);
+        if (!Files.exists(filePath)) {
+            source.sendError(Text.literal("§cSource file not found: loominary_data/"
+                    + PayloadState.currentSourceFilename));
+            return 0;
+        }
+
+        try {
+            boolean isGif = PayloadState.currentSourceFilename.toLowerCase().endsWith(".gif");
+            boolean legalOnly = !PayloadState.allShades;
+            int totalW = PayloadState.gridColumns * MAP_SIZE;
+            int totalH = PayloadState.gridRows    * MAP_SIZE;
+
+            // Load source frames (one element for static images, N for GIF).
+            BufferedImage[] sourceFrames;
+            if (isGif) {
+                sourceFrames = PngToMapColors.coalesceGifFrames(filePath);
+            } else {
+                BufferedImage img = ImageIO.read(filePath.toFile());
+                if (img == null) {
+                    source.sendError(Text.literal("§cCould not decode source image."));
+                    return 0;
+                }
+                sourceFrames = new BufferedImage[]{img};
+            }
+
+            float[][] oklabLookup = PngToMapColors.buildOklabLookup();
+            float[][] rgbLookup   = (requantizeMetric == PngToMapColors.MatchMetric.RGB)
+                    ? PngToMapColors.buildLinearRgbLookup() : null;
+
+            // Quantize each GIF source frame across the full tile grid.
+            // frameResults[srcGifFrame][tileIdx] = byte[MAP_BYTES]
+            byte[][][] frameResults = new byte[sourceFrames.length][PayloadState.tiles.size()][];
+            for (int gf = 0; gf < sourceFrames.length; gf++) {
+                if (requantizeDitherAlgo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG
+                        && requantizeMetric == PngToMapColors.MatchMetric.OKLAB) {
+                    // Cross-tile path: consistent palette + error propagation across seams.
+                    byte[][] tiles = PngToMapColors.convertTwoPassGrid(
+                            sourceFrames[gf], legalOnly, 0, true,
+                            PayloadState.gridColumns, PayloadState.gridRows);
+                    for (int t = 0; t < PayloadState.tiles.size(); t++)
+                        frameResults[gf][t] = tiles[t];
+                } else {
+                    // Per-tile path: scale once, then extract each tile subimage.
+                    BufferedImage scaled = PngToMapColors.scale(sourceFrames[gf], totalW, totalH);
+                    for (int t = 0; t < PayloadState.tiles.size(); t++) {
+                        int col = t % PayloadState.gridColumns;
+                        int row = t / PayloadState.gridColumns;
+                        BufferedImage tileImg = scaled.getSubimage(
+                                col * MAP_SIZE, row * MAP_SIZE, MAP_SIZE, MAP_SIZE);
+                        frameResults[gf][t] = quantizeTileImage(tileImg, legalOnly, oklabLookup, rgbLookup);
+                    }
+                }
+            }
+
+            PayloadState.syncToActiveTile();
+            String playerName = source.getPlayer().getGameProfile().getName();
+            int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
+
+            for (int t = 0; t < PayloadState.tiles.size(); t++) {
+                PayloadState.TileData tile = PayloadState.tiles.get(t);
+                List<String> chunks = (t == PayloadState.activeTileIndex)
+                        ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
+
+                preReductionChunks.putIfAbsent(t, new ArrayList<>(chunks));
+                if (tile.carpetEncoded && tile.carpetCompressedB64 != null)
+                    preReductionCarpetB64.putIfAbsent(t, tile.carpetCompressedB64);
+
+                int fc = tile.frameCount;
+
+                // Read existing frames for transparency masking; fails gracefully for
+                // mux receiver tiles whose stored data is a partial zstd fragment.
+                byte[][] existing = null;
+                if (preserveTransparent) {
+                    try {
+                        existing = resolveAllFramesForTile(tile, chunks);
+                    } catch (Exception ignored) { }
+                }
+
+                byte[] allFramesBytes = new byte[fc * MAP_BYTES];
+                for (int f = 0; f < fc; f++) {
+                    int srcGif = (tile.frameSourceIndices != null && f < tile.frameSourceIndices.size())
+                            ? tile.frameSourceIndices.get(f) : f;
+                    srcGif = Math.min(srcGif, sourceFrames.length - 1);
+                    byte[] newFrame = frameResults[srcGif][t].clone();
+                    if (existing != null && f < existing.length) {
+                        byte[] cur = existing[f];
+                        for (int p = 0; p < MAP_BYTES; p++)
+                            if (cur[p] == 0) newFrame[p] = 0;
+                    }
+                    System.arraycopy(newFrame, 0, allFramesBytes, f * MAP_BYTES, MAP_BYTES);
+                }
+
+                tile.muxed = false;
+                tile.muxReceiver = false;
+                tile.muxCargoB64 = null;
+
+                int[] delays = tileDelays(tile, fc);
+                long crc = PayloadManifest.crc32(Arrays.copyOf(allFramesBytes, MAP_BYTES));
+                byte[] manifest = buildReduceManifest(t, crc, playerName, flags, fc, delays);
+                saveTileData(t, manifest, allFramesBytes);
+            }
+
+            PayloadState.syncFromActiveTile();
+            PayloadState.save();
+
+            String metricName = switch (requantizeMetric) {
+                case OKLAB        -> "OKLab";
+                case CHROMA_FIRST -> "Chroma";
+                case LUMA_FIRST   -> "Luma";
+                case HUE_ONLY     -> "Hue";
+                case RGB          -> "RGB";
+            };
+            String ditherName = switch (requantizeDitherAlgo) {
+                case NONE            -> "none";
+                case FLOYD_STEINBERG -> "FS";
+                case ATKINSON        -> "Atkinson";
+                case BAYER_4X4       -> "Bayer 4×4";
+            };
+            source.sendFeedback(Text.literal(String.format(
+                    "§6=== Re-quantized %d tile%s [%s, %s%s] ===",
+                    PayloadState.tiles.size(), PayloadState.tiles.size() == 1 ? "" : "s",
+                    metricName, ditherName,
+                    preserveTransparent ? ", preserve-transparent" : "")));
+            boolean anyOverBudget = false;
+            for (int t = 0; t < PayloadState.tiles.size(); t++) {
+                PayloadState.TileData tile = PayloadState.tiles.get(t);
+                boolean overBudget = tile.carpetEncoded
+                        ? carpetCompressedBytes(tile) > CarpetChannel.MAX_TOTAL_BYTES
+                        : (t == PayloadState.activeTileIndex
+                                ? PayloadState.ACTIVE_CHUNKS.size() > MAX_CHUNKS
+                                : tile.chunks.size() > MAX_CHUNKS);
+                if (overBudget) anyOverBudget = true;
+                source.sendFeedback(Text.literal(String.format("§7  %s: §f%d frame%s%s",
+                        PayloadState.tileLabel(t), tile.frameCount,
+                        tile.frameCount == 1 ? "" : "s",
+                        overBudget ? " §c[OVER BUDGET]" : "")));
+            }
+            if (anyOverBudget)
+                source.sendFeedback(Text.literal(
+                        "§e⚠ Some tiles over budget — use §f/loominary reduce§e or §f/loominary mux§e."));
+            source.sendFeedback(Text.literal(
+                    "§7Use §f/loominary preview§7 to inspect. §f/loominary reduce undo§7 reverts the active tile."));
+            return 1;
+
+        } catch (IOException e) {
+            source.sendError(Text.literal("§cError reading source: " + e.getMessage()));
+            return 0;
+        }
+    }
+
+    private static byte[] quantizeTileImage(BufferedImage tileImg, boolean legalOnly,
+            float[][] oklabLookup, float[][] rgbLookup) {
+        // First pass: OKLAB nearest-color to derive the source-based palette.
+        byte[] firstPass = new byte[MAP_BYTES];
+        for (int y = 0; y < MAP_SIZE; y++)
+            for (int x = 0; x < MAP_SIZE; x++)
+                firstPass[x + y * MAP_SIZE] = PngToMapColors.findClosestMapColorByte(
+                        tileImg.getRGB(x, y), legalOnly, oklabLookup);
+        boolean[] palette = PngToMapColors.buildPalette(firstPass);
+
+        return switch (requantizeDitherAlgo) {
+            case NONE -> {
+                if (requantizeMetric == PngToMapColors.MatchMetric.OKLAB) yield firstPass;
+                byte[] out = new byte[MAP_BYTES];
+                float[] palHues = (requantizeMetric == PngToMapColors.MatchMetric.HUE_ONLY)
+                        ? PngToMapColors.buildPaletteHues(palette, oklabLookup) : null;
+                for (int y = 0; y < MAP_SIZE; y++)
+                    for (int x = 0; x < MAP_SIZE; x++) {
+                        int argb = tileImg.getRGB(x, y);
+                        if (((argb >>> 24) & 0xFF) < 128) { out[x + y * MAP_SIZE] = 0; continue; }
+                        float[] lab = PngToMapColors.rgbToOklab(argb);
+                        out[x + y * MAP_SIZE] = PngToMapColors.findClosestInPalette(
+                                lab[0], lab[1], lab[2], palette, oklabLookup,
+                                requantizeMetric, rgbLookup, palHues);
+                    }
+                yield out;
+            }
+            case FLOYD_STEINBERG -> {
+                // Non-OKLAB FS: per-tile path (cross-tile OKLAB path handled above in requantizeAll).
+                float[] flat = new float[MAP_BYTES];
+                Arrays.fill(flat, 1.0f);
+                yield PngToMapColors.renderDithered(tileImg, palette, oklabLookup, flat,
+                        MAP_SIZE, MAP_SIZE, 1.0f, requantizeMetric, rgbLookup);
+            }
+            case ATKINSON -> PngToMapColors.renderAtkinson(tileImg, palette, oklabLookup,
+                    MAP_SIZE, MAP_SIZE, requantizeMetric, rgbLookup);
+            case BAYER_4X4 -> PngToMapColors.renderBayer4x4(tileImg, palette, oklabLookup,
+                    MAP_SIZE, MAP_SIZE, requantizeMetric, rgbLookup);
+        };
+    }
+
     // resalt
     // ════════════════════════════════════════════════════════════════════
 

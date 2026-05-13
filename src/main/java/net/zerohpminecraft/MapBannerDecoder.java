@@ -15,6 +15,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
+import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CjkCodec;
 import net.zerohpminecraft.mixin.MapStateAccessor;
 
@@ -38,6 +39,24 @@ public class MapBannerDecoder {
     private static final Set<Integer> claimedMaps = new HashSet<>();
     private static final Map<Integer, AnimatedMapState> animatedMaps = new HashMap<>();
     private static int tickCounter = 0;
+
+    // ── Mux (cross-tile redistribution) state ────────────────────────────
+
+    private static class MuxBuffer {
+        final byte[] data;
+        int received;
+        MapIdComponent mapId;
+        MapState mapState;
+        ItemFrameEntity frame;
+
+        MuxBuffer(int total) { this.data = new byte[total]; }
+    }
+
+    /** Fully-allocated mux buffers, keyed by "col:row". */
+    private static final Map<String, MuxBuffer> muxBuffers = new HashMap<>();
+    /** Segments received before the receiver's LR banner was processed. */
+    private static final Map<String, List<Integer>> muxPendingOffsets = new HashMap<>();
+    private static final Map<String, List<byte[]>>  muxPendingBytes   = new HashMap<>();
 
     // ── Animated map state ────────────────────────────────────────────────
 
@@ -142,11 +161,15 @@ public class MapBannerDecoder {
         if (decorations.isEmpty())
             return;
 
-        // Check for carpet-hybrid LC/LS manifest banner first.
+        // Check for mux receiver (LR) banner, then carpet LC/LS manifest banner.
         for (MapDecoration dec : decorations.values()) {
             Text text = dec.name().orElse(null);
             if (text == null) continue;
             String s = text.getString();
+            if (s.length() >= 18 && s.startsWith("LR")) {
+                processReceiverCarpetFrame(client, mapId, mapState, s, decorations, frame);
+                return;
+            }
             boolean isLC = s.length() >= 6  && s.startsWith("LC");
             boolean isLS = s.length() >= 10 && s.startsWith("LS");
             if (isLC || isLS) {
@@ -277,6 +300,32 @@ public class MapBannerDecoder {
 
             processDecompressedPayload(client, mapId, mapState, frame, full);
 
+            // Route any MG guest segments hosted in this tile's cargo.
+            // MG<seqIdx:2><ownLen:4><tCol:2><tRow:2><tOffset:8><tLen:4>
+            List<String> mgBanners = new ArrayList<>();
+            for (MapDecoration dec : decorations.values()) {
+                Text t2 = dec.name().orElse(null);
+                if (t2 == null) continue;
+                String s = t2.getString();
+                if (s.length() >= 24 && s.startsWith("MG")) mgBanners.add(s);
+            }
+            if (!mgBanners.isEmpty()) {
+                mgBanners.sort(java.util.Comparator.comparingInt(
+                        s -> Integer.parseInt(s.substring(2, 4), 16)));
+                int mgOwnLen = Integer.parseInt(mgBanners.get(0).substring(4, 8), 16);
+                int guestStart = mgOwnLen;
+                for (String mg : mgBanners) {
+                    int tCol    = Integer.parseInt(mg.substring(8, 10), 16);
+                    int tRow    = Integer.parseInt(mg.substring(10, 12), 16);
+                    int tOffset = (int) Long.parseLong(mg.substring(12, 20), 16);
+                    int tLen    = Integer.parseInt(mg.substring(20, 24), 16);
+                    String key = tCol + ":" + tRow;
+                    routeMuxSegment(key, tOffset, compressed, guestStart, tLen);
+                    checkMuxCompletion(key, client);
+                    guestStart += tLen;
+                }
+            }
+
             claimedMaps.add(mapId.id());
             decorations.clear();
             System.out.println(TAG + " Claimed map " + mapId.id() + " (carpet)");
@@ -284,6 +333,134 @@ public class MapBannerDecoder {
         } catch (Exception e) {
             System.err.println(TAG + " Carpet decode failed for map " + mapId.id()
                     + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Decodes a mux receiver tile — its own segment is stored in its carpet, while
+     * the remainder of its payload is distributed across donor tiles' carpets.
+     *
+     * <p>LR banner format: {@code LR<col:2><row:2><ownLen:4><total:8>}
+     */
+    private static void processReceiverCarpetFrame(MinecraftClient client,
+            MapIdComponent mapId, MapState mapState,
+            String lrName, Map<String, MapDecoration> decorations,
+            ItemFrameEntity frame) {
+        try {
+            int col    = Integer.parseInt(lrName.substring(2, 4), 16);
+            int row    = Integer.parseInt(lrName.substring(4, 6), 16);
+            int ownLen = Integer.parseInt(lrName.substring(6, 10), 16);
+            int total  = (int) Long.parseLong(lrName.substring(10, 18), 16);
+
+            // Derive carpet/shade split from ownLen (same formula as encoder).
+            int carpetBytes = Math.min(ownLen, CarpetChannel.MAX_CARPET_BYTES);
+            boolean hasShade = ownLen > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES;
+            int shadeBytes = hasShade ? Math.min(ownLen - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
+
+            byte[] carpetData = CarpetChannel.decodeBytes(mapState.colors, carpetBytes);
+            byte[] shadeData  = shadeBytes > 0 ? CarpetChannel.decodeShade(mapState.colors, shadeBytes) : new byte[0];
+
+            int overflowStart = carpetBytes + shadeBytes;
+            byte[] overflowData = new byte[0];
+            if (ownLen > overflowStart) {
+                List<String> ovfNames = new ArrayList<>();
+                for (MapDecoration dec : decorations.values()) {
+                    Text t2 = dec.name().orElse(null);
+                    if (t2 == null) continue;
+                    String s = t2.getString();
+                    if (s.startsWith("LR")) continue;
+                    if (s.length() < 2) continue;
+                    try { Integer.parseInt(s.substring(0, 2), 16); }
+                    catch (NumberFormatException e) { continue; }
+                    ovfNames.add(s);
+                }
+                ovfNames.sort(java.util.Comparator.comparingInt(
+                        s -> Integer.parseInt(s.substring(0, 2), 16)));
+                boolean cjk = !ovfNames.isEmpty() && ovfNames.get(0).length() > 2
+                        && ovfNames.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
+                if (cjk) {
+                    overflowData = CjkCodec.assembleChunks(ovfNames);
+                } else {
+                    StringBuilder b64 = new StringBuilder();
+                    for (String s : ovfNames) b64.append(s.substring(2));
+                    overflowData = Base64.getDecoder().decode(b64.toString());
+                }
+            }
+
+            byte[] ownSeg = new byte[ownLen];
+            System.arraycopy(carpetData, 0, ownSeg, 0, carpetBytes);
+            System.arraycopy(shadeData, 0, ownSeg, carpetBytes, shadeData.length);
+            System.arraycopy(overflowData, 0, ownSeg, carpetBytes + shadeData.length, overflowData.length);
+
+            System.out.println(TAG + " Mux receiver LR(" + col + "," + row + ") map id="
+                    + mapId.id() + " ownLen=" + ownLen + " total=" + total);
+
+            String key = col + ":" + row;
+            // Allocate buffer if needed, then add the own segment at offset 0.
+            MuxBuffer buf = muxBuffers.get(key);
+            if (buf == null) {
+                buf = new MuxBuffer(total);
+                buf.mapId    = mapId;
+                buf.mapState = mapState;
+                buf.frame    = frame;
+                // Apply any segments that arrived before this banner was scanned.
+                List<Integer> pendingOff = muxPendingOffsets.remove(key);
+                List<byte[]>  pendingByt = muxPendingBytes.remove(key);
+                if (pendingOff != null) {
+                    for (int i = 0; i < pendingOff.size(); i++) {
+                        int off = pendingOff.get(i);
+                        byte[] pb = pendingByt.get(i);
+                        System.arraycopy(pb, 0, buf.data, off, pb.length);
+                        buf.received += pb.length;
+                    }
+                }
+                muxBuffers.put(key, buf);
+            }
+            System.arraycopy(ownSeg, 0, buf.data, 0, ownLen);
+            buf.received += ownLen;
+
+            claimedMaps.add(mapId.id());
+            decorations.clear();
+            checkMuxCompletion(key, client);
+
+        } catch (Exception e) {
+            System.err.println(TAG + " Mux receiver decode failed for map " + mapId.id()
+                    + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void routeMuxSegment(String key, int targetOffset,
+            byte[] srcBytes, int srcPos, int len) {
+        MuxBuffer buf = muxBuffers.get(key);
+        if (buf != null) {
+            System.arraycopy(srcBytes, srcPos, buf.data, targetOffset, len);
+            buf.received += len;
+        } else {
+            byte[] copy = Arrays.copyOfRange(srcBytes, srcPos, srcPos + len);
+            muxPendingOffsets.computeIfAbsent(key, k -> new ArrayList<>()).add(targetOffset);
+            muxPendingBytes.computeIfAbsent(key, k -> new ArrayList<>()).add(copy);
+        }
+    }
+
+    private static void checkMuxCompletion(String key, MinecraftClient client) {
+        MuxBuffer buf = muxBuffers.get(key);
+        if (buf == null || buf.received < buf.data.length) return;
+        muxBuffers.remove(key);
+        try {
+            long frameSize = Zstd.getFrameContentSize(buf.data);
+            if (frameSize < 0) {
+                System.err.println(TAG + " Mux completion: bad zstd frame for receiver " + key);
+                return;
+            }
+            byte[] full = Zstd.decompress(buf.data, (int) frameSize);
+            processDecompressedPayload(client, buf.mapId, buf.mapState, buf.frame, full);
+            if (buf.mapState != null) ((MapStateAccessor) buf.mapState).getDecorations().clear();
+            System.out.println(TAG + " Mux-decoded receiver " + key
+                    + " (map id=" + buf.mapId.id() + ", " + buf.data.length + " bytes)");
+        } catch (Exception e) {
+            System.err.println(TAG + " Mux completion failed for " + key + ": " + e.getMessage());
             e.printStackTrace();
         }
     }
@@ -574,5 +751,8 @@ public class MapBannerDecoder {
     public static void clearCache() {
         claimedMaps.clear();
         animatedMaps.clear();
+        muxBuffers.clear();
+        muxPendingOffsets.clear();
+        muxPendingBytes.clear();
     }
 }

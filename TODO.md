@@ -42,6 +42,7 @@ Still missing:
 **Shipped v1.10.0.** `/loominary export image` renders the active tile as a PNG (static) or looping animated GIF (animated) to `loominary_exports/`. GIF export builds an `IndexColorModel` from the exact map color bytes — no quantization loss.
 
 ### ~~Editor color reduction (K key + budget badge)~~
+### ~~FLAG_LINKED shared-dictionary multi-tile animated GIFs~~ **Shipped.** `/loominary import ... linked`, `/loominary link`/`unlink`, rich status reporting, decoder group coordination, and manifest flag support.
 **Shipped v1.10.0.** `K` merges one palette step using the active strategy; `Shift+K` cycles strategies. A budget badge in the palette header shows compressed bytes vs. capacity (or banner count vs. 63) and turns red when over budget.
 
 ### ~~Selection-aware editor filters and reduction~~

@@ -248,4 +248,26 @@ class PayloadManifestTest {
         assertFalse(m.animated());
         assertEquals(1, m.frameCount);
     }
+
+    @Test
+    void roundtrip_FLAG_MUX() {
+        int flags = PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_MUX;
+        byte[] bytes = PayloadManifest.toBytes(
+                flags, 3, 3, 1, 1, 0xABCDEFL,
+                "Player", "Mux Test", 0,
+                5, 0, new int[]{100});
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+        assertEquals(3, m.manifestVersion);
+        assertTrue(m.animated());
+        assertTrue(m.muxed());
+        assertEquals(flags, m.flags);
+        assertEquals(3, m.cols);
+        assertEquals(3, m.rows);
+        assertEquals(1, m.tileCol);
+        assertEquals(1, m.tileRow);
+        assertEquals(5, m.frameCount);
+        assertEquals("Player", m.username);
+        assertEquals("Mux Test", m.title);
+    }
 }

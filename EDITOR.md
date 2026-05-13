@@ -70,9 +70,13 @@ Once you have a lasso selection, all the usual selection operations apply (`Ctrl
 
 Left-click to select a contiguous region of similar colors. Uses the same 4-connected Oklab flood-fill as the Fill tool, with the same tolerance setting.
 
-**Tolerance:** `=` / `-` keys, or Shift+Scroll. Shared with the Fill tool.
+**Hover preview:** While the wand is active, a translucent blue overlay shows the region that would be selected if you clicked the pixel under the cursor. The preview updates live as you move the mouse or adjust tolerance.
 
-The Magic Wand is useful for selecting a large solid area before applying a re-quantize or dither-brush pass only to that region.
+**Drag to extend:** Hold the mouse button and drag across the canvas to union additional regions into the selection. Each pixel the cursor passes over triggers a new flood-fill from that point, ORed into the growing selection. Pixels already selected are skipped for efficiency. The selection is committed when you release the mouse.
+
+**Tolerance:** `=` / `-` keys, or Shift+Scroll. Shared with the Fill tool. Changing tolerance while hovering immediately updates the blue preview.
+
+The Magic Wand is useful for selecting a large solid area (or several neighboring areas via drag) before applying a re-quantize or dither-brush pass only to that region.
 
 ### Eyedropper (`E`)
 
@@ -97,13 +101,19 @@ The dither mask overrides the automatic Otsu-threshold map when you press `R` �
 
 ## Palette Panel
 
-The right side of the editor shows the colors currently in use in the tile, sorted by frequency (most common first). Click a swatch to set it as the active paint color.
+The right side of the editor shows the active color palette with frequency data. Click any swatch to set it as the active paint color. **Hovering a swatch highlights every pixel of that color on the canvas** with a white flash so you can see where it appears before committing to a change.
 
 **Budget badge:** The palette panel header shows current budget usage — compressed bytes vs. the 15,414-byte ceiling for carpet tiles, or banner count vs. 63 for banner tiles. The display turns red when over budget. It updates whenever you make a change that would affect compressed size.
 
-**"All colors" toggle:** Below the palette, a checkbox expands the list to show all ~186 legal map colors (or ~248 with `allshades`). Useful for painting colors not yet present in the tile.
+**Show: tabs** — Three tabs below the budget badge control which colors are listed:
 
-**Frequency tooltip:** Hover over a swatch to see the map-color byte index and how many pixels use that color.
+- **Tile** (default) — colors present in the current frame, sorted by frequency. A small green bar below each swatch shows relative pixel count.
+- **All** — every legal map color (~186 standard, ~248 with `allshades`). Use this to pick colors not yet present in the tile.
+- **Sel** — colors present within the active selection only, with per-selection-pixel frequency bars. This tab appears automatically when you create a selection and switches back to Tile when the selection is cleared. You can switch tabs manually at any time.
+
+**Transparency row:** A dedicated checkerboard swatch sits between the Show: tabs and the color grid. Click it to set transparent (index 0) as the active color. In Tile and Sel modes the swatch shows a frequency bar if the tile contains transparent pixels.
+
+**Scrolling:** If the palette has more swatches than fit on screen, a scrollbar appears on the right edge of the panel. Scroll the mouse wheel while hovering the palette to scroll through it.
 
 ---
 

@@ -214,8 +214,8 @@ All filter commands re-quantize pixel colors back to the existing tile palette a
 
 ### Export
 
-- `/loominary export` — Write a Litematica `.litematic` for the active tile. Carpet tiles get a flat or staircase schematic depending on their channel usage. Banner tiles get a banner-layout schematic. Both go to Litematica's `schematics/` folder.
-- `/loominary export <name>` — Write with a custom filename.
+- `/loominary export` — Write a Litematica `.litematic` for **every tile** in the batch. Each tile is written as a separate file (`<name>_tile0.litematic`, `_tile1.litematic`, …; single-tile batches drop the suffix). Carpet tiles get flat or staircase schematics; banner tiles get a banner-layout schematic.
+- `/loominary export <name>` — Write with a custom base filename.
 - `/loominary export image` — Export the active tile as a PNG (static tiles) or looping animated GIF (animated tiles) to `loominary_exports/`. Pixel colors are rendered from the map palette exactly — no re-quantization.
 
 ### Cleanup

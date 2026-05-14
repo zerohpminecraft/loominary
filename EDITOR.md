@@ -1,6 +1,6 @@
 # Loominary Editor Guide
 
-The in-world pixel editor is a full-featured 128×128 canvas that operates directly on Minecraft map-color bytes. Because it works in map-color space rather than RGB, what you paint is exactly what encodes — there is no re-quantization delay and no color drift from format conversion.
+The in-world pixel editor is a full-featured 128×128 canvas (or N×M in multi-tile mode) that operates directly on Minecraft map-color bytes. Because it works in map-color space rather than RGB, what you paint is exactly what encodes — there is no re-quantization delay and no color drift from format conversion.
 
 Open the editor with `/loominary edit` (or your configured hotkey) while looking at a framed map.
 
@@ -46,7 +46,7 @@ Painting is constrained to the active selection if one exists.
 
 Left-click to flood-fill a region. The fill spreads to all 4-connected pixels whose Oklab perceptual distance from the clicked pixel is within the tolerance threshold.
 
-**Tolerance:** `=` / `-` keys, or Shift+Scroll. Display: `tol:0.xx` in the status bar. A tolerance of 0 fills only exact color matches; higher values fill similar-looking areas.
+**Tolerance:** `=` / `-` keys (when no selection is active), or Shift+Scroll. Display: `tol:0.xx` in the status bar. A tolerance of 0 fills only exact color matches; higher values fill similar-looking areas.
 
 Right-click while using Fill acts as an eyedropper.
 
@@ -56,15 +56,19 @@ Left-click and drag to draw a selection marquee. All subsequent paint, fill, re-
 
 - `Ctrl+A` — select all
 - `Ctrl+D` — deselect
+- `=` / `Shift+=` — grow selection by 1 / 5 pixels outward (morphological dilation)
+- `-` / `Shift+-` — shrink selection by 1 / 5 pixels inward (morphological erosion)
 - `Esc` — deselect (also cancels lasso in progress)
 
-Selections are stored as a `boolean[16384]` pixel mask, so they can be any shape (including non-rectangular — see Lasso and Magic Wand below).
+Selections are stored as a pixel mask, so they can be any shape (including non-rectangular — see Lasso and Magic Wand below). In multi-tile mode the mask spans the full grid.
+
+**Grow/Shrink** is useful after using Magic Wand to select a color region: select the interior, then press `=` once or twice to expand the selection outward and capture the outline pixels.
 
 ### Lasso (`L`)
 
-Left-click and drag to draw a freehand selection boundary. Release the mouse button to close the path and convert the enclosed region to a pixel mask. The closed path is rasterized using Java's `Path2D` area fill.
+Left-click and drag to draw a freehand selection boundary. Release the mouse button to close the path and convert the enclosed region to a pixel mask. The closed path is rasterized using Java's `Path2D` area fill. In multi-tile mode the lasso can span tile boundaries.
 
-Once you have a lasso selection, all the usual selection operations apply (`Ctrl+D` to deselect, combine with paint/fill/re-quantize, etc.).
+Once you have a lasso selection, all the usual selection operations apply (`Ctrl+D` to deselect, grow/shrink with `=`/`-`, combine with paint/fill/re-quantize, etc.).
 
 ### Magic Wand (`W`)
 
@@ -74,9 +78,9 @@ Left-click to select a contiguous region of similar colors. Uses the same 4-conn
 
 **Drag to extend:** Hold the mouse button and drag across the canvas to union additional regions into the selection. Each pixel the cursor passes over triggers a new flood-fill from that point, ORed into the growing selection. Pixels already selected are skipped for efficiency. The selection is committed when you release the mouse.
 
-**Tolerance:** `=` / `-` keys, or Shift+Scroll. Shared with the Fill tool. Changing tolerance while hovering immediately updates the blue preview.
+**Tolerance:** `=` / `-` keys (when no selection is active), or Shift+Scroll. Shared with the Fill tool. Changing tolerance while hovering immediately updates the blue preview.
 
-The Magic Wand is useful for selecting a large solid area (or several neighboring areas via drag) before applying a re-quantize or dither-brush pass only to that region.
+The Magic Wand is useful for selecting a large solid area (or several neighboring areas via drag) before applying a re-quantize or dither-brush pass only to that region. After selecting the interior of a shape, press `=` to grow the selection outward to capture its outline.
 
 ### Eyedropper (`E`)
 
@@ -91,7 +95,7 @@ Paints values into a floating-point dither-strength mask (`float[16384]`). This 
 - **Left-click / drag** — paint strength (0.0 to 1.0) into the mask
 - **Right-click / drag** — erase (paint 0.0)
 - **Brush radius:** `[` / `]`, or Shift+Scroll (shared with the paint brush)
-- **Strength value:** `=` / `-` keys adjust the paint strength. Display: `s:0.x` in the status bar
+- **Strength value:** `=` / `-` keys adjust the paint strength (when no selection is active)
 
 **Mask overlay (`M`):** Toggle a yellow heat-map overlay that visualizes the current dither-strength values. Bright yellow = full dither, transparent = no dither.
 
@@ -99,9 +103,23 @@ The dither mask overrides the automatic Otsu-threshold map when you press `R` �
 
 ---
 
+## Copy / Paste
+
+A clipboard lets you copy, cut, and paste any selection within or across tiles.
+
+- `Ctrl+C` — copy the current selection to the clipboard. The bounding box is captured; transparent pixels and unselected slots within the box are skipped.
+- `Ctrl+X` — cut: same as copy, then erase the selected pixels to transparent (undoable).
+- `Ctrl+V` — enter **paste mode**. A floating preview of the clipboard appears under the cursor, center-anchored to the bounding box. Move the cursor to position it, then:
+  - **Left-click** or **Enter / Y** — stamp the paste at the current position. Pixels that fall outside the canvas are skipped (count reported in the status bar). After committing, the pasted footprint becomes the active selection.
+  - **Right-click** or **Esc** — cancel paste mode without writing anything.
+
+Paste works in both single-tile and multi-tile canvas mode. Out-of-bounds pixels in the preview are shown in red to indicate they will be clipped. The stamp is undoable with `Ctrl+Z`.
+
+---
+
 ## Palette Panel
 
-The right side of the editor shows the active color palette with frequency data. Click any swatch to set it as the active paint color. **Hovering a swatch highlights every pixel of that color on the canvas** with a white flash so you can see where it appears before committing to a change.
+The right side of the editor shows the active color palette with frequency data. Click any swatch to set it as the active paint color. **Hovering a swatch pulses a white highlight over every pixel of that color on the canvas** so you can see where it appears before committing to a change.
 
 **Budget badge:** The palette panel header shows current budget usage — compressed bytes vs. the 15,414-byte ceiling for carpet tiles, or banner count vs. 63 for banner tiles. The display turns red when over budget. It updates whenever you make a change that would affect compressed size.
 
@@ -110,6 +128,8 @@ The right side of the editor shows the active color palette with frequency data.
 - **Tile** (default) — colors present in the current frame, sorted by frequency. A small green bar below each swatch shows relative pixel count.
 - **All** — every legal map color (~186 standard, ~248 with `allshades`). Use this to pick colors not yet present in the tile.
 - **Sel** — colors present within the active selection only, with per-selection-pixel frequency bars. This tab appears automatically when you create a selection and switches back to Tile when the selection is cleared. You can switch tabs manually at any time.
+
+**Shift+click a swatch in the Sel tab** to remove all pixels of that color from the current selection. This lets you quickly refine a wand or lasso selection by color — select a region, switch to Sel, then Shift+click any colors you don't want included. If the selection becomes empty it is cleared automatically.
 
 **Transparency row:** A dedicated checkerboard swatch sits between the Show: tabs and the color grid. Click it to set transparent (index 0) as the active color. In Tile and Sel modes the swatch shows a frequency bar if the tile contains transparent pixels.
 
@@ -182,6 +202,8 @@ Re-quantizes the selection (or the whole tile if nothing is selected) from the o
 4. The editor enters **preview mode** — the re-quantized result is shown overlaid on the canvas with a yellow border.
 5. Press `Enter` or `Y` to commit, `Esc` to discard.
 
+In multi-tile mode, `Shift+R` runs a cross-tile Floyd-Steinberg pass across the entire grid simultaneously, eliminating color and dither discontinuities at seams. The preview is shown on all tiles before you commit.
+
 When a dither mask exists and dither is on, `R` uses the mask's per-pixel strength instead of the image-relative Otsu threshold. Paint the mask first with `T` to control exactly where dithering is heavy vs. smooth.
 
 **Dither toggle (`D`):** Toggle Floyd-Steinberg dithering on or off for re-quantize. The current state is shown in the status bar (`§aDITHER` when active).
@@ -195,7 +217,7 @@ When a dither mask exists and dither is on, `R` uses the mask's per-pixel streng
 - `Ctrl+Z` — Undo (up to 20 levels)
 - `Ctrl+Y` — Redo
 
-Every destructive operation (paint stroke, fill, lasso close, magic wand select + paint, re-quantize commit, color merge commit, filter apply) snapshots **all frames** before modifying them. This means `Ctrl+Z` after a Tile-scope merge or a filter correctly reverts all frames, not just the active one. Memory cost scales with frame count — roughly 20 × frameCount × 16 KB per undo level; negligible for typical animated tiles.
+Every destructive operation (paint stroke, fill, lasso close, magic wand select + paint, re-quantize commit, color merge commit, filter apply, cut, paste) snapshots the full grid state before modifying it. In multi-tile mode this means `Ctrl+Z` reverts all tiles touched by the operation, not just the active one.
 
 ---
 
@@ -209,6 +231,23 @@ The minimap is rendered at import time and cached; it only updates when you swit
 
 ---
 
+## Multi-tile Canvas (`Shift+G`)
+
+In multi-tile batches, `Shift+G` toggles **multi-tile canvas mode**. Instead of showing one 128×128 tile at a time, the canvas expands to show all tiles simultaneously — arranged in their correct grid positions.
+
+- **Active tile** — rendered at full brightness with a highlighted border.
+- **Other tiles** — rendered at reduced brightness.
+- **Click a tile region** — switches the active tile without leaving the editor.
+- **All selection tools** (lasso, wand, rect select) work across tile boundaries; a lasso path or wand drag can span multiple tiles.
+- **Painting and fill** are still constrained to the active tile.
+- **Grow/Shrink** (`=`/`-`) respects tile boundaries in the global mask.
+
+Switching between single-tile and multi-tile mode clears the current selection (the selection mask size changes between modes).
+
+In multi-tile mode, press `Shift+R` (rather than plain `R`) to run a seamless cross-tile dither pass.
+
+---
+
 ## Animated Tiles
 
 When editing an animated tile (imported from a GIF, or assembled from multiple frames), the editor loads all frames and provides per-frame navigation.
@@ -217,7 +256,6 @@ When editing an animated tile (imported from a GIF, or assembled from multiple f
 |---|---|
 | Previous frame | `Ctrl+[` |
 | Next frame | `Ctrl+]` |
-| Go to first frame | `Ctrl+Shift+[` (when on single tile; navigates tiles in multi-tile batches) |
 | Decrease frame delay | `,` (−10 ms; Shift+`,` = −100 ms) |
 | Increase frame delay | `.` (+10 ms; Shift+`.` = +100 ms) |
 | Delete current frame | `Delete` (blocked if only one frame remains) |
@@ -241,6 +279,7 @@ When your batch has more than one tile, you can switch between tiles without clo
 |---|---|
 | Previous tile | `Ctrl+Shift+[` |
 | Next tile | `Ctrl+Shift+]` |
+| Multi-tile canvas | `Shift+G` |
 
 The editor saves any unsaved changes to the current tile before switching. Undo history is reset per tile switch.
 
@@ -251,6 +290,8 @@ The editor saves any unsaved changes to the current tile before switching. Undo 
 The editor saves automatically when you close it (press `Esc` from the base state — no selection, no lasso in progress, no merge queue). The pixel data is re-encoded into the tile's banner chunks and written to the saved state file.
 
 If you close without changes, the save is skipped. If the save fails (e.g., encoding error), an error message is printed to chat.
+
+**Discard and exit:** Press `Shift+Esc` to close the editor immediately without saving any changes. This is useful if you've made edits you don't want to keep and undo would take too many steps. The shortcut is shown in red in the guide panel as a reminder.
 
 For carpet tiles, closing the editor does **not** automatically re-export the schematic. Run `/loominary export` after editing if you need an updated `.litematic`.
 
@@ -280,27 +321,44 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 ### Fill / Magic Wand tolerance
 | Key | Action |
 |---|---|
-| `=` | Increase tolerance |
-| `-` | Decrease tolerance |
+| `=` | Increase tolerance (when no selection is active) |
+| `-` | Decrease tolerance (when no selection is active) |
 | Shift+Scroll | Increase / decrease tolerance |
 
 ### Dither Brush strength
 | Key | Action |
 |---|---|
-| `=` | Increase paint strength |
-| `-` | Decrease paint strength |
+| `=` | Increase paint strength (when no selection is active) |
+| `-` | Decrease paint strength (when no selection is active) |
 
 ### Selection
 | Key | Action |
 |---|---|
 | `Ctrl+A` | Select all |
 | `Ctrl+D` | Deselect |
+| `=` | Grow selection by 1 pixel (when selection is active) |
+| `Shift+=` | Grow selection by 5 pixels (when selection is active) |
+| `-` | Shrink selection by 1 pixel (when selection is active) |
+| `Shift+-` | Shrink selection by 5 pixels (when selection is active) |
 | `Esc` | Clear merge queue → cancel lasso → deselect → close |
+| `Shift+Esc` | Discard all changes and close immediately |
+
+When a selection is active, `=` and `-` control grow/shrink rather than Fill/Wand tolerance or Dither Brush strength.
+
+### Copy / Paste
+| Key | Action |
+|---|---|
+| `Ctrl+C` | Copy selection to clipboard |
+| `Ctrl+X` | Cut selection (copy + erase selected pixels) |
+| `Ctrl+V` | Enter paste mode (floating preview follows cursor) |
+| Left-click / `Enter` / `Y` | Commit paste at cursor position (in paste mode) |
+| Right-click / `Esc` | Cancel paste mode |
 
 ### Re-quantize / dither
 | Key | Action |
 |---|---|
 | `R` | Re-quantize selection from source (enters preview mode) |
+| `Shift+R` | Cross-tile re-quantize (multi-tile mode only; seamless dither across full grid) |
 | `D` | Toggle dither for re-quantize |
 | `M` | Toggle dither-mask heat-map overlay |
 | `Enter` / `Y` | Commit preview |
@@ -310,6 +368,7 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 | Key | Action |
 |---|---|
 | `Ctrl+click` swatch or canvas pixel | Add / remove color from merge-source queue |
+| `Shift+click` swatch (Sel tab only) | Remove all selected pixels of that color from the selection |
 | `V` | Cycle merge scope: frame → tile → all tiles |
 | `C` | Commit merge (sources → active color, in current scope) |
 | `Esc` | Clear merge queue |
@@ -336,6 +395,7 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 | Key | Action |
 |---|---|
 | `G` | Toggle tile minimap |
+| `Shift+G` | Toggle multi-tile canvas mode (multi-tile batches only) |
 | `Ctrl+Shift+[` | Previous tile (multi-tile batches) |
 | `Ctrl+Shift+]` | Next tile (multi-tile batches) |
 | `Ctrl+[` | Previous frame (animated tiles) |
@@ -361,6 +421,12 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 4. Accept with `Enter` or adjust with paint brush first.
 5. Close to save.
 
+### Selecting a region and its outline
+
+1. Use Magic Wand (`W`) to select the interior of the shape (adjust tolerance with Shift+Scroll until the interior is covered cleanly).
+2. Press `=` once or twice to grow the selection outward by 1–2 pixels, capturing the outline.
+3. The selection now covers both the fill and the border and can be used for re-quantize, copy, or color reduction.
+
 ### Painting a custom dither gradient
 
 1. Open the editor.
@@ -382,7 +448,8 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 
 1. Run `/loominary tile <n>` to switch to the target tile, then `/loominary edit`.
 2. Or: open the editor on any tile, press `G` to show the minimap, and click the target tile thumbnail.
-3. Use `Ctrl+Shift+[` / `Ctrl+Shift+]` to step through tiles without leaving the editor.
+3. Press `Shift+G` to switch to multi-tile canvas mode and view the full mural at once.
+4. Use `Ctrl+Shift+[` / `Ctrl+Shift+]` to step through tiles without leaving the editor.
 
 ### Trimming an animated GIF
 
@@ -391,3 +458,10 @@ For carpet tiles, closing the editor does **not** automatically re-export the sc
 3. Press `Delete` to drop the current frame.
 4. Adjust delays with `,` / `.` as needed.
 5. Close to save; re-run the anvil batch to place the updated tile.
+
+### Refining a selection by color
+
+1. Make a selection with Lasso or Magic Wand.
+2. The palette panel switches to the **Sel** tab automatically, showing only colors present in the selection.
+3. `Shift+click` any swatch you want to exclude — all pixels of that color are removed from the selection instantly.
+4. Repeat until only the pixels you want remain selected.

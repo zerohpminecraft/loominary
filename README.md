@@ -13,7 +13,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 - **CJK overflow banners**: named overflow banners carry 84 bytes each (14-bit CJK alphabet, 2.33× the base64 capacity). Combined capacity: 15,414 compressed bytes per tile
 - **Encode any image** into carpet + banner data (PNG, JPEG, GIF, BMP — anything `ImageIO` can read)
 - **Animated GIF import**: encode a GIF as multiple frames in a single payload; the decoder cycles frames on a wall-clock timer with distance culling and multi-tile sync
-- **In-world pixel editor** (`/loominary edit`): full-featured 128×128 canvas — see [EDITOR.md](EDITOR.md) for a complete guide
+- **In-world pixel editor** (`/loominary edit`): full-featured canvas with brush, fill, lasso, magic wand, eyedropper, dither brush, copy/paste, selection grow/shrink, and multi-tile canvas mode — see [EDITOR.md](EDITOR.md) for a complete guide
 - **Multi-tile murals**: split a large image across an N×M grid of maps for wall-sized art
 - **Steal existing map art** as a Loominary payload by looking at any framed map
 - **Perceptual color matching** using Oklab color space — better-looking results than RGB Euclidean distance, especially on gradients and skin tones
@@ -23,7 +23,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 - **Workflow automation** at the anvil: stack-aware banner extraction, automatic renaming, automatic bundle storage
 - **Stuck-chunk recovery**: if the server permanently rejects a banner name the handler halts cleanly; `/loominary resalt` re-encodes the tile with a random nonce — same image, new chunk names, works for both carpet and banner tiles
 - **Two-pass dithering with adaptive edge detection**: Floyd-Steinberg error diffusion in Oklab space, with per-pixel strength controlled by an image-relative Otsu threshold — smooth gradients dither fully, sharp edges stay crisp, solid fills stay clean
-- **Multi-tile grid consistency**: dithering operates on the full grid image before splitting into tiles, eliminating colour and texture discontinuities at seams
+- **Multi-tile grid consistency**: dithering operates on the full grid image before splitting into tiles, eliminating colour and texture discontinuities at seams; the editor's multi-tile canvas mode (`Shift+G`) shows and selects across all tiles simultaneously
 - **Color palette histogram**: `/loominary palette [all]` shows a rarity distribution histogram with sigmoid-adaptive bucket boundaries and cumulative removal-cost table; `palette all` covers every tile's frames together
 - **Flexible palette reduction**: reduce by banner count or distinct colour count, on the active tile or all tiles at once; three palette strategies (rarest, closest, weighted) control how colors are merged
 - **Image filters**: `/loominary filter smooth|median|sharpen|posterize [all]` applies spatial pre-processing in-place on the current tile state — no source file required, preserves skip/stride/edit work; also available in the editor with `P`

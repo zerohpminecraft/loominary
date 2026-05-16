@@ -40,6 +40,10 @@ public class MapBannerDecoder {
     private static final Map<Integer, AnimatedMapState> animatedMaps = new HashMap<>();
     private static int tickCounter = 0;
 
+    public static boolean decodingEnabled = true;
+    private static final Map<Integer, byte[]> rawColors     = new HashMap<>();
+    private static final Map<Integer, byte[]> decodedColors = new HashMap<>();
+
     // ── Mux (cross-tile redistribution) state ────────────────────────────
 
     private static class MuxBuffer {
@@ -538,7 +542,31 @@ public class MapBannerDecoder {
 
     // ── Animation tick ────────────────────────────────────────────────────
 
+    public static void toggle(MinecraftClient client) {
+        decodingEnabled = !decodingEnabled;
+        if (client.world == null || client.player == null) return;
+        for (int id : claimedMaps) {
+            MapIdComponent mapId = new MapIdComponent(id);
+            MapState ms = FilledMapItem.getMapState(mapId, client.world);
+            if (ms == null) continue;
+            byte[] target;
+            if (!decodingEnabled) {
+                target = rawColors.get(id);
+            } else {
+                AnimatedMapState anim = animatedMaps.get(id);
+                target = anim != null ? anim.frames[anim.currentFrame] : decodedColors.get(id);
+            }
+            if (target != null) {
+                System.arraycopy(target, 0, ms.colors, 0, target.length);
+                client.getMapTextureManager().setNeedsUpdate(mapId, ms);
+            }
+        }
+        String msg = decodingEnabled ? "§aLoominary decoding ON" : "§cLoominary decoding OFF (raw maps)";
+        client.player.sendMessage(Text.literal(msg), true);
+    }
+
     private static void advanceAnimatedFrames(MinecraftClient client) {
+        if (!decodingEnabled) return;
         long currentMs = System.currentTimeMillis();
         Vec3d playerPos = client.player.getPos();
 
@@ -672,6 +700,9 @@ public class MapBannerDecoder {
             MapIdComponent mapId,
             MapState mapState,
             byte[] mapColors) {
+        rawColors.computeIfAbsent(mapId.id(), k -> mapState.colors.clone());
+        decodedColors.put(mapId.id(), mapColors.clone());
+        if (!decodingEnabled) return;
         System.arraycopy(mapColors, 0, mapState.colors, 0, mapColors.length);
         client.getMapTextureManager().setNeedsUpdate(mapId, mapState);
     }
@@ -754,5 +785,7 @@ public class MapBannerDecoder {
         muxBuffers.clear();
         muxPendingOffsets.clear();
         muxPendingBytes.clear();
+        rawColors.clear();
+        decodedColors.clear();
     }
 }

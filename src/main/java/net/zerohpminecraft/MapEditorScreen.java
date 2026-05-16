@@ -56,12 +56,12 @@ public class MapEditorScreen extends Screen {
     private static final int STATUS_H        = 14;
     private static final int PANEL_W         = 160;
     private static final int SCROLL_W        = 6;
-    private static final int GUIDE_W         = 100;
+    private static final int GUIDE_W         = 133;
     private static final int SWATCH_SZ       = 12;
     private static final int SWATCH_GAP      = 4;   // extra 2px used for frequency bar
     private static final int SWATCH_STRIDE   = SWATCH_SZ + SWATCH_GAP;
     private static final int PANEL_MARGIN    = 2;
-    private static final int SWATCHES_PER_ROW = (PANEL_W - PANEL_MARGIN * 2 - SCROLL_W) / SWATCH_STRIDE;
+    private static final int SWATCHES_PER_ROW = 8;
     private static final int SWATCHES_START_Y = 84;
     private static final int ACTIVE_SWATCH_SZ = 20;
     private static final int CHUNK_SIZE      = 48;
@@ -168,6 +168,9 @@ public class MapEditorScreen extends Screen {
     // Phase 6 — re-quantize from source (R key)
     private PngToMapColors.DitherAlgo editorDitherAlgo;
     private float     fsErrorStrength    = 1.0f;   // FS error diffusion amount (0.1–1.0)
+    private float     atkErrorStrength   = 1.0f;   // Atkinson diffusion amount (0.1–1.0)
+    private float     bayerScale         = 0.08f;  // Bayer threshold amplitude (0.02–0.20)
+    private float     chromaBoost        = 1.0f;   // OKLab a,b multiplier before quantization
     private boolean   requantizeTilePalette = false; // restrict R to colors already in tile
     private BufferedImage cachedRequantizeSrc  = null; // source image cached for live preview refresh
     private BufferedImage[] cachedGifFrames   = null; // all coalesced GIF frames for the active source
@@ -225,6 +228,7 @@ public class MapEditorScreen extends Screen {
 
     // Background-blur suppression — captured once in constructor
     private final int savedBlur;
+    private float prevHealth = -1f;
 
     // ── Constructor ─────────────────────────────────────────────────────
 
@@ -289,6 +293,16 @@ public class MapEditorScreen extends Screen {
         rebuildTileColors();
         allMapColors = computeAllMapColors();
         if (tileColors.length > 0) activeColor = tileColors[0];
+    }
+
+    @Override
+    public void tick() {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player != null) {
+            float health = mc.player.getHealth();
+            if (prevHealth >= 0 && health < prevHealth) close();
+            prevHealth = health;
+        }
     }
 
     private void recomputeScale() {
@@ -808,17 +822,18 @@ public class MapEditorScreen extends Screen {
             for (int f : selFreqs) if (f > maxSelFreq) maxSelFreq = f;
         }
 
-        int totalRows    = (palette.length + SWATCHES_PER_ROW - 1) / SWATCHES_PER_ROW;
+        int[][] layout   = buildPaletteLayout(palette);
+        int totalRows    = layout.length > 0 ? layout[layout.length - 1][0] + 1 : 0;
         int visibleRows  = (panelH - SWATCHES_START_Y) / SWATCH_STRIDE;
         paletteScrollRow = Math.max(0, Math.min(paletteScrollRow,
                 Math.max(0, totalRows - visibleRows)));
 
         int hoveredSwatchColor = transHovered ? 0 : -1;
         for (int i = 0; i < palette.length; i++) {
-            int absRow = i / SWATCHES_PER_ROW;
+            int absRow = layout[i][0];
             int visRow = absRow - paletteScrollRow;
             if (visRow < 0) continue;
-            int col = i % SWATCHES_PER_ROW;
+            int col = layout[i][1];
             int swx = panelX + PANEL_MARGIN + col * SWATCH_STRIDE;
             int swy = SWATCHES_START_Y + visRow * SWATCH_STRIDE;
             if (swy + SWATCH_SZ > panelH) break;
@@ -886,6 +901,29 @@ public class MapEditorScreen extends Screen {
         // Transparent (index 0) is shown in its own dedicated row — exclude from grid
         if (raw.length > 0 && raw[0] == 0) return Arrays.copyOfRange(raw, 1, raw.length);
         return raw;
+    }
+
+    /**
+     * Assigns each palette entry a (row, col) position.
+     * Starts a new row when the map-color family (byte >> 2) changes and the
+     * current row already holds more than 4 swatches, keeping related shades
+     * together while still capping rows at SWATCHES_PER_ROW.
+     */
+    private static int[][] buildPaletteLayout(int[] palette) {
+        int[][] layout = new int[palette.length][2];
+        int row = 0, col = 0, prevFamily = -1;
+        for (int i = 0; i < palette.length; i++) {
+            int family = palette[i] >> 2;
+            if (family != prevFamily && col > 4) {
+                row++;
+                col = 0;
+            }
+            layout[i][0] = row;
+            layout[i][1] = col;
+            if (++col >= SWATCHES_PER_ROW) { row++; col = 0; }
+            prevFamily = family;
+        }
+        return layout;
     }
 
     private int[] selColors() {
@@ -1053,6 +1091,24 @@ public class MapEditorScreen extends Screen {
             ctx.drawTextWithShadow(textRenderer,
                     Text.literal(String.format("§7FS err:§f%.1f %s", fsErrorStrength, errLbl)),
                     x, y, 0xFFFFFF); y += 9;
+        } else if (editorDitherAlgo == PngToMapColors.DitherAlgo.ATKINSON) {
+            String errLbl = inPreview ? "§7sh+sc" : "§8(in preview)";
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal(String.format("§7Atk err:§f%.1f %s", atkErrorStrength, errLbl)),
+                    x, y, 0xFFFFFF); y += 9;
+        } else if (editorDitherAlgo == PngToMapColors.DitherAlgo.BAYER_4X4) {
+            String errLbl = inPreview ? "§7sh+sc" : "§8(in preview)";
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal(String.format("§7Bayer sc:§f%.2f %s", bayerScale, errLbl)),
+                    x, y, 0xFFFFFF); y += 9;
+        }
+        if (chromaBoost != 1.0f) {
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal(String.format("§aN chroma:§f%.2fx", chromaBoost)),
+                    x, y, 0xFFFFFF); y += 9;
+        } else {
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal("§8N  chroma:1.0x"), x, y, 0xFFFFFF); y += 9;
         }
         String palLbl = requantizeTilePalette
                 ? (selMask != null ? "§asel§r" : "§atile§r") : "§8full";
@@ -1388,20 +1444,36 @@ public class MapEditorScreen extends Screen {
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY,
                                   double hAmt, double vAmt) {
-        // In preview: Shift+scroll adjusts FS error diffusion strength and live-refreshes
+        // In preview: Shift+scroll adjusts the algo-specific strength parameter and live-refreshes
         if (inPreview) {
-            if (hasShiftDown() && editorDitherAlgo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG) {
-                fsErrorStrength = Math.round(Math.max(0.1f, Math.min(1.0f,
-                        fsErrorStrength + (float) Math.signum(vAmt) * 0.1f)) * 10) / 10f;
-                refreshRequantizePreview();
+            if (hasShiftDown()) {
+                switch (editorDitherAlgo) {
+                    case FLOYD_STEINBERG -> {
+                        fsErrorStrength = Math.round(Math.max(0.1f, Math.min(1.0f,
+                                fsErrorStrength + (float) Math.signum(vAmt) * 0.1f)) * 10) / 10f;
+                        refreshRequantizePreview();
+                    }
+                    case ATKINSON -> {
+                        atkErrorStrength = Math.round(Math.max(0.1f, Math.min(1.0f,
+                                atkErrorStrength + (float) Math.signum(vAmt) * 0.1f)) * 10) / 10f;
+                        refreshRequantizePreview();
+                    }
+                    case BAYER_4X4 -> {
+                        bayerScale = Math.round(Math.max(0.02f, Math.min(0.20f,
+                                bayerScale + (float) Math.signum(vAmt) * 0.02f)) * 100) / 100f;
+                        refreshRequantizePreview();
+                    }
+                    default -> {}
+                }
             }
             return true;
         }
         if (mouseX < GUIDE_W) return false;
         if (mouseX >= width - PANEL_W) {
             if (mouseY >= SWATCHES_START_Y) {
-                int[] palette = activePaletteColors();
-                int totalRows   = (palette.length + SWATCHES_PER_ROW - 1) / SWATCHES_PER_ROW;
+                int[] palette   = activePaletteColors();
+                int[][] layout  = buildPaletteLayout(palette);
+                int totalRows   = layout.length > 0 ? layout[layout.length - 1][0] + 1 : 0;
                 int visibleRows = (height - STATUS_H - SWATCHES_START_Y) / SWATCH_STRIDE;
                 if (totalRows > visibleRows) {
                     paletteScrollRow = Math.max(0, Math.min(totalRows - visibleRows,
@@ -1505,18 +1577,36 @@ public class MapEditorScreen extends Screen {
             }
             // Transparency dedicated row
             if (relY >= 68 && relY < 82 && relX >= 2 && relX < 2 + SWATCH_SZ + 18) {
-                activeColor = 0;
+                if (button == 0 && hasShiftDown()
+                        && paletteMode == PaletteMode.SEL && selMask != null) {
+                    int gW = gridW(), gH = gridH();
+                    for (int gy = 0; gy < gH; gy++)
+                        for (int gx = 0; gx < gW; gx++) {
+                            int si = selIdx(gx, gy);
+                            if (selMask[si] && getGlobalPixel(gx, gy) == 0) selMask[si] = false;
+                        }
+                    boolean empty = true;
+                    for (boolean b : selMask) { if (b) { empty = false; break; } }
+                    setSelMask(empty ? null : selMask);
+                    setStatusMsg("Deselected transparent pixels from selection.");
+                } else {
+                    activeColor = 0;
+                }
                 return true;
             }
             // Swatch grid
             if (relY >= SWATCHES_START_Y) {
-                int[] palette = activePaletteColors();
+                int[] palette  = activePaletteColors();
+                int[][] layout = buildPaletteLayout(palette);
                 int visRow = (relY - SWATCHES_START_Y) / SWATCH_STRIDE;
                 int absRow = visRow + paletteScrollRow;
                 int col    = (relX - PANEL_MARGIN) / SWATCH_STRIDE;
                 if (col >= 0 && col < SWATCHES_PER_ROW) {
-                    int idx = absRow * SWATCHES_PER_ROW + col;
-                    if (idx < palette.length) {
+                    int idx = -1;
+                    for (int li = 0; li < layout.length; li++) {
+                        if (layout[li][0] == absRow && layout[li][1] == col) { idx = li; break; }
+                    }
+                    if (idx >= 0) {
                         int c = palette[idx];
                         if (button == 0 && hasControlDown()) {
                             if (!mergeSources.remove(c)) mergeSources.add(c);
@@ -1557,6 +1647,16 @@ public class MapEditorScreen extends Screen {
                     activeColor = allTileFrames[ti][f][lx + ly * MAP_SIZE] & 0xFF;
                 }
                 currentTool = prevTool;
+                return true;
+            }
+            if (button == 0 && hasControlDown()) {
+                int ti = tileAt(hoverMapX, hoverMapY);
+                int lx = localX(hoverMapX), ly = localY(hoverMapY);
+                if (allTileFrames != null && ti < allTileFrames.length && allTileFrames[ti] != null) {
+                    int f = Math.min(activeFrame, allTileFrames[ti].length - 1);
+                    int c = allTileFrames[ti][f][lx + ly * MAP_SIZE] & 0xFF;
+                    if (c != 0) { if (!mergeSources.remove(c)) mergeSources.add(c); }
+                }
                 return true;
             }
             if (button == 0) {
@@ -1730,6 +1830,12 @@ public class MapEditorScreen extends Screen {
             } else if (keyCode == GLFW.GLFW_KEY_Q) {
                 cycleMatchMetric();
                 refreshRequantizePreview();
+            } else if (keyCode == GLFW.GLFW_KEY_N) {
+                float step = 0.25f;
+                chromaBoost = Math.round(Math.max(0.25f, Math.min(4.0f,
+                        chromaBoost + (shift ? -step : step))) / step) * step;
+                setStatusMsg(String.format("Chroma boost: %.2fx", chromaBoost));
+                refreshRequantizePreview();
             } else if (keyCode == GLFW.GLFW_KEY_R && shift) {
                 requantizeTilePalette = !requantizeTilePalette;
                 String pal = requantizeTilePalette
@@ -1879,6 +1985,14 @@ public class MapEditorScreen extends Screen {
             return true;
         }
         if (keyCode == GLFW.GLFW_KEY_M) { showMask = !showMask; return true; }
+        if (keyCode == GLFW.GLFW_KEY_N) {
+            float step = 0.25f;
+            chromaBoost = Math.round(Math.max(0.25f, Math.min(4.0f,
+                    chromaBoost + (shift ? -step : step))) / step) * step;
+            if (inPreview) refreshRequantizePreview();
+            setStatusMsg(String.format("Chroma boost: %.2fx  (Sh+N to decrease, N to increase)", chromaBoost));
+            return true;
+        }
         if (keyCode == GLFW.GLFW_KEY_H) {
             heatmapMode = !heatmapMode;
             setStatusMsg(heatmapMode
@@ -2267,7 +2381,7 @@ public class MapEditorScreen extends Screen {
             if (src == null) { setStatusMsg("Could not decode source image"); return; }
             boolean legalOnly = !PayloadState.allShades;
             byte[][] result = PngToMapColors.convertTwoPassGrid(
-                    src, legalOnly, 0, true,
+                    withChromaBoost(src), legalOnly, 0, true,
                     PayloadState.gridColumns, PayloadState.gridRows);
             pendingGridResult     = result;
             previewColors        = result[tileIndex].clone();
@@ -2314,7 +2428,7 @@ public class MapEditorScreen extends Screen {
                 try {
                     boolean legalOnly = !PayloadState.allShades;
                     gridResult = PngToMapColors.convertTwoPassGrid(
-                            cachedRequantizeSrc, legalOnly, 0, true,
+                            withChromaBoost(cachedRequantizeSrc), legalOnly, 0, true,
                             PayloadState.gridColumns, PayloadState.gridRows);
                 } catch (Exception ignored) {}
             }
@@ -2343,8 +2457,13 @@ public class MapEditorScreen extends Screen {
         }
     }
 
+    private BufferedImage withChromaBoost(BufferedImage src) {
+        return chromaBoost != 1.0f ? PngToMapColors.boostChroma(src, chromaBoost) : src;
+    }
+
     /** Compute requantize result for tile `ti` (pass tileIndex for the active tile). */
     private byte[] computeRequantizeTile(int ti, BufferedImage src) {
+        src = withChromaBoost(src);
         boolean legalOnly = !PayloadState.allShades;
         PngToMapColors.DitherAlgo algo = editorDitherAlgo;
 
@@ -2414,9 +2533,9 @@ public class MapEditorScreen extends Screen {
                         fsErrorStrength, matchMetric, rgbLookup);
             }
             case ATKINSON -> PngToMapColors.renderAtkinson(tileImg, palette, oklabLookup, MAP_SIZE, MAP_SIZE,
-                    matchMetric, rgbLookup);
+                    matchMetric, rgbLookup, atkErrorStrength);
             case BAYER_4X4 -> PngToMapColors.renderBayer4x4(tileImg, palette, oklabLookup, MAP_SIZE, MAP_SIZE,
-                    matchMetric, rgbLookup);
+                    matchMetric, rgbLookup, bayerScale);
         };
     }
 
@@ -2461,30 +2580,22 @@ public class MapEditorScreen extends Screen {
         dirty = true;
         rebuildTileColors();
 
-        // In multi-tile mode: also apply requantize to non-active tiles that have selected pixels.
+        // In multi-tile mode: apply the already-computed preview results to all non-active tiles.
         int crossTileCount = 0;
-        if (multiTileMode && selMask != null && cachedRequantizeSrc != null && allTileFrames != null) {
-            // For standard FS path, run convertTwoPassGrid once for all tiles.
-            byte[][] gridResult = null;
-            if (editorDitherAlgo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && !requantizeTilePalette
-                    && matchMetric == PngToMapColors.MatchMetric.OKLAB
-                    && !(useCustomMask && ditherMask != null)) {
-                try {
-                    boolean legalOnly = !PayloadState.allShades;
-                    gridResult = PngToMapColors.convertTwoPassGrid(
-                            cachedRequantizeSrc, legalOnly, 0, true,
-                            PayloadState.gridColumns, PayloadState.gridRows);
-                } catch (Exception ignored) {}
-            }
+        if (multiTileMode && allTileFrames != null && allTilePreviewColors != null) {
             for (int i = 0; i < PayloadState.tiles.size(); i++) {
                 if (i == tileIndex || i >= allTileFrames.length || allTileFrames[i] == null) continue;
-                boolean[] ts = localSelMaskForTile(i);
-                if (ts == null) continue;
+                if (allTilePreviewColors[i] == null) continue;
+                boolean[] ts = (selMask != null) ? localSelMaskForTile(i) : null;
+                if (selMask != null && ts == null) continue; // selection exists but not on this tile
                 try {
-                    byte[] result = (gridResult != null) ? gridResult[i]
-                            : computeRequantizeTile(i, cachedRequantizeSrc);
+                    byte[] result = allTilePreviewColors[i];
                     byte[] frame = allTileFrames[i][Math.min(activeFrame, allTileFrames[i].length - 1)];
-                    for (int j = 0; j < MAP_BYTES; j++) if (ts[j]) frame[j] = result[j];
+                    if (ts != null) {
+                        for (int j = 0; j < MAP_BYTES; j++) if (ts[j]) frame[j] = result[j];
+                    } else {
+                        System.arraycopy(result, 0, frame, 0, MAP_BYTES);
+                    }
                     if (tileDirty != null && i < tileDirty.length) tileDirty[i] = true;
                     crossTileCount++;
                 } catch (Exception ignored) {}
@@ -2546,10 +2657,10 @@ public class MapEditorScreen extends Screen {
         PngToMapColors.DitherAlgo[] values = PngToMapColors.DitherAlgo.values();
         editorDitherAlgo = values[(editorDitherAlgo.ordinal() + 1) % values.length];
         String name = switch (editorDitherAlgo) {
-            case NONE -> "none";
-            case FLOYD_STEINBERG -> "Floyd-Steinberg";
-            case ATKINSON -> "Atkinson";
-            case BAYER_4X4 -> "Bayer 4×4";
+            case NONE            -> "none";
+            case FLOYD_STEINBERG -> String.format("Floyd-Steinberg (err:%.1f — Sh+scroll in preview)", fsErrorStrength);
+            case ATKINSON        -> String.format("Atkinson (err:%.1f — Sh+scroll in preview)", atkErrorStrength);
+            case BAYER_4X4       -> String.format("Bayer 4×4 (scale:%.2f — Sh+scroll in preview)", bayerScale);
         };
         setStatusMsg("Dither: " + name);
     }

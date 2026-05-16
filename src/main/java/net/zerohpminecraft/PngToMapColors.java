@@ -890,9 +890,11 @@ public class PngToMapColors {
     /**
      * Atkinson dithering: diffuses 6/8 of the error across 6 neighbors (right×2, below-left,
      * below, below-right, two-below). The discarded 2/8 preserves highlights better than FS.
+     * {@code diffuseAmount} scales total error spread (1.0 = classic Atkinson, 0.1 = near-none).
      */
     static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height) {
+                                          float[][] oklabLookup, int width, int height,
+                                          float diffuseAmount) {
         byte[] out     = new byte[width * height];
         float[] errCur  = new float[width * 3];
         float[] errNxt  = new float[width * 3];
@@ -916,7 +918,8 @@ public class PngToMapColors {
                 out[x + y * width] = chosen;
 
                 float[] cl = oklabLookup[chosen & 0xFF];
-                float seL = (L - cl[0]) / 8f, sea = (a - cl[1]) / 8f, seb = (b - cl[2]) / 8f;
+                float scale = diffuseAmount / 8f;
+                float seL = (L - cl[0]) * scale, sea = (a - cl[1]) * scale, seb = (b - cl[2]) * scale;
 
                 if (x + 1 < width) { int ri=(x+1)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
                 if (x + 2 < width) { int ri=(x+2)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
@@ -929,10 +932,16 @@ public class PngToMapColors {
         return out;
     }
 
+    static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height) {
+        return renderAtkinson(scaled, palette, oklabLookup, width, height, 1.0f);
+    }
+
     public static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
                                           float[][] oklabLookup, int width, int height,
-                                          MatchMetric metric, float[][] rgbLookup) {
-        if (metric == MatchMetric.OKLAB) return renderAtkinson(scaled, palette, oklabLookup, width, height);
+                                          MatchMetric metric, float[][] rgbLookup,
+                                          float diffuseAmount) {
+        if (metric == MatchMetric.OKLAB) return renderAtkinson(scaled, palette, oklabLookup, width, height, diffuseAmount);
         float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
         byte[] out     = new byte[width * height];
         float[] errCur  = new float[width * 3];
@@ -952,7 +961,8 @@ public class PngToMapColors {
                 byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup, metric, rgbLookup, palHues);
                 out[x + y * width] = chosen;
                 float[] cl = oklabLookup[chosen & 0xFF];
-                float seL = (L - cl[0]) / 8f, sea = (a - cl[1]) / 8f, seb = (b - cl[2]) / 8f;
+                float sc = diffuseAmount / 8f;
+                float seL = (L - cl[0]) * sc, sea = (a - cl[1]) * sc, seb = (b - cl[2]) * sc;
                 if (x + 1 < width) { int ri=(x+1)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
                 if (x + 2 < width) { int ri=(x+2)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
                 if (x - 1 >= 0)    { int li=(x-1)*3; errNxt[li]+=seL; errNxt[li+1]+=sea; errNxt[li+2]+=seb; }
@@ -964,6 +974,12 @@ public class PngToMapColors {
         return out;
     }
 
+    public static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height,
+                                          MatchMetric metric, float[][] rgbLookup) {
+        return renderAtkinson(scaled, palette, oklabLookup, width, height, metric, rgbLookup, 1.0f);
+    }
+
     private static final int[][] BAYER_MATRIX_4X4 = {
         { 0,  8,  2, 10},
         {12,  4, 14,  6},
@@ -973,9 +989,11 @@ public class PngToMapColors {
     // OKLab offset scale: max threshold = ±½ × BAYER_SCALE per component
     private static final float BAYER_SCALE = 0.08f;
 
-    /** Bayer 4×4 ordered dithering: deterministic, no error propagation. */
+    /** Bayer 4×4 ordered dithering: deterministic, no error propagation.
+     * {@code bayerScale} sets the OKLab threshold amplitude (default {@link #BAYER_SCALE}). */
     static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height) {
+                                          float[][] oklabLookup, int width, int height,
+                                          float bayerScale) {
         byte[] out = new byte[width * height];
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
@@ -984,7 +1002,7 @@ public class PngToMapColors {
 
                 float[] src = rgbToOklab(argb);
                 float t = (BAYER_MATRIX_4X4[y & 3][x & 3] + 0.5f) / 16.0f - 0.5f;
-                float offset = t * BAYER_SCALE;
+                float offset = t * bayerScale;
                 out[x + y * width] = findClosestInPalette(
                         src[0] + offset, src[1] + offset, src[2] + offset, palette, oklabLookup);
             }
@@ -992,10 +1010,16 @@ public class PngToMapColors {
         return out;
     }
 
+    static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height) {
+        return renderBayer4x4(scaled, palette, oklabLookup, width, height, BAYER_SCALE);
+    }
+
     public static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
                                           float[][] oklabLookup, int width, int height,
-                                          MatchMetric metric, float[][] rgbLookup) {
-        if (metric == MatchMetric.OKLAB) return renderBayer4x4(scaled, palette, oklabLookup, width, height);
+                                          MatchMetric metric, float[][] rgbLookup,
+                                          float bayerScale) {
+        if (metric == MatchMetric.OKLAB) return renderBayer4x4(scaled, palette, oklabLookup, width, height, bayerScale);
         float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
         byte[] out = new byte[width * height];
         for (int y = 0; y < height; y++) {
@@ -1004,13 +1028,19 @@ public class PngToMapColors {
                 if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
                 float[] src = rgbToOklab(argb);
                 float t = (BAYER_MATRIX_4X4[y & 3][x & 3] + 0.5f) / 16.0f - 0.5f;
-                float offset = t * BAYER_SCALE;
+                float offset = t * bayerScale;
                 out[x + y * width] = findClosestInPalette(
                         src[0] + offset, src[1] + offset, src[2] + offset,
                         palette, oklabLookup, metric, rgbLookup, palHues);
             }
         }
         return out;
+    }
+
+    public static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
+                                          float[][] oklabLookup, int width, int height,
+                                          MatchMetric metric, float[][] rgbLookup) {
+        return renderBayer4x4(scaled, palette, oklabLookup, width, height, metric, rgbLookup, BAYER_SCALE);
     }
 
     // ── Tile splitting ────────────────────────────────────────────────────
@@ -1210,6 +1240,40 @@ public class PngToMapColors {
 
     static float srgbToLinear(float c) {
         return c <= 0.04045f ? c / 12.92f : (float) Math.pow((c + 0.055f) / 1.055f, 2.4);
+    }
+
+    static float linearToSrgb(float c) {
+        if (c <= 0f) return 0f;
+        if (c >= 1f) return 1f;
+        return c <= 0.0031308f ? c * 12.92f : 1.055f * (float) Math.pow(c, 1.0 / 2.4) - 0.055f;
+    }
+
+    /**
+     * Returns a new image with each pixel's OKLab a,b (chroma) components scaled by {@code boost}.
+     * Values {@literal >}1.0 saturate; values {@literal <}1.0 desaturate. Out-of-gamut results are
+     * clamped per channel (hue may shift slightly at high boost values near the gamut boundary).
+     */
+    public static BufferedImage boostChroma(BufferedImage img, float boost) {
+        if (boost == 1.0f) return img;
+        BufferedImage src = ensureArgb(img);
+        int w = src.getWidth(), h = src.getHeight();
+        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int argb = src.getRGB(x, y);
+                int alpha = (argb >>> 24) & 0xFF;
+                if (alpha == 0) { out.setRGB(x, y, 0); continue; }
+                float[] lab = rgbToOklab(argb);
+                lab[1] *= boost;
+                lab[2] *= boost;
+                float[] rgb = oklabToLinearRgb(lab[0], lab[1], lab[2]);
+                int r = clampByte(Math.round(linearToSrgb(rgb[0]) * 255f));
+                int g = clampByte(Math.round(linearToSrgb(rgb[1]) * 255f));
+                int b = clampByte(Math.round(linearToSrgb(rgb[2]) * 255f));
+                out.setRGB(x, y, (alpha << 24) | (r << 16) | (g << 8) | b);
+            }
+        }
+        return out;
     }
 
     static float[] oklabToLinearRgb(float L, float a, float b) {

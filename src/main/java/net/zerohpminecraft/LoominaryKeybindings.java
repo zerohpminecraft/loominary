@@ -33,15 +33,17 @@ public class LoominaryKeybindings {
     private static KeyBinding keyTilePrev;
     private static KeyBinding keyStatus;
     private static KeyBinding keyEdit;
+    private static KeyBinding keyDecodeToggle;
 
     public static void register() {
-        keySteal    = registerUnbound("key.loominary.steal");
-        keyPreview  = registerUnbound("key.loominary.preview");
-        keyRevert   = registerUnbound("key.loominary.revert");
-        keyTileNext = registerUnbound("key.loominary.tile_next");
-        keyTilePrev = registerUnbound("key.loominary.tile_prev");
-        keyStatus   = registerUnbound("key.loominary.status");
-        keyEdit     = registerUnbound("key.loominary.edit");
+        keySteal        = registerUnbound("key.loominary.steal");
+        keyPreview      = registerUnbound("key.loominary.preview");
+        keyRevert       = registerUnbound("key.loominary.revert");
+        keyTileNext     = registerUnbound("key.loominary.tile_next");
+        keyTilePrev     = registerUnbound("key.loominary.tile_prev");
+        keyStatus       = registerUnbound("key.loominary.status");
+        keyEdit         = registerUnbound("key.loominary.edit");
+        keyDecodeToggle = registerUnbound("key.loominary.decode_toggle");
 
         ClientTickEvents.END_CLIENT_TICK.register(LoominaryKeybindings::onTick);
     }
@@ -59,13 +61,14 @@ public class LoominaryKeybindings {
 
         // wasPressed() drains the press queue, so a single press fires once
         // even if multiple ticks pass before we read it.
-        while (keySteal.wasPressed())    runCommand(client, "loominary import steal");
-        while (keyPreview.wasPressed())  runCommand(client, "loominary preview");
-        while (keyRevert.wasPressed())   runCommand(client, "loominary revert");
-        while (keyTileNext.wasPressed()) runCommand(client, "loominary tile next");
-        while (keyTilePrev.wasPressed()) runCommand(client, "loominary tile prev");
-        while (keyStatus.wasPressed())   runCommand(client, "loominary status");
-        while (keyEdit.wasPressed())     runCommand(client, "loominary edit");
+        while (keySteal.wasPressed())        runCommand(client, "loominary import steal");
+        while (keyPreview.wasPressed())      runCommand(client, "loominary preview");
+        while (keyRevert.wasPressed())       runCommand(client, "loominary revert");
+        while (keyTileNext.wasPressed())     runCommand(client, "loominary tile next");
+        while (keyTilePrev.wasPressed())     runCommand(client, "loominary tile prev");
+        while (keyStatus.wasPressed())       runCommand(client, "loominary status");
+        while (keyEdit.wasPressed())         runCommand(client, "loominary edit");
+        while (keyDecodeToggle.wasPressed()) MapBannerDecoder.toggle(client);
     }
 
     private static void runCommand(MinecraftClient client, String command) {

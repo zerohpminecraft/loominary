@@ -17,6 +17,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CjkCodec;
+import net.zerohpminecraft.PayloadManifest;
 import net.zerohpminecraft.mixin.MapStateAccessor;
 
 import java.util.ArrayList;
@@ -39,6 +40,10 @@ public class MapBannerDecoder {
     private static final Set<Integer> claimedMaps = new HashSet<>();
     private static final Map<Integer, AnimatedMapState> animatedMaps = new HashMap<>();
     private static int tickCounter = 0;
+
+    /** Manifests extracted at decode time, keyed by map ID. Queried by steal-grid
+     *  after decorations have been cleared. Cleared on disconnect. */
+    public static final Map<Integer, PayloadManifest> decodedManifests = new HashMap<>();
 
     public static boolean decodingEnabled = true;
     private static final Map<Integer, byte[]> rawColors     = new HashMap<>();
@@ -492,6 +497,8 @@ public class MapBannerDecoder {
             throw new IllegalStateException("header_size=" + offset + " past payload end");
         }
 
+        decodedManifests.put(mapId.id(), manifest);
+
         if (manifest.manifestVersion > PayloadManifest.CURRENT_VERSION) {
             System.out.println(TAG + " Unknown manifest version " + manifest.manifestVersion
                     + " — rendering frame 0 without metadata");
@@ -779,6 +786,101 @@ public class MapBannerDecoder {
         return claimedMaps.contains(mapId);
     }
 
+    /**
+     * Attempts to decode the {@link PayloadManifest} embedded in a map's
+     * decorations, without applying colors or registering animation.
+     *
+     * Handles carpet-encoded (LC/LS) and legacy banner-encoded tiles.
+     * Returns {@code null} if no Loominary payload is found or decoding fails.
+     */
+    public static PayloadManifest extractManifest(MapState mapState) {
+        Map<String, MapDecoration> decorations = ((MapStateAccessor) mapState).getDecorations();
+        if (decorations.isEmpty()) return null;
+
+        // Carpet path: look for LC/LS manifest banner
+        for (MapDecoration dec : decorations.values()) {
+            Text text = dec.name().orElse(null);
+            if (text == null) continue;
+            String s = text.getString();
+            boolean isLC = s.length() >= 6  && s.startsWith("LC");
+            boolean isLS = s.length() >= 10 && s.startsWith("LS");
+            if (!isLC && !isLS) continue;
+            try {
+                boolean hasShade = s.startsWith("LS");
+                int totalBytes  = Integer.parseInt(s.substring(2, 6), 16);
+                int shadeBytes  = hasShade ? Integer.parseInt(s.substring(6, 10), 16) : 0;
+                String lcPayload = hasShade
+                        ? (s.length() > 10 ? s.substring(10) : "")
+                        : (s.length() >  6 ? s.substring(6)  : "");
+
+                int carpetBytes = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
+                byte[] carpetData = CarpetChannel.decodeBytes(mapState.colors, carpetBytes);
+                byte[] shadeData  = shadeBytes > 0
+                        ? CarpetChannel.decodeShade(mapState.colors, shadeBytes)
+                        : new byte[0];
+
+                int overflowStart = carpetBytes + shadeBytes;
+                byte[] overflowData = new byte[0];
+                if (totalBytes > overflowStart) {
+                    List<String> ovNames = new ArrayList<>();
+                    for (MapDecoration od : decorations.values()) {
+                        Text t2 = od.name().orElse(null);
+                        if (t2 == null) continue;
+                        String s2 = t2.getString();
+                        if (s2.startsWith("LC") || s2.startsWith("LS")) continue;
+                        if (s2.length() < 2) continue;
+                        try { Integer.parseInt(s2.substring(0, 2), 16); }
+                        catch (NumberFormatException e) { continue; }
+                        ovNames.add(s2);
+                    }
+                    ovNames.sort(Comparator.comparingInt(o -> Integer.parseInt(o.substring(0, 2), 16)));
+                    boolean cjkOv = !ovNames.isEmpty()
+                            && ovNames.get(0).length() > 2
+                            && ovNames.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
+                    if (cjkOv) {
+                        overflowData = CjkCodec.assembleChunks(ovNames);
+                    } else {
+                        StringBuilder b64 = new StringBuilder(lcPayload);
+                        for (String o : ovNames) b64.append(o.substring(2));
+                        overflowData = Base64.getDecoder().decode(b64.toString());
+                    }
+                }
+
+                byte[] compressed = new byte[carpetBytes + shadeData.length + overflowData.length];
+                System.arraycopy(carpetData,   0, compressed, 0,                              carpetBytes);
+                System.arraycopy(shadeData,    0, compressed, carpetBytes,                    shadeData.length);
+                System.arraycopy(overflowData, 0, compressed, carpetBytes + shadeData.length, overflowData.length);
+
+                long frameSize = Zstd.getFrameContentSize(compressed);
+                if (frameSize <= MAP_BYTES) return null;
+                byte[] full = Zstd.decompress(compressed, (int) frameSize);
+                if (full.length <= MAP_BYTES) return null;
+                return PayloadManifest.fromBytes(full);
+            } catch (Exception e) {
+                return null;
+            }
+        }
+
+        // Legacy banner path: hex-indexed chunks
+        List<String> names = new ArrayList<>();
+        for (MapDecoration dec : decorations.values()) {
+            Text text = dec.name().orElse(null);
+            if (text == null) continue;
+            String s = text.getString();
+            if (s.length() < 2) continue;
+            try { Integer.parseInt(s.substring(0, 2), 16); names.add(s); }
+            catch (NumberFormatException ignored) {}
+        }
+        if (names.isEmpty()) return null;
+        try {
+            byte[] full = assembleAndDecompress(names);
+            if (full.length <= MAP_BYTES) return null;
+            return PayloadManifest.fromBytes(full);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     public static void clearCache() {
         claimedMaps.clear();
         animatedMaps.clear();
@@ -787,5 +889,6 @@ public class MapBannerDecoder {
         muxPendingBytes.clear();
         rawColors.clear();
         decodedColors.clear();
+        decodedManifests.clear();
     }
 }

@@ -15,6 +15,7 @@ import net.minecraft.entity.decoration.ItemFrameEntity;
 import net.minecraft.item.FilledMapItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.item.map.MapDecoration;
 import net.minecraft.item.map.MapState;
 import net.minecraft.text.Text;
 import net.minecraft.util.hit.EntityHitResult;
@@ -25,11 +26,14 @@ import net.minecraft.util.math.Vec3d;
 import net.zerohpminecraft.AnvilAutoFillHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.CarpetChannel;
+import net.zerohpminecraft.CatalogueState;
+import net.zerohpminecraft.FrameHighlightRenderer;
 import net.zerohpminecraft.MapBannerDecoder;
 import net.zerohpminecraft.PayloadManifest;
 import net.zerohpminecraft.PayloadState;
 import net.zerohpminecraft.PngToMapColors;
 import net.zerohpminecraft.SchematicExporter;
+import net.zerohpminecraft.mixin.MapStateAccessor;
 
 import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
@@ -51,10 +55,14 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.stream.Collectors;
 import net.zerohpminecraft.CjkCodec;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -735,11 +743,26 @@ public class LoominaryCommand {
                             // ── import ─────────────────────────────────────────
                             // Default: carpet encoding. Add "banners" for legacy mode.
                             .then(ClientCommandManager.literal("import")
-                                    // steal — default = carpet; "banners" = legacy
+                                    // steal — default = carpet; "banners" = legacy; "grid" = multi-tile
                                     .then(ClientCommandManager.literal("steal")
                                             .executes(ctx -> importStealCarpet(ctx.getSource()))
                                             .then(ClientCommandManager.literal("banners")
-                                                    .executes(ctx -> importSteal(ctx.getSource()))))
+                                                    .executes(ctx -> importSteal(ctx.getSource())))
+                                            .then(ClientCommandManager.literal("grid")
+                                                    .executes(ctx -> importStealGrid(ctx.getSource(), 0, 0, true))
+                                                    .then(ClientCommandManager.literal("banners")
+                                                            .executes(ctx -> importStealGrid(ctx.getSource(), 0, 0, false)))
+                                                    .then(ClientCommandManager.argument("columns", IntegerArgumentType.integer(1, 16))
+                                                            .then(ClientCommandManager.argument("rows", IntegerArgumentType.integer(1, 16))
+                                                                    .executes(ctx -> importStealGrid(ctx.getSource(),
+                                                                            IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                            IntegerArgumentType.getInteger(ctx, "rows"),
+                                                                            true))
+                                                                    .then(ClientCommandManager.literal("banners")
+                                                                            .executes(ctx -> importStealGrid(ctx.getSource(),
+                                                                                    IntegerArgumentType.getInteger(ctx, "columns"),
+                                                                                    IntegerArgumentType.getInteger(ctx, "rows"),
+                                                                                    false)))))))
                                     .then(ClientCommandManager.argument("filename", StringArgumentType.string())
                                             .suggests(FILENAME_SUGGESTIONS)
                                             // Default (carpet) — bare filename
@@ -1144,7 +1167,35 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.literal("memory")
                                             .executes(ctx -> clearMemory(ctx.getSource())))
                                     .then(ClientCommandManager.literal("disk")
-                                            .executes(ctx -> clearDisk(ctx.getSource())))));
+                                            .executes(ctx -> clearDisk(ctx.getSource()))))
+
+                            // ── catalogue ────────────────────────────────────
+                            .then(ClientCommandManager.literal("catalogue")
+                                    .executes(ctx -> catalogueOpen(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("open")
+                                            .executes(ctx -> catalogueOpen(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("list")
+                                            .executes(ctx -> catalogueList(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("add")
+                                            .executes(ctx -> catalogueAdd(ctx.getSource(), null))
+                                            .then(ClientCommandManager.argument("title", StringArgumentType.greedyString())
+                                                    .executes(ctx -> catalogueAdd(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "title")))))
+                                    .then(ClientCommandManager.literal("load")
+                                            .then(ClientCommandManager.argument("id", StringArgumentType.string())
+                                                    .executes(ctx -> catalogueLoad(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "id")))))
+                                    .then(ClientCommandManager.literal("share")
+                                            .then(ClientCommandManager.argument("id", StringArgumentType.string())
+                                                    .executes(ctx -> catalogueShare(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "id")))))
+                                    .then(ClientCommandManager.literal("remove")
+                                            .then(ClientCommandManager.argument("id", StringArgumentType.string())
+                                                    .executes(ctx -> catalogueRemove(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "id")))))
+                                    .then(ClientCommandManager.literal("import")
+                                            .then(ClientCommandManager.literal("all")
+                                                    .executes(ctx -> catalogueImportAll(ctx.getSource()))))));
         });
     }
 
@@ -1981,6 +2032,134 @@ public class LoominaryCommand {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // import steal helpers — Jaro-Winkler clustering
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * Jaro-Winkler string similarity. Returns 1.0 for identical strings,
+     * 0.0 for completely different strings.
+     */
+    private static double jaroWinklerSimilarity(String s1, String s2) {
+        if (s1.equals(s2)) return 1.0;
+        int len1 = s1.length(), len2 = s2.length();
+        if (len1 == 0 || len2 == 0) return 0.0;
+
+        int window = Math.max(len1, len2) / 2 - 1;
+        if (window < 0) window = 0;
+
+        boolean[] m1 = new boolean[len1], m2 = new boolean[len2];
+        int matches = 0;
+        for (int i = 0; i < len1; i++) {
+            int lo = Math.max(0, i - window), hi = Math.min(i + window + 1, len2);
+            for (int j = lo; j < hi; j++) {
+                if (!m2[j] && s1.charAt(i) == s2.charAt(j)) {
+                    m1[i] = m2[j] = true;
+                    matches++;
+                    break;
+                }
+            }
+        }
+        if (matches == 0) return 0.0;
+
+        int transpositions = 0, k = 0;
+        for (int i = 0; i < len1; i++) {
+            if (!m1[i]) continue;
+            while (!m2[k]) k++;
+            if (s1.charAt(i) != s2.charAt(k)) transpositions++;
+            k++;
+        }
+
+        double jaro = ((double) matches / len1
+                + (double) matches / len2
+                + (matches - transpositions / 2.0) / matches) / 3.0;
+
+        int prefix = 0, maxP = Math.min(4, Math.min(len1, len2));
+        while (prefix < maxP && s1.charAt(prefix) == s2.charAt(prefix)) prefix++;
+        return jaro + prefix * 0.1 * (1.0 - jaro);
+    }
+
+    /**
+     * Returns a short fingerprint string for Jaro-Winkler comparison:
+     * sorted 6-char prefixes of each decoration key name, space-joined.
+     * Same-encoding tiles produce nearly identical fingerprints.
+     */
+    private static String decorationFingerprint(MapState mapState) {
+        Map<String, MapDecoration> decorations =
+                ((MapStateAccessor) mapState).getDecorations();
+        List<String> keys = new ArrayList<>();
+        for (MapDecoration dec : decorations.values()) {
+            Text t = dec.name().orElse(null);
+            if (t == null) continue;
+            String s = t.getString();
+            if (s.length() >= 2) keys.add(s.substring(0, Math.min(s.length(), 6)));
+        }
+        Collections.sort(keys);
+        return String.join(" ", keys);
+    }
+
+    /**
+     * Clusters {@code GridCell} objects by Loominary batch identity.
+     *
+     * Primary grouping: cells whose decoded {@link PayloadManifest} shares the
+     * same (title, author) pair are always co-clustered.
+     * Fallback: Jaro-Winkler similarity ≥ 0.80 on decoration key fingerprints.
+     * Tiles with empty fingerprints (no named decorations) are always singletons —
+     * they cannot be reliably distinguished from each other and would otherwise
+     * all cluster together at 100% similarity.
+     */
+    private static List<List<GridCell>> clusterCells(List<GridCell> cells) {
+        List<List<GridCell>> clusters = new ArrayList<>();
+        List<String>         manifestKeys = new ArrayList<>(); // null = JW cluster
+        List<String>         fingerprints = new ArrayList<>(); // null = manifest cluster
+
+        for (GridCell cell : cells) {
+            // extractManifest reads live decorations; fall back to the decode-time cache
+            // if MapBannerDecoder already processed and cleared this map's decorations.
+            PayloadManifest mf = MapBannerDecoder.extractManifest(cell.mapState());
+            if (mf == null) mf = MapBannerDecoder.decodedManifests.get(cell.mapId().id());
+            String mKey = null;
+            if (mf != null && (mf.title != null || mf.username != null)) {
+                mKey = (mf.title    != null ? mf.title    : "")
+                     + "\0"
+                     + (mf.username != null ? mf.username : "");
+            }
+
+            if (mKey != null) {
+                int idx = manifestKeys.indexOf(mKey);
+                if (idx >= 0) { clusters.get(idx).add(cell); continue; }
+                List<GridCell> c = new ArrayList<>();
+                c.add(cell);
+                clusters.add(c);
+                manifestKeys.add(mKey);
+                fingerprints.add(null);
+                continue;
+            }
+
+            // Jaro-Winkler fallback — empty fingerprints are always singletons
+            String fp = decorationFingerprint(cell.mapState());
+            if (!fp.isEmpty()) {
+                int best = -1; double bestScore = 0.80;
+                for (int i = 0; i < clusters.size(); i++) {
+                    String fp2 = fingerprints.get(i);
+                    if (fp2 == null || fp2.isEmpty()) continue; // skip manifest/empty clusters
+                    double score = jaroWinklerSimilarity(fp, fp2);
+                    if (score > bestScore) { bestScore = score; best = i; }
+                }
+                if (best >= 0) {
+                    clusters.get(best).add(cell);
+                    continue;
+                }
+            }
+            List<GridCell> c = new ArrayList<>();
+            c.add(cell);
+            clusters.add(c);
+            manifestKeys.add(null);
+            fingerprints.add(fp);
+        }
+        return clusters;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // import steal
     // ════════════════════════════════════════════════════════════════════
 
@@ -2114,6 +2293,145 @@ public class LoominaryCommand {
         source.sendFeedback(Text.literal(String.format(
                 "§7%d tile%s total. Steal more maps or place the schematic.",
                 PayloadState.tiles.size(), PayloadState.tiles.size() == 1 ? "" : "s")));
+        return 1;
+    }
+
+    /**
+     * Steal a cluster of related map tiles from a wall of item frames.
+     *
+     * Discovers all coplanar same-facing filled-map frames adjacent to the
+     * crosshair frame, clusters them by manifest (title/author) or Jaro-Winkler
+     * fingerprint similarity, and steals the cluster that contains the crosshair
+     * frame as a properly-dimensioned grid batch (replacing any existing batch).
+     *
+     * @param colOverride 0 = auto-detect columns from positions; >0 = use this value
+     * @param rowOverride 0 = auto-detect rows  from positions; >0 = use this value
+     * @param carpet      true = carpet encoding (default); false = legacy banners
+     */
+    private static int importStealGrid(FabricClientCommandSource source,
+            int colOverride, int rowOverride, boolean carpet) {
+        FramedMap fm = resolveCrosshairMap(source);
+        if (fm == null) return 0;
+
+        List<GridCell> allCells = discoverMapGrid(fm.client, fm.frame);
+        if (allCells == null) {
+            source.sendError(Text.literal(
+                    "§cFloor/ceiling frames not supported — aim at a wall frame."));
+            return 0;
+        }
+
+        // Filter cells by title JW similarity to the crosshair tile (≥ 0.80)
+        PayloadManifest crosshairMf = MapBannerDecoder.decodedManifests.get(fm.mapId.id());
+        if (crosshairMf == null) crosshairMf = MapBannerDecoder.extractManifest(fm.mapState);
+        final String crosshairTitle = (crosshairMf != null && crosshairMf.title != null)
+                ? crosshairMf.title : "";
+
+        List<GridCell> siblings = allCells.stream()
+                .filter(c -> {
+                    PayloadManifest mf = MapBannerDecoder.decodedManifests.get(c.mapId().id());
+                    if (mf == null) mf = MapBannerDecoder.extractManifest(c.mapState());
+                    String title = (mf != null && mf.title != null) ? mf.title : "";
+                    return jaroWinklerSimilarity(title, crosshairTitle) >= 0.80;
+                })
+                .collect(Collectors.toList());
+        if (siblings.isEmpty()) {
+            allCells.stream().filter(c -> c.frame() == fm.frame).findFirst()
+                    .ifPresent(siblings::add);
+        }
+
+        // Highlight: green = target cluster, orange = other clusters
+        List<ItemFrameEntity> targetFrames = siblings.stream()
+                .map(GridCell::frame).collect(Collectors.toList());
+        List<ItemFrameEntity> allFrames = allCells.stream()
+                .map(GridCell::frame).collect(Collectors.toList());
+        FrameHighlightRenderer.setHighlights(targetFrames, allFrames);
+
+        // Sort row-major (top-left first)
+        siblings.sort(Comparator.comparingInt(GridCell::row).thenComparingInt(GridCell::col));
+
+        // Determine grid dimensions
+        int cols, rows;
+        if (colOverride > 0 && rowOverride > 0) {
+            cols = colOverride;
+            rows = rowOverride;
+        } else {
+            cols = siblings.stream().mapToInt(GridCell::col).max().orElse(0) + 1;
+            rows = siblings.stream().mapToInt(GridCell::row).max().orElse(0) + 1;
+        }
+
+        // Set title from manifest if not user-set
+        if (PayloadState.currentTitle == null) {
+            PayloadManifest mf = MapBannerDecoder.extractManifest(fm.mapState);
+            PayloadState.currentTitle = (mf != null && mf.title != null)
+                    ? mf.title : "map_" + fm.mapId.id();
+        }
+
+        String playerName = source.getPlayer().getGameProfile().getName();
+
+        // Replace (not append to) the existing batch
+        PayloadState.tiles.clear();
+        PayloadState.activeTileIndex = 0;
+        PayloadState.activeChunkIndex = 0;
+        PayloadState.ACTIVE_CHUNKS.clear();
+
+        int stolen = 0;
+        for (GridCell cell : siblings) {
+            byte[] mapColors = cell.mapState().colors.clone();
+            byte[] manifestBytes = PayloadManifest.toBytes(
+                    0, cols, rows, cell.col(), cell.row(),
+                    PayloadManifest.crc32(mapColors), playerName, PayloadState.currentTitle);
+
+            PayloadState.TileData tile = new PayloadState.TileData();
+            if (carpet) {
+                CarpetEncoding enc;
+                try {
+                    enc = buildCarpetEncoding(manifestBytes, mapColors);
+                } catch (IllegalStateException overflow) {
+                    PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
+                            mapColors, manifestBytes, CHUNK_SIZE, MAX_CHUNKS_CARPET);
+                    mapColors = fit.mapColors;
+                    manifestBytes = PayloadManifest.toBytes(
+                            0, cols, rows, cell.col(), cell.row(),
+                            PayloadManifest.crc32(mapColors), playerName, PayloadState.currentTitle);
+                    enc = buildCarpetEncoding(manifestBytes, mapColors);
+                }
+                tile.chunks.addAll(enc.allChunks());
+                tile.carpetEncoded = true;
+                tile.carpetCompressedB64 = Base64.getEncoder().encodeToString(enc.compressed());
+            } else {
+                List<String> chunks = buildChunks(manifestBytes, mapColors);
+                if (chunks.size() > MAX_CHUNKS) {
+                    PngToMapColors.FitResult fit = PngToMapColors.reduceToFitKJ(
+                            mapColors, manifestBytes, MAX_CHUNKS);
+                    mapColors = fit.mapColors;
+                    manifestBytes = PayloadManifest.toBytes(
+                            0, cols, rows, cell.col(), cell.row(),
+                            PayloadManifest.crc32(mapColors), playerName, PayloadState.currentTitle);
+                    chunks = buildChunks(manifestBytes, mapColors);
+                }
+                tile.chunks.addAll(chunks);
+            }
+            tile.currentIndex = 0;
+            PayloadState.tiles.add(tile);
+            stolen++;
+        }
+
+        PayloadState.currentSourceFilename = "stolen grid (" + cols + "×" + rows + ")";
+        PayloadState.gridColumns = cols;
+        PayloadState.gridRows = rows;
+        PayloadState.activeTileIndex = 0;
+        PayloadState.syncFromActiveTile();
+        PayloadState.save();
+
+        source.sendFeedback(Text.literal(String.format(
+                "§aStole %d-tile grid (%d×%d). Run §f/loominary export§a to generate schematics.",
+                stolen, cols, rows)));
+        int notStolen = allCells.size() - siblings.size();
+        if (notStolen > 0) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§7(%d other map%s on this wall — not stolen)",
+                    notStolen, notStolen == 1 ? "" : "s")));
+        }
         return 1;
     }
 
@@ -4756,5 +5074,232 @@ public class LoominaryCommand {
         PayloadState.clearDisk();
         source.sendFeedback(Text.literal("§aDeleted state file. §7In-memory state untouched."));
         return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // catalogue
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int catalogueOpen(FabricClientCommandSource source) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client == null) return 0;
+        client.send(() -> client.setScreen(new net.zerohpminecraft.CatalogueScreen()));
+        return 1;
+    }
+
+    private static int catalogueList(FabricClientCommandSource source) {
+        if (CatalogueState.entries.isEmpty()) {
+            source.sendFeedback(Text.literal("§7Catalogue is empty. Add art with §f/loominary catalogue add§7."));
+            return 1;
+        }
+        source.sendFeedback(Text.literal("§aCatalogue (" + CatalogueState.entries.size() + " entries):"));
+        for (int i = 0; i < CatalogueState.entries.size(); i++) {
+            CatalogueState.CatalogueEntry e = CatalogueState.entries.get(i);
+            String shared = e.shareEnabled ? " §a[shared]" : "";
+            String local  = e.tiles != null ? "" : " §e[metadata only]";
+            String src    = e.sourcePeer != null ? " §7(from " + e.sourcePeer + ")" : "";
+            source.sendFeedback(Text.literal(String.format(
+                    "§7[%d] §f%s §7%s %dx%d%s%s%s",
+                    i, e.id.substring(0, 8), e.title != null ? e.title : "Untitled",
+                    e.gridCols, e.gridRows, shared, local, src)));
+        }
+        return 1;
+    }
+
+    private static int catalogueAdd(FabricClientCommandSource source, String titleArg) {
+        if (PayloadState.tiles.isEmpty()) {
+            source.sendError(Text.literal("§cNo active batch. Import or steal a map first."));
+            return 0;
+        }
+        if (titleArg != null && !titleArg.isBlank()) {
+            PayloadState.currentTitle = titleArg;
+        }
+        CatalogueState.CatalogueEntry entry = CatalogueState.fromCurrentBatch();
+        CatalogueState.entries.add(0, entry);
+        CatalogueState.save();
+        source.sendFeedback(Text.literal(String.format(
+                "§aAdded §f\"%s\"§a to catalogue (id=%s, %d tile%s).",
+                entry.title, entry.id.substring(0, 8),
+                entry.tiles.size(), entry.tiles.size() == 1 ? "" : "s")));
+        return 1;
+    }
+
+    private static int catalogueLoad(FabricClientCommandSource source, String idPrefix) {
+        CatalogueState.CatalogueEntry entry = findEntryById(source, idPrefix);
+        if (entry == null) return 0;
+        if (entry.tiles == null) {
+            source.sendError(Text.literal("§cThis entry has no tile data. Download it first."));
+            return 0;
+        }
+        CatalogueState.loadIntoBatch(entry);
+        source.sendFeedback(Text.literal(String.format(
+                "§aLoaded §f\"%s\"§a into batch (%d tile%s). Run §f/loominary export§a to build.",
+                entry.title, entry.tiles.size(), entry.tiles.size() == 1 ? "" : "s")));
+        return 1;
+    }
+
+    private static int catalogueShare(FabricClientCommandSource source, String idPrefix) {
+        CatalogueState.CatalogueEntry entry = findEntryById(source, idPrefix);
+        if (entry == null) return 0;
+        entry.shareEnabled = !entry.shareEnabled;
+        entry.updatedAt = System.currentTimeMillis();
+        CatalogueState.save();
+        source.sendFeedback(Text.literal(String.format(
+                "§a\"%s\" sharing: §f%s", entry.title, entry.shareEnabled ? "ON" : "OFF")));
+        return 1;
+    }
+
+    private static int catalogueRemove(FabricClientCommandSource source, String idPrefix) {
+        CatalogueState.CatalogueEntry entry = findEntryById(source, idPrefix);
+        if (entry == null) return 0;
+        CatalogueState.entries.remove(entry);
+        CatalogueState.save();
+        source.sendFeedback(Text.literal("§aRemoved §f\"" + entry.title + "\"§a from catalogue."));
+        return 1;
+    }
+
+    /**
+     * Scans all item frames within 32 blocks of the player, clusters them by
+     * manifest/Jaro-Winkler similarity, and imports each cluster as a
+     * {@link net.zerohpminecraft.CatalogueState.CatalogueEntry}.
+     */
+    private static int catalogueImportAll(FabricClientCommandSource source) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null || client.player == null) {
+            source.sendError(Text.literal("§cNot in a world."));
+            return 0;
+        }
+
+        // Collect ALL filled-map frames within 32 blocks regardless of facing
+        net.minecraft.util.math.Vec3d center = client.player.getPos();
+        net.minecraft.util.math.Box box = new net.minecraft.util.math.Box(
+                center.x - 32, center.y - 32, center.z - 32,
+                center.x + 32, center.y + 32, center.z + 32);
+        List<net.minecraft.entity.decoration.ItemFrameEntity> rawFrames =
+                client.world.getEntitiesByClass(
+                        net.minecraft.entity.decoration.ItemFrameEntity.class, box, f -> {
+                            net.minecraft.item.ItemStack s = f.getHeldItemStack();
+                            if (!(s.getItem() instanceof net.minecraft.item.FilledMapItem)) return false;
+                            net.minecraft.component.type.MapIdComponent mid =
+                                    s.get(net.minecraft.component.DataComponentTypes.MAP_ID);
+                            return mid != null;
+                        });
+
+        if (rawFrames.isEmpty()) {
+            source.sendError(Text.literal("§cNo Loominary-encoded map frames found within 32 blocks."));
+            return 0;
+        }
+
+        // Convert to GridCell with (col=0, row=0) placeholders for clustering purposes
+        List<GridCell> allCells = new ArrayList<>();
+        for (net.minecraft.entity.decoration.ItemFrameEntity frame : rawFrames) {
+            net.minecraft.component.type.MapIdComponent mid =
+                    frame.getHeldItemStack().get(net.minecraft.component.DataComponentTypes.MAP_ID);
+            net.minecraft.item.map.MapState ms =
+                    net.minecraft.item.FilledMapItem.getMapState(mid, client.world);
+            if (ms != null) allCells.add(new GridCell(frame, mid, ms, 0, 0));
+        }
+
+        // Cluster by manifest then JW
+        List<List<GridCell>> clusters = clusterCells(allCells);
+
+        // Filter out clusters with no Loominary data (no decorations match our format)
+        clusters.removeIf(cluster -> cluster.stream().allMatch(
+                cell -> MapBannerDecoder.extractManifest(cell.mapState()) == null
+                        && ((MapStateAccessor) cell.mapState()).getDecorations().isEmpty()));
+
+        if (clusters.isEmpty()) {
+            source.sendError(Text.literal("§cNo Loominary-encoded maps found in nearby frames."));
+            return 0;
+        }
+
+        String playerName = source.getPlayer().getGameProfile().getName();
+        int imported = 0;
+        int tiles    = 0;
+
+        for (List<GridCell> cluster : clusters) {
+            if (cluster.isEmpty()) continue;
+
+            // Sort frames by position to infer grid layout (row-major, top-left = 0,0)
+            // For multi-facing frames we do a simple relative sort by (y desc, x/z asc)
+            GridCell rep = cluster.get(0);
+            net.minecraft.util.math.Direction facing = rep.frame().getHorizontalFacing();
+            cluster.sort((a, b) -> {
+                net.minecraft.util.math.BlockPos pa = a.frame().getBlockPos();
+                net.minecraft.util.math.BlockPos pb = b.frame().getBlockPos();
+                int rowCmp = Integer.compare(pb.getY(), pa.getY()); // higher y = earlier row
+                if (rowCmp != 0) return rowCmp;
+                // Within same row: sort by x or z depending on facing
+                if (facing != null && facing.getAxis() == net.minecraft.util.math.Direction.Axis.Z)
+                    return Integer.compare(pa.getX(), pb.getX());
+                return Integer.compare(pa.getZ(), pb.getZ());
+            });
+
+            // Infer grid dimensions from manifest or treat as 1×N column
+            PayloadManifest mf = MapBannerDecoder.extractManifest(cluster.get(0).mapState());
+            int cols = mf != null ? mf.cols : 1;
+            int rows = mf != null ? mf.rows : cluster.size();
+            if (cols < 1) cols = 1;
+            if (rows < 1) rows = 1;
+
+            // Build catalogue entry
+            CatalogueState.CatalogueEntry entry = new CatalogueState.CatalogueEntry();
+            entry.id        = java.util.UUID.randomUUID().toString().replace("-", "");
+            entry.author    = (mf != null && mf.username != null) ? mf.username : playerName;
+            entry.title     = (mf != null && mf.title    != null) ? mf.title    : "Stolen art";
+            entry.dateAdded = java.time.LocalDate.now().toString();
+            entry.gridCols  = cols;
+            entry.gridRows  = rows;
+            entry.frameCount = (mf != null) ? mf.frameCount : 1;
+            entry.createdAt  = System.currentTimeMillis();
+            entry.updatedAt  = entry.createdAt;
+            entry.tiles      = new ArrayList<>();
+
+            for (int ti = 0; ti < cluster.size(); ti++) {
+                GridCell cell = cluster.get(ti);
+                byte[] mapColors = cell.mapState().colors.clone();
+                byte[] manifestBytes = PayloadManifest.toBytes(
+                        0, cols, rows, ti % cols, ti / cols,
+                        PayloadManifest.crc32(mapColors), playerName, entry.title);
+                CarpetEncoding enc;
+                try {
+                    enc = buildCarpetEncoding(manifestBytes, mapColors);
+                } catch (IllegalStateException overflow) {
+                    PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
+                            mapColors, manifestBytes, CHUNK_SIZE, MAX_CHUNKS_CARPET);
+                    mapColors = fit.mapColors;
+                    manifestBytes = PayloadManifest.toBytes(
+                            0, cols, rows, ti % cols, ti / cols,
+                            PayloadManifest.crc32(mapColors), playerName, entry.title);
+                    enc = buildCarpetEncoding(manifestBytes, mapColors);
+                }
+                CatalogueState.TileSnapshot snap = new CatalogueState.TileSnapshot();
+                snap.carpetEncoded       = true;
+                snap.carpetCompressedB64 = Base64.getEncoder().encodeToString(enc.compressed());
+                snap.frameCount          = 1;
+                entry.tiles.add(snap);
+            }
+
+            entry.thumbnailB64 = CatalogueState.buildThumbnail(entry);
+            CatalogueState.entries.add(entry);
+            imported++;
+            tiles += cluster.size();
+        }
+
+        CatalogueState.save();
+        source.sendFeedback(Text.literal(String.format(
+                "§aImported %d cluster%s (%d tile%s total) into catalogue.",
+                imported, imported == 1 ? "" : "s",
+                tiles, tiles == 1 ? "" : "s")));
+        return 1;
+    }
+
+    private static CatalogueState.CatalogueEntry findEntryById(
+            FabricClientCommandSource source, String idPrefix) {
+        for (CatalogueState.CatalogueEntry e : CatalogueState.entries) {
+            if (e.id.startsWith(idPrefix)) return e;
+        }
+        source.sendError(Text.literal("§cNo catalogue entry with id starting \"" + idPrefix + "\"."));
+        return null;
     }
 }

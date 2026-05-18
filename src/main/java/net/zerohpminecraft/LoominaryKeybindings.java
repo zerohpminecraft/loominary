@@ -27,6 +27,7 @@ public class LoominaryKeybindings {
     private static final String CATEGORY = "key.categories.loominary";
 
     private static KeyBinding keySteal;
+    private static KeyBinding keyStealGrid;
     private static KeyBinding keyPreview;
     private static KeyBinding keyRevert;
     private static KeyBinding keyTileNext;
@@ -37,6 +38,7 @@ public class LoominaryKeybindings {
 
     public static void register() {
         keySteal        = registerUnbound("key.loominary.steal");
+        keyStealGrid    = registerUnbound("key.loominary.steal_grid");
         keyPreview      = registerUnbound("key.loominary.preview");
         keyRevert       = registerUnbound("key.loominary.revert");
         keyTileNext     = registerUnbound("key.loominary.tile_next");
@@ -62,6 +64,7 @@ public class LoominaryKeybindings {
         // wasPressed() drains the press queue, so a single press fires once
         // even if multiple ticks pass before we read it.
         while (keySteal.wasPressed())        runCommand(client, "loominary import steal");
+        while (keyStealGrid.wasPressed())    runCommand(client, "loominary import steal grid");
         while (keyPreview.wasPressed())      runCommand(client, "loominary preview");
         while (keyRevert.wasPressed())       runCommand(client, "loominary revert");
         while (keyTileNext.wasPressed())     runCommand(client, "loominary tile next");

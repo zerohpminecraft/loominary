@@ -16,10 +16,13 @@ public class ClientModInit implements ClientModInitializer {
 
         CarpetChannel.init();
         PayloadState.load();
+        CatalogueState.load();
         LoominaryCommand.register();
         LoominaryKeybindings.register();
         AnvilAutoFillHandler.register();
         MapBannerDecoder.register();
         BannerAutoClickHandler.register();
+        FrameHighlightRenderer.register();
+        P2PValidationCommand.register(); // Stage 0 only — remove before Stage 3
     }
 }

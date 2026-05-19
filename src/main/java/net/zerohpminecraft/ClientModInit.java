@@ -23,6 +23,6 @@ public class ClientModInit implements ClientModInitializer {
         MapBannerDecoder.register();
         BannerAutoClickHandler.register();
         FrameHighlightRenderer.register();
-        P2PValidationCommand.register(); // Stage 0 only — remove before Stage 3
+        BroadcastChannel.register();
     }
 }

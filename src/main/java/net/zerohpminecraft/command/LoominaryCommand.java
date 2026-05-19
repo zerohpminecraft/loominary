@@ -17,6 +17,8 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.item.map.MapDecoration;
 import net.minecraft.item.map.MapState;
+import net.minecraft.text.ClickEvent;
+import net.minecraft.text.MutableText;
 import net.minecraft.text.Text;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.math.BlockPos;
@@ -58,6 +60,7 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.stream.Collectors;
+import net.zerohpminecraft.BroadcastChannel;
 import net.zerohpminecraft.CjkCodec;
 import java.util.HashMap;
 import java.util.List;
@@ -1195,7 +1198,34 @@ public class LoominaryCommand {
                                                             StringArgumentType.getString(ctx, "id")))))
                                     .then(ClientCommandManager.literal("import")
                                             .then(ClientCommandManager.literal("all")
-                                                    .executes(ctx -> catalogueImportAll(ctx.getSource()))))));
+                                                    .executes(ctx -> catalogueImportAll(ctx.getSource())))))
+
+                            // ── broadcast ────────────────────────────────────
+                            .then(ClientCommandManager.literal("broadcast")
+                                    .then(ClientCommandManager.literal("start")
+                                            .executes(ctx -> broadcastStart(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("stop")
+                                            .executes(ctx -> broadcastStop(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("announce")
+                                            .executes(ctx -> broadcastAnnounce(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("peers")
+                                            .executes(ctx -> broadcastPeers(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("index")
+                                            .then(ClientCommandManager.argument("peer", StringArgumentType.word())
+                                                    .executes(ctx -> broadcastIndex(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "peer")))))
+                                    .then(ClientCommandManager.literal("get")
+                                            .then(ClientCommandManager.argument("peer", StringArgumentType.word())
+                                                    .then(ClientCommandManager.argument("entryId", StringArgumentType.word())
+                                                            .executes(ctx -> broadcastGet(ctx.getSource(),
+                                                                    StringArgumentType.getString(ctx, "peer"),
+                                                                    StringArgumentType.getString(ctx, "entryId"))))))
+                                    .then(ClientCommandManager.literal("status")
+                                            .executes(ctx -> broadcastStatus(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("debug")
+                                            .executes(ctx -> broadcastDebug(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("browse")
+                                            .executes(ctx -> broadcastBrowse(ctx.getSource())))));
         });
     }
 
@@ -5301,5 +5331,185 @@ public class LoominaryCommand {
         }
         source.sendError(Text.literal("§cNo catalogue entry with id starting \"" + idPrefix + "\"."));
         return null;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // broadcast
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int broadcastStart(FabricClientCommandSource source) {
+        BroadcastChannel.beaconing    = true;
+        BroadcastChannel.beaconTickCounter = 0;
+        BroadcastChannel.sendAnnounce(MinecraftClient.getInstance());
+        source.sendFeedback(Text.literal(
+            "§a[Broadcast] Beaconing ON — sending ANNOUNCE every 60s."));
+        return 1;
+    }
+
+    private static int broadcastStop(FabricClientCommandSource source) {
+        BroadcastChannel.beaconing = false;
+        source.sendFeedback(Text.literal("§a[Broadcast] Beaconing OFF."));
+        return 1;
+    }
+
+    private static int broadcastAnnounce(FabricClientCommandSource source) {
+        BroadcastChannel.sendAnnounce(MinecraftClient.getInstance());
+        source.sendFeedback(Text.literal("§a[Broadcast] Sent one ANNOUNCE."));
+        return 1;
+    }
+
+    private static int broadcastPeers(FabricClientCommandSource source) {
+        if (BroadcastChannel.peers.isEmpty()) {
+            source.sendFeedback(Text.literal("§7[Broadcast] No known peers yet."));
+            return 1;
+        }
+        long now = System.currentTimeMillis();
+        source.sendFeedback(Text.literal(
+            "§a[Broadcast] " + BroadcastChannel.peers.size() + " peer(s):"));
+        for (BroadcastChannel.PeerInfo p : BroadcastChannel.peers.values()) {
+            long agoS = (now - p.lastSeen) / 1000;
+            String ago = agoS < 60 ? agoS + "s" : (agoS / 60) + "m";
+            String idx = p.indexRequested ? "  §e(fetching...)" : ("  index=" + p.index.size());
+            source.sendFeedback(Text.literal(String.format(
+                "  §f%s§7  crc=%08X  shared=%d%s  seen=%s ago",
+                p.name, p.catalogueCrc & 0xFFFFFFFFL, p.sharedCount, idx, ago)));
+        }
+        return 1;
+    }
+
+    private static int broadcastIndex(FabricClientCommandSource source, String peer) {
+        BroadcastChannel.PeerInfo p = BroadcastChannel.peers.get(peer);
+        if (p == null) {
+            source.sendError(Text.literal("§c[Broadcast] Unknown peer: " + peer));
+            return 0;
+        }
+        p.indexRequested   = true;
+        p.indexRequestedAt = System.currentTimeMillis();
+        p.catalogueCrc     = -1; // force GET_INDEX on next tick even if CRC matches
+        BroadcastChannel.enqueueControl(peer, new byte[]{BroadcastChannel.MSG_GET_INDEX});
+        source.sendFeedback(Text.literal("§a[Broadcast] GET_INDEX sent to " + peer + "."));
+        return 1;
+    }
+
+    private static int broadcastGet(FabricClientCommandSource source,
+                                    String peer, String entryIdPrefix) {
+        BroadcastChannel.PeerInfo p = BroadcastChannel.peers.get(peer);
+        if (p == null) {
+            source.sendError(Text.literal("§c[Broadcast] Unknown peer: " + peer));
+            return 0;
+        }
+        String entryId = null;
+        for (String id : p.index.keySet()) {
+            if (id.startsWith(entryIdPrefix)) { entryId = id; break; }
+        }
+        if (entryId == null) {
+            source.sendError(Text.literal(
+                "§c[Broadcast] No entry matching \"" + entryIdPrefix
+                + "\" in " + peer + "'s index."));
+            return 0;
+        }
+        BroadcastChannel.requestEntry(peer, entryId);
+        return 1;
+    }
+
+    private static int broadcastStatus(FabricClientCommandSource source) {
+        BroadcastChannel.UploadState u = BroadcastChannel.upload;
+        if (u != null) {
+            source.sendFeedback(Text.literal(String.format(
+                "§a[Broadcast] Upload: frag %d/%d → §f%s§a  retry=%d  queue=%d",
+                u.nextSeq, u.totalFragments, u.targetName, u.retryCount,
+                BroadcastChannel.outboundQueue.size())));
+        } else {
+            source.sendFeedback(Text.literal(
+                "§7[Broadcast] No active upload.  queue=" + BroadcastChannel.outboundQueue.size()));
+        }
+        if (!BroadcastChannel.downloads.isEmpty()) {
+            for (BroadcastChannel.RemoteEntry d : BroadcastChannel.downloads.values()) {
+                long elapsed = System.currentTimeMillis() - d.lastFragmentAt;
+                source.sendFeedback(Text.literal(String.format(
+                    "§a[Broadcast] Download §f\"%s\"§a from §f%s§a  %d/%d frags  idle=%ds",
+                    d.title, d.fromPeer,
+                    d.receivedSeqs.cardinality(), d.totalFragments,
+                    elapsed / 1000)));
+            }
+        }
+        source.sendFeedback(Text.literal(
+            "§7[Broadcast] beaconing=" + BroadcastChannel.beaconing
+            + "  peers=" + BroadcastChannel.peers.size()
+            + "  debug=" + BroadcastChannel.debugMode));
+        return 1;
+    }
+
+    private static int broadcastDebug(FabricClientCommandSource source) {
+        BroadcastChannel.debugMode = !BroadcastChannel.debugMode;
+        source.sendFeedback(Text.literal(
+            "§a[Broadcast] Debug: " + (BroadcastChannel.debugMode ? "ON" : "OFF")));
+        return 1;
+    }
+
+    private static int broadcastBrowse(FabricClientCommandSource source) {
+        if (BroadcastChannel.peers.isEmpty()) {
+            source.sendFeedback(Text.literal("§7[Broadcast] No peer indices loaded. Wait for ANNOUNCE beacons."));
+            return 1;
+        }
+
+        int totalEntries = 0;
+        for (Map.Entry<String, BroadcastChannel.PeerInfo> pe : BroadcastChannel.peers.entrySet()) {
+            String peerName = pe.getKey();
+            BroadcastChannel.PeerInfo peer = pe.getValue();
+            if (peer.index.isEmpty()) continue;
+
+            boolean online = BroadcastChannel.peers.containsKey(peerName)
+                && MinecraftClient.getInstance().getNetworkHandler() != null
+                && MinecraftClient.getInstance().getNetworkHandler().getPlayerList().stream()
+                    .anyMatch(e -> e.getProfile().getName().equalsIgnoreCase(peerName));
+
+            String onlineTag = online ? "§a[online]" : "§8[offline]";
+            source.sendFeedback(Text.literal(
+                "§b" + peerName + " " + onlineTag + "§7  " + peer.index.size() + " entr" +
+                (peer.index.size() == 1 ? "y" : "ies")));
+
+            for (BroadcastChannel.RemoteEntry entry : peer.index.values()) {
+                String sizeStr = entry.compressedSize >= 1024
+                    ? (entry.compressedSize / 1024) + " KB"
+                    : entry.compressedSize + " B";
+                String gridStr = entry.gridCols + "×" + entry.gridRows;
+                String title   = entry.title  != null ? entry.title  : "(untitled)";
+                String author  = entry.author != null && !entry.author.isEmpty()
+                    ? " §7by §f" + entry.author : "";
+                String shortId = entry.entryId.substring(0, 8);
+
+                boolean alreadyLocal = net.zerohpminecraft.CatalogueState.entries.stream()
+                    .anyMatch(e -> e.id.equals(entry.entryId));
+                boolean downloading  = BroadcastChannel.downloads.containsKey(entry.entryId);
+
+                String statusTag;
+                if (alreadyLocal)   statusTag = " §a[have]";
+                else if (downloading) statusTag = " §e[downloading]";
+                else                statusTag = "";
+
+                MutableText line = Text.literal(
+                    "  §f\"" + title + "\"" + author +
+                    "§7  " + gridStr + " • " + entry.frameCount + " fr • " + sizeStr +
+                    "  §8id=" + shortId + statusTag);
+
+                if (!alreadyLocal && !downloading && online) {
+                    String cmd = "/loominary broadcast get " + peerName + " " + shortId;
+                    MutableText btn = Text.literal(" §a§l[▶ get]")
+                        .styled(s -> s
+                            .withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, cmd))
+                            .withUnderline(false));
+                    line.append(btn);
+                }
+
+                source.sendFeedback(line);
+                totalEntries++;
+            }
+        }
+
+        if (totalEntries == 0) {
+            source.sendFeedback(Text.literal("§7[Broadcast] Peers known but no index entries fetched yet."));
+        }
+        return 1;
     }
 }

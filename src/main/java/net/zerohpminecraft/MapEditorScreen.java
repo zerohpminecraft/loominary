@@ -25,6 +25,10 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * In-world map pixel editor — Phases 1–8 + Eyedropper.
@@ -68,7 +72,15 @@ public class MapEditorScreen extends Screen {
     private static final int MIN_SCALE       = 1;
     private static final int MAX_SCALE       = 16;
     private static final int MAX_BRUSH       = 10;
+    private static final int MAX_SEG_BRUSH   = 32;
     private static final int UNDO_DEPTH      = 20;
+
+    // Single background thread for the CG solver; replaces stale queued jobs via DiscardOldestPolicy.
+    private static final ThreadPoolExecutor SEG_EXECUTOR = new ThreadPoolExecutor(
+            1, 1, 60L, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(1),
+            r -> { Thread t = new Thread(r, "loominary-seg"); t.setDaemon(true); return t; },
+            new ThreadPoolExecutor.DiscardOldestPolicy());
 
     // ── Minimap constants ────────────────────────────────────────────────
     private static final int THUMB_SZ        = 32;   // px per thumbnail
@@ -90,7 +102,7 @@ public class MapEditorScreen extends Screen {
     private static final int COL_MERGE_RING  = 0xFFFF7722;  // orange — merge source
 
     // ── Tool enum ───────────────────────────────────────────────────────
-    private enum Tool { BRUSH, FILL, SELECT, EYEDROPPER, DITHER_BRUSH, LASSO, MAGIC_WAND }
+    private enum Tool { BRUSH, FILL, SELECT, EYEDROPPER, DITHER_BRUSH, LASSO, MAGIC_WAND, SEGMENTATION }
     private enum BrushShape { SQUARE, CIRCLE }
 
     // ── State ───────────────────────────────────────────────────────────
@@ -129,9 +141,11 @@ public class MapEditorScreen extends Screen {
     private boolean stroking      = false;
 
     // Selection (Phase 5, refactored to boolean mask in Phase 8)
-    private boolean[] selMask    = null;  // null = no selection
-    private boolean   selecting  = false;
+    private boolean[] selMask          = null;  // null = no selection
+    private boolean   selecting        = false;
     private int       dragOriginX, dragOriginY;
+    private boolean   selSubtract      = false;  // shift held at op start → subtract mode
+    private boolean[] selMaskBeforeDrag = null;  // snapshot before rect drag for live recompute
 
     // Lasso (Phase 8)
     private List<int[]> lassoPoints = null;
@@ -141,6 +155,15 @@ public class MapEditorScreen extends Screen {
     private boolean[] wandPreview          = null;
     private int       wandPreviewX         = -1, wandPreviewY = -1;
     private float     wandPreviewTolerance = -1f;
+
+    // Random Walker segmentation (Z key)
+    // 0 = unlabeled, 1 = background seed, 2 = foreground seed
+    private byte[]        segSeeds         = null;
+    private byte[]        segSeedsTemplate = null; // persists across frames; cleared by Shift+Z only
+    private float         segBeta          = 30f;
+    private int           segBrushRadius   = 5;
+    private byte          segSeedType      = 2;   // type being painted in current stroke
+    private final AtomicInteger segSolverVersion = new AtomicInteger(0);
 
     // Palette swatch hover highlight (-1 = none)
     private int paletteHoverColor = -1;
@@ -156,7 +179,8 @@ public class MapEditorScreen extends Screen {
     private PaletteMode paletteMode    = PaletteMode.TILE;
     private int         paletteScrollRow = 0;
 
-    // Color-merge state: Ctrl+click swatches or canvas pixels to build the source set, C to commit
+    // Color-merge state: Ctrl+click/drag swatches or canvas pixels to build the source set, C to commit
+    private boolean mergeStroking = false; // true while Ctrl+drag is collecting merge-source colors
     private final Set<Integer> mergeSources = new LinkedHashSet<>();
     private enum MergeScope { FRAME, TILE, ALL_TILES }
     private MergeScope mergeScope = MergeScope.FRAME;
@@ -339,12 +363,35 @@ public class MapEditorScreen extends Screen {
         close();
     }
 
-    /** Saves the active tile (if dirty) and any other tiles dirtied by cross-tile operations. */
+    /** Saves all dirty tiles asynchronously — returns immediately, saves continue in background. */
     private void saveAllDirtyTiles() {
-        if (dirty) { reEncode(); dirty = false; }
-        if (tileDirty == null) return;
+        // Mux clearing is fast; do it synchronously before dispatching async encodes.
+        boolean hadMux = PayloadState.tiles.stream().anyMatch(t -> t.muxCargoB64 != null);
+        if (hadMux) {
+            PayloadState.tiles.forEach(t -> { t.muxed = false; t.muxReceiver = false; t.muxCargoB64 = null; });
+            MinecraftClient mc2 = MinecraftClient.getInstance();
+            if (mc2.player != null) {
+                mc2.player.sendMessage(Text.literal(
+                        "§eMux state cleared — run §f/loominary mux§e again after reducing over-budget tiles."),
+                        false);
+            }
+        }
+
         MinecraftClient mc = MinecraftClient.getInstance();
         String playerName = mc.player != null ? mc.player.getGameProfile().getName() : "Player";
+
+        // Active tile
+        boolean activeDirty = dirty || (tileDirty != null && tileIndex < tileDirty.length && tileDirty[tileIndex]);
+        if (activeDirty && !PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size()) {
+            System.out.println("[Loominary] Editor: saving " + tileLabel
+                    + (totalFrames > 1 ? " (" + totalFrames + " frames)" : "") + " (async)");
+            LoominaryCommand.saveEditorChangesAsync(allFrames, frameDelayMs, tileIndex, playerName);
+        }
+        dirty = false;
+        if (tileDirty != null && tileIndex < tileDirty.length) tileDirty[tileIndex] = false;
+
+        // Other dirty tiles
+        if (tileDirty == null) return;
         for (int i = 0; i < tileDirty.length; i++) {
             if (!tileDirty[i] || i == tileIndex) continue;
             if (allTileFrames == null || i >= allTileFrames.length || allTileFrames[i] == null) continue;
@@ -354,11 +401,9 @@ public class MapEditorScreen extends Screen {
                     ? tile.frameDelays.stream().mapToInt(Integer::intValue).toArray()
                     : new int[allTileFrames[i].length];
             if (tile.frameDelays == null || tile.frameDelays.isEmpty()) Arrays.fill(delays, 100);
-            try {
-                LoominaryCommand.saveEditorChanges(allTileFrames[i], delays, i, playerName);
-            } catch (Exception e) {
-                System.err.println("[Loominary] Failed to save tile " + (i+1) + " on close: " + e.getMessage());
-            }
+            System.out.println("[Loominary] Editor: saving tile " + (i + 1)
+                    + (allTileFrames[i].length > 1 ? " (" + allTileFrames[i].length + " frames)" : "") + " (async)");
+            LoominaryCommand.saveEditorChangesAsync(allTileFrames[i], delays, i, playerName);
             tileDirty[i] = false;
         }
     }
@@ -407,6 +452,7 @@ public class MapEditorScreen extends Screen {
         renderWandPreview(ctx);
         renderSelectionOverlay(ctx);
         renderLassoPath(ctx);
+        renderSegmentationSeeds(ctx);
         renderPasteOverlay(ctx);
         renderMapBorder(ctx);
         renderPalettePanel(ctx, mouseX, mouseY);
@@ -637,6 +683,20 @@ public class MapEditorScreen extends Screen {
             int sy = (int)(translateY + pt[1] * scale);
             int sz = Math.max(1, scale / 2);
             ctx.fill(sx, sy, sx + sz, sy + sz, 0xFFFFFF00);
+        }
+    }
+
+    private void renderSegmentationSeeds(DrawContext ctx) {
+        if (segSeeds == null || currentTool != Tool.SEGMENTATION) return;
+        int gW = gridW(), gH = gridH();
+        for (int gy = 0; gy < gH; gy++) {
+            for (int gx = 0; gx < gW; gx++) {
+                byte s = segSeeds[selIdx(gx, gy)];
+                if (s == 0) continue;
+                int sx = (int)(translateX + gx * scale);
+                int sy = (int)(translateY + gy * scale);
+                ctx.fill(sx, sy, sx + scale, sy + scale, s == 2 ? 0x8000CC44 : 0x80FF4400);
+            }
         }
     }
 
@@ -974,10 +1034,10 @@ public class MapEditorScreen extends Screen {
 
         // Tool list — active tool highlighted green
         Tool[]   toolOrder  = { Tool.BRUSH, Tool.FILL, Tool.SELECT, Tool.EYEDROPPER,
-                                 Tool.DITHER_BRUSH, Tool.LASSO, Tool.MAGIC_WAND };
-        String[] toolKeys   = { "B", "F", "S", "E", "T", "L", "W" };
+                                 Tool.DITHER_BRUSH, Tool.LASSO, Tool.MAGIC_WAND, Tool.SEGMENTATION };
+        String[] toolKeys   = { "B", "F", "S", "E", "T", "L", "W", "Z" };
         String[] toolLabels = { "Brush", "Fill", "Rect Sel", "Eyedrop",
-                                 "Dither", "Lasso", "Wand" };
+                                 "Dither", "Lasso", "Wand", "Segment" };
         for (int i = 0; i < toolOrder.length; i++) {
             String col = currentTool == toolOrder[i] ? "§a" : "§8";
             ctx.drawTextWithShadow(textRenderer,
@@ -1010,9 +1070,11 @@ public class MapEditorScreen extends Screen {
             }
             case SELECT -> {
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal("§8drag: rect sel"), x, y, 0xFFFFFF); y += 9;
+                        Text.literal("§8drag: add rect"), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal("§8click: deselect"), x, y, 0xFFFFFF); y += 9;
+                        Text.literal("§8Sh+drag: deselect rect"), x, y, 0xFFFFFF); y += 9;
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal("§8click: clear all"), x, y, 0xFFFFFF); y += 9;
             }
             case EYEDROPPER -> {
                 ctx.drawTextWithShadow(textRenderer,
@@ -1034,7 +1096,9 @@ public class MapEditorScreen extends Screen {
                 ctx.drawTextWithShadow(textRenderer,
                         Text.literal("§8drag: trace path"), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal("§8release: commit"), x, y, 0xFFFFFF); y += 9;
+                        Text.literal("§8release: add region"), x, y, 0xFFFFFF); y += 9;
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal("§8Sh+release: deselect"), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
                         Text.literal("§8Esc: cancel lasso"), x, y, 0xFFFFFF); y += 9;
             }
@@ -1044,7 +1108,23 @@ public class MapEditorScreen extends Screen {
                 ctx.drawTextWithShadow(textRenderer,
                         Text.literal("§8= - sh+sc §7ctrl:fine"), x, y, 0xFFFFFF); y += 9;
                 ctx.drawTextWithShadow(textRenderer,
-                        Text.literal("§8click: flood sel"), x, y, 0xFFFFFF); y += 9;
+                        Text.literal("§8click: add flood"), x, y, 0xFFFFFF); y += 9;
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal("§8Sh+click: deselect"), x, y, 0xFFFFFF); y += 9;
+            }
+            case SEGMENTATION -> {
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal(String.format("§7β:§f%.1f  §8= -", segBeta)), x, y, 0xFFFFFF); y += 9;
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal(String.format("§7r:§f%d  §8[ ] sh+sc", segBrushRadius)), x, y, 0xFFFFFF); y += 9;
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal("§8lt=fg  rt=bg  drag"), x, y, 0xFFFFFF); y += 9;
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal("§8auto-runs on stroke"), x, y, 0xFFFFFF); y += 9;
+                ctx.drawTextWithShadow(textRenderer,
+                        Text.literal("§8Enter=re-run  Esc=seeds"), x, y, 0xFFFFFF); y += 9;
+                String tmplHint = segSeedsTemplate != null ? "§7Sh+Z=clr tmpl §a✓" : "§8Sh+Z=clr tmpl";
+                ctx.drawTextWithShadow(textRenderer, Text.literal(tmplHint), x, y, 0xFFFFFF); y += 9;
             }
         }
         y += 2;
@@ -1055,7 +1135,9 @@ public class MapEditorScreen extends Screen {
         ctx.drawTextWithShadow(textRenderer, Text.literal(selHdr), x, y, 0xFFFFFF); y += 10;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+A  all"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+D  clear"), x, y, 0xFFFFFF); y += 9;
+        ctx.drawTextWithShadow(textRenderer, Text.literal("§8Ctrl+I  invert"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8=/-  grow/shrink"), x, y, 0xFFFFFF); y += 9;
+        ctx.drawTextWithShadow(textRenderer, Text.literal("§8Del  clear→trans"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§8Esc  clear/close"), x, y, 0xFFFFFF); y += 9;
         ctx.drawTextWithShadow(textRenderer, Text.literal("§c[Sh+Esc] discard+exit"), x, y, 0xFFFFFF); y += 9;
         y += 2;
@@ -1343,6 +1425,9 @@ public class MapEditorScreen extends Screen {
         cachedGifFrames      = null;
         pendingGridResult     = null;
         selMask            = null;
+        selSubtract        = false;
+        selMaskBeforeDrag  = null;
+        mergeStroking      = false;
         lassoPoints        = null;
         ditherMask         = null;
         useCustomMask      = false;
@@ -1355,6 +1440,8 @@ public class MapEditorScreen extends Screen {
         wandPreview          = null;
         wandPreviewX         = -1; wandPreviewY = -1;
         wandPreviewTolerance = -1f;
+        segSeeds             = null;
+        segSolverVersion.incrementAndGet();
 
         if (!multiTileMode) centerMap(); // recenter viewport on the newly active tile
         rebuildTileColors();
@@ -1387,6 +1474,7 @@ public class MapEditorScreen extends Screen {
                 case DITHER_BRUSH -> String.format("§a[T]Dither§r s:%.1f §8Sh+sc  [M]mask", ditherStrength);
                 case LASSO        -> "§a[L]Lasso§r §8drag";
                 case MAGIC_WAND   -> String.format("§a[W]Wand§r tol:%.3f §8Sh+sc/Ct+fine", fillTolerance);
+                case SEGMENTATION -> String.format("§a[Z]Segment§r β:%.1f r:%d §8lt=fg rt=bg auto-runs", segBeta, segBrushRadius);
             };
             String undoHint  = history.canUndo() ? " §8Ctrl+Z" : "";
             String redoHint  = history.canRedo() ? " §8Ctrl+Y" : "";
@@ -1500,6 +1588,8 @@ public class MapEditorScreen extends Screen {
                     fillTolerance = Math.round(Math.max(0f, Math.min(0.5f,
                             fillTolerance + (float) Math.signum(vAmt) * tStep)) * tScale) / (float) tScale;
                 }
+                case SEGMENTATION -> segBrushRadius = Math.max(0, Math.min(MAX_SEG_BRUSH,
+                        segBrushRadius + (int) Math.signum(vAmt)));
                 default -> {}
             }
             return true;
@@ -1577,6 +1667,11 @@ public class MapEditorScreen extends Screen {
             }
             // Transparency dedicated row
             if (relY >= 68 && relY < 82 && relX >= 2 && relX < 2 + SWATCH_SZ + 18) {
+                if (button == 0 && hasControlDown()) {
+                    if (!mergeSources.remove(0)) mergeSources.add(0);
+                    mergeStroking = true;
+                    return true;
+                }
                 if (button == 0 && hasShiftDown()
                         && paletteMode == PaletteMode.SEL && selMask != null) {
                     int gW = gridW(), gH = gridH();
@@ -1610,6 +1705,7 @@ public class MapEditorScreen extends Screen {
                         int c = palette[idx];
                         if (button == 0 && hasControlDown()) {
                             if (!mergeSources.remove(c)) mergeSources.add(c);
+                            mergeStroking = true;
                         } else if (button == 0 && hasShiftDown()
                                 && paletteMode == PaletteMode.SEL && selMask != null) {
                             // Deselect all pixels of this color
@@ -1637,8 +1733,13 @@ public class MapEditorScreen extends Screen {
         if (!inMapBounds(hoverMapX, hoverMapY))
             return super.mouseClicked(mouseX, mouseY, button);
 
-        // In multi-tile mode: clicking a non-active tile switches to it
+        // In multi-tile mode: clicking a non-active tile normally switches to it,
+        // but selection tools (SELECT, LASSO, WAND) work across tiles — let them fall through.
         if (multiTileMode && !inActiveTile(hoverMapX, hoverMapY) && button != 2) {
+            boolean isSelTool = currentTool == Tool.SELECT
+                             || currentTool == Tool.LASSO
+                             || currentTool == Tool.MAGIC_WAND
+                             || currentTool == Tool.SEGMENTATION;
             if (button == 0 && currentTool == Tool.EYEDROPPER) {
                 int ti = tileAt(hoverMapX, hoverMapY);
                 int lx = localX(hoverMapX), ly = localY(hoverMapY);
@@ -1655,15 +1756,18 @@ public class MapEditorScreen extends Screen {
                 if (allTileFrames != null && ti < allTileFrames.length && allTileFrames[ti] != null) {
                     int f = Math.min(activeFrame, allTileFrames[ti].length - 1);
                     int c = allTileFrames[ti][f][lx + ly * MAP_SIZE] & 0xFF;
-                    if (c != 0) { if (!mergeSources.remove(c)) mergeSources.add(c); }
+                    if (!mergeSources.remove(c)) mergeSources.add(c);
                 }
                 return true;
             }
-            if (button == 0) {
-                int newTile = tileAt(hoverMapX, hoverMapY);
-                if (newTile >= 0 && newTile < PayloadState.tiles.size()) switchToTile(newTile);
+            if (!isSelTool) {
+                if (button == 0) {
+                    int newTile = tileAt(hoverMapX, hoverMapY);
+                    if (newTile >= 0 && newTile < PayloadState.tiles.size()) switchToTile(newTile);
+                }
+                return true;
             }
-            return true;
+            // Selection tools: fall through to normal handling below
         }
 
         int lhx = localHoverX(), lhy = localHoverY();
@@ -1671,9 +1775,8 @@ public class MapEditorScreen extends Screen {
         // Ctrl+left-click on canvas: toggle color under cursor in merge-source set
         if (button == 0 && hasControlDown()) {
             int c = mapColors[lhx + lhy * MAP_SIZE] & 0xFF;
-            if (c != 0) {
-                if (!mergeSources.remove(c)) mergeSources.add(c);
-            }
+            if (!mergeSources.remove(c)) mergeSources.add(c);
+            mergeStroking = true;
             return true;
         }
 
@@ -1692,6 +1795,15 @@ public class MapEditorScreen extends Screen {
             return true;
         }
 
+        // Segmentation seed painting (left=fg, right=bg) — works across tiles in multi-tile mode
+        if (currentTool == Tool.SEGMENTATION && (button == 0 || button == 1)) {
+            ensureSegSeeds();
+            segSeedType = button == 0 ? (byte)2 : (byte)1;
+            paintSegSeed(hoverMapX, hoverMapY, segSeedType);
+            stroking = true;
+            return true;
+        }
+
         // Right-click = eyedropper (picks from active tile, or any tile)
         if (button == 1 && (currentTool == Tool.BRUSH || currentTool == Tool.FILL)) {
             activeColor = mapColors[lhx + lhy * MAP_SIZE] & 0xFF;
@@ -1701,18 +1813,21 @@ public class MapEditorScreen extends Screen {
         if (button == 0) {
             switch (currentTool) {
                 case SELECT -> {
-                    selMask = new boolean[selSize()];
-                    selMask[activeSelIdx(lhx, lhy)] = true;
+                    selSubtract      = hasShiftDown();
+                    selMaskBeforeDrag = selMask != null ? selMask.clone() : null;
+                    selMask = selMaskBeforeDrag != null ? selMaskBeforeDrag.clone() : new boolean[selSize()];
                     selecting   = true;
-                    dragOriginX = lhx;
-                    dragOriginY = lhy;
+                    dragOriginX = hoverMapX;
+                    dragOriginY = hoverMapY;
                 }
                 case LASSO -> {
+                    selSubtract = hasShiftDown();
                     lassoPoints = new ArrayList<>();
                     lassoPoints.add(new int[]{hoverMapX, hoverMapY});
                 }
                 case MAGIC_WAND -> {
-                    selMask = null;
+                    selSubtract = hasShiftDown();
+                    if (selSubtract && selMask == null) return true;
                     addWandRegionAt(hoverMapX, hoverMapY);
                     wandDragging = true;
                 }
@@ -1742,17 +1857,21 @@ public class MapEditorScreen extends Screen {
     public boolean mouseReleased(double mouseX, double mouseY, int button) {
         if (inPasteMode) return true;
         if (inPreview) return true;
-        if (button == 0 || (button == 1 && currentTool == Tool.DITHER_BRUSH)) {
-            if (stroking) { stroking = false; rebuildTileColors(); }
+        if (button == 0 || (button == 1 && (currentTool == Tool.DITHER_BRUSH || currentTool == Tool.SEGMENTATION))) {
+            if (mergeStroking) { mergeStroking = false; return true; }
+            if (stroking) {
+                stroking = false;
+                rebuildTileColors();
+                if (currentTool == Tool.SEGMENTATION && segHasBothTypes()) runRandomWalker();
+            }
             if (selecting) {
                 selecting = false;
-                int lhx = localHoverX(), lhy = localHoverY();
                 // Single click with no drag → deselect; otherwise commit via setSelMask
-                setSelMask(lhx == dragOriginX && lhy == dragOriginY ? null : selMask);
+                setSelMask(hoverMapX == dragOriginX && hoverMapY == dragOriginY ? null : selMask);
             }
             if (wandDragging) {
                 wandDragging = false;
-                setSelMask(selMask);  // trigger palette mode switch now that drag is done
+                setSelMask(selMask);
             }
             if (button == 0 && lassoPoints != null) commitLasso();
         }
@@ -1766,19 +1885,23 @@ public class MapEditorScreen extends Screen {
         if (inPasteMode) return true;
         if (inPreview) return true;
         if (button == 0) {
-            if (selecting && inMapBounds(hoverMapX, hoverMapY) && inHoverActiveLocal()) {
-                int lhx = localHoverX(), lhy = localHoverY();
-                int x1 = Math.min(dragOriginX, lhx), y1 = Math.min(dragOriginY, lhy);
-                int x2 = Math.max(dragOriginX, lhx), y2 = Math.max(dragOriginY, lhy);
-                if (selMask == null) selMask = new boolean[selSize()];
-                else Arrays.fill(selMask, false);
-                for (int ly = y1; ly <= y2; ly++)
-                    for (int lx = x1; lx <= x2; lx++)
-                        selMask[activeSelIdx(lx, ly)] = true;
+            if (mergeStroking) { pickMergeColorAt(mouseX, mouseY); return true; }
+            if (selecting && inMapBounds(hoverMapX, hoverMapY)) {
+                int x1 = Math.min(dragOriginX, hoverMapX), y1 = Math.min(dragOriginY, hoverMapY);
+                int x2 = Math.max(dragOriginX, hoverMapX), y2 = Math.max(dragOriginY, hoverMapY);
+                selMask = selMaskBeforeDrag != null ? selMaskBeforeDrag.clone() : new boolean[selSize()];
+                for (int gy = y1; gy <= y2; gy++)
+                    for (int gx = x1; gx <= x2; gx++)
+                        selMask[selIdx(gx, gy)] = !selSubtract;
                 return true;
             }
             if (wandDragging && inMapBounds(hoverMapX, hoverMapY)) {
                 if (multiTileMode || inHoverActiveLocal()) addWandRegionAt(hoverMapX, hoverMapY);
+                return true;
+            }
+            if (stroking && currentTool == Tool.SEGMENTATION && inMapBounds(hoverMapX, hoverMapY)) {
+                ensureSegSeeds();
+                paintSegSeed(hoverMapX, hoverMapY, segSeedType);
                 return true;
             }
             if (stroking && currentTool == Tool.BRUSH && inMapBounds(hoverMapX, hoverMapY)
@@ -1795,6 +1918,11 @@ public class MapEditorScreen extends Screen {
                     lassoPoints.add(new int[]{hoverMapX, hoverMapY});
                 return true;
             }
+        }
+        if (button == 1 && stroking && currentTool == Tool.SEGMENTATION && inMapBounds(hoverMapX, hoverMapY)) {
+            ensureSegSeeds();
+            paintSegSeed(hoverMapX, hoverMapY, segSeedType);
+            return true;
         }
         if ((button == 0 || button == 1) && stroking
                 && currentTool == Tool.DITHER_BRUSH && inMapBounds(hoverMapX, hoverMapY)
@@ -1876,15 +2004,47 @@ public class MapEditorScreen extends Screen {
             return true;
         }
 
+        // Segmentation: Enter re-runs solver; = / - adjust beta; [ / ] adjust seed brush radius
+        if (currentTool == Tool.SEGMENTATION) {
+            if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) {
+                runRandomWalker(); return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_EQUAL) {
+                segBeta = Math.round(Math.min(100f, segBeta + (shift ? 5f : 1f)) * 10) / 10f;
+                if (segHasBothTypes()) runRandomWalker();
+                else setStatusMsg(String.format("β = %.1f", segBeta));
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_MINUS) {
+                segBeta = Math.round(Math.max(0.1f, segBeta - (shift ? 5f : 1f)) * 10) / 10f;
+                if (segHasBothTypes()) runRandomWalker();
+                else setStatusMsg(String.format("β = %.1f", segBeta));
+                return true;
+            }
+            if (!ctrl && keyCode == GLFW.GLFW_KEY_LEFT_BRACKET) {
+                segBrushRadius = Math.max(0, segBrushRadius - 1);
+                setStatusMsg("Seed brush r:" + segBrushRadius); return true;
+            }
+            if (!ctrl && keyCode == GLFW.GLFW_KEY_RIGHT_BRACKET) {
+                segBrushRadius = Math.min(MAX_SEG_BRUSH, segBrushRadius + 1);
+                setStatusMsg("Seed brush r:" + segBrushRadius); return true;
+            }
+            if (shift && keyCode == GLFW.GLFW_KEY_Z) {
+                segSeedsTemplate = null;
+                setStatusMsg("Seed template cleared"); return true;
+            }
+        }
+
         // Shift+Escape: discard all changes and exit immediately
         if (shift && keyCode == GLFW.GLFW_KEY_ESCAPE) {
             closeDiscarding();
             return true;
         }
 
-        // Escape: cancel paste → clear merge sources → cancel lasso → deselect → close (saves)
+        // Escape: cancel paste → clear merge sources → clear seg seeds → cancel lasso → deselect → close (saves)
         if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
             if (!mergeSources.isEmpty()) { mergeSources.clear(); return true; }
+            if (segSeeds != null) { segSeeds = null; return true; }
             if (lassoPoints != null) { lassoPoints = null; return true; }
             if (selMask != null)     { setSelMask(null);   return true; }
             // fall through to super → close()
@@ -1932,9 +2092,21 @@ public class MapEditorScreen extends Screen {
             }
         }
 
-        // Drop current frame (Delete) — blocked if only one frame
-        if (keyCode == GLFW.GLFW_KEY_DELETE && totalFrames > 1) {
-            dropCurrentFrame(); return true;
+        // Delete: clear selection to transparent if active, otherwise drop frame
+        if (keyCode == GLFW.GLFW_KEY_DELETE) {
+            if (selMask != null) {
+                history.snapshot();
+                int gW = gridW(), gH = gridH();
+                int cleared = 0;
+                for (int gy = 0; gy < gH; gy++)
+                    for (int gx = 0; gx < gW; gx++)
+                        if (selMask[selIdx(gx, gy)]) { setGlobalPixel(gx, gy, 0); cleared++; }
+                dirty = true;
+                rebuildTileColors();
+                setStatusMsg("Cleared " + cleared + " selected pixel" + (cleared == 1 ? "" : "s") + " to transparent.");
+                return true;
+            }
+            if (totalFrames > 1) { dropCurrentFrame(); return true; }
         }
         // Insert a frame from the current GIF source frame (animated GIF tiles only)
         if (keyCode == GLFW.GLFW_KEY_INSERT && totalFrames > 1
@@ -1955,6 +2127,15 @@ public class MapEditorScreen extends Screen {
             setSelMask(all); return true;
         }
         if (ctrl && keyCode == GLFW.GLFW_KEY_D) { setSelMask(null); return true; }
+        if (ctrl && keyCode == GLFW.GLFW_KEY_I) {
+            boolean[] inv = new boolean[selSize()];
+            boolean any = false;
+            for (int i = 0; i < inv.length; i++) {
+                inv[i] = selMask == null || !selMask[i];
+                if (inv[i]) any = true;
+            }
+            setSelMask(any ? inv : null); return true;
+        }
         if (selMask != null) {
             if (keyCode == GLFW.GLFW_KEY_EQUAL) { growOrShrinkSelection(shift ? 5 : 1);  return true; }
             if (keyCode == GLFW.GLFW_KEY_MINUS) { growOrShrinkSelection(shift ? -5 : -1); return true; }
@@ -1971,6 +2152,7 @@ public class MapEditorScreen extends Screen {
         if (keyCode == GLFW.GLFW_KEY_T) { setTool(Tool.DITHER_BRUSH); return true; }
         if (keyCode == GLFW.GLFW_KEY_L) { setTool(Tool.LASSO);        return true; }
         if (keyCode == GLFW.GLFW_KEY_W) { setTool(Tool.MAGIC_WAND);   return true; }
+        if (!ctrl && keyCode == GLFW.GLFW_KEY_Z) { setTool(Tool.SEGMENTATION); return true; }
         if (keyCode == GLFW.GLFW_KEY_X) {
             brushShape = brushShape == BrushShape.SQUARE ? BrushShape.CIRCLE : BrushShape.SQUARE;
             return true;
@@ -2004,7 +2186,8 @@ public class MapEditorScreen extends Screen {
             if (shift && PayloadState.tiles.size() > 1) {
                 multiTileMode = !multiTileMode;
                 showMinimap = false;
-                selMask = null; wandPreview = null; // selSize() changes between modes
+                selMask = null; wandPreview = null; segSeeds = null; // selSize() changes between modes
+                segSolverVersion.incrementAndGet();
                 recomputeScale();
                 centerMap();
                 setStatusMsg(multiTileMode ? "Multi-tile canvas — click tile to switch active"
@@ -2175,6 +2358,205 @@ public class MapEditorScreen extends Screen {
         }
     }
 
+    // ── Random Walker segmentation ──────────────────────────────────────────
+
+    /** Paint a seed circle at global (gx, gy) into segSeeds. In single-tile mode, restricted to active tile. */
+    private void paintSegSeed(int gx, int gy, byte seedType) {
+        int r = segBrushRadius, r2 = r * r;
+        for (int dy = -r; dy <= r; dy++) {
+            for (int dx = -r; dx <= r; dx++) {
+                if (dx*dx + dy*dy > r2) continue;
+                int px = gx + dx, py = gy + dy;
+                if (!inMapBounds(px, py)) continue;
+                if (!multiTileMode && !inActiveTile(px, py)) continue;
+                segSeeds[selIdx(px, py)] = seedType;
+            }
+        }
+    }
+
+    /** Ensure segSeeds is allocated at selSize(). Preserves data if size is unchanged. */
+    private void ensureSegSeeds() {
+        int sz = selSize();
+        if (segSeeds == null || segSeeds.length != sz) {
+            byte[] old = segSeeds;
+            segSeeds = new byte[sz];
+            if (old != null) System.arraycopy(old, 0, segSeeds, 0, Math.min(old.length, sz));
+        }
+    }
+
+    /** Returns true if segSeeds contains at least one foreground (2) and one background (1) seed. */
+    private boolean segHasBothTypes() {
+        if (segSeeds == null) return false;
+        boolean hasFg = false, hasBg = false;
+        for (byte s : segSeeds) {
+            if (s == 2) hasFg = true;
+            else if (s == 1) hasBg = true;
+            if (hasFg && hasBg) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Snapshot pixel/seed data on the main thread, then submit the CG solver to SEG_EXECUTOR.
+     * Results are dispatched back via mc.execute() once the background thread finishes.
+     * Stale results (superseded by a newer run) are silently discarded via segSolverVersion.
+     */
+    private void runRandomWalker() {
+        if (!segHasBothTypes()) {
+            setStatusMsg("Paint both foreground (left-click) and background (right-click) seeds.");
+            return;
+        }
+
+        final int gxMin, gxMax, gyMin, gyMax;
+        if (multiTileMode) {
+            gxMin = 0; gxMax = gridW() - 1;
+            gyMin = 0; gyMax = gridH() - 1;
+        } else {
+            gxMin = activeTileGx0(); gxMax = gxMin + MAP_SIZE - 1;
+            gyMin = activeTileGy0(); gyMax = gyMin + MAP_SIZE - 1;
+        }
+
+        // Snapshot all mutable state before handing off — background thread must not touch 'this'
+        final int   gW          = gridW();
+        final int   sz          = selSize();
+        final byte[] seedsSnap  = segSeeds.clone();
+        segSeedsTemplate = seedsSnap; // save template whenever solver runs
+        final byte[] pixSnap    = new byte[sz];
+        for (int gy = gyMin; gy <= gyMax; gy++)
+            for (int gx = gxMin; gx <= gxMax; gx++)
+                pixSnap[gx + gy * gW] = (byte) getGlobalPixel(gx, gy);
+        final float  betaSnap   = segBeta;
+        final int    myVersion  = segSolverVersion.incrementAndGet();
+        final int[]  clut       = colorLookup;
+        final MinecraftClient mc = MinecraftClient.getInstance();
+
+        SEG_EXECUTOR.submit(() -> {
+            // ── Edge weights ───────────────────────────────────────────
+            float[] rightW = new float[sz], downW = new float[sz];
+            for (int gy = gyMin; gy <= gyMax; gy++) {
+                for (int gx = gxMin; gx <= gxMax; gx++) {
+                    int i = gx + gy * gW;
+                    int ci = pixSnap[i] & 0xFF;
+                    float[] labI = ci == 0 ? new float[]{0,0,0} : PngToMapColors.rgbToOklab(clut[ci]);
+                    if (gx < gxMax) {
+                        int cj = pixSnap[i + 1] & 0xFF;
+                        float[] labJ = cj == 0 ? new float[]{0,0,0} : PngToMapColors.rgbToOklab(clut[cj]);
+                        float dL=labI[0]-labJ[0], da=labI[1]-labJ[1], db=labI[2]-labJ[2];
+                        rightW[i] = Math.max((float)Math.exp(-betaSnap*(dL*dL+da*da+db*db)), 1e-3f);
+                    }
+                    if (gy < gyMax) {
+                        int cj = pixSnap[i + gW] & 0xFF;
+                        float[] labJ = cj == 0 ? new float[]{0,0,0} : PngToMapColors.rgbToOklab(clut[cj]);
+                        float dL=labI[0]-labJ[0], da=labI[1]-labJ[1], db=labI[2]-labJ[2];
+                        downW[i] = Math.max((float)Math.exp(-betaSnap*(dL*dL+da*da+db*db)), 1e-3f);
+                    }
+                }
+            }
+
+            // ── Unknown index map ──────────────────────────────────────
+            int[] unknownIdx = new int[sz];
+            Arrays.fill(unknownIdx, -1);
+            int numUnknown = 0;
+            for (int gy = gyMin; gy <= gyMax; gy++)
+                for (int gx = gxMin; gx <= gxMax; gx++) {
+                    int i = gx + gy * gW;
+                    if (seedsSnap[i] == 0) unknownIdx[i] = numUnknown++;
+                }
+
+            // ── CG solve ───────────────────────────────────────────────
+            float[] xResult = null;
+            if (numUnknown > 0) {
+                float[] b = new float[numUnknown];
+                for (int gy = gyMin; gy <= gyMax; gy++) {
+                    for (int gx = gxMin; gx <= gxMax; gx++) {
+                        int i = gx + gy * gW;
+                        int k = unknownIdx[i];
+                        if (k < 0) continue;
+                        if (gx < gxMax && seedsSnap[i+1]  == 1) b[k] += rightW[i];
+                        if (gx > gxMin && seedsSnap[i-1]  == 1) b[k] += rightW[i-1];
+                        if (gy < gyMax && seedsSnap[i+gW] == 1) b[k] += downW[i];
+                        if (gy > gyMin && seedsSnap[i-gW] == 1) b[k] += downW[i-gW];
+                    }
+                }
+                float[] x = new float[numUnknown];
+                float[] r = b.clone(), p = r.clone();
+                float rDotR = dot(r, r);
+                int iter = 0;
+                for (; iter < 300 && rDotR > 1e-6f; iter++) {
+                    float[] Ap = applyLaplacian(p, unknownIdx, rightW, downW, numUnknown,
+                                                gW, gxMin, gxMax, gyMin, gyMax);
+                    float pAp = dot(p, Ap);
+                    if (pAp == 0f) break;
+                    float alpha = rDotR / pAp;
+                    addScaled(x,  alpha, p);
+                    addScaled(r, -alpha, Ap);
+                    float rDotRNew = dot(r, r);
+                    float beta2 = rDotRNew / rDotR;
+                    for (int k = 0; k < numUnknown; k++) p[k] = r[k] + beta2 * p[k];
+                    rDotR = rDotRNew;
+                }
+                System.out.printf("[Loominary] RandomWalker: %d CG iters, residual=%.2e, unknowns=%d%n",
+                        iter, rDotR, numUnknown);
+                xResult = x;
+            }
+
+            if (segSolverVersion.get() != myVersion) return; // superseded
+
+            final float[] xFinal    = xResult;
+            final int[]   idxFinal  = unknownIdx;
+            mc.execute(() -> {
+                if (mc.currentScreen != MapEditorScreen.this) return;
+                if (segSolverVersion.get() != myVersion) return; // superseded between queue and exec
+                applySegResult(xFinal, idxFinal, seedsSnap, gW, gxMin, gxMax, gyMin, gyMax);
+                setStatusMsg("Background selected — Del to erase transparent, or paint more seeds and re-run.");
+            });
+        });
+    }
+
+    /** Apply CG solution x[] to create the selection mask (background = true). Called on main thread. */
+    private void applySegResult(float[] x, int[] unknownIdx, byte[] seeds,
+                                 int gW, int gxMin, int gxMax, int gyMin, int gyMax) {
+        boolean[] newSel = selMask != null ? selMask.clone() : new boolean[selSize()];
+        for (int gy = gyMin; gy <= gyMax; gy++) {
+            for (int gx = gxMin; gx <= gxMax; gx++) {
+                int i = gx + gy * gW;
+                byte seed = seeds[i];
+                newSel[i] = seed != 0 ? (seed == 1) : (unknownIdx[i] >= 0 && x != null && x[unknownIdx[i]] > 0.5f);
+            }
+        }
+        setSelMask(newSel);
+    }
+
+    /** Apply graph-Laplacian L_U restricted to unknowns. Pure function — safe to call from background thread. */
+    private static float[] applyLaplacian(float[] p, int[] unknownIdx, float[] rightW, float[] downW,
+                                           int numUnknown, int gW, int gxMin, int gxMax, int gyMin, int gyMax) {
+        float[] result = new float[numUnknown];
+        for (int gy = gyMin; gy <= gyMax; gy++) {
+            for (int gx = gxMin; gx <= gxMax; gx++) {
+                int i = gx + gy * gW;
+                int k = unknownIdx[i];
+                if (k < 0) continue;
+                float diag = 0f;
+                if (gx < gxMax) { float w=rightW[i];      diag+=w; int kj=unknownIdx[i+1];   if(kj>=0) result[k]-=w*p[kj]; }
+                if (gx > gxMin) { float w=rightW[i-1];    diag+=w; int kj=unknownIdx[i-1];   if(kj>=0) result[k]-=w*p[kj]; }
+                if (gy < gyMax) { float w=downW[i];        diag+=w; int kj=unknownIdx[i+gW];  if(kj>=0) result[k]-=w*p[kj]; }
+                if (gy > gyMin) { float w=downW[i-gW];     diag+=w; int kj=unknownIdx[i-gW];  if(kj>=0) result[k]-=w*p[kj]; }
+                result[k] += diag * p[k];
+            }
+        }
+        return result;
+    }
+
+    private static float dot(float[] a, float[] b) {
+        float s = 0f;
+        for (int i = 0; i < a.length; i++) s += a[i] * b[i];
+        return s;
+    }
+
+    private static void addScaled(float[] a, float alpha, float[] b) {
+        for (int i = 0; i < a.length; i++) a[i] += alpha * b[i];
+    }
+
     private boolean[] computeWandRegion(int startGx, int startGy) {
         int target = getGlobalPixel(startGx, startGy);
         float[] targetOklab = fillTolerance > 0f ? getMapColorOklab(target) : null;
@@ -2247,27 +2629,32 @@ public class MapEditorScreen extends Screen {
     private void addWandRegionAt(int gx, int gy) {
         if (!inMapBounds(gx, gy)) return;
         if (!multiTileMode && !inActiveTile(gx, gy)) return;
-        int si = selIdx(gx, gy);
-        if (selMask != null && selMask[si]) return; // already covered
         boolean[] region = computeWandRegion(gx, gy);
-        if (selMask == null) selMask = new boolean[selSize()];
-        for (int i = 0; i < region.length; i++) if (region[i]) selMask[i] = true;
+        if (!selSubtract) {
+            if (selMask == null) selMask = new boolean[selSize()];
+            for (int i = 0; i < region.length; i++) if (region[i]) selMask[i] = true;
+        } else {
+            if (selMask == null) return;
+            for (int i = 0; i < region.length; i++) if (region[i]) selMask[i] = false;
+        }
     }
 
     private void renderWandPreview(DrawContext ctx) {
         if (wandPreview == null || wandDragging) return;
+        boolean subMode = hasShiftDown();
         int gW = gridW(), gH = gridH();
         int canvasH = height - STATUS_H;
         for (int gy = 0; gy < gH; gy++) {
             for (int gx = 0; gx < gW; gx++) {
                 int idx = selIdx(gx, gy);
                 if (!wandPreview[idx]) continue;
-                if (selMask != null && selMask[idx]) continue;
                 if (!multiTileMode && !inActiveTile(gx, gy)) continue;
+                if (!subMode && selMask != null && selMask[idx]) continue; // add: skip already-selected
+                if (subMode && (selMask == null || !selMask[idx])) continue; // subtract: skip unselected
                 int sx = (int)(translateX + gx * scale);
                 int sy = (int)(translateY + gy * scale);
                 if (sx >= width - PANEL_W || sy >= canvasH || sx + scale <= GUIDE_W || sy + scale <= 0) continue;
-                ctx.fill(sx, sy, sx + scale, sy + scale, 0x500088FF);
+                ctx.fill(sx, sy, sx + scale, sy + scale, subMode ? 0x50FF4400 : 0x500088FF);
             }
         }
     }
@@ -2309,7 +2696,19 @@ public class MapEditorScreen extends Screen {
             for (int gx = 0; gx < gridW(); gx++)
                 if (path.contains(gx + 0.5, gy + 0.5))
                     newMask[selIdx(gx, gy)] = true;
-        setSelMask(newMask);
+        if (!selSubtract) {
+            if (selMask != null) {
+                boolean[] combined = selMask.clone();
+                for (int i = 0; i < newMask.length; i++) if (newMask[i]) combined[i] = true;
+                setSelMask(combined);
+            } else {
+                setSelMask(newMask);
+            }
+        } else if (selMask != null) {
+            boolean[] combined = selMask.clone();
+            for (int i = 0; i < newMask.length; i++) if (newMask[i]) combined[i] = false;
+            setSelMask(combined);
+        }
         lassoPoints = null;
     }
 
@@ -2750,6 +3149,37 @@ public class MapEditorScreen extends Screen {
         return new MergeScope[]{MergeScope.FRAME};
     }
 
+    /**
+     * Adds (without toggling) the color at the given screen position to mergeSources.
+     * Used by Ctrl+drag on both the canvas and the palette panel.
+     */
+    private void pickMergeColorAt(double mouseX, double mouseY) {
+        int panelX = width - PANEL_W;
+        if ((int) mouseX >= panelX) {
+            int relX = (int) mouseX - panelX, relY = (int) mouseY;
+            if (relY >= 68 && relY < 82 && relX >= 2 && relX < 2 + SWATCH_SZ + 18) {
+                mergeSources.add(0);
+                return;
+            }
+            if (relY >= SWATCHES_START_Y) {
+                int[] palette  = activePaletteColors();
+                int[][] layout = buildPaletteLayout(palette);
+                int visRow = (relY - SWATCHES_START_Y) / SWATCH_STRIDE;
+                int absRow = visRow + paletteScrollRow;
+                int col    = (relX - PANEL_MARGIN) / SWATCH_STRIDE;
+                if (col >= 0 && col < SWATCHES_PER_ROW)
+                    for (int li = 0; li < layout.length; li++)
+                        if (layout[li][0] == absRow && layout[li][1] == col) {
+                            mergeSources.add(palette[li]);
+                            return;
+                        }
+            }
+            return;
+        }
+        if (inMapBounds(hoverMapX, hoverMapY))
+            mergeSources.add(getGlobalPixel(hoverMapX, hoverMapY));
+    }
+
     /** Applies the pending merge to one frame. Respects selMask only for the active frame. */
     private int applyMergeToFrame(byte[] frame, boolean respectSel) {
         int replaced = 0;
@@ -2974,17 +3404,6 @@ public class MapEditorScreen extends Screen {
                 frame[idx] = (byte) bestColor;
             }
         }
-    }
-
-    // ── Re-encode on close ───────────────────────────────────────────────
-
-    private void reEncode() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client.player == null || PayloadState.tiles.isEmpty()) return;
-        String playerName = client.player.getGameProfile().getName();
-        net.zerohpminecraft.command.LoominaryCommand.saveEditorChanges(allFrames, frameDelayMs, tileIndex, playerName);
-        System.out.println("[Loominary] Editor: saved changes for " + tileLabel
-                + (totalFrames > 1 ? " (" + totalFrames + " frames)" : ""));
     }
 
     // ── Palette helpers ──────────────────────────────────────────────────
@@ -3341,6 +3760,7 @@ public class MapEditorScreen extends Screen {
         mapColors   = allFrames[newFrame];
         history.clear();
         inPreview = false; previewColors = null; previewSelMask = null; allTilePreviewColors = null; cachedRequantizeSrc = null;
+        segSolverVersion.incrementAndGet(); // cancel any in-flight solve — pixels have changed
         // Sync requantize source frame from provenance for this new editor frame.
         if (!PayloadState.tiles.isEmpty() && tileIndex < PayloadState.tiles.size()) {
             List<Integer> src = PayloadState.tiles.get(tileIndex).frameSourceIndices;
@@ -3348,6 +3768,12 @@ public class MapEditorScreen extends Screen {
                 requantizeSourceFrame = src.get(newFrame);
         }
         rebuildTileColors();
+        // In segmentation mode, restore template into seeds and auto-run on the new frame's pixels.
+        if (currentTool == Tool.SEGMENTATION && segSeedsTemplate != null && !segHasBothTypes()) {
+            segSeeds = segSeedsTemplate.clone();
+            ensureSegSeeds();
+            if (segHasBothTypes()) runRandomWalker();
+        }
     }
 
     /** Updates cachedRequantizeSrc from cachedGifFrames at the current requantizeSourceFrame. */

@@ -18,17 +18,25 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(value = MapRenderer.class, priority = 1500)
 public abstract class MapRendererMixin {
 
+    // Track whether THIS call to update() temporarily unlocked a map.
+    // Without this, the RETURN inject would lock unlocked maps (breaking animation/toggle).
+    private static final ThreadLocal<Boolean> wasUnlocked = ThreadLocal.withInitial(() -> false);
+
     @Inject(method = "update", at = @At("HEAD"))
     private void unlockForLoominary(MapIdComponent mapId, MapState mapState, MapRenderState renderState, CallbackInfo ci) {
         if (MapBannerDecoder.isClaimed(mapId.id()) && mapState.locked) {
             ((MapStateAccessor) mapState).setLocked(false);
+            wasUnlocked.set(true);
+        } else {
+            wasUnlocked.set(false);
         }
     }
 
     @Inject(method = "update", at = @At("RETURN"))
     private void relockAfterUpdate(MapIdComponent mapId, MapState mapState, MapRenderState renderState, CallbackInfo ci) {
-        if (MapBannerDecoder.isClaimed(mapId.id())) {
+        if (wasUnlocked.get()) {
             ((MapStateAccessor) mapState).setLocked(true);
+            wasUnlocked.set(false);
         }
     }
 }

@@ -1,5 +1,6 @@
 package net.zerohpminecraft.mixin;
 
+import net.minecraft.client.render.MapRenderState;
 import net.minecraft.client.render.MapRenderer;
 import net.minecraft.component.type.MapIdComponent;
 import net.minecraft.item.map.MapState;
@@ -17,15 +18,15 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(value = MapRenderer.class, priority = 1500)
 public abstract class MapRendererMixin {
 
-    @Inject(method = "updateTexture", at = @At("HEAD"))
-    private void unlockForLoominary(MapIdComponent mapId, MapState mapState, CallbackInfo ci) {
+    @Inject(method = "update", at = @At("HEAD"))
+    private void unlockForLoominary(MapIdComponent mapId, MapState mapState, MapRenderState renderState, CallbackInfo ci) {
         if (MapBannerDecoder.isClaimed(mapId.id()) && mapState.locked) {
             ((MapStateAccessor) mapState).setLocked(false);
         }
     }
 
-    @Inject(method = "updateTexture", at = @At("RETURN"))
-    private void relockAfterUpdate(MapIdComponent mapId, MapState mapState, CallbackInfo ci) {
+    @Inject(method = "update", at = @At("RETURN"))
+    private void relockAfterUpdate(MapIdComponent mapId, MapState mapState, MapRenderState renderState, CallbackInfo ci) {
         if (MapBannerDecoder.isClaimed(mapId.id())) {
             ((MapStateAccessor) mapState).setLocked(true);
         }

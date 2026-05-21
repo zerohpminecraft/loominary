@@ -5,6 +5,7 @@
   "client": [
     "AnvilScreenAccessor",
     "AnvilScreenHandlerAccessor",
+    "MapRendererMixin",
     "MapStateAccessor"
   ],
   "injectors": {

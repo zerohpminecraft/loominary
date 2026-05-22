@@ -11,6 +11,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 There are currently no tests. The CI workflow (`.github/workflows/build.yml`) only runs `./gradlew build`.
 
+## Release process
+
+1. Write release notes and add them to the **top** of `CHANGELOG.md` (see that file for style)
+2. Bump `mod_version` in `gradle.properties` to match the new tag
+3. Run `./gradlew build` — must pass cleanly
+4. Commit both files: `git commit -m "v<version>: <summary>"`
+5. Tag: `git tag v<version>`
+6. Push: `git push origin master && git push origin v<version>`
+
 ## Stack
 
 - Fabric mod loader, Minecraft 1.21.4, Java 21, Gradle

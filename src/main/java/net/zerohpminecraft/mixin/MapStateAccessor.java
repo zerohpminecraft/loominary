@@ -3,6 +3,7 @@ package net.zerohpminecraft.mixin;
 import net.minecraft.item.map.MapDecoration;
 import net.minecraft.item.map.MapState;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.gen.Accessor;
 
 import java.util.Map;
@@ -11,4 +12,8 @@ import java.util.Map;
 public interface MapStateAccessor {
     @Accessor("decorations")
     Map<String, MapDecoration> getDecorations();
+
+    @Mutable
+    @Accessor("locked")
+    void setLocked(boolean locked);
 }

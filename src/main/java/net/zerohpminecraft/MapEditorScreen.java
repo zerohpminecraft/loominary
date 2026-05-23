@@ -82,6 +82,13 @@ public class MapEditorScreen extends Screen {
             r -> { Thread t = new Thread(r, "loominary-seg"); t.setDaemon(true); return t; },
             new ThreadPoolExecutor.DiscardOldestPolicy());
 
+    // Single background thread for requantize preview and filter; same stale-task pattern.
+    private static final ThreadPoolExecutor EDITOR_EXECUTOR = new ThreadPoolExecutor(
+            1, 1, 60L, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(1),
+            r -> { Thread t = new Thread(r, "loominary-editor"); t.setDaemon(true); return t; },
+            new ThreadPoolExecutor.DiscardOldestPolicy());
+
     // ── Minimap constants ────────────────────────────────────────────────
     private static final int THUMB_SZ        = 32;   // px per thumbnail
     private static final int MINI_GAP        = 4;    // gap between thumbnails
@@ -163,7 +170,9 @@ public class MapEditorScreen extends Screen {
     private float         segBeta          = 30f;
     private int           segBrushRadius   = 5;
     private byte          segSeedType      = 2;   // type being painted in current stroke
-    private final AtomicInteger segSolverVersion = new AtomicInteger(0);
+    private final AtomicInteger segSolverVersion  = new AtomicInteger(0);
+    private final AtomicInteger editorTaskVersion = new AtomicInteger(0);
+    private boolean editorComputing = false; // true while requantize/filter bg task is running
 
     // Palette swatch hover highlight (-1 = none)
     private int paletteHoverColor = -1;
@@ -1442,6 +1451,8 @@ public class MapEditorScreen extends Screen {
         wandPreviewTolerance = -1f;
         segSeeds             = null;
         segSolverVersion.incrementAndGet();
+        editorTaskVersion.incrementAndGet();
+        editorComputing      = false;
 
         if (!multiTileMode) centerMap(); // recenter viewport on the newly active tile
         rebuildTileColors();
@@ -1457,8 +1468,16 @@ public class MapEditorScreen extends Screen {
             String previewLabel = pendingGridResult != null
                     ? "§e[GRID PREVIEW]§r  Enter=apply all " + PayloadState.tiles.size()
                             + " tiles  §8Esc=cancel"
-                    : "§e[PREVIEW]§r  Enter=apply  §8Esc=cancel";
+                    : (editorComputing
+                            ? "§e[PREVIEW]§r  §8⟳ Computing...  Esc=cancel"
+                            : "§e[PREVIEW]§r  Enter=apply  §8Esc=cancel");
             ctx.drawTextWithShadow(textRenderer, Text.literal(previewLabel), 4, barY + 3, 0xFFFFFF);
+            return;
+        }
+
+        if (editorComputing) {
+            ctx.drawTextWithShadow(textRenderer,
+                    Text.literal("§e⟳ Applying filter...§r  §8Esc=cancel"), 4, barY + 3, 0xFFFFFF);
             return;
         }
 
@@ -1612,7 +1631,7 @@ public class MapEditorScreen extends Screen {
             else inPasteMode = false;
             return true;
         }
-        if (inPreview) return true;
+        if (inPreview || editorComputing) return true;
         int panelX = width - PANEL_W;
 
         // ── Minimap: intercept left-clicks on tile thumbnails ────────────
@@ -1856,7 +1875,7 @@ public class MapEditorScreen extends Screen {
     @Override
     public boolean mouseReleased(double mouseX, double mouseY, int button) {
         if (inPasteMode) return true;
-        if (inPreview) return true;
+        if (inPreview || editorComputing) return true;
         if (button == 0 || (button == 1 && (currentTool == Tool.DITHER_BRUSH || currentTool == Tool.SEGMENTATION))) {
             if (mergeStroking) { mergeStroking = false; return true; }
             if (stroking) {
@@ -1883,7 +1902,7 @@ public class MapEditorScreen extends Screen {
     public boolean mouseDragged(double mouseX, double mouseY, int button,
                                  double dX, double dY) {
         if (inPasteMode) return true;
-        if (inPreview) return true;
+        if (inPreview || editorComputing) return true;
         if (button == 0) {
             if (mergeStroking) { pickMergeColorAt(mouseX, mouseY); return true; }
             if (selecting && inMapBounds(hoverMapX, hoverMapY)) {
@@ -1950,6 +1969,7 @@ public class MapEditorScreen extends Screen {
                     || keyCode == GLFW.GLFW_KEY_Y) {
                 commitPreview();
             } else if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+                editorTaskVersion.incrementAndGet(); editorComputing = false;
                 pendingGridResult = null;
                 inPreview = false; previewColors = null; previewSelMask = null; allTilePreviewColors = null; cachedRequantizeSrc = null;
             } else if (keyCode == GLFW.GLFW_KEY_D) {
@@ -2041,8 +2061,9 @@ public class MapEditorScreen extends Screen {
             return true;
         }
 
-        // Escape: cancel paste → clear merge sources → clear seg seeds → cancel lasso → deselect → close (saves)
+        // Escape: cancel paste → cancel bg compute → clear merge sources → clear seg seeds → cancel lasso → deselect → close (saves)
         if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+            if (editorComputing) { editorTaskVersion.incrementAndGet(); editorComputing = false; setStatusMsg("Cancelled."); return true; }
             if (!mergeSources.isEmpty()) { mergeSources.clear(); return true; }
             if (segSeeds != null) { segSeeds = null; return true; }
             if (lassoPoints != null) { lassoPoints = null; return true; }
@@ -2766,8 +2787,9 @@ public class MapEditorScreen extends Screen {
         if (!Files.exists(sourcePath)) {
             setStatusMsg("Source not found: loominary_data/" + fname); return;
         }
+        // I/O stays on the main thread; only the pixel crunch is backgrounded
+        BufferedImage src;
         try {
-            BufferedImage src;
             if (totalFrames > 1 && fname.toLowerCase().endsWith(".gif")) {
                 if (cachedGifFrames == null)
                     cachedGifFrames = PngToMapColors.coalesceGifFrames(sourcePath);
@@ -2778,20 +2800,52 @@ public class MapEditorScreen extends Screen {
                 src = cachedRequantizeSrc;
             }
             if (src == null) { setStatusMsg("Could not decode source image"); return; }
-            boolean legalOnly = !PayloadState.allShades;
-            byte[][] result = PngToMapColors.convertTwoPassGrid(
-                    withChromaBoost(src), legalOnly, 0, true,
-                    PayloadState.gridColumns, PayloadState.gridRows);
-            pendingGridResult     = result;
-            previewColors        = result[tileIndex].clone();
-            previewSelMask       = null;
-            allTilePreviewColors = new byte[result.length][];
-            for (int i = 0; i < result.length; i++)
-                if (i != tileIndex) allTilePreviewColors[i] = result[i].clone();
-            inPreview            = true;
         } catch (Exception e) {
             setStatusMsg("Grid requantize failed: " + e.getMessage());
+            return;
         }
+
+        final BufferedImage srcSnap  = src;
+        final float  chromaSnap      = chromaBoost;
+        final boolean legalOnly      = !PayloadState.allShades;
+        final int gridCols           = PayloadState.gridColumns;
+        final int gridRows           = PayloadState.gridRows;
+        final int tiSnap             = tileIndex;
+        final int myVersion          = editorTaskVersion.incrementAndGet();
+        final MinecraftClient mc     = MinecraftClient.getInstance();
+
+        inPreview         = true;
+        previewColors     = null;          // not ready yet
+        pendingGridResult = new byte[0][]; // sentinel: blocks refreshRequantizePreview during compute
+        editorComputing   = true;
+
+        EDITOR_EXECUTOR.submit(() -> {
+            byte[][] result;
+            try {
+                BufferedImage boosted = chromaSnap != 1f ? PngToMapColors.boostChroma(srcSnap, chromaSnap) : srcSnap;
+                result = PngToMapColors.convertTwoPassGrid(boosted, legalOnly, 0, true, gridCols, gridRows);
+            } catch (Exception e) {
+                mc.execute(() -> {
+                    if (editorTaskVersion.get() != myVersion) return;
+                    inPreview = false; editorComputing = false;
+                    setStatusMsg("Grid requantize failed: " + e.getMessage());
+                });
+                return;
+            }
+            if (editorTaskVersion.get() != myVersion) return;
+            final byte[][] resultF = result;
+            mc.execute(() -> {
+                if (mc.currentScreen != MapEditorScreen.this) return;
+                if (editorTaskVersion.get() != myVersion) return;
+                pendingGridResult    = resultF;
+                previewColors        = resultF[tiSnap].clone();
+                previewSelMask       = null;
+                allTilePreviewColors = new byte[resultF.length][];
+                for (int i = 0; i < resultF.length; i++)
+                    if (i != tiSnap) allTilePreviewColors[i] = resultF[i].clone();
+                editorComputing = false;
+            });
+        });
     }
 
     private void refreshRequantizePreview() {
@@ -2801,167 +2855,123 @@ public class MapEditorScreen extends Screen {
     }
 
     private void computeRequantizePreview() {
-        // Active tile preview
-        byte[] fullTile = computeRequantizeTile(tileIndex, cachedRequantizeSrc);
-        byte[] preview  = mapColors.clone();
-        boolean[] pMask = null;
-        if (selMask != null) {
-            pMask = selMask.clone();
-            for (int i = 0; i < MAP_BYTES; i++)
-                if (selMaskAt(i)) preview[i] = fullTile[i];
-        } else {
-            System.arraycopy(fullTile, 0, preview, 0, MAP_BYTES);
-        }
-        previewColors  = preview;
-        previewSelMask = pMask;
+        final BufferedImage srcSnap = cachedRequantizeSrc;
+        if (srcSnap == null) return;
 
-        // Non-active tile previews in multi-tile mode
-        allTilePreviewColors = null;
-        if (multiTileMode && allTileFrames != null) {
-            int numTiles = PayloadState.tiles.size();
-            // For standard cross-tile FS, run convertTwoPassGrid once rather than per-tile
-            byte[][] gridResult = null;
-            if (editorDitherAlgo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && !requantizeTilePalette
-                    && matchMetric == PngToMapColors.MatchMetric.OKLAB
-                    && !(useCustomMask && ditherMask != null)) {
-                try {
-                    boolean legalOnly = !PayloadState.allShades;
-                    gridResult = PngToMapColors.convertTwoPassGrid(
-                            withChromaBoost(cachedRequantizeSrc), legalOnly, 0, true,
-                            PayloadState.gridColumns, PayloadState.gridRows);
-                } catch (Exception ignored) {}
-            }
-            allTilePreviewColors = new byte[numTiles][];
-            int crossCount = 0;
+        // Snapshot all mutable state needed by the background computation
+        final int tiSnap      = tileIndex;
+        final int frameSnap   = activeFrame;
+        final byte[] pixSnap  = mapColors.clone();
+        final boolean[] globalSelSnap  = selMask != null ? selMask.clone() : null;
+        final boolean[] activeSelLocal = selMask != null ? localSelMask() : null; // MAP_BYTES local mask
+        final boolean multiSnap = multiTileMode;
+        final int numTiles = PayloadState.tiles.size();
+
+        // Snapshot per-tile frames needed for cross-tile preview
+        byte[][] tileFrameSnaps   = null; // [ti] → frame snapshot (for palette restriction)
+        byte[][] tileCurrentSnaps = null; // [ti] → frame snapshot (for blending base)
+        boolean[][] tileSelSnaps  = null; // [ti] → local sel mask
+        int crossCount = 0;
+        if (multiSnap && allTileFrames != null) {
+            tileFrameSnaps   = new byte[numTiles][];
+            tileCurrentSnaps = new byte[numTiles][];
+            tileSelSnaps     = new boolean[numTiles][];
             for (int i = 0; i < numTiles; i++) {
-                if (i == tileIndex || i >= allTileFrames.length || allTileFrames[i] == null) continue;
+                if (i == tiSnap || i >= allTileFrames.length || allTileFrames[i] == null) continue;
                 boolean[] ts = (selMask != null) ? localSelMaskForTile(i) : null;
-                if (selMask != null && ts == null) continue;  // selection exists but not on this tile
-                try {
-                    byte[] tileResult = (gridResult != null) ? gridResult[i]
-                            : computeRequantizeTile(i, cachedRequantizeSrc);
-                    int f = Math.min(activeFrame, allTileFrames[i].length - 1);
-                    byte[] tilePreview = allTileFrames[i][f].clone();
-                    if (ts != null) {
-                        for (int j = 0; j < MAP_BYTES; j++) if (ts[j]) tilePreview[j] = tileResult[j];
-                    } else {
-                        System.arraycopy(tileResult, 0, tilePreview, 0, MAP_BYTES);
-                    }
-                    allTilePreviewColors[i] = tilePreview;
-                    crossCount++;
-                } catch (Exception ignored) {}
+                if (selMask != null && ts == null) continue;
+                int f = Math.min(frameSnap, allTileFrames[i].length - 1);
+                tileFrameSnaps[i]   = allTileFrames[i][f].clone();
+                tileCurrentSnaps[i] = allTileFrames[i][f].clone();
+                tileSelSnaps[i]     = ts;
+                crossCount++;
             }
-            if (crossCount > 0)
-                setStatusMsg("Preview: " + (crossCount + 1) + " tiles — Enter to commit.");
         }
-    }
+        final byte[][] tileFrameSnapsF   = tileFrameSnaps;
+        final byte[][] tileCurrentSnapsF = tileCurrentSnaps;
+        final boolean[][] tileSelSnapsF  = tileSelSnaps;
+        final int crossCountF            = crossCount;
 
-    private BufferedImage withChromaBoost(BufferedImage src) {
-        return chromaBoost != 1.0f ? PngToMapColors.boostChroma(src, chromaBoost) : src;
-    }
+        final ReqParams params = new ReqParams(
+                chromaBoost, fsErrorStrength, atkErrorStrength, bayerScale,
+                !PayloadState.allShades, requantizeTilePalette,
+                useCustomMask && ditherMask != null,
+                editorDitherAlgo, matchMetric,
+                tiSnap, PayloadState.gridColumns, PayloadState.gridRows,
+                pixSnap, globalSelSnap,
+                (useCustomMask && ditherMask != null) ? ditherMask.clone() : null,
+                tileFrameSnapsF);
 
-    /** Compute requantize result for tile `ti` (pass tileIndex for the active tile). */
-    private byte[] computeRequantizeTile(int ti, BufferedImage src) {
-        src = withChromaBoost(src);
-        boolean legalOnly = !PayloadState.allShades;
-        PngToMapColors.DitherAlgo algo = editorDitherAlgo;
+        final int myVersion = editorTaskVersion.incrementAndGet();
+        final MinecraftClient mc = MinecraftClient.getInstance();
+        editorComputing = true;
 
-        // Custom-mask FS: painted dither mask applies to active tile; uniform mask for others
-        if (algo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && useCustomMask && ditherMask != null) {
-            float[] strengthMap = (ti == tileIndex) ? ditherMask : new float[MAP_BYTES];
-            if (ti != tileIndex) Arrays.fill(strengthMap, 1.0f);
-            return requantizePerTile(ti, src, strengthMap, fsErrorStrength);
-        }
-
-        // Standard cross-tile FS: uses Otsu strength map and cross-seam propagation
-        if (algo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && !requantizeTilePalette
-                && matchMetric == PngToMapColors.MatchMetric.OKLAB) {
-            byte[][] tiles = PngToMapColors.convertTwoPassGrid(
-                    src, legalOnly, 0, true, PayloadState.gridColumns, PayloadState.gridRows);
-            return tiles[ti];
-        }
-
-        // Per-tile path for NONE, ATKINSON, BAYER_4X4, FS+tile-palette, and non-OKLAB metrics
-        int totalW = PayloadState.gridColumns * MAP_SIZE;
-        int totalH = PayloadState.gridRows * MAP_SIZE;
-        BufferedImage scaledFull = PngToMapColors.scale(src, totalW, totalH);
-        int tileCol = PayloadState.tileCol(ti);
-        int tileRow = PayloadState.tileRow(ti);
-        BufferedImage tileImg = scaledFull.getSubimage(
-                tileCol * MAP_SIZE, tileRow * MAP_SIZE, MAP_SIZE, MAP_SIZE);
-        float[][] oklabLookup = PngToMapColors.buildOklabLookup();
-        float[][] rgbLookup = (matchMetric == PngToMapColors.MatchMetric.RGB)
-                ? PngToMapColors.buildLinearRgbLookup() : null;
-
-        // Pass 1: nearest-color (OKLAB) to establish source-derived palette
-        byte[] firstPass = new byte[MAP_BYTES];
-        for (int y = 0; y < MAP_SIZE; y++)
-            for (int x = 0; x < MAP_SIZE; x++)
-                firstPass[x + y * MAP_SIZE] = PngToMapColors.findClosestMapColorByte(
-                        tileImg.getRGB(x, y), legalOnly, oklabLookup);
-
-        // For tile palette: restrict to colors currently selected in that tile's frame
-        byte[] tileFrame = (ti == tileIndex) ? mapColors
-                : (allTileFrames != null && ti < allTileFrames.length && allTileFrames[ti] != null)
-                  ? allTileFrames[ti][Math.min(activeFrame, allTileFrames[ti].length - 1)]
-                  : firstPass;
-        boolean[] palette = requantizeTilePalette
-                ? PngToMapColors.buildPalette(selectionFilteredColors(tileFrame, localSelMaskForTile(ti)))
-                : PngToMapColors.buildPalette(firstPass);
-
-        return switch (algo) {
-            case NONE -> {
-                if (matchMetric == PngToMapColors.MatchMetric.OKLAB && !requantizeTilePalette) yield firstPass;
-                byte[] out = new byte[MAP_BYTES];
-                float[] palHues = matchMetric == PngToMapColors.MatchMetric.HUE_ONLY
-                        ? PngToMapColors.buildPaletteHues(palette, oklabLookup) : null;
-                for (int y = 0; y < MAP_SIZE; y++)
-                    for (int x = 0; x < MAP_SIZE; x++) {
-                        int argb = tileImg.getRGB(x, y);
-                        if (((argb >>> 24) & 0xFF) < 128) { out[x + y * MAP_SIZE] = 0; continue; }
-                        float[] lab = PngToMapColors.rgbToOklab(argb);
-                        out[x + y * MAP_SIZE] = PngToMapColors.findClosestInPalette(
-                                lab[0], lab[1], lab[2], palette, oklabLookup, matchMetric, rgbLookup, palHues);
-                    }
-                yield out;
+        EDITOR_EXECUTOR.submit(() -> {
+            // Active tile
+            byte[] fullTile;
+            try { fullTile = computeTileS(tiSnap, srcSnap, params); }
+            catch (Exception e) {
+                mc.execute(() -> {
+                    if (editorTaskVersion.get() != myVersion) return;
+                    editorComputing = false;
+                    setStatusMsg("Preview failed: " + e.getMessage());
+                });
+                return;
             }
-            case FLOYD_STEINBERG -> {
-                float[] flat = new float[MAP_BYTES];
-                Arrays.fill(flat, 1.0f);
-                yield PngToMapColors.renderDithered(tileImg, palette, oklabLookup, flat, MAP_SIZE, MAP_SIZE,
-                        fsErrorStrength, matchMetric, rgbLookup);
+            byte[] preview = pixSnap.clone();
+            if (activeSelLocal != null) {
+                for (int i = 0; i < MAP_BYTES; i++) if (activeSelLocal[i]) preview[i] = fullTile[i];
+            } else {
+                System.arraycopy(fullTile, 0, preview, 0, MAP_BYTES);
             }
-            case ATKINSON -> PngToMapColors.renderAtkinson(tileImg, palette, oklabLookup, MAP_SIZE, MAP_SIZE,
-                    matchMetric, rgbLookup, atkErrorStrength);
-            case BAYER_4X4 -> PngToMapColors.renderBayer4x4(tileImg, palette, oklabLookup, MAP_SIZE, MAP_SIZE,
-                    matchMetric, rgbLookup, bayerScale);
-        };
-    }
 
-    /** Per-tile FS path with explicit dither-strength array and error diffusion scalar. */
-    private byte[] requantizePerTile(int ti, BufferedImage src, float[] strengthMap, float diffuseAmount) {
-        int totalW = PayloadState.gridColumns * MAP_SIZE;
-        int totalH = PayloadState.gridRows * MAP_SIZE;
-        BufferedImage scaledFull = PngToMapColors.scale(src, totalW, totalH);
-        int tileCol = PayloadState.tileCol(ti);
-        int tileRow = PayloadState.tileRow(ti);
-        BufferedImage tileImg = scaledFull.getSubimage(
-                tileCol * MAP_SIZE, tileRow * MAP_SIZE, MAP_SIZE, MAP_SIZE);
-        float[][] oklabLookup = PngToMapColors.buildOklabLookup();
-        boolean legalOnly = !PayloadState.allShades;
-        byte[] firstPass = new byte[MAP_BYTES];
-        for (int y = 0; y < MAP_SIZE; y++)
-            for (int x = 0; x < MAP_SIZE; x++)
-                firstPass[x + y * MAP_SIZE] = PngToMapColors.findClosestMapColorByte(
-                        tileImg.getRGB(x, y), legalOnly, oklabLookup);
-        byte[] tileFrame = (ti == tileIndex) ? mapColors
-                : (allTileFrames != null && ti < allTileFrames.length && allTileFrames[ti] != null)
-                  ? allTileFrames[ti][Math.min(activeFrame, allTileFrames[ti].length - 1)]
-                  : firstPass;
-        boolean[] palette = requantizeTilePalette
-                ? PngToMapColors.buildPalette(selectionFilteredColors(tileFrame, localSelMaskForTile(ti)))
-                : PngToMapColors.buildPalette(firstPass);
-        return PngToMapColors.renderDithered(tileImg, palette, oklabLookup, strengthMap, MAP_SIZE, MAP_SIZE, diffuseAmount);
+            // Cross-tile previews
+            byte[][] crossPreviews = null;
+            if (multiSnap && tileCurrentSnapsF != null) {
+                byte[][] gridResult = null;
+                if (params.algo() == PngToMapColors.DitherAlgo.FLOYD_STEINBERG
+                        && !params.tilePalette() && params.metric() == PngToMapColors.MatchMetric.OKLAB
+                        && !params.useCustomDither()) {
+                    try {
+                        BufferedImage boosted = params.chromaBoost() != 1f
+                                ? PngToMapColors.boostChroma(srcSnap, params.chromaBoost()) : srcSnap;
+                        gridResult = PngToMapColors.convertTwoPassGrid(
+                                boosted, params.legalOnly(), 0, true, params.gridCols(), params.gridRows());
+                    } catch (Exception ignored) {}
+                }
+                crossPreviews = new byte[numTiles][];
+                for (int i = 0; i < numTiles; i++) {
+                    if (tileCurrentSnapsF[i] == null) continue;
+                    try {
+                        byte[] tileResult = (gridResult != null) ? gridResult[i]
+                                : computeTileS(i, srcSnap, params);
+                        boolean[] ts = tileSelSnapsF[i];
+                        byte[] tilePreview = tileCurrentSnapsF[i]; // already cloned
+                        if (ts != null) {
+                            for (int j = 0; j < MAP_BYTES; j++) if (ts[j]) tilePreview[j] = tileResult[j];
+                        } else {
+                            System.arraycopy(tileResult, 0, tilePreview, 0, MAP_BYTES);
+                        }
+                        crossPreviews[i] = tilePreview;
+                    } catch (Exception ignored) {}
+                }
+            }
+
+            if (editorTaskVersion.get() != myVersion) return;
+
+            final byte[] previewF = preview;
+            final byte[][] crossF = crossPreviews;
+            mc.execute(() -> {
+                if (mc.currentScreen != MapEditorScreen.this) return;
+                if (editorTaskVersion.get() != myVersion) return;
+                previewColors        = previewF;
+                previewSelMask       = globalSelSnap != null ? globalSelSnap.clone() : null;
+                allTilePreviewColors = crossF;
+                editorComputing      = false;
+                if (crossCountF > 0)
+                    setStatusMsg("Preview: " + (crossCountF + 1) + " tiles — Enter to commit.");
+            });
+        });
     }
 
     private void commitPreview() {
@@ -3281,8 +3291,11 @@ public class MapEditorScreen extends Screen {
                     delays = new int[frames.length];
                     Arrays.fill(delays, 100);
                 }
+                boolean[] ts = (selMask != null) ? localSelMaskForTile(i) : null;
+                if (selMask != null && ts == null) continue; // selection active but no pixels in this tile
                 for (byte[] frame : frames) {
                     for (int j = 0; j < MAP_BYTES; j++) {
+                        if (ts != null && !ts[j]) continue;
                         if (mergeSources.contains(frame[j] & 0xFF)) {
                             frame[j] = (byte) activeColor;
                             totalReplaced++;
@@ -3313,16 +3326,15 @@ public class MapEditorScreen extends Screen {
     // ── In-editor filter ────────────────────────────────────────────────
 
     private void applyEditorFilter() {
-        PngToMapColors.FilterParams params = switch (editorFilterType) {
+        PngToMapColors.FilterParams filterParams = switch (editorFilterType) {
             case SMOOTH    -> PngToMapColors.FilterParams.smooth(1.0f);
             case MEDIAN    -> PngToMapColors.FilterParams.median(1);
             case SHARPEN   -> PngToMapColors.FilterParams.sharpen(0.8f);
             case POSTERIZE -> PngToMapColors.FilterParams.posterize(4);
         };
-        float[][] oklabLookup = PngToMapColors.buildOklabLookup();
 
-        // Active tile: candidate colors scoped to selection when active
-        int[] activeCandidates;
+        // Build active-tile candidate set on the main thread (cheap)
+        final int[] activeCandidates;
         if (selMask != null) {
             boolean[] inSel = new boolean[256];
             for (int i = 0; i < MAP_BYTES; i++)
@@ -3332,46 +3344,73 @@ public class MapEditorScreen extends Screen {
             for (int c = 1; c < 256; c++) if (inSel[c]) list.add(c);
             activeCandidates = list.stream().mapToInt(Integer::intValue).toArray();
         } else {
-            activeCandidates = tileColors;
+            activeCandidates = tileColors.clone();
         }
 
-        history.snapshot();
-        applyEditorFilterToFrame(mapColors, selMask != null ? localSelMask() : null,
-                oklabLookup, activeCandidates, params);
-        dirty = true;
+        // Snapshot inputs for the background thread
+        final byte[]    frameSnap     = mapColors.clone();
+        final boolean[] activeSelSnap = selMask != null ? localSelMask() : null;
 
-        int crossTileCount = 0;
+        // Collect cross-tile work up front (still on main thread — just clones)
+        record CrossFilter(int tileIdx, byte[] frame, boolean[] sel, int[] candidates) {}
+        final List<CrossFilter> crossList = new ArrayList<>();
         if (multiTileMode && selMask != null && allTileFrames != null) {
             for (int i = 0; i < PayloadState.tiles.size(); i++) {
                 if (i == tileIndex || i >= allTileFrames.length || allTileFrames[i] == null) continue;
                 boolean[] ts = localSelMaskForTile(i);
                 if (ts == null) continue;
                 byte[] frame = allTileFrames[i][Math.min(activeFrame, allTileFrames[i].length - 1)];
-                // Candidate colors derived from that tile's selected pixels
                 boolean[] inSel2 = new boolean[256];
                 for (int j = 0; j < MAP_BYTES; j++) if (ts[j]) inSel2[frame[j] & 0xFF] = true;
                 inSel2[0] = false;
                 List<Integer> list2 = new ArrayList<>();
                 for (int c = 1; c < 256; c++) if (inSel2[c]) list2.add(c);
                 int[] cands = list2.stream().mapToInt(Integer::intValue).toArray();
-                if (cands.length > 0) {
-                    applyEditorFilterToFrame(frame, ts, oklabLookup, cands, params);
-                    if (tileDirty != null && i < tileDirty.length) tileDirty[i] = true;
-                    crossTileCount++;
-                }
+                if (cands.length > 0) crossList.add(new CrossFilter(i, frame.clone(), ts, cands));
             }
         }
 
-        rebuildTileColors();
-        String scope = selMask != null
-                ? (crossTileCount > 0 ? "cross-tile selection (" + (crossTileCount + 1) + " tiles)" : "selection")
-                : "frame";
-        boolean weakInEditor = editorFilterType == PngToMapColors.FilterParams.FilterType.POSTERIZE
-                || editorFilterType == PngToMapColors.FilterParams.FilterType.SHARPEN;
-        String hint = weakInEditor ? " (use /loominary filter for full effect)" : "";
-        String undoNote = crossTileCount > 0 ? " Ctrl+Z reverts active tile only." : " Ctrl+Z to undo.";
-        setStatusMsg(String.format("Applied %s to %s.%s%s",
-                editorFilterType.name().toLowerCase(), scope, undoNote, hint));
+        history.snapshot(); // captured now so undo restores pre-filter state
+        final int myVersion      = editorTaskVersion.incrementAndGet();
+        final MinecraftClient mc = MinecraftClient.getInstance();
+        final PngToMapColors.FilterParams.FilterType filterType = editorFilterType;
+        editorComputing = true;
+
+        EDITOR_EXECUTOR.submit(() -> {
+            float[][] oklab = PngToMapColors.buildOklabLookup();
+            applyEditorFilterToFrame(frameSnap, activeSelSnap, oklab, activeCandidates, filterParams);
+            for (CrossFilter cf : crossList)
+                applyEditorFilterToFrame(cf.frame(), cf.sel(), oklab, cf.candidates(), filterParams);
+
+            if (editorTaskVersion.get() != myVersion) return;
+
+            mc.execute(() -> {
+                if (mc.currentScreen != MapEditorScreen.this) return;
+                if (editorTaskVersion.get() != myVersion) return;
+                System.arraycopy(frameSnap, 0, mapColors, 0, MAP_BYTES);
+                dirty = true;
+                int crossTileCount = 0;
+                for (CrossFilter cf : crossList) {
+                    if (allTileFrames == null || cf.tileIdx() >= allTileFrames.length
+                            || allTileFrames[cf.tileIdx()] == null) continue;
+                    int f = Math.min(activeFrame, allTileFrames[cf.tileIdx()].length - 1);
+                    System.arraycopy(cf.frame(), 0, allTileFrames[cf.tileIdx()][f], 0, MAP_BYTES);
+                    if (tileDirty != null && cf.tileIdx() < tileDirty.length) tileDirty[cf.tileIdx()] = true;
+                    crossTileCount++;
+                }
+                editorComputing = false;
+                rebuildTileColors();
+                String scope = activeSelSnap != null
+                        ? (crossTileCount > 0 ? "cross-tile selection (" + (crossTileCount + 1) + " tiles)" : "selection")
+                        : "frame";
+                boolean weakInEditor = filterType == PngToMapColors.FilterParams.FilterType.POSTERIZE
+                        || filterType == PngToMapColors.FilterParams.FilterType.SHARPEN;
+                String hint = weakInEditor ? " (use /loominary filter for full effect)" : "";
+                String undoNote = crossTileCount > 0 ? " Ctrl+Z reverts active tile only." : " Ctrl+Z to undo.";
+                setStatusMsg(String.format("Applied %s to %s.%s%s",
+                        filterType.name().toLowerCase(), scope, undoNote, hint));
+            });
+        });
     }
 
     /** Apply spatial filter to one frame, remapping only selected pixels to the given candidate colors. */
@@ -3645,6 +3684,123 @@ public class MapEditorScreen extends Screen {
                 local[lx + ly * MAP_SIZE] = selMask[activeSelIdx(lx, ly)];
         return local;
     }
+    // ── Background-safe requantize helpers ───────────────────────────────
+
+    /** Immutable snapshot of all requantize parameters; safe to hand off to EDITOR_EXECUTOR. */
+    private record ReqParams(
+        float chromaBoost, float fsStrength, float atkStrength, float bayerScale,
+        boolean legalOnly, boolean tilePalette, boolean useCustomDither,
+        PngToMapColors.DitherAlgo algo, PngToMapColors.MatchMetric metric,
+        int activeTileIdx, int gridCols, int gridRows,
+        byte[]   mapColors,   // active tile's frame snapshot
+        boolean[] selMask,    // global selection mask snapshot (null = no selection)
+        float[]  ditherMask,  // active tile's dither mask snapshot (null if not used)
+        byte[][] tileFrames   // per-tile frame snapshots indexed by tile idx (null entries = no data)
+    ) {}
+
+    /** Static equivalent of localSelMaskForTile — safe to call from background threads. */
+    private static boolean[] localSelMaskForTileS(int ti, boolean[] sel, int gridCols) {
+        if (sel == null) return null;
+        int gx0 = PayloadState.tileCol(ti) * MAP_SIZE;
+        int gy0 = PayloadState.tileRow(ti) * MAP_SIZE;
+        int gridW = gridCols * MAP_SIZE;
+        boolean[] local = new boolean[MAP_BYTES];
+        boolean any = false;
+        for (int ly = 0; ly < MAP_SIZE; ly++)
+            for (int lx = 0; lx < MAP_SIZE; lx++)
+                if ((local[lx + ly * MAP_SIZE] = sel[gx0 + lx + (gy0 + ly) * gridW])) any = true;
+        return any ? local : null;
+    }
+
+    /** Pure static version of computeRequantizeTile, reading all state from a ReqParams snapshot. */
+    private static byte[] computeTileS(int ti, BufferedImage src, ReqParams p) {
+        BufferedImage boosted = p.chromaBoost() != 1f ? PngToMapColors.boostChroma(src, p.chromaBoost()) : src;
+        PngToMapColors.DitherAlgo algo = p.algo();
+
+        if (algo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && p.useCustomDither()) {
+            float[] sm = new float[MAP_BYTES];
+            if (ti == p.activeTileIdx() && p.ditherMask() != null) {
+                System.arraycopy(p.ditherMask(), 0, sm, 0, MAP_BYTES);
+            } else {
+                Arrays.fill(sm, 1.0f);
+            }
+            return requantizePerTileS(ti, boosted, sm, p.fsStrength(), p);
+        }
+
+        if (algo == PngToMapColors.DitherAlgo.FLOYD_STEINBERG && !p.tilePalette()
+                && p.metric() == PngToMapColors.MatchMetric.OKLAB) {
+            byte[][] tiles = PngToMapColors.convertTwoPassGrid(
+                    boosted, p.legalOnly(), 0, true, p.gridCols(), p.gridRows());
+            return tiles[ti];
+        }
+
+        BufferedImage scaledFull = PngToMapColors.scale(boosted, p.gridCols() * MAP_SIZE, p.gridRows() * MAP_SIZE);
+        BufferedImage tileImg = scaledFull.getSubimage(
+                PayloadState.tileCol(ti) * MAP_SIZE, PayloadState.tileRow(ti) * MAP_SIZE, MAP_SIZE, MAP_SIZE);
+        float[][] oklab = PngToMapColors.buildOklabLookup();
+        float[][] rgbLut = (p.metric() == PngToMapColors.MatchMetric.RGB)
+                ? PngToMapColors.buildLinearRgbLookup() : null;
+        byte[] firstPass = new byte[MAP_BYTES];
+        for (int y = 0; y < MAP_SIZE; y++)
+            for (int x = 0; x < MAP_SIZE; x++)
+                firstPass[x + y * MAP_SIZE] = PngToMapColors.findClosestMapColorByte(
+                        tileImg.getRGB(x, y), p.legalOnly(), oklab);
+        byte[] tileFrame = (ti == p.activeTileIdx()) ? p.mapColors()
+                : (p.tileFrames() != null && ti < p.tileFrames().length && p.tileFrames()[ti] != null)
+                  ? p.tileFrames()[ti] : firstPass;
+        boolean[] tsm = localSelMaskForTileS(ti, p.selMask(), p.gridCols());
+        boolean[] palette = p.tilePalette()
+                ? PngToMapColors.buildPalette(selectionFilteredColors(tileFrame, tsm))
+                : PngToMapColors.buildPalette(firstPass);
+        return switch (algo) {
+            case NONE -> {
+                if (p.metric() == PngToMapColors.MatchMetric.OKLAB && !p.tilePalette()) yield firstPass;
+                byte[] out = new byte[MAP_BYTES];
+                float[] palHues = p.metric() == PngToMapColors.MatchMetric.HUE_ONLY
+                        ? PngToMapColors.buildPaletteHues(palette, oklab) : null;
+                for (int y = 0; y < MAP_SIZE; y++)
+                    for (int x = 0; x < MAP_SIZE; x++) {
+                        int argb = tileImg.getRGB(x, y);
+                        if (((argb >>> 24) & 0xFF) < 128) { out[x + y * MAP_SIZE] = 0; continue; }
+                        float[] lab = PngToMapColors.rgbToOklab(argb);
+                        out[x + y * MAP_SIZE] = PngToMapColors.findClosestInPalette(
+                                lab[0], lab[1], lab[2], palette, oklab, p.metric(), rgbLut, palHues);
+                    }
+                yield out;
+            }
+            case FLOYD_STEINBERG -> {
+                float[] flat = new float[MAP_BYTES]; Arrays.fill(flat, 1.0f);
+                yield PngToMapColors.renderDithered(tileImg, palette, oklab, flat, MAP_SIZE, MAP_SIZE,
+                        p.fsStrength(), p.metric(), rgbLut);
+            }
+            case ATKINSON -> PngToMapColors.renderAtkinson(tileImg, palette, oklab, MAP_SIZE, MAP_SIZE,
+                    p.metric(), rgbLut, p.atkStrength());
+            case BAYER_4X4 -> PngToMapColors.renderBayer4x4(tileImg, palette, oklab, MAP_SIZE, MAP_SIZE,
+                    p.metric(), rgbLut, p.bayerScale());
+        };
+    }
+
+    /** Pure static version of requantizePerTile — safe to call from background threads. */
+    private static byte[] requantizePerTileS(int ti, BufferedImage src, float[] sm, float diffuse, ReqParams p) {
+        BufferedImage scaledFull = PngToMapColors.scale(src, p.gridCols() * MAP_SIZE, p.gridRows() * MAP_SIZE);
+        BufferedImage tileImg = scaledFull.getSubimage(
+                PayloadState.tileCol(ti) * MAP_SIZE, PayloadState.tileRow(ti) * MAP_SIZE, MAP_SIZE, MAP_SIZE);
+        float[][] oklab = PngToMapColors.buildOklabLookup();
+        byte[] firstPass = new byte[MAP_BYTES];
+        for (int y = 0; y < MAP_SIZE; y++)
+            for (int x = 0; x < MAP_SIZE; x++)
+                firstPass[x + y * MAP_SIZE] = PngToMapColors.findClosestMapColorByte(
+                        tileImg.getRGB(x, y), p.legalOnly(), oklab);
+        byte[] tileFrame = (ti == p.activeTileIdx()) ? p.mapColors()
+                : (p.tileFrames() != null && ti < p.tileFrames().length && p.tileFrames()[ti] != null)
+                  ? p.tileFrames()[ti] : firstPass;
+        boolean[] tsm = localSelMaskForTileS(ti, p.selMask(), p.gridCols());
+        boolean[] palette = p.tilePalette()
+                ? PngToMapColors.buildPalette(selectionFilteredColors(tileFrame, tsm))
+                : PngToMapColors.buildPalette(firstPass);
+        return PngToMapColors.renderDithered(tileImg, palette, oklab, sm, MAP_SIZE, MAP_SIZE, diffuse);
+    }
+
     /** Returns a MAP_BYTES-sized selection slice for tile `ti`, or null if no pixels are selected in that tile. */
     private boolean[] localSelMaskForTile(int ti) {
         if (selMask == null) return null;
@@ -3797,7 +3953,16 @@ public class MapEditorScreen extends Screen {
             if (cachedGifFrames == null)
                 cachedGifFrames = PngToMapColors.coalesceGifFrames(sourcePath);
             BufferedImage src = cachedGifFrames[Math.min(requantizeSourceFrame, cachedGifFrames.length - 1)];
-            byte[] newFrame = computeRequantizeTile(tileIndex, src);
+            ReqParams snap = new ReqParams(
+                    chromaBoost, fsErrorStrength, atkErrorStrength, bayerScale,
+                    !PayloadState.allShades, requantizeTilePalette,
+                    useCustomMask && ditherMask != null,
+                    editorDitherAlgo, matchMetric,
+                    tileIndex, PayloadState.gridColumns, PayloadState.gridRows,
+                    mapColors.clone(), selMask != null ? selMask.clone() : null,
+                    (useCustomMask && ditherMask != null) ? ditherMask.clone() : null,
+                    null);
+            byte[] newFrame = computeTileS(tileIndex, src, snap);
 
             int insertAt = activeFrame + 1;
             byte[][] newFrames  = new byte[totalFrames + 1][];

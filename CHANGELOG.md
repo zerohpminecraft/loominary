@@ -4,6 +4,24 @@
 
 ---
 
+## v1.16.0
+
+### Editor threading
+
+CPU-intensive editor operations (requantize preview, chroma boost, dithering, color interpolation, spatial filter) now run on a dedicated background thread, preventing watchdog crashes on large multi-tile maps. The approach mirrors the segmentation solver: stale-task elimination via a version counter and `DiscardOldestPolicy`, results dispatched back to the render thread via `mc.execute()`.
+
+- **Background compute** — requantize preview, all-tile requantize, and the spatial filter are no longer blocking main-thread operations
+- **Computing indicator** — status bar shows `⟳ Computing...` while a task is in flight
+- **Esc to cancel** — pressing Esc while computing discards the in-flight task immediately
+- **Canvas blocked during compute** — mouse events are ignored while computing to prevent state races
+- **Grid sentinel fix** — changing dither/metric parameters (D/N/Q) while a grid requantize is computing no longer silently cancels it
+
+### Merge fix
+
+When scope is "all tiles" with an active selection spanning multiple tiles, the color merge now correctly restricts to the selected area on every tile. Previously, non-current tiles had the merge applied to all their pixels regardless of the selection mask.
+
+---
+
 ## v1.15.0
 
 ### Segmentation

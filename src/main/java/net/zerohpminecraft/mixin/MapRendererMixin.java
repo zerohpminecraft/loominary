@@ -20,8 +20,15 @@ public abstract class MapRendererMixin {
     @Inject(method = "update", at = @At("HEAD"))
     private void unlockForLoominary(MapIdComponent mapId, MapState mapState,
                                     MapRenderState renderState, CallbackInfo ci) {
-        if (MapBannerDecoder.isClaimed(mapId.id()) && mapState.locked) {
+        boolean claimed = MapBannerDecoder.isClaimed(mapId.id());
+        boolean wasLocked = mapState.locked;
+        boolean unlocked = false;
+        if (claimed && wasLocked) {
             ((MapStateAccessor) mapState).setLocked(false);
+            unlocked = true;
+        }
+        if (claimed) {
+            MapBannerDecoder.onRenderUpdateHead(mapId.id(), wasLocked, unlocked, mapState.colors);
         }
     }
 }

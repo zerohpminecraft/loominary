@@ -40,6 +40,16 @@ public class MapBannerDecoder {
     private static final Map<Integer, AnimatedMapState> animatedMaps = new HashMap<>();
     private static int tickCounter = 0;
 
+    /** Map IDs we've already logged a first-render-update for, to keep mixin logs cheap. */
+    private static final Set<Integer> renderUpdateSeen = new HashSet<>();
+    /** Map IDs we've already logged a first-scan for, to keep scanner logs cheap. */
+    private static final Set<Integer> scanSeen = new HashSet<>();
+    /** Per-mapId paint log counter — log first {@link #PAINT_LOG_LIMIT} paints per session. */
+    private static final Map<Integer, Integer> paintLogCount = new HashMap<>();
+    private static final int PAINT_LOG_LIMIT = 3;
+    /** Map IDs we've already logged a first-unlock for. */
+    private static final Set<Integer> unlockLogged = new HashSet<>();
+
     public static boolean decodingEnabled = true;
     private static final Map<Integer, byte[]> rawColors     = new HashMap<>();
     private static final Map<Integer, byte[]> decodedColors = new HashMap<>();
@@ -151,6 +161,14 @@ public class MapBannerDecoder {
 
         Map<String, MapDecoration> decorations = ((MapStateAccessor) mapState).getDecorations();
 
+        if (scanSeen.add(mapId.id())) {
+            System.out.println(TAG + " scan first-see mapId=" + mapId.id()
+                    + " framePos=" + frame.getBlockPos()
+                    + " locked=" + mapState.locked
+                    + " claimed=" + claimedMaps.contains(mapId.id())
+                    + " decorations=" + decorations.size());
+        }
+
         if (claimedMaps.contains(mapId.id())) {
             AnimatedMapState anim = animatedMaps.get(mapId.id());
             if (anim != null) {
@@ -158,6 +176,17 @@ public class MapBannerDecoder {
             }
             if (!decorations.isEmpty()) {
                 decorations.clear();
+            }
+            // When another player places/replaces the item frame, the server resends
+            // the map snapshot (raw carpet bytes) to observers, overwriting our paint.
+            // Detect and re-paint from the cached decoded bytes.
+            byte[] expected = anim != null
+                    ? anim.frames[anim.currentFrame]
+                    : decodedColors.get(mapId.id());
+            if (expected != null && !Arrays.equals(mapState.colors, expected)) {
+                System.out.println(TAG + " server overwrite detected mapId=" + mapId.id()
+                        + " — re-painting cached decode");
+                paintMap(client, mapId, mapState, expected);
             }
             return;
         }
@@ -703,8 +732,52 @@ public class MapBannerDecoder {
         rawColors.computeIfAbsent(mapId.id(), k -> mapState.colors.clone());
         decodedColors.put(mapId.id(), mapColors.clone());
         if (!decodingEnabled) return;
+        // Unlock before setNeedsUpdate so MapMipMapMod doesn't see a locked map at
+        // dirty-mark time and freeze the texture; MapRendererMixin handles re-unlock
+        // if the server later sends a re-lock packet.
+        if (mapState.locked) ((MapStateAccessor) mapState).setLocked(false);
         System.arraycopy(mapColors, 0, mapState.colors, 0, mapColors.length);
         client.getMapTextureManager().setNeedsUpdate(mapId, mapState);
+        int painted = paintLogCount.getOrDefault(mapId.id(), 0);
+        if (painted < PAINT_LOG_LIMIT) {
+            paintLogCount.put(mapId.id(), painted + 1);
+            System.out.println(TAG + " paintMap #" + (painted + 1) + " mapId=" + mapId.id()
+                    + " locked=" + mapState.locked
+                    + " bytes=" + mapColors.length
+                    + " checksum=" + Integer.toHexString(colorsChecksum(mapColors))
+                    + " mapStateChecksum=" + Integer.toHexString(colorsChecksum(mapState.colors)));
+        }
+    }
+
+    /** Cheap rolling hash over map colors; only used for diagnostic logs. */
+    private static int colorsChecksum(byte[] b) {
+        int s = 0;
+        for (byte x : b) s = s * 31 + (x & 0xff);
+        return s;
+    }
+
+    /**
+     * Called from MapRendererMixin HEAD inject for every MapRenderer.update call.
+     * Logs cheaply: one line per (mapId) per session, plus one line every time we
+     * actually flip locked → unlocked.
+     */
+    public static void onRenderUpdateHead(int mapId, boolean wasLocked, boolean unlocked, byte[] currentColors) {
+        if (renderUpdateSeen.add(mapId)) {
+            byte[] expected = decodedColors.get(mapId);
+            String expectedChk = expected != null
+                    ? Integer.toHexString(colorsChecksum(expected)) : "(none)";
+            String currentChk = Integer.toHexString(colorsChecksum(currentColors));
+            System.out.println(TAG + " MapRenderer.update first-call mapId=" + mapId
+                    + " claimed=" + claimedMaps.contains(mapId)
+                    + " wasLocked=" + wasLocked
+                    + " unlocked=" + unlocked
+                    + " currentChecksum=" + currentChk
+                    + " expectedChecksum=" + expectedChk
+                    + " match=" + currentChk.equals(expectedChk));
+        }
+        if (unlocked && unlockLogged.add(mapId)) {
+            System.out.println(TAG + " MapRendererMixin unlocked mapId=" + mapId + " (first)");
+        }
     }
 
     /**
@@ -787,5 +860,9 @@ public class MapBannerDecoder {
         muxPendingBytes.clear();
         rawColors.clear();
         decodedColors.clear();
+        renderUpdateSeen.clear();
+        scanSeen.clear();
+        paintLogCount.clear();
+        unlockLogged.clear();
     }
 }

@@ -4,6 +4,21 @@
 
 ---
 
+## v1.16.1
+
+### Multi-tile rendering reliability
+
+Two distinct bugs could leave one or more tiles of a mural showing the raw carpet pattern instead of the decoded image. Both are fixed.
+
+- **MapMipMapMod interaction** — placing or approaching a freshly-decoded mural could leave tiles unrendered because the texture commit was suppressed for maps that were locked when `setNeedsUpdate` ran. `paintMap` now unlocks the `MapState` before marking the texture dirty, so the dirty-mark and atlas commit both see an unlocked map. `MapRendererMixin` continues to handle re-locks from later server packets.
+- **Observer overwrite** — when another player placed or replaced a tile, the server re-sent the raw map snapshot to other observers, overwriting Loominary's decoded bytes. The map was already claimed, so the scanner's early-return path skipped re-decoding and the tile stayed raw. The scanner now compares `mapState.colors` against the cached decoded bytes on each scan tick and re-paints when they diverge.
+
+### Diagnostics
+
+Rate-limited per-mapId logging now fires on first scan, first paint (up to 3 paints), first `MapRenderer.update` call, and first unlock — useful for diagnosing any future multi-tile rendering anomalies without flooding the log.
+
+---
+
 ## v1.16.0
 
 ### Editor threading

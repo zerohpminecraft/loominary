@@ -10,8 +10,11 @@ import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.command.CommandSource;
 import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.BundleContentsComponent;
 import net.minecraft.component.type.MapIdComponent;
 import net.minecraft.entity.decoration.ItemFrameEntity;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.BannerItem;
 import net.minecraft.item.FilledMapItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -91,6 +94,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * /loominary reduce undo all — restore all tiles to pre-reduction state
  * /loominary click — toggle auto-right-click of banners while holding map
  * /loominary click stop — stop auto-clicking
+ * /loominary whitelist — show how many named banners are whitelisted for reuse
+ * /loominary whitelist add — scan inventory + bundle contents, mark every named banner reusable
+ * /loominary whitelist clear — empty the whitelist
  * /loominary mux — redistribute overflow bytes from over-budget tiles into spare carpet space
  * /loominary ring — add a ring of transparent tiles around the current grid (expands cols+2, rows+2)
  * /loominary export [name] — write a Litematica .litematic for active tile
@@ -882,6 +888,14 @@ public class LoominaryCommand {
                                             .executes(ctx -> importStealCarpet(ctx.getSource()))
                                             .then(ClientCommandManager.literal("banners")
                                                     .executes(ctx -> importSteal(ctx.getSource()))))
+                                    // header — reconstruct state from a map screenshot + LC/LS banner string
+                                    .then(ClientCommandManager.literal("header")
+                                            .then(ClientCommandManager.argument("banner", StringArgumentType.string())
+                                                    .then(ClientCommandManager.argument("filename", StringArgumentType.string())
+                                                            .suggests(FILENAME_SUGGESTIONS)
+                                                            .executes(ctx -> importHeader(ctx.getSource(),
+                                                                    StringArgumentType.getString(ctx, "banner"),
+                                                                    StringArgumentType.getString(ctx, "filename"))))))
                                     .then(ClientCommandManager.argument("filename", StringArgumentType.string())
                                             .suggests(FILENAME_SUGGESTIONS)
                                             // Default (carpet) — bare filename
@@ -1134,6 +1148,14 @@ public class LoominaryCommand {
                                     .executes(ctx -> clickToggle(ctx.getSource()))
                                     .then(ClientCommandManager.literal("stop")
                                             .executes(ctx -> clickStop(ctx.getSource()))))
+
+                            // ── whitelist ──────────────────────────────────────
+                            .then(ClientCommandManager.literal("whitelist")
+                                    .executes(ctx -> whitelistStatus(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("add")
+                                            .executes(ctx -> whitelistAdd(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("clear")
+                                            .executes(ctx -> whitelistClear(ctx.getSource()))))
 
                             // ── title ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("title")
@@ -1761,6 +1783,152 @@ public class LoominaryCommand {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // import header <lc-ls-banner> <mapshot.png>
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * Reconstructs a carpet-encoded PayloadState from a 128×128 map screenshot and
+     * an LC/LS manifest banner string.
+     *
+     * <p>The image pixels are nearest-color matched to map color bytes.  The carpet
+     * and shade channels are extracted from those bytes using the byte counts declared
+     * in the header.  Any inline base64 overflow embedded in the header is appended.
+     * The assembled payload is stored in {@code carpetCompressedB64} so the map-color
+     * preview and schematic export work without additional banners.
+     */
+    private static int importHeader(FabricClientCommandSource source,
+            String header, String filename) {
+        // 1. Parse header
+        boolean isLS = header.startsWith("LS");
+        boolean isLC = header.startsWith("LC");
+        if (!isLC && !isLS) {
+            source.sendError(Text.literal("§cInvalid header — must start with LC or LS."));
+            return 0;
+        }
+        if (isLC && header.length() < 6) {
+            source.sendError(Text.literal("§cInvalid LC header — expected LC<4hex>[<b64>]."));
+            return 0;
+        }
+        if (isLS && header.length() < 10) {
+            source.sendError(Text.literal("§cInvalid LS header — expected LS<4hex><4hex>[<b64>]."));
+            return 0;
+        }
+        int totalBytes, shadeBytes;
+        String inlineB64;
+        try {
+            totalBytes = Integer.parseInt(header.substring(2, 6), 16);
+            if (isLS) {
+                shadeBytes = Integer.parseInt(header.substring(6, 10), 16);
+                inlineB64  = header.length() > 10 ? header.substring(10) : "";
+            } else {
+                shadeBytes = 0;
+                inlineB64  = header.length() > 6 ? header.substring(6) : "";
+            }
+        } catch (NumberFormatException e) {
+            source.sendError(Text.literal("§cInvalid header — hex parse failed: " + e.getMessage()));
+            return 0;
+        }
+        int carpetBytes = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
+        byte[] inlineOverflow;
+        try {
+            inlineOverflow = inlineB64.isEmpty() ? new byte[0] : Base64.getDecoder().decode(inlineB64);
+        } catch (IllegalArgumentException e) {
+            source.sendError(Text.literal("§cInvalid base64 in header inline overflow."));
+            return 0;
+        }
+
+        // 2. Load the 128×128 image
+        MinecraftClient client = MinecraftClient.getInstance();
+        Path filePath = client.runDirectory.toPath().resolve("loominary_data").resolve(filename);
+        if (!Files.exists(filePath)) {
+            source.sendError(Text.literal("§cFile not found: loominary_data/" + filename));
+            return 0;
+        }
+        final BufferedImage img;
+        try {
+            byte[] fileBytes = Files.readAllBytes(filePath);
+            img = ImageIO.read(new ByteArrayInputStream(fileBytes));
+        } catch (IOException e) {
+            source.sendError(Text.literal("§cError reading image: " + e.getMessage()));
+            return 0;
+        }
+        if (img == null) {
+            source.sendError(Text.literal("§cCouldn't decode image: " + filename));
+            return 0;
+        }
+        if (img.getWidth() != MAP_SIZE || img.getHeight() != MAP_SIZE) {
+            source.sendError(Text.literal(String.format(
+                    "§cImage must be %d×%d pixels, got %d×%d.",
+                    MAP_SIZE, MAP_SIZE, img.getWidth(), img.getHeight())));
+            return 0;
+        }
+
+        // 3. Nearest-color match: image pixels → map color bytes (all shades)
+        byte[] mapColors = PngToMapColors.convert(img, false);
+
+        // 4. Extract carpet and shade channels
+        byte[] carpetData;
+        try {
+            carpetData = CarpetChannel.decodeBytes(mapColors, carpetBytes);
+        } catch (IllegalStateException e) {
+            source.sendError(Text.literal(
+                    "§cCarpet decode failed — image may not be a carpet map: " + e.getMessage()));
+            return 0;
+        }
+        byte[] shadeData = shadeBytes > 0
+                ? CarpetChannel.decodeShade(mapColors, shadeBytes)
+                : new byte[0];
+
+        // 5. Assemble compressed payload: carpet + shade + inline overflow
+        int assembledLen = carpetBytes + shadeData.length + inlineOverflow.length;
+        byte[] compressed = new byte[assembledLen];
+        System.arraycopy(carpetData,     0, compressed, 0,                               carpetBytes);
+        System.arraycopy(shadeData,      0, compressed, carpetBytes,                     shadeData.length);
+        System.arraycopy(inlineOverflow, 0, compressed, carpetBytes + shadeData.length,  inlineOverflow.length);
+
+        int missingBytes = totalBytes - assembledLen;
+
+        // 6. Warn if the assembled data is not a valid zstd frame (only relevant when complete)
+        if (missingBytes == 0 && Zstd.getFrameContentSize(compressed) < 0) {
+            source.sendFeedback(Text.literal(
+                    "§e⚠ Assembled payload is not a valid zstd frame — image colors may be inaccurate."));
+        }
+
+        // 7. Build PayloadState (single-tile carpet batch)
+        PayloadState.clear();
+        PayloadState.TileData tile = new PayloadState.TileData();
+        tile.carpetEncoded = true;
+        tile.carpetCompressedB64 = Base64.getEncoder().encodeToString(compressed);
+        tile.chunks.add(header); // chunk[0] = LC/LS manifest banner name
+        tile.currentIndex = 0;
+
+        PayloadState.tiles.add(tile);
+        PayloadState.gridColumns = 1;
+        PayloadState.gridRows = 1;
+        PayloadState.activeTileIndex = 0;
+        PayloadState.currentSourceFilename = filename;
+        PayloadState.allShades = isLS;
+        PayloadState.dither = false;
+        PayloadState.syncFromActiveTile();
+        PayloadState.save();
+
+        // 8. Feedback
+        source.sendFeedback(Text.literal(String.format(
+                "§aReconstructed carpet state from §f%s §7(%d bytes: %d carpet + %d shade + %d inline).",
+                filename, assembledLen, carpetBytes, shadeData.length, inlineOverflow.length)));
+        if (missingBytes > 0) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§e⚠ %d bytes from overflow banners not recoverable from image — "
+                    + "map preview may be corrupt.",
+                    missingBytes)));
+        } else {
+            source.sendFeedback(Text.literal(
+                    "§aPayload complete. Run §f/loominary export§a to generate a schematic."));
+        }
+        return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // import <file> carpet
     // ════════════════════════════════════════════════════════════════════
 
@@ -2366,6 +2534,12 @@ public class LoominaryCommand {
         source.sendFeedback(Text.literal(String.format(
                 "§7Overall: §f%d§7/§f%d §7banner%s%s",
                 totalDone, totalChunks, anyCarpet ? "s/LC chunks" : "s", overallBudget)));
+        int whitelistCount = PayloadState.whitelistedBannerNames.size();
+        if (whitelistCount > 0) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§7Whitelist: §f%d§7 named banner%s reusable as raw material.",
+                    whitelistCount, whitelistCount == 1 ? "" : "s")));
+        }
         return 1;
     }
 
@@ -3654,6 +3828,80 @@ public class LoominaryCommand {
         }
         BannerAutoClickHandler.stop();
         source.sendFeedback(Text.literal("§aAuto-click stopped."));
+        return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // whitelist [add|clear]
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int whitelistStatus(FabricClientCommandSource source) {
+        int n = PayloadState.whitelistedBannerNames.size();
+        if (n == 0) {
+            source.sendFeedback(Text.literal(
+                    "§7Whitelist empty. Run §f/loominary whitelist add§7 "
+                            + "to mark every named banner in your inventory and bundles as reusable raw material."));
+        } else {
+            source.sendFeedback(Text.literal(String.format(
+                    "§a%d§7 named banner%s whitelisted for reuse. "
+                            + "The renamer will pull them (from loose slots or from inside bundles) "
+                            + "and overwrite the name with the current chunk name.",
+                    n, n == 1 ? "" : "s")));
+        }
+        return 1;
+    }
+
+    private static int whitelistAdd(FabricClientCommandSource source) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) {
+            source.sendError(Text.literal("§cNot in a world."));
+            return 0;
+        }
+        PlayerInventory inv = client.player.getInventory();
+        int before = PayloadState.whitelistedBannerNames.size();
+        int loose = 0;
+        int bundled = 0;
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack stack = inv.getStack(i);
+            if (stack.isEmpty()) continue;
+            if (stack.getItem() instanceof BannerItem && stack.getCustomName() != null) {
+                String name = stack.getCustomName().getString();
+                if (PayloadState.whitelistedBannerNames.add(name)) loose++;
+                continue;
+            }
+            if (stack.getItem() == Items.BUNDLE) {
+                BundleContentsComponent contents = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+                if (contents == null) continue;
+                for (ItemStack inside : contents.iterate()) {
+                    if (!(inside.getItem() instanceof BannerItem)) continue;
+                    if (inside.getCustomName() == null) continue;
+                    String name = inside.getCustomName().getString();
+                    if (PayloadState.whitelistedBannerNames.add(name)) bundled++;
+                }
+            }
+        }
+        PayloadState.save();
+        int added = PayloadState.whitelistedBannerNames.size() - before;
+        source.sendFeedback(Text.literal(String.format(
+                "§aWhitelisted §f%d§a new name%s §7(%d loose, %d in bundles; %d total now eligible).",
+                added, added == 1 ? "" : "s",
+                loose, bundled, PayloadState.whitelistedBannerNames.size())));
+        if (bundled > 0) {
+            source.sendFeedback(Text.literal(
+                    "§7Reminder: the renamer will §fnot§7 insert renamed banners back into "
+                            + "bundles that hold whitelisted entries. "
+                            + "§7Add at least one §fempty bundle§7 to your inventory for output."));
+        }
+        return 1;
+    }
+
+    private static int whitelistClear(FabricClientCommandSource source) {
+        int n = PayloadState.whitelistedBannerNames.size();
+        PayloadState.whitelistedBannerNames.clear();
+        PayloadState.save();
+        source.sendFeedback(Text.literal(String.format(
+                "§aCleared whitelist (%d name%s removed).",
+                n, n == 1 ? "" : "s")));
         return 1;
     }
 

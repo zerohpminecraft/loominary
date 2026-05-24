@@ -7,8 +7,10 @@ import net.minecraft.client.gui.screen.ingame.AnvilScreen;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.BundleContentsComponent;
 import net.minecraft.item.BannerItem;
+import net.minecraft.item.BundleItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.network.packet.c2s.play.BundleItemSelectedC2SPacket;
 import net.minecraft.network.packet.c2s.play.RenameItemC2SPacket;
 import net.minecraft.screen.AnvilScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
@@ -35,6 +37,19 @@ public class AnvilAutoFillHandler {
     // Same reason: step 5 must not fire until the server has confirmed step 4.
     // storeState 1 = step 4 sent, waiting for cursor to have the banner.
     private static int storeState = 0;
+
+    // ── Bundle-extract state (whitelist reuse from inside a bundle) ────────
+    // 0 = idle. 1 = sent BundleItemSelectedC2SPacket last tick; right-click
+    // bundle this tick to pop the selected item to cursor. 2 = banner is on
+    // cursor; drop it into anvil slot 0 this tick so PRIORITY 2 can rename.
+    private static int bundleExtractState = 0;
+    private static int bundleExtractSlot  = -1;
+
+    // True while a banner that was already named (and was on the whitelist)
+    // sits in anvil slot 0. PRIORITY 2 ignores the "must be unnamed" rule
+    // when this is set, since the whole point is to overwrite the old name.
+    private static boolean extractedNamed   = false;
+    private static String  extractedOldName = null;
 
     private static String pendingName  = null;
     private static int    pendingIndex = -1;
@@ -65,6 +80,11 @@ public class AnvilAutoFillHandler {
             extractState = 0;
             extractSlot  = -1;
             storeState   = 0;
+            bundleExtractState = 0;
+            bundleExtractSlot  = -1;
+            extractedNamed   = false;
+            extractedOldName = null;
+            noBundleWarningShown = false;
             xpPausedLogged     = false;
             bannerPausedLogged = false;
             batchDoneLogged    = false;
@@ -124,7 +144,8 @@ public class AnvilAutoFillHandler {
             // ── Cursor safety ──────────────────────────────────────────────
             // The cursor must be empty except while we're mid-operation.
             // If anything unexpected is on it, put it back before proceeding.
-            if (!cursor.isEmpty() && extractState == 0 && storeState == 0) {
+            if (!cursor.isEmpty() && extractState == 0 && storeState == 0
+                    && bundleExtractState == 0) {
                 if (cursor.getItem() instanceof BannerItem
                         && cursor.getCustomName() != null && pendingName != null) {
                     // Renamed banner stuck on cursor — try bundle first.
@@ -172,6 +193,85 @@ public class AnvilAutoFillHandler {
                 return;
             }
 
+            // ── Bundle-extract states: pop a whitelisted banner out of a bundle ─
+            if (bundleExtractState == 1) {
+                if (bundleExtractSlot < 0 || bundleExtractSlot >= handler.slots.size()) {
+                    bundleExtractState = 0;
+                    bundleExtractSlot  = -1;
+                    return;
+                }
+                System.out.println(TAG + "   Bundle step 1: RIGHT-click slot "
+                        + bundleExtractSlot + " → pop selected ('" + extractedOldName
+                        + "') to cursor");
+                client.interactionManager.clickSlot(
+                        handler.syncId, bundleExtractSlot, RIGHT_CLICK,
+                        SlotActionType.PICKUP, client.player);
+                bundleExtractState = 2;
+                cooldown = ACTION_COOLDOWN_TICKS;
+                return;
+            }
+            if (bundleExtractState == 2) {
+                boolean wrongItem = cursor.isEmpty()
+                        || !(cursor.getItem() instanceof BannerItem)
+                        || cursor.getCustomName() == null
+                        || !cursor.getCustomName().getString().equals(extractedOldName);
+                if (wrongItem) {
+                    // Server's selected-item index didn't match ours (race or
+                    // out-of-range), so the wrong banner — or something other
+                    // than a banner — was popped. Park whatever's on the cursor
+                    // in a free slot and abort this extraction.
+                    if (!cursor.isEmpty()) {
+                        int dst = findEmptySlot(handler);
+                        if (dst != -1) {
+                            client.interactionManager.clickSlot(
+                                    handler.syncId, dst, LEFT_CLICK,
+                                    SlotActionType.PICKUP, client.player);
+                        }
+                    }
+                    System.out.println(TAG + " Bundle extract for '"
+                            + extractedOldName + "' produced "
+                            + (cursor.isEmpty() ? "nothing"
+                                    : cursor.getItem().toString()
+                                            + (cursor.getCustomName() != null
+                                                    ? " ('" + cursor.getCustomName().getString() + "')"
+                                                    : ""))
+                            + " — aborting.");
+                    bundleExtractState = 0;
+                    bundleExtractSlot  = -1;
+                    extractedNamed   = false;
+                    extractedOldName = null;
+                    cooldown = ACTION_COOLDOWN_TICKS;
+                    return;
+                }
+                if (!leftSlot.isEmpty()) {
+                    // Anvil input occupied (shouldn't normally happen here, but
+                    // be defensive). Stash the popped banner in a free slot and
+                    // reset extraction state. Clearing extractedNamed prevents
+                    // PRIORITY 2 from later trying to rename whatever is in
+                    // slot 0 as if it were this banner.
+                    int dst = findEmptySlot(handler);
+                    if (dst != -1) {
+                        client.interactionManager.clickSlot(
+                                handler.syncId, dst, LEFT_CLICK,
+                                SlotActionType.PICKUP, client.player);
+                    }
+                    bundleExtractState = 0;
+                    bundleExtractSlot  = -1;
+                    extractedNamed   = false;
+                    extractedOldName = null;
+                    cooldown = ACTION_COOLDOWN_TICKS;
+                    return;
+                }
+                System.out.println(TAG + "   Bundle step 2: LEFT-click slot 0 → drop '"
+                        + extractedOldName + "' into anvil input");
+                client.interactionManager.clickSlot(
+                        handler.syncId, 0, LEFT_CLICK, SlotActionType.PICKUP, client.player);
+                bundleExtractState = 0;
+                bundleExtractSlot  = -1;
+                cooldown = ACTION_COOLDOWN_TICKS;
+                return;
+            }
+
             // ── storeState 1: confirm QUICK_MOVE ──────────────────────────────
             if (storeState == 1) {
                 if (!outputSlot.isEmpty()) {
@@ -197,6 +297,7 @@ public class AnvilAutoFillHandler {
                                     client.player);
                             storeState = 2;
                         } else {
+                            warnNoOutputBundle(client, handler);
                             advance(pendingIndex);
                         }
                         cooldown = ACTION_COOLDOWN_TICKS;
@@ -232,7 +333,9 @@ public class AnvilAutoFillHandler {
                         client.interactionManager.clickSlot(
                                 handler.syncId, bundleSlot, LEFT_CLICK, SlotActionType.PICKUP,
                                 client.player);
+                        noBundleWarningShown = false;
                     } else {
+                        warnNoOutputBundle(client, handler);
                         // No bundle — return banner to any free slot.
                         int dst = findEmptySlot(handler);
                         if (dst != -1) {
@@ -255,7 +358,7 @@ public class AnvilAutoFillHandler {
             // tries to process the same chunk again.  If the banner is already in
             // inventory, bundle it and advance rather than renaming a fresh banner.
             if (pendingName == null && storeState == 0 && extractState == 0
-                    && cursor.isEmpty()) {
+                    && bundleExtractState == 0 && cursor.isEmpty()) {
                 String target = PayloadState.ACTIVE_CHUNKS.get(PayloadState.activeChunkIndex);
                 int existing = findNamedBannerInInventory(handler, target);
                 if (existing != -1) {
@@ -264,6 +367,12 @@ public class AnvilAutoFillHandler {
                         System.out.println(TAG + " Already-renamed banner found in slot "
                                 + existing + " for index " + PayloadState.activeChunkIndex
                                 + " — bundling directly");
+                        // Remove from whitelist so this name can't double-match
+                        // a later extraction (and so our own freshly-written
+                        // banners are never seen as raw material).
+                        if (PayloadState.whitelistedBannerNames.remove(target)) {
+                            PayloadState.save();
+                        }
                         pendingName  = target;
                         pendingIndex = PayloadState.activeChunkIndex;
                         client.interactionManager.clickSlot(
@@ -309,6 +418,8 @@ public class AnvilAutoFillHandler {
                             pendingName  = null;
                             pendingIndex = -1;
                             storeState   = 0;
+                            extractedNamed   = false;
+                            extractedOldName = null;
                             cooldown = ACTION_COOLDOWN_TICKS;
                         } else {
                             System.out.println(TAG + " Output empty after " + RENAME_TIMEOUT_TICKS
@@ -329,17 +440,30 @@ public class AnvilAutoFillHandler {
                         pendingName  = null;
                         pendingIndex = -1;
                         storeState   = 0;
+                        extractedNamed   = false;
+                        extractedOldName = null;
                         cooldown = ACTION_COOLDOWN_TICKS;
                     }
                 }
                 return;
             }
 
-            // ── PRIORITY 2: single unnamed banner in slot 0 → rename it ─────
+            // ── PRIORITY 2: single banner in slot 0 → rename it ─────────────
+            // Normally the input must be unnamed (we never want to clobber a
+            // banner the user dropped in by hand). The `extractedNamed` flag
+            // marks banners we deliberately pulled from the whitelist; for
+            // those, overwriting the old name is the entire point — but we
+            // additionally require the name in slot 0 to match the name we
+            // expected to pull, so a stray named banner left in slot 0 can't
+            // be silently renamed.
+            boolean namedAndExpected = extractedNamed
+                    && extractedOldName != null
+                    && leftSlot.getCustomName() != null
+                    && extractedOldName.equals(leftSlot.getCustomName().getString());
             if (pendingName == null
                     && !leftSlot.isEmpty()
                     && leftSlot.getItem() instanceof BannerItem
-                    && leftSlot.getCustomName() == null
+                    && (leftSlot.getCustomName() == null || namedAndExpected)
                     && leftSlot.getCount() == 1) {  // never rename a stack
 
                 renameTicks  = 0;
@@ -348,7 +472,9 @@ public class AnvilAutoFillHandler {
 
                 System.out.println(TAG + " STAGE: Rename — name='" + pendingName
                         + "' (index " + pendingIndex + "/"
-                        + (PayloadState.ACTIVE_CHUNKS.size() - 1) + ")");
+                        + (PayloadState.ACTIVE_CHUNKS.size() - 1) + ")"
+                        + (extractedNamed ? " [reusing whitelist banner '"
+                                + extractedOldName + "']" : ""));
 
                 // Priority 1 fires when the server confirms the output slot is populated.
                 // Omitting the client-side setNewItemName() call means the output slot
@@ -372,11 +498,18 @@ public class AnvilAutoFillHandler {
     // ── Extraction step 1 ──────────────────────────────────────────────────
 
     private static void startExtraction(MinecraftClient client, AnvilScreenHandler handler) {
+        // Current chunk's target name; used to short-circuit when a whitelisted
+        // banner already happens to carry the exact name we'd rename it to.
+        // Vanilla anvil treats same-name as a no-op (empty output), which would
+        // stall PRIORITY 2 and eventually trip the resalt halt.
+        String target = PayloadState.ACTIVE_CHUNKS.get(PayloadState.activeChunkIndex);
+
+        // Pass 1: prefer an unnamed banner stack (existing behavior).
         for (int i = 3; i < handler.slots.size(); i++) {
             ItemStack stack = handler.getSlot(i).getStack();
             if (stack.isEmpty()) continue;
             if (!(stack.getItem() instanceof BannerItem)) continue;
-            if (stack.getCustomName() != null) continue;  // skip already-named banners
+            if (stack.getCustomName() != null) continue;
 
             System.out.println(TAG + " STAGE: Extract — unnamed banner at slot "
                     + i + " (count=" + stack.getCount() + ")");
@@ -390,12 +523,107 @@ public class AnvilAutoFillHandler {
             bannerPausedLogged = false;
             return;
         }
+
+        // Pass 2: a loose whitelisted named banner — pick it up, run it through
+        // the anvil with the current chunk name. Same three-step extract as for
+        // unnamed stacks (works fine for count=1 named banners; step 3 is a
+        // no-op return).
+        for (int i = 3; i < handler.slots.size(); i++) {
+            ItemStack stack = handler.getSlot(i).getStack();
+            if (stack.isEmpty()) continue;
+            if (!(stack.getItem() instanceof BannerItem)) continue;
+            if (stack.getCustomName() == null) continue;
+            String name = stack.getCustomName().getString();
+            if (!PayloadState.whitelistedBannerNames.contains(name)) continue;
+
+            // Same-name short-circuit: nothing to rename, this chunk is already
+            // satisfied by the existing loose banner. Skip slot ops and advance.
+            // The line-257 shortcut would have caught this if a bundle slot
+            // were free; we handle the "no bundle space" case here.
+            if (name.equals(target)) {
+                System.out.println(TAG + " Chunk " + PayloadState.activeChunkIndex
+                        + " already satisfied by loose whitelisted banner '"
+                        + name + "' at slot " + i + " — advancing.");
+                PayloadState.whitelistedBannerNames.remove(name);
+                advance(PayloadState.activeChunkIndex);
+                return;
+            }
+
+            PayloadState.whitelistedBannerNames.remove(name);
+            PayloadState.save();
+            extractedNamed   = true;
+            extractedOldName = name;
+            System.out.println(TAG + " STAGE: Extract — whitelisted banner '" + name
+                    + "' at slot " + i + " (reuse as raw material)");
+            client.interactionManager.clickSlot(
+                    handler.syncId, i, LEFT_CLICK, SlotActionType.PICKUP, client.player);
+            extractState = 1;
+            extractSlot  = i;
+            cooldown = ACTION_COOLDOWN_TICKS;
+            bannerPausedLogged = false;
+            return;
+        }
+
+        // Pass 3: a whitelisted banner inside a bundle — pop it out via the
+        // bundle's selected-item slot interaction, then drop it into anvil
+        // slot 0 in subsequent ticks.
+        for (int i = 3; i < handler.slots.size(); i++) {
+            ItemStack stack = handler.getSlot(i).getStack();
+            if (stack.isEmpty()) continue;
+            if (stack.getItem() != Items.BUNDLE) continue;
+            BundleContentsComponent contents = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+            if (contents == null || contents.isEmpty()) continue;
+            for (int j = 0; j < contents.size(); j++) {
+                ItemStack inside = contents.get(j);
+                if (!(inside.getItem() instanceof BannerItem)) continue;
+                if (inside.getCustomName() == null) continue;
+                String name = inside.getCustomName().getString();
+                if (!PayloadState.whitelistedBannerNames.contains(name)) continue;
+
+                // Same-name short-circuit (see Pass 2). The banner is already
+                // bundled and already named correctly — chunk is done.
+                if (name.equals(target)) {
+                    System.out.println(TAG + " Chunk " + PayloadState.activeChunkIndex
+                            + " already satisfied by bundled whitelisted banner '"
+                            + name + "' at slot " + i + " (index " + j + ") — advancing.");
+                    PayloadState.whitelistedBannerNames.remove(name);
+                    advance(PayloadState.activeChunkIndex);
+                    return;
+                }
+
+                PayloadState.whitelistedBannerNames.remove(name);
+                PayloadState.save();
+                extractedNamed    = true;
+                extractedOldName  = name;
+                bundleExtractSlot = i;
+                System.out.println(TAG + " STAGE: Extract — whitelisted banner '" + name
+                        + "' inside bundle at slot " + i + " (index " + j + ")");
+                System.out.println(TAG + "   Bundle pre-step: SelectBundleItem(slot="
+                        + i + ", index=" + j + ")");
+                // Critical: ALSO update the client-side bundle component so the
+                // local optimistic right-click in bundleExtractState 1 pops the
+                // same index as the server. Without this, the client's
+                // selectedStackIndex stays at -1 (or stale) and removeSelected
+                // falls back to index 0 — popping a different item than the
+                // server. The symptom: "Bundle extract produced nothing" / the
+                // wrong banner ends up on cursor and gets parked.
+                BundleItem.setSelectedStackIndex(stack, j);
+                client.player.networkHandler.sendPacket(
+                        new BundleItemSelectedC2SPacket(i, j));
+                bundleExtractState = 1;
+                cooldown = ACTION_COOLDOWN_TICKS;
+                bannerPausedLogged = false;
+                return;
+            }
+        }
+
         if (!bannerPausedLogged) {
-            System.out.println(TAG + " Paused: no unnamed banner stacks in inventory.");
+            System.out.println(TAG + " Paused: no unnamed or whitelisted banners available.");
             bannerPausedLogged = true;
         }
         client.inGameHud.setOverlayMessage(
-                Text.literal("§e" + TAG + " Paused — add unnamed banners to resume."), false);
+                Text.literal("§e" + TAG + " Paused — add unnamed banners or §f/loominary whitelist add§e."),
+                false);
     }
 
     // ── Slot search helpers ────────────────────────────────────────────────
@@ -406,9 +634,66 @@ public class AnvilAutoFillHandler {
             if (stack.getItem() != Items.BUNDLE) continue;
             BundleContentsComponent contents = stack.getOrDefault(
                     DataComponentTypes.BUNDLE_CONTENTS, BundleContentsComponent.DEFAULT);
-            if (contents.getOccupancy().doubleValue() < 1.0) return i;
+            if (contents.getOccupancy().doubleValue() >= 1.0) continue;
+            // Never use a bundle that still holds whitelisted source banners as
+            // an output target. Inserting at index 0 shifts the remaining
+            // whitelist entries and seems to desync the bundle's selected-index
+            // book-keeping with the server, causing later pops to come up empty
+            // or stall around the halfway mark. The user must provide separate
+            // empty bundles for renamer output.
+            if (bundleContainsWhitelisted(contents)) continue;
+            return i;
         }
         return -1;
+    }
+
+    /**
+     * Shows a one-shot HUD warning when the renamer has just produced a banner
+     * but every bundle in inventory is either full or excluded as a source
+     * (still holds whitelisted entries). Triggered once per "stuck" episode;
+     * resets when the user adds an empty bundle and a future bundle-insert
+     * succeeds (see {@link #noBundleWarningShown} reset on storeState 2).
+     */
+    private static boolean noBundleWarningShown = false;
+
+    private static void warnNoOutputBundle(MinecraftClient client, AnvilScreenHandler handler) {
+        if (noBundleWarningShown) return;
+        int sourceBundleCount = 0;
+        for (int i = 3; i < handler.slots.size(); i++) {
+            ItemStack stack = handler.getSlot(i).getStack();
+            if (stack.getItem() != Items.BUNDLE) continue;
+            BundleContentsComponent contents = stack.getOrDefault(
+                    DataComponentTypes.BUNDLE_CONTENTS, BundleContentsComponent.DEFAULT);
+            if (bundleContainsWhitelisted(contents)) sourceBundleCount++;
+        }
+        if (sourceBundleCount > 0) {
+            System.out.println(TAG + " No output bundle available — "
+                    + sourceBundleCount + " bundle(s) hold whitelisted source banners and"
+                    + " can't be reused. Renamed banner left loose; add an empty bundle.");
+            client.inGameHud.setOverlayMessage(
+                    Text.literal("§e" + TAG + " Add empty bundle for renamed output ("
+                            + sourceBundleCount + " source bundle"
+                            + (sourceBundleCount == 1 ? "" : "s") + " skipped)."),
+                    false);
+        } else {
+            System.out.println(TAG + " No output bundle available — all bundles full or absent."
+                    + " Renamed banner left loose.");
+            client.inGameHud.setOverlayMessage(
+                    Text.literal("§e" + TAG + " Add a bundle for renamed output."),
+                    false);
+        }
+        noBundleWarningShown = true;
+    }
+
+    private static boolean bundleContainsWhitelisted(BundleContentsComponent contents) {
+        if (PayloadState.whitelistedBannerNames.isEmpty()) return false;
+        for (ItemStack inside : contents.iterate()) {
+            if (!(inside.getItem() instanceof BannerItem)) continue;
+            if (inside.getCustomName() == null) continue;
+            if (PayloadState.whitelistedBannerNames.contains(
+                    inside.getCustomName().getString())) return true;
+        }
+        return false;
     }
 
     private static int findEmptySlot(AnvilScreenHandler handler) {
@@ -443,6 +728,8 @@ public class AnvilAutoFillHandler {
         renameTicks  = 0;
         storeState   = 0;
         renameAttemptCount = 0;
+        extractedNamed   = false;
+        extractedOldName = null;
         cooldown = ACTION_COOLDOWN_TICKS;
     }
 }

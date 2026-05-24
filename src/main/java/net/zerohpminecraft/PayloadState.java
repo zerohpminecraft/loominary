@@ -8,7 +8,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Persists the multi-tile banner-rename batch to disk.
@@ -49,6 +51,15 @@ public class PayloadState {
     // ── Per-tile data ──────────────────────────────────────────────────
 
     public static final List<TileData> tiles = new ArrayList<>();
+
+    // ── Banner-rename whitelist ────────────────────────────────────────
+    // Names of existing named banners (loose or inside bundles) that the
+    // renamer is allowed to consume as raw material — extract them, run them
+    // through the anvil with the current chunk name, and bundle the result.
+    // Entries are removed as the renamer consumes them so that the renamer's
+    // OWN OUTPUT (which may happen to carry a name that was once whitelisted)
+    // is not later mistaken for further raw material.
+    public static final Set<String> whitelistedBannerNames = new HashSet<>();
 
     public static class TileData {
         public List<String> chunks = new ArrayList<>();
@@ -91,6 +102,7 @@ public class PayloadState {
         boolean allShades;
         boolean dither;
         String title;
+        List<String> whitelist;
     }
 
     public static int totalTiles() {
@@ -164,6 +176,7 @@ public class PayloadState {
             snap.allShades = allShades;
             snap.dither = dither;
             snap.title = currentTitle;
+            snap.whitelist = new ArrayList<>(whitelistedBannerNames);
             Files.writeString(path, GSON.toJson(snap));
         } catch (IOException e) {
             System.err.println(TAG + " Failed to save to " + path.getFileName() + ": " + e.getMessage());
@@ -189,6 +202,8 @@ public class PayloadState {
         currentTitle = snap.title;
         tiles.clear();
         tiles.addAll(snap.tiles);
+        whitelistedBannerNames.clear();
+        if (snap.whitelist != null) whitelistedBannerNames.addAll(snap.whitelist);
         syncFromActiveTile();
         String src = snap.sourceFilename != null ? snap.sourceFilename : "<unknown>";
         return src + " (" + gridColumns + "×" + gridRows + " grid, "
@@ -207,6 +222,7 @@ public class PayloadState {
             snap.allShades = allShades;
             snap.dither = dither;
             snap.title = currentTitle;
+            snap.whitelist = new ArrayList<>(whitelistedBannerNames);
             Files.writeString(stateFile(), GSON.toJson(snap));
         } catch (IOException e) {
             System.err.println(TAG + " Failed to save state: " + e.getMessage());
@@ -240,6 +256,9 @@ public class PayloadState {
             tiles.clear();
             tiles.addAll(snap.tiles);
 
+            whitelistedBannerNames.clear();
+            if (snap.whitelist != null) whitelistedBannerNames.addAll(snap.whitelist);
+
             syncFromActiveTile();
 
             String fname = snap.sourceFilename == null ? "<unknown>" : snap.sourceFilename;
@@ -268,6 +287,7 @@ public class PayloadState {
         dither = false;
         currentTitle = null;
         tiles.clear();
+        whitelistedBannerNames.clear();
         ACTIVE_CHUNKS.clear();
         activeChunkIndex = 0;
     }

@@ -158,7 +158,7 @@ class PayloadManifestTest {
     // ── v3 animated manifest ──────────────────────────────────────────────
 
     @Test
-    void roundtrip_v3_globalDelay() {
+    void roundtrip_v4_globalDelay() {
         byte[] bytes = PayloadManifest.toBytes(
                 PayloadManifest.FLAG_ANIMATED,
                 2, 1, 0, 0, 0xABCDL,
@@ -167,7 +167,7 @@ class PayloadManifestTest {
 
         PayloadManifest m = PayloadManifest.fromBytes(bytes);
 
-        assertEquals(3, m.manifestVersion);
+        assertEquals(4, m.manifestVersion);
         assertEquals(bytes.length, m.headerSize);
         assertTrue(m.animated());
         assertEquals(4, m.frameCount);
@@ -179,7 +179,7 @@ class PayloadManifestTest {
     }
 
     @Test
-    void roundtrip_v3_perFrameDelays() {
+    void roundtrip_v4_perFrameDelays() {
         int[] delays = {100, 200, 150, 300};
         byte[] bytes = PayloadManifest.toBytes(
                 PayloadManifest.FLAG_ANIMATED,
@@ -189,7 +189,7 @@ class PayloadManifestTest {
 
         PayloadManifest m = PayloadManifest.fromBytes(bytes);
 
-        assertEquals(3, m.manifestVersion);
+        assertEquals(4, m.manifestVersion);
         assertEquals(bytes.length, m.headerSize);
         assertTrue(m.animated());
         assertEquals(4, m.frameCount);
@@ -198,9 +198,36 @@ class PayloadManifestTest {
     }
 
     @Test
-    void v3_headerSize_isSkipPointer() {
+    void roundtrip_v4_largeFrameCount() {
+        // v4 supports up to 65535 frames via u16 frame_count field.
+        byte[] bytes = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED,
+                1, 1, 0, 0, 0L,
+                null, null, 0,
+                1000, 0, new int[]{50});
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+        assertEquals(4, m.manifestVersion);
+        assertEquals(1000, m.frameCount);
+        assertEquals(50, m.frameDelays[0]);
+    }
+
+    @Test
+    void roundtrip_v4_maxFrameCount() {
+        byte[] bytes = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED,
+                1, 1, 0, 0, 0L,
+                null, null, 0,
+                65535, 0, new int[]{100});
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+        assertEquals(4, m.manifestVersion);
+        assertEquals(65535, m.frameCount);
+    }
+
+    @Test
+    void v4_headerSize_isSkipPointer() {
         // Verify that header_size correctly skips over all animation fields.
-        // Append a known sentinel after the manifest and confirm the skip lands on it.
         byte[] manifest = PayloadManifest.toBytes(
                 PayloadManifest.FLAG_ANIMATED,
                 1, 1, 0, 0, 0L,
@@ -216,15 +243,14 @@ class PayloadManifestTest {
     }
 
     @Test
-    void v3_tooManyFrames_throws() {
-        // 78 per-frame delays × 2 bytes = 156 bytes of delays alone;
-        // combined with max strings this should overflow the u8 header_size.
-        // In practice the frame count that trips the limit depends on string lengths.
-        // With no strings: 21 + 78*2 = 177 bytes — still under 255.
-        // With max strings (16 + 64 = 80 bytes): 21 + 80 + 78*2 = 257 bytes — over.
+    void v4_tooManyFrames_perFrameDelayThrows() {
+        // Per-frame delays of N frames add N×2 bytes; combined with max strings
+        // this overflows the u8 header_size (max 255 bytes).
+        // With no strings (v4 base = 22 bytes): 22 + 77*2 = 176 bytes < 255.
+        // With max strings (16 + 64 = 80 extra): 22 + 80 + 77*2 = 256 bytes — over.
         String maxUsername = "A".repeat(16);
         String maxTitle    = "B".repeat(64);
-        int[] manyDelays   = new int[78]; // 78 per-frame delays
+        int[] manyDelays   = new int[77];
         java.util.Arrays.fill(manyDelays, 100);
 
         assertThrows(IllegalArgumentException.class, () ->
@@ -232,19 +258,31 @@ class PayloadManifestTest {
                         PayloadManifest.FLAG_ANIMATED,
                         1, 1, 0, 0, 0L,
                         maxUsername, maxTitle, 0,
-                        78, 0, manyDelays));
+                        77, 0, manyDelays));
     }
 
     @Test
-    void v3_staticTile_flagNotSet() {
-        // A v3 manifest with frameCount=1 and no FLAG_ANIMATED is a valid static tile.
+    void v4_invalidFrameCount_throws() {
+        assertThrows(IllegalArgumentException.class, () ->
+                PayloadManifest.toBytes(PayloadManifest.FLAG_ANIMATED,
+                        1, 1, 0, 0, 0L, null, null, 0,
+                        0, 0, new int[]{100}));
+        assertThrows(IllegalArgumentException.class, () ->
+                PayloadManifest.toBytes(PayloadManifest.FLAG_ANIMATED,
+                        1, 1, 0, 0, 0L, null, null, 0,
+                        65536, 0, new int[]{100}));
+    }
+
+    @Test
+    void v4_staticTile_flagNotSet() {
+        // A v4 manifest with frameCount=1 and no FLAG_ANIMATED is a valid static tile.
         byte[] bytes = PayloadManifest.toBytes(
                 0, 1, 1, 0, 0, 0xDEADL,
                 null, null, 0x11223344,
                 1, 0, new int[]{100});
 
         PayloadManifest m = PayloadManifest.fromBytes(bytes);
-        assertEquals(3, m.manifestVersion);
+        assertEquals(4, m.manifestVersion);
         assertFalse(m.animated());
         assertEquals(1, m.frameCount);
     }
@@ -258,7 +296,7 @@ class PayloadManifestTest {
                 5, 0, new int[]{100});
 
         PayloadManifest m = PayloadManifest.fromBytes(bytes);
-        assertEquals(3, m.manifestVersion);
+        assertEquals(4, m.manifestVersion);
         assertTrue(m.animated());
         assertTrue(m.muxed());
         assertEquals(flags, m.flags);

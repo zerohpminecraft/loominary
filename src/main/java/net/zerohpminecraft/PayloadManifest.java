@@ -8,7 +8,7 @@ import java.util.zip.CRC32;
  * Manifest header prepended to map-color bytes inside the zstd frame.
  *
  * Wire layout (bytes at the start of the decompressed payload):
- *   [0]     manifest_version  u8  — schema version; 1, 2, or 3
+ *   [0]     manifest_version  u8  — schema version; 1, 2, 3, or 4
  *   [1]     header_size       u8  — total bytes in this header (allows future
  *                                   clients to skip unknown versions and still
  *                                   find the map colors at offset header_size)
@@ -26,12 +26,17 @@ import java.util.zip.CRC32;
  *   […]     nonce             u32 big-endian — random salt from /loominary resalt;
  *                                 informational only; decoders use header_size to find
  *                                 map colors and can safely ignore this field.
- *   (v3 only, appended after nonce)
+ *   (v3, appended after nonce — frame_count is u8, max 255 frames)
  *   […]     frame_count       u8  — total frames; 1 for static tiles
  *   […]     loop_count        u16 big-endian — 0 = loop forever; >0 = stop after N loops
  *   […]     delay_mode        u8  — 0 = single global delay; 1 = per-frame table
  *   […]     delay             u16 big-endian (delay_mode=0), or
  *                             frame_count × u16 (delay_mode=1) — milliseconds per frame
+ *   (v4, same as v3 but frame_count is u16, max 65535 frames)
+ *   […]     frame_count       u16 big-endian — total frames; 1 for static tiles
+ *   […]     loop_count        u16 big-endian
+ *   […]     delay_mode        u8
+ *   […]     delay             u16 (delay_mode=0) or frame_count × u16 (delay_mode=1)
  *
  * Map-color bytes follow at offset header_size.
  * For animated tiles (FLAG_ANIMATED): frame_count × 16,384 bytes.
@@ -48,7 +53,7 @@ import java.util.zip.CRC32;
 public class PayloadManifest {
 
     /** Highest manifest version this client can decode. */
-    public static final int CURRENT_VERSION = 3;
+    public static final int CURRENT_VERSION = 4;
 
     public static final int FLAG_ALL_SHADES = 0x01;
     /** Set when the payload contains multiple animation frames. */
@@ -216,22 +221,26 @@ public class PayloadManifest {
         byte[] usernameBytes = encodeString(username, 16);
         byte[] titleBytes    = encodeString(title, 64);
 
+        if (frameCount < 1 || frameCount > 65535) {
+            throw new IllegalArgumentException(
+                    "frameCount must be 1–65535, got " + frameCount);
+        }
         boolean perFrame = frameDelays.length > 1;
         int delayBytes = perFrame ? frameCount * 2 : 2;
 
         // 7 fixed + 4 crc32 + 1 username_len + username + 1 title_len + title
-        // + 4 nonce + 1 frame_count + 2 loop_count + 1 delay_mode + delayBytes
-        int totalSize = 21 + usernameBytes.length + titleBytes.length + delayBytes;
+        // + 4 nonce + 2 frame_count (v4 u16) + 2 loop_count + 1 delay_mode + delayBytes
+        int totalSize = 22 + usernameBytes.length + titleBytes.length + delayBytes;
 
         if (totalSize > 255) {
             throw new IllegalArgumentException(
-                    "v3 manifest header exceeds 255 bytes (" + totalSize + ") — "
+                    "v4 manifest header exceeds 255 bytes (" + totalSize + ") — "
                     + "reduce frame count or shorten username/title");
         }
 
         byte[] out = new byte[totalSize];
         int i = 0;
-        out[i++] = 3;                  // manifest_version = 3
+        out[i++] = 4;                  // manifest_version = 4
         out[i++] = (byte) totalSize;   // header_size
         out[i++] = (byte) flags;
         out[i++] = (byte) cols;
@@ -253,8 +262,9 @@ public class PayloadManifest {
         out[i++] = (byte) ((nonce >> 16) & 0xFF);
         out[i++] = (byte) ((nonce >>  8) & 0xFF);
         out[i++] = (byte) ( nonce        & 0xFF);
-        // animation fields
-        out[i++] = (byte) frameCount;
+        // animation fields (v4: frame_count is u16)
+        out[i++] = (byte) (frameCount >>> 8);
+        out[i++] = (byte)  frameCount;
         out[i++] = (byte) ((loopCount >> 8) & 0xFF);
         out[i++] = (byte)  (loopCount       & 0xFF);
         out[i++] = (byte) (perFrame ? 1 : 0);  // delay_mode
@@ -349,7 +359,14 @@ public class PayloadManifest {
         int loopCount  = 0;
         int[] frameDelays = {100};
         if (ver >= 3 && i < data.length) {
-            frameCount = data[i++] & 0xFF;
+            if (ver >= 4 && i + 2 <= data.length) {
+                // v4: frame_count is u16
+                frameCount = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
+                i += 2;
+            } else {
+                // v3: frame_count is u8
+                frameCount = data[i++] & 0xFF;
+            }
             if (i + 2 <= data.length) {
                 loopCount = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
                 i += 2;

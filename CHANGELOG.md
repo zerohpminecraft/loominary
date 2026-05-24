@@ -4,6 +4,32 @@
 
 ---
 
+## v1.17.1
+
+### Animated frame count raised to 65535
+
+The manifest `frame_count` field was a 1-byte unsigned integer, capping animated art at 255 frames regardless of how many banners were available. The manifest format is bumped to v4, expanding `frame_count` to a 2-byte unsigned integer. Old decoders (v3 and earlier) continue to read their own format correctly; new decoders handle both v3 (u8 frame_count) and v4 (u16 frame_count) transparently.
+
+- **v4 manifest** — `frame_count` is now u16 (big-endian), supporting 1–65535 frames
+- **Wire-format backward compat** — v3 banners already placed in item frames decode identically; the encoder now produces v4 for all animated tiles
+- **65536-frame validation** — `toBytes` throws `IllegalArgumentException` for out-of-range frame counts
+
+### Whitelist-banner reuse and bundle extraction
+
+The anvil renamer can now recycle existing named banners as raw material, eliminating the need to always supply a stock of fresh unnamed banners.
+
+- **`/loominary whitelist add`** — scans inventory (loose slots and bundle contents) and marks every named banner as reusable raw material
+- **`/loominary whitelist clear`** — empties the whitelist
+- **Three-pass extraction** — the renamer first tries unnamed banners (existing behavior), then loose whitelisted banners, then banners inside bundles; the bundle selection protocol (`BundleItemSelectedC2SPacket` + right-click) pops the target banner to the cursor
+- **Output-bundle protection** — bundles holding whitelisted source banners are never used as rename output targets to avoid index desync; a HUD warning fires when all bundles are either full or excluded
+- **Whitelist persistence** — the whitelist survives save/load cycles via `config/loominary_state.json`
+
+### Carpet import from map screenshot
+
+- **`/loominary import header <lc-ls-banner> <mapshot.png>`** — reconstructs a carpet-encoded `PayloadState` from a 128×128 map screenshot and an LC/LS manifest banner string, enabling schematic export without re-encoding
+
+---
+
 ## v1.16.1
 
 ### Multi-tile rendering reliability

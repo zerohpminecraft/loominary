@@ -302,19 +302,22 @@ public class MapBannerDecoder {
                     catch (NumberFormatException e) { continue; }
                     overflowNames.add(s);
                 }
-                overflowNames.sort(Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
 
-                // CJK overflow (new format): first hex banner's payload starts with a CJK char.
-                // Base64 overflow (legacy format): manifest payload + banner payloads as ASCII.
-                boolean cjkOverflow = !overflowNames.isEmpty()
-                        && overflowNames.get(0).length() > 2
-                        && overflowNames.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
-                if (cjkOverflow) {
-                    overflowData = CjkCodec.assembleChunks(overflowNames);
-                } else {
-                    StringBuilder b64 = new StringBuilder(lcPayload);
-                    for (String s : overflowNames) b64.append(s.substring(2));
-                    overflowData = Base64.getDecoder().decode(b64.toString());
+                // CJK overflow: detect old (2-char index) vs new (4-char index) format.
+                // Base64 overflow (legacy): all ASCII payloads, 2-char index.
+                if (!overflowNames.isEmpty()) {
+                    String ofirst = overflowNames.get(0);
+                    boolean oldCjk = ofirst.length() > 2 && ofirst.charAt(2) >= CjkCodec.ALPHA_BASE;
+                    boolean newCjk = !oldCjk && ofirst.length() > 4 && ofirst.charAt(4) >= CjkCodec.ALPHA_BASE;
+                    if (oldCjk || newCjk) {
+                        overflowData = CjkCodec.assembleChunks(overflowNames);
+                    } else {
+                        overflowNames.sort(Comparator.comparingInt(
+                                s -> Integer.parseInt(s.substring(0, 2), 16)));
+                        StringBuilder b64 = new StringBuilder(lcPayload);
+                        for (String s : overflowNames) b64.append(s.substring(2));
+                        overflowData = Base64.getDecoder().decode(b64.toString());
+                    }
                 }
             }
 
@@ -408,16 +411,19 @@ public class MapBannerDecoder {
                     catch (NumberFormatException e) { continue; }
                     ovfNames.add(s);
                 }
-                ovfNames.sort(java.util.Comparator.comparingInt(
-                        s -> Integer.parseInt(s.substring(0, 2), 16)));
-                boolean cjk = !ovfNames.isEmpty() && ovfNames.get(0).length() > 2
-                        && ovfNames.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
-                if (cjk) {
-                    overflowData = CjkCodec.assembleChunks(ovfNames);
-                } else {
-                    StringBuilder b64 = new StringBuilder();
-                    for (String s : ovfNames) b64.append(s.substring(2));
-                    overflowData = Base64.getDecoder().decode(b64.toString());
+                if (!ovfNames.isEmpty()) {
+                    String ofirst = ovfNames.get(0);
+                    boolean oldCjk = ofirst.length() > 2 && ofirst.charAt(2) >= CjkCodec.ALPHA_BASE;
+                    boolean newCjk = !oldCjk && ofirst.length() > 4 && ofirst.charAt(4) >= CjkCodec.ALPHA_BASE;
+                    if (oldCjk || newCjk) {
+                        overflowData = CjkCodec.assembleChunks(ovfNames);
+                    } else {
+                        ovfNames.sort(java.util.Comparator.comparingInt(
+                                s -> Integer.parseInt(s.substring(0, 2), 16)));
+                        StringBuilder b64 = new StringBuilder();
+                        for (String s : ovfNames) b64.append(s.substring(2));
+                        overflowData = Base64.getDecoder().decode(b64.toString());
+                    }
                 }
             }
 
@@ -650,27 +656,39 @@ public class MapBannerDecoder {
      * or more 16,384-byte frame arrays.
      */
     private static byte[] assembleAndDecompress(List<String> names) {
-        names.sort(Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
+        // Detect format from first banner:
+        //   Old CJK  (2-char index, 2-byte header): charAt(2) ≥ U+4E00
+        //   New CJK  (4-char index, 4-byte header): charAt(4) ≥ U+4E00
+        //   Old base64 (2-char index, no header)  : everything else (all ASCII)
+        String first = names.get(0);
+        final int prefix;
+        final boolean cjk;
+        final int headerBytes;
+        if (first.length() > 2 && first.charAt(2) >= CjkCodec.ALPHA_BASE) {
+            prefix = 2; cjk = true; headerBytes = 2;   // old CJK
+        } else if (first.length() > 4 && first.charAt(4) >= CjkCodec.ALPHA_BASE) {
+            prefix = 4; cjk = true; headerBytes = 4;   // new CJK
+        } else {
+            prefix = 2; cjk = false; headerBytes = 0;  // old base64
+        }
 
-        // Detect encoding: CJK payload chars are ≥ U+4E00; base64 chars are all ASCII (≤ 0x7F).
-        boolean cjk = !names.isEmpty() && names.get(0).length() > 2
-                && names.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
+        names.sort(Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, prefix), 16)));
 
         byte[] compressed;
         if (cjk) {
             StringBuilder sb = new StringBuilder();
-            for (String s : names) sb.append(s.substring(2));
-            compressed = CjkCodec.decode(sb.toString());
+            for (String s : names) sb.append(s.substring(prefix));
+            compressed = CjkCodec.decode(sb.toString(), headerBytes);
         } else {
             StringBuilder b64 = new StringBuilder();
             int expectedIndex = 0;
             for (String s : names) {
-                int idx = Integer.parseInt(s.substring(0, 2), 16);
+                int idx = Integer.parseInt(s.substring(0, prefix), 16);
                 if (idx != expectedIndex)
                     throw new IllegalStateException("Non-contiguous chunk index: expected "
                             + expectedIndex + " but got " + idx);
                 expectedIndex++;
-                b64.append(s.substring(2));
+                b64.append(s.substring(prefix));
             }
             compressed = Base64.getDecoder().decode(b64.toString());
         }

@@ -711,17 +711,30 @@ public class LoominaryCommand {
             return Zstd.decompress(compressed, (int) size);
         }
         // Banner tile: reassemble chunks → CJK or base64 decode → decompress
+        // Detect format: old CJK (2-char index, charAt(2)≥ALPHA_BASE),
+        //                new CJK (4-char index, charAt(4)≥ALPHA_BASE),
+        //                legacy base64 (2-char index, ASCII payload).
         List<String> names = new ArrayList<>(chunks);
-        names.sort(java.util.Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
+        String first = names.isEmpty() ? "" : names.get(0);
+        final int prefix;
+        final boolean isCjk;
+        final int headerBytes;
+        if (first.length() > 2 && first.charAt(2) >= CjkCodec.ALPHA_BASE) {
+            prefix = 2; isCjk = true; headerBytes = 2;
+        } else if (first.length() > 4 && first.charAt(4) >= CjkCodec.ALPHA_BASE) {
+            prefix = 4; isCjk = true; headerBytes = 4;
+        } else {
+            prefix = 2; isCjk = false; headerBytes = 0;
+        }
+        names.sort(java.util.Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, prefix), 16)));
         byte[] compressed;
-        if (!names.isEmpty() && names.get(0).length() > 2
-                && names.get(0).charAt(2) >= CjkCodec.ALPHA_BASE) {
+        if (isCjk) {
             StringBuilder sb = new StringBuilder();
-            for (String s : names) sb.append(s.substring(2));
-            compressed = CjkCodec.decode(sb.toString());
+            for (String s : names) sb.append(s.substring(prefix));
+            compressed = CjkCodec.decode(sb.toString(), headerBytes);
         } else {
             StringBuilder b64 = new StringBuilder();
-            for (String s : names) b64.append(s.substring(2));
+            for (String s : names) b64.append(s.substring(prefix));
             compressed = Base64.getDecoder().decode(b64.toString());
         }
         long originalSize = Zstd.getFrameContentSize(compressed);

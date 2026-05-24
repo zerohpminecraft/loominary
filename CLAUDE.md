@@ -67,8 +67,10 @@ Writes Litematica v6 `.litematic` files (gzipped NBT). Banners are arranged in a
 
 ## Encoding invariants
 
-- Banner name capacity: 50 chars = 2 hex index + 48 base64 payload chars
-- Max banners per map: 255 (hex indices `00`–`ff`)
-- Max compressed bytes per map: 255 × 48 base64 chars = ~9,000 bytes
+- Banner name capacity: 50 chars = 4 hex index + 46 CJK payload chars (new format)
+- Max banners per map: 65535 (hex indices `0000`–`ffff`)
+- CJK format: 46 chars × 14 bits = 644 bits ≈ 80.5 bytes per banner; 4-byte big-endian length header prepended before bit-packing
+- Legacy base64 format: 2 hex index + 48 base64 payload chars, max 255 banners — still decoded for backward compat
+- Backward compat detection: `charAt(2) ≥ U+4E00` → old CJK (2-char index, 2-byte header); `charAt(4) ≥ U+4E00` → new CJK (4-char index, 4-byte header); else legacy base64
 - Map color array is always exactly 16,384 bytes (128×128); `reassemblePayload` validates this
 - Map color byte layout: upper 6 bits = base color ID (1–63), lower 2 bits = shade ID (0–3); shade 3 is unobtainable via normal block placement

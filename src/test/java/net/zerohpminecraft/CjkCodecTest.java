@@ -13,10 +13,11 @@ class CjkCodecTest {
 
     @Test
     void bytesPerBanner_isExact() {
-        // 48 chars × 14 bits must divide evenly by 8 — no fractional bytes
-        assertEquals(0, (CjkCodec.PAYLOAD_CHARS * CjkCodec.ALPHA_BITS) % 8,
-                "PAYLOAD_CHARS × ALPHA_BITS must be divisible by 8");
-        assertEquals(84, CjkCodec.BYTES_PER_BANNER);
+        // 46 chars × 14 bits = 644 bits = 80.5 bytes — not an exact integer.
+        // BYTES_PER_BANNER is the integer floor (80); wire format uses a 4-byte
+        // length header to handle any trailing padding precisely.
+        assertEquals(46, CjkCodec.PAYLOAD_CHARS);
+        assertEquals(80, CjkCodec.BYTES_PER_BANNER);
     }
 
     // ── encode / decode round-trips ───────────────────────────────────────
@@ -35,8 +36,8 @@ class CjkCodecTest {
 
     @Test
     void roundtrip_exactlyOneFullBanner() {
-        // BYTES_PER_BANNER bytes − 2 header bytes = data that fills one banner
-        byte[] src = new byte[CjkCodec.BYTES_PER_BANNER - 2];
+        // BYTES_PER_BANNER bytes − 4 header bytes = data that fits snugly in one banner
+        byte[] src = new byte[CjkCodec.BYTES_PER_BANNER - 4];
         for (int i = 0; i < src.length; i++) src[i] = (byte)(i * 37 ^ 0x5A);
         assertArrayEquals(src, CjkCodec.decode(CjkCodec.encode(src)));
     }
@@ -80,8 +81,8 @@ class CjkCodecTest {
 
     @Test
     void encode_lengthIsCorrect() {
-        byte[] src = new byte[83]; // one byte less than a full banner of payload
-        int expectedChars = (int) Math.ceil((2.0 + src.length) * 8 / CjkCodec.ALPHA_BITS);
+        byte[] src = new byte[76]; // 4-byte header + 76 = 80 bytes → 1 banner (46 CJK chars)
+        int expectedChars = (int) Math.ceil((4.0 + src.length) * 8.0 / CjkCodec.ALPHA_BITS);
         assertEquals(expectedChars, CjkCodec.encode(src).length());
     }
 
@@ -99,12 +100,12 @@ class CjkCodecTest {
         byte[] src = new byte[CjkCodec.BYTES_PER_BANNER * 10];
         new Random(7).nextBytes(src);
         List<String> chunks = CjkCodec.buildChunks(src);
-        // Each chunk starts with a 2-char hex index followed by CJK payload
+        // Each chunk starts with a 4-char hex index followed by CJK payload
         for (int i = 0; i < chunks.size(); i++) {
             String s = chunks.get(i);
-            assertEquals(String.format("%02x", i), s.substring(0, 2), "chunk index prefix");
-            assertTrue(s.length() > 2, "chunk has payload");
-            assertTrue(s.charAt(2) >= CjkCodec.ALPHA_BASE, "payload starts with CJK char");
+            assertEquals(String.format("%04x", i), s.substring(0, 4), "chunk index prefix");
+            assertTrue(s.length() > 4, "chunk has payload");
+            assertTrue(s.charAt(4) >= CjkCodec.ALPHA_BASE, "payload starts with CJK char");
         }
         assertArrayEquals(src, CjkCodec.assembleChunks(new java.util.ArrayList<>(chunks)));
     }
@@ -126,7 +127,7 @@ class CjkCodecTest {
         // For any reasonable payload, CJK needs fewer banners than base64
         byte[] src = new byte[1000];
         new Random(0).nextBytes(src);
-        int cjkBanners  = CjkCodec.chunksNeeded(src); // 84 bytes/banner
+        int cjkBanners  = CjkCodec.chunksNeeded(src); // ~80.5 bytes/banner
         int b64Banners  = (int) Math.ceil(src.length * 4.0 / 3.0 / 48); // ~36 bytes/banner
         assertTrue(cjkBanners < b64Banners,
                 "CJK should need fewer banners: cjk=" + cjkBanners + " b64=" + b64Banners);

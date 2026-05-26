@@ -130,6 +130,10 @@ public class MapBannerDecoder {
                 advanceAnimatedFrames(client);
             }
 
+            // Held-map check runs every tick: cheap for claimed maps, decodes once on first encounter.
+            processHeldItem(client, client.player.getMainHandStack());
+            processHeldItem(client, client.player.getOffHandStack());
+
             // Frame scan runs every 20 ticks to discover new encoded maps.
             tickCounter++;
             if (tickCounter < SCAN_INTERVAL_TICKS)
@@ -144,6 +148,75 @@ public class MapBannerDecoder {
                 processFrame(client, frame);
             }
         });
+    }
+
+    private static void processHeldItem(MinecraftClient client, ItemStack stack) {
+        if (!(stack.getItem() instanceof FilledMapItem))
+            return;
+
+        MapIdComponent mapId = stack.get(DataComponentTypes.MAP_ID);
+        if (mapId == null)
+            return;
+
+        MapState mapState = FilledMapItem.getMapState(mapId, client.world);
+        if (mapState == null)
+            return;
+
+        Map<String, MapDecoration> decorations = ((MapStateAccessor) mapState).getDecorations();
+
+        if (claimedMaps.contains(mapId.id())) {
+            AnimatedMapState anim = animatedMaps.get(mapId.id());
+            if (!decorations.isEmpty())
+                decorations.clear();
+            byte[] expected = anim != null ? anim.frames[anim.currentFrame] : decodedColors.get(mapId.id());
+            if (expected != null && !Arrays.equals(mapState.colors, expected))
+                paintMap(client, mapId, mapState, expected);
+            return;
+        }
+
+        if (decorations.isEmpty())
+            return;
+
+        // Carpet-hybrid encoding (LC/LS manifest banner). Skip LR mux-receiver — it
+        // requires payload segments from sibling tiles that may not be loaded in hand.
+        for (MapDecoration dec : decorations.values()) {
+            Text text = dec.name().orElse(null);
+            if (text == null) continue;
+            String s = text.getString();
+            boolean isLC = s.length() >= 6  && s.startsWith("LC");
+            boolean isLS = s.length() >= 10 && s.startsWith("LS");
+            if (isLC || isLS) {
+                processCarpetFrame(client, mapId, mapState, s, decorations, null);
+                return;
+            }
+        }
+
+        // Legacy banner encoding: hex-indexed chunks.
+        List<String> names = new ArrayList<>();
+        for (MapDecoration dec : decorations.values()) {
+            Text text = dec.name().orElse(null);
+            if (text == null) continue;
+            String s = text.getString();
+            if (s.length() < 2) continue;
+            try { Integer.parseInt(s.substring(0, 2), 16); }
+            catch (NumberFormatException e) { continue; }
+            names.add(s);
+        }
+        if (names.isEmpty())
+            return;
+
+        System.out.println(TAG + " Decoding held map id=" + mapId.id()
+                + " from " + names.size() + " banner markers");
+        try {
+            byte[] full = assembleAndDecompress(names);
+            processDecompressedPayload(client, mapId, mapState, null, full);
+            claimedMaps.add(mapId.id());
+            decorations.clear();
+            System.out.println(TAG + " Claimed held map " + mapId.id());
+        } catch (Exception e) {
+            System.err.println(TAG + " Held map decode failed for map " + mapId.id()
+                    + ": " + e.getMessage());
+        }
     }
 
     private static void processFrame(MinecraftClient client, ItemFrameEntity frame) {

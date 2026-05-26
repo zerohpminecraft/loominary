@@ -4,6 +4,19 @@
 
 ---
 
+## v1.17.2
+
+### Decode and render maps held in hand
+
+Loominary maps now decode and display their image when held in the main hand or off-hand, not only when placed in an item frame. Banner markers are hidden in both cases.
+
+- **Held-map decode** — carpet-hybrid (LC/LS) and legacy banner-encoded maps are detected and decoded the first time they appear in the player's hand
+- **Marker suppression** — banner pin decorations are cleared every tick while the map is held, matching item-frame behaviour
+- **Claimed-map maintenance** — already-decoded maps repaint from cache if the server overwrites their colors while held
+- **LR mux-receiver tiles skipped** — a single held tile cannot reconstruct its payload without the sibling donor tiles; these are left for the item-frame scanner to handle once placed
+
+---
+
 ## v1.17.1
 
 ### Animated frame count raised to 65535

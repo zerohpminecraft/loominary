@@ -31,15 +31,159 @@ public class CarpetChannel {
     public static final int MAX_CARPET_BYTES  = MAP_PIXELS / 2;       // 8192
     /** Shade channel capacity: 31 four-row groups + 1 three-row tail, 128 cols. */
     public static final int MAX_SHADE_BYTES   = 31 * 128 * 4 / 8 + 128 * 2 / 8; // 2016
-    /** CJK overflow capacity: 62 banners × 84 bytes − 2 bytes for CjkCodec length header. */
+    /** CJK overflow capacity: 62 banners × 84 bytes − 2 bytes for CjkCodec length header (legacy LC/LS format). */
     public static final int MAX_OVERFLOW_BYTES = 62 * 84 - 2;          // 5206
+    /** Total capacity for legacy LC/LS format: carpet + shade + 62 overflow banners. */
     public static final int MAX_TOTAL_BYTES   =
             MAX_CARPET_BYTES + MAX_SHADE_BYTES + MAX_OVERFLOW_BYTES;   // 15414
+
+    // ── LOOM-header format constants ──────────────────────────────────────
+
+    /** Size of the fixed portion of the LOOM header prepended to the carpet channel. */
+    public static final int LOOM_FIXED_HEADER = 16;
+    /** Bytes per mux guest descriptor inside the LOOM header. */
+    public static final int LOOM_GUEST_DESC   = 10;
+    /** LOOM header magic bytes: ASCII "LOOM" (0x4C4F4F4D). */
+    public static final byte[] LOOM_MAGIC = { 0x4C, 0x4F, 0x4F, 0x4D };
+
+    // LOOM flag bits
+    public static final int LOOM_FLAG_SHADE     = 0x01;
+    public static final int LOOM_FLAG_BANNERS   = 0x02;
+    public static final int LOOM_FLAG_MUX_DONOR = 0x04;
+    public static final int LOOM_FLAG_MUX_RX    = 0x08;
+
+    /** Carpet payload bytes available after subtracting the fixed LOOM header. */
+    public static final int MAX_CARPET_PAYLOAD = MAX_CARPET_BYTES - LOOM_FIXED_HEADER; // 8176
+    /**
+     * CJK overflow capacity in the LOOM format: the freed LC/LS slot gives 63 overflow banners.
+     * 63 × 84 − 2 bytes for CjkCodec length header.
+     */
+    public static final int MAX_OVERFLOW_BYTES_LOOM = 63 * 84 - 2;    // 5290
+    /** Total payload capacity for LOOM carpet+shade+overflow (CARPET_SHADE mode). */
+    public static final int MAX_TOTAL_BYTES_LOOM =
+            MAX_CARPET_PAYLOAD + MAX_SHADE_BYTES + MAX_OVERFLOW_BYTES_LOOM; // 15482
+    /** Total payload capacity for LOOM carpet+overflow (CARPET mode, no shade). */
+    public static final int MAX_CARPET_OVERFLOW_BYTES_LOOM =
+            MAX_CARPET_PAYLOAD + MAX_OVERFLOW_BYTES_LOOM;               // 13466
+    /** Total payload capacity for LOOM carpet+shade (CARPET_ONLY mode, no overflow). */
+    public static final int MAX_CARPET_SHADE_ONLY_BYTES_LOOM =
+            MAX_CARPET_PAYLOAD + MAX_SHADE_BYTES;                       // 10192
 
     /** Base64 chars in the LC banner's overflow payload slot (no shade channel). */
     public static final int LC_PAYLOAD_CHARS = 44; // 33 bytes
     /** Base64 chars in the LS banner's overflow payload slot (shade channel present). */
     public static final int LS_PAYLOAD_CHARS = 40; // 30 bytes; 4 extra chars hold the shade count
+
+    // ── LOOM header encode / decode ───────────────────────────────────────
+
+    /**
+     * Parsed representation of a LOOM header decoded from the first bytes of the carpet channel.
+     */
+    public static class LoomHeader {
+        public int flags;
+        public int col, row;
+        public int ownBytes;    // size of own zstd frame
+        public int totalBytes;  // full payload size (= ownBytes for non-mux)
+        public int guestCount;
+        /** [g][0]=tCol  [g][1]=tRow  [g][2]=tOffset  [g][3]=tLen */
+        public int[][] guestDescs;
+        /** Byte offset within cargo where actual data begins (after header + descriptors). */
+        public int dataOffset;
+
+        public boolean hasShade()   { return (flags & LOOM_FLAG_SHADE)     != 0; }
+        public boolean hasBanners() { return (flags & LOOM_FLAG_BANNERS)   != 0; }
+        public boolean isMuxDonor() { return (flags & LOOM_FLAG_MUX_DONOR) != 0; }
+        public boolean isMuxRx()    { return (flags & LOOM_FLAG_MUX_RX)    != 0; }
+    }
+
+    /**
+     * Checks whether the first 4 bytes of the carpet channel in {@code mapColors} match
+     * the LOOM magic "LOOM" (0x4C4F4F4D).  Fast — 8 array lookups, no JNI.
+     */
+    public static boolean peekLoomMagic(byte[] mapColors) {
+        if (mapColors.length < 8) return false;
+        int n0 = MAP_BYTE_TO_NIBBLE[mapColors[0] & 0xFF];
+        int n1 = MAP_BYTE_TO_NIBBLE[mapColors[1] & 0xFF];
+        int n2 = MAP_BYTE_TO_NIBBLE[mapColors[2] & 0xFF];
+        int n3 = MAP_BYTE_TO_NIBBLE[mapColors[3] & 0xFF];
+        int n4 = MAP_BYTE_TO_NIBBLE[mapColors[4] & 0xFF];
+        int n5 = MAP_BYTE_TO_NIBBLE[mapColors[5] & 0xFF];
+        int n6 = MAP_BYTE_TO_NIBBLE[mapColors[6] & 0xFF];
+        int n7 = MAP_BYTE_TO_NIBBLE[mapColors[7] & 0xFF];
+        if (n0 < 0 || n1 < 0 || n2 < 0 || n3 < 0 || n4 < 0 || n5 < 0 || n6 < 0 || n7 < 0)
+            return false;
+        return ((n0 << 4) | n1) == 0x4C
+            && ((n2 << 4) | n3) == 0x4F
+            && ((n4 << 4) | n5) == 0x4F
+            && ((n6 << 4) | n7) == 0x4D;
+    }
+
+    /**
+     * Decodes the LOOM header from the start of a cargo byte array (already decoded
+     * from the carpet channel via {@link #decodeBytes}).
+     */
+    public static LoomHeader decodeLoomHeader(byte[] cargo) {
+        if (cargo.length < LOOM_FIXED_HEADER)
+            throw new IllegalArgumentException("Cargo too short for LOOM header: " + cargo.length);
+        LoomHeader h = new LoomHeader();
+        // [0..3] magic — caller must have verified
+        h.flags      = cargo[4]  & 0xFF;
+        h.col        = cargo[5]  & 0xFF;
+        h.row        = cargo[6]  & 0xFF;
+        h.ownBytes   = ((cargo[7]  & 0xFF) << 24) | ((cargo[8]  & 0xFF) << 16)
+                     | ((cargo[9]  & 0xFF) <<  8) |  (cargo[10] & 0xFF);
+        h.totalBytes = ((cargo[11] & 0xFF) << 24) | ((cargo[12] & 0xFF) << 16)
+                     | ((cargo[13] & 0xFF) <<  8) |  (cargo[14] & 0xFF);
+        h.guestCount = cargo[15] & 0xFF;
+        h.dataOffset = LOOM_FIXED_HEADER + h.guestCount * LOOM_GUEST_DESC;
+        h.guestDescs = new int[h.guestCount][4];
+        for (int g = 0; g < h.guestCount; g++) {
+            int off = LOOM_FIXED_HEADER + g * LOOM_GUEST_DESC;
+            if (off + LOOM_GUEST_DESC > cargo.length)
+                throw new IllegalArgumentException("LOOM header guest descriptor " + g + " out of bounds");
+            h.guestDescs[g][0] = cargo[off]     & 0xFF;
+            h.guestDescs[g][1] = cargo[off + 1] & 0xFF;
+            h.guestDescs[g][2] = ((cargo[off+2] & 0xFF) << 24) | ((cargo[off+3] & 0xFF) << 16)
+                               |  ((cargo[off+4] & 0xFF) <<  8) |  (cargo[off+5] & 0xFF);
+            h.guestDescs[g][3] = ((cargo[off+6] & 0xFF) << 24) | ((cargo[off+7] & 0xFF) << 16)
+                               |  ((cargo[off+8] & 0xFF) <<  8) |  (cargo[off+9] & 0xFF);
+        }
+        return h;
+    }
+
+    /**
+     * Builds a LOOM header byte array.
+     *
+     * @param guestDescs  null or empty for non-donor tiles; each entry is
+     *                    {tCol, tRow, tOffset, tLen}.
+     */
+    public static byte[] buildLoomHeader(int flags, int col, int row,
+                                          int ownBytes, int totalBytes,
+                                          int[][] guestDescs) {
+        int gc = (guestDescs != null) ? guestDescs.length : 0;
+        byte[] h = new byte[LOOM_FIXED_HEADER + gc * LOOM_GUEST_DESC];
+        h[0] = 0x4C; h[1] = 0x4F; h[2] = 0x4F; h[3] = 0x4D; // "LOOM"
+        h[4]  = (byte) flags;
+        h[5]  = (byte) col;
+        h[6]  = (byte) row;
+        h[7]  = (byte)(ownBytes  >> 24); h[8]  = (byte)(ownBytes  >> 16);
+        h[9]  = (byte)(ownBytes  >>  8); h[10] = (byte)(ownBytes);
+        h[11] = (byte)(totalBytes >> 24); h[12] = (byte)(totalBytes >> 16);
+        h[13] = (byte)(totalBytes >>  8); h[14] = (byte)(totalBytes);
+        h[15] = (byte) gc;
+        if (guestDescs != null) {
+            for (int g = 0; g < gc; g++) {
+                int off = LOOM_FIXED_HEADER + g * LOOM_GUEST_DESC;
+                h[off]     = (byte) guestDescs[g][0];
+                h[off + 1] = (byte) guestDescs[g][1];
+                h[off + 2] = (byte)(guestDescs[g][2] >> 24); h[off + 3] = (byte)(guestDescs[g][2] >> 16);
+                h[off + 4] = (byte)(guestDescs[g][2] >>  8); h[off + 5] = (byte)(guestDescs[g][2]);
+                h[off + 6] = (byte)(guestDescs[g][3] >> 24); h[off + 7] = (byte)(guestDescs[g][3] >> 16);
+                h[off + 8] = (byte)(guestDescs[g][3] >>  8); h[off + 9] = (byte)(guestDescs[g][3]);
+            }
+        }
+        return h;
+    }
 
     // ── Shade-channel sequence tables ────────────────────────────────────
 

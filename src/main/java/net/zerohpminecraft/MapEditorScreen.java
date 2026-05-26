@@ -3603,7 +3603,11 @@ public class MapEditorScreen extends Screen {
         byte[] compressed = Zstd.compress(mapColors, Zstd.maxCompressionLevel());
         if (cachedIsCarpet) {
             cachedBudgetUsed = compressed.length;
-            cachedBudgetMax  = CarpetChannel.MAX_TOTAL_BYTES;
+            PayloadState.TileData tileData = tileIndex < PayloadState.tiles.size()
+                    ? PayloadState.tiles.get(tileIndex) : null;
+            cachedBudgetMax = (tileData != null && tileData.loomEncoded)
+                    ? LoominaryCommand.maxBytesForTile(tileData)
+                    : CarpetChannel.MAX_TOTAL_BYTES;
         } else {
             cachedBudgetUsed = CjkCodec.chunksNeeded(compressed);
             cachedBudgetMax  = 63;

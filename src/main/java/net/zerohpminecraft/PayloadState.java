@@ -39,6 +39,11 @@ public class PayloadState {
     public static int gridRows = 1;
     public static int activeTileIndex = 0;
 
+    // ── Codec ──────────────────────────────────────────────────────────
+
+    /** Encoding strategy for new imports and re-encodes. */
+    public static CodecMode codecMode = CodecMode.CARPET_SHADE;
+
     // ── Manifest metadata ──────────────────────────────────────────────
 
     /** Whether the batch was encoded with allShades (FLAG_ALL_SHADES). */
@@ -76,6 +81,11 @@ public class PayloadState {
         /** True when this tile uses the carpet-hybrid encoding (carpet platform + optional overflow banners). */
         public boolean carpetEncoded = false;
         /**
+         * True when this tile uses the new LOOM-header carpet format (no LC/LS banner).
+         * False for legacy LC/LS tiles and banner-only tiles.
+         */
+        public boolean loomEncoded = false;
+        /**
          * Full zstd-compressed payload as base64, present only when {@code carpetEncoded == true}.
          * Stored so the schematic can be re-exported and map-color preview works without the
          * physical carpet platform being scanned.  Typically 2–14 KB as base64 per tile.
@@ -103,6 +113,7 @@ public class PayloadState {
         boolean dither;
         String title;
         List<String> whitelist;
+        String codecMode; // null in old saves → defaults to CARPET_SHADE on load
     }
 
     public static int totalTiles() {
@@ -177,6 +188,7 @@ public class PayloadState {
             snap.dither = dither;
             snap.title = currentTitle;
             snap.whitelist = new ArrayList<>(whitelistedBannerNames);
+            snap.codecMode = codecMode.name();
             Files.writeString(path, GSON.toJson(snap));
         } catch (IOException e) {
             System.err.println(TAG + " Failed to save to " + path.getFileName() + ": " + e.getMessage());
@@ -200,6 +212,7 @@ public class PayloadState {
         allShades = snap.allShades;
         dither = snap.dither;
         currentTitle = snap.title;
+        codecMode = snap.codecMode != null ? CodecMode.valueOf(snap.codecMode) : CodecMode.CARPET_SHADE;
         tiles.clear();
         tiles.addAll(snap.tiles);
         whitelistedBannerNames.clear();
@@ -223,6 +236,7 @@ public class PayloadState {
             snap.dither = dither;
             snap.title = currentTitle;
             snap.whitelist = new ArrayList<>(whitelistedBannerNames);
+            snap.codecMode = codecMode.name();
             Files.writeString(stateFile(), GSON.toJson(snap));
         } catch (IOException e) {
             System.err.println(TAG + " Failed to save state: " + e.getMessage());
@@ -252,6 +266,7 @@ public class PayloadState {
             allShades = snap.allShades;
             dither = snap.dither;
             currentTitle = snap.title;
+            codecMode = snap.codecMode != null ? CodecMode.valueOf(snap.codecMode) : CodecMode.CARPET_SHADE;
 
             tiles.clear();
             tiles.addAll(snap.tiles);
@@ -286,6 +301,7 @@ public class PayloadState {
         allShades = false;
         dither = false;
         currentTitle = null;
+        codecMode = CodecMode.CARPET_SHADE;
         tiles.clear();
         whitelistedBannerNames.clear();
         ACTIVE_CHUNKS.clear();

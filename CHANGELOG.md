@@ -4,6 +4,33 @@
 
 ---
 
+## v1.17.3
+
+### Codec selection and LOOM carpet format
+
+Adds `/loominary codec` to select the encoding strategy per session, and replaces the LC/LS banner header with a compact in-carpet LOOM header for all new carpet-mode tiles. The freed banner slot is added to the overflow pool.
+
+**Codec modes** (select with `/loominary codec <mode>`):
+- `banner` — 63 hex-indexed CJK banner chunks; no carpet platform required
+- `carpet` — LOOM carpet + overflow banners; shade disabled
+- `carpet+shade` — LOOM carpet + shade + overflow banners **(default)**
+- `carpet-only` — LOOM carpet + shade; no overflow banners
+
+**LOOM header format**: a 16-byte uncompressed prefix at the start of the carpet channel replaces the LC/LS banner. Detected by the magic `"LOOM"` (0x4C4F4F4D) in the first 4 carpet bytes. Frees one banner slot per tile (63 overflow banners vs 62 previously).
+
+**Mux in all modes**: `/loominary mux` now works across all four codec modes.
+- `banner` and `carpet`/`carpet+shade`: receiver identified by `LB`/LOOM-MUX_RX banner; donors use MG routing banners (same wire format, updated capacity formula)
+- `carpet-only`: routing info embedded entirely in the LOOM header guest descriptors (10 bytes per guest vs 84 bytes for a banner slot); no MG banners needed
+
+**Backward compatibility**: existing LC/LS tiles decode identically via the unchanged `processCarpetFrame` path. LOOM tiles are detected by carpet magic; old tiles are detected by LC/LS banner presence.
+
+- **`CodecMode` enum** — `BANNER`, `CARPET`, `CARPET_SHADE`, `CARPET_ONLY`; persisted in `loominary_state.json`
+- **`TileData.loomEncoded`** — distinguishes new LOOM tiles from legacy LC/LS tiles for budget display and re-encoding
+- **`CarpetChannel` LOOM helpers** — `peekLoomMagic`, `decodeLoomHeader`, `buildLoomHeader`, updated capacity constants
+- **Decoder** — `processLoomCarpetFrame`, `processBannerMuxReceiver` (LB), `processBannerMuxDonor` (MG without carpet) added to `MapBannerDecoder`
+
+---
+
 ## v1.17.2
 
 ### Decode and render maps held in hand

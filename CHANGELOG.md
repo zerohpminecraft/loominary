@@ -4,6 +4,46 @@
 
 ---
 
+## v1.19.0
+
+### Sub-tick animation
+
+Animation frames now advance on the render thread (`WorldRenderEvents.END`) instead of the game tick event, allowing frame delays shorter than 50 ms to be honoured. The sync-group map used to group sibling tiles is now cached and rebuilt only when `animatedMaps` changes, eliminating per-frame allocations at high refresh rates.
+
+### v5 manifest — large animated GIF support (Bad Apple)
+
+The v4 manifest stored per-frame delay tables inline in the header, capping the total header at 255 bytes. For animations with many frames and variable delays (≥ ~116 frames), the table overflowed and import failed. A new v5 manifest format moves the delay table to after the last frame's data; `header_size` stays within the u8 field and old decoders gracefully render frame 0. Uniform delay arrays are normalized to a single global delay before deciding whether v5 is needed, so most animations remain v4.
+
+- **v5 manifest** — trailing delay table at `data[headerSize + frameCount × 16384]`; `fromBytes` detects version and reads accordingly
+- **Normalization** — uniform per-frame arrays collapsed to global delay at encode time
+- **`withTrailing` / `trailingDelayBytes`** — helpers for callers that build the payload before compressing
+
+### Mux redesign — strand donors replace ring
+
+`/loominary mux` no longer redistributes overflow across existing art tiles. Instead it calculates the minimum number of blank donor tiles needed to absorb all overflow and appends them as a numbered strand after the last art tile. Donors can be placed anywhere within 32 blocks of the art — they don't need to surround it.
+
+- **Remux** — calling `/loominary mux` again removes old donor tiles and recomputes the minimum, which may be fewer after reduction
+- **`/loominary mux undo`** — removes all donor tiles and resets art tiles to their original (possibly over-budget) state
+- **`/loominary ring` removed** — superseded by the donor-strand approach
+- **`isDonorOnly` flag** on `TileData` — identifies appended donor tiles for mux undo and status display
+
+### Import never fails on size
+
+Carpet imports that produce payloads too large for the current codec now fall back to a force-encode rather than aborting the entire import. The tile is imported as over-budget with a note; the user can then reduce or mux.
+
+### Adaptive compression level — native OOM fix
+
+`Zstd.compress` at level 22 allocates native working memory proportional to the window size. For Bad Apple's ~86 MB frame payload this reaches 500 MB–2 GB of native heap, crashing the LWJGL window without a Java exception. All compression calls now use an adaptive level: max (22) for payloads under 256 KB, level 9 up to 4 MB, level 3 above that.
+
+### Status and export improvements for mux batches
+
+- **Status receiver line** — shows own-segment bytes and full logical payload size so the user can see how much the donor strand is absorbing
+- **Donor summary** — shows total overflow banner count and links to the new paged donor view
+- **`/loominary status donors [page]`** — 10 donors per page with per-tile banner count and placement progress; navigation links at the bottom
+- **Export naming** — donor tiles export as `name_donor_001.litematic`, `_002`, etc. rather than all overwriting the same file
+
+---
+
 ## v1.18.1
 
 Five bug fixes for the 1.18.0 codec/LOOM changes:

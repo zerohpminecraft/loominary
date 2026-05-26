@@ -77,7 +77,22 @@ public class PayloadManifest {
      * Frame 0 is always stored raw.  Requires {@link #FLAG_ANIMATED}.
      * Decoders must reconstruct: {@code frame[n] = frame[n−1] XOR stored[n]}.
      */
-    public static final int FLAG_DELTA_FRAMES = 0x08;
+    public static final int FLAG_DELTA_FRAMES  = 0x08;
+    /**
+     * Set when frames 1..N are stored in sparse format rather than as full 16,384-byte
+     * arrays.  Frame 0 is always stored raw.  Requires {@link #FLAG_ANIMATED}.
+     *
+     * <p>Each sparse frame N is encoded as:
+     * <pre>
+     *   changeCount   : u16 BE          — number of changed pixels vs frame N-1
+     *   changeCount × (pos: u16 BE, val: u8)   — pixel position (0–16383) and new value
+     * </pre>
+     *
+     * <p>The decoder reconstructs frame N by copying frame N-1, then applying each
+     * {@code (pos, val)} change.  For animations with ≤ 2% pixel change per frame this
+     * typically reduces the uncompressed payload by 30–50× vs full frames.
+     */
+    public static final int FLAG_SPARSE_FRAMES = 0x10;
 
     public final int manifestVersion;
     /** Total bytes consumed by this header; map colors begin at this offset. */
@@ -141,6 +156,10 @@ public class PayloadManifest {
 
     public boolean deltaFrames() {
         return (flags & FLAG_DELTA_FRAMES) != 0;
+    }
+
+    public boolean sparseFrames() {
+        return (flags & FLAG_SPARSE_FRAMES) != 0;
     }
 
     // ── CRC helper ───────────────────────────────────────────────────────

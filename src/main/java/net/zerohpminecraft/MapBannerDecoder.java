@@ -998,20 +998,11 @@ public class MapBannerDecoder {
         }
 
         if (manifest.animated() && manifest.frameCount > 1 && frameEntity != null) {
-            int frameCount = manifest.frameCount;
-            byte[][] frames = new byte[frameCount][MAP_BYTES];
-            for (int f = 0; f < frameCount; f++) {
-                int start = offset + f * MAP_BYTES;
-                if (start + MAP_BYTES > full.length) {
-                    System.err.println(TAG + " Truncated animated payload: only "
-                            + f + "/" + frameCount + " frames present");
-                    frameCount = f;
-                    frames = Arrays.copyOf(frames, frameCount);
-                    break;
-                }
-                System.arraycopy(full, start, frames[f], 0, MAP_BYTES);
+            byte[][] frames = extractFrames(full, manifest);
+            if (frames.length < 2) {
+                paintMap(client, mapId, mapState, frames[0]);
+                return;
             }
-            if (manifest.deltaFrames()) reconstructDeltaFrames(frames);
             AnimatedMapState animState = new AnimatedMapState(
                     mapId, frames, manifest.frameDelays, manifest.loopCount,
                     frameEntity.getBlockPos(), manifest.cols, manifest.rows,
@@ -1272,20 +1263,8 @@ public class MapBannerDecoder {
             PayloadManifest manifest = PayloadManifest.fromBytes(full);
             if (!manifest.animated() || manifest.frameCount <= 1) return;
 
-            int fc = manifest.frameCount;
-            int offset = manifest.headerSize;
-            byte[][] frames = new byte[fc][MAP_BYTES];
-            for (int f = 0; f < fc; f++) {
-                int start = offset + f * MAP_BYTES;
-                if (start + MAP_BYTES > full.length) {
-                    fc = f;
-                    frames = Arrays.copyOf(frames, f);
-                    break;
-                }
-                System.arraycopy(full, start, frames[f], 0, MAP_BYTES);
-            }
-            if (fc == 0) return;
-            if (manifest.deltaFrames()) reconstructDeltaFrames(frames);
+            byte[][] frames = extractFrames(full, manifest);
+            if (frames.length < 2) return;
 
             AnimatedMapState animState = new AnimatedMapState(
                     mapId, frames, manifest.frameDelays, manifest.loopCount,
@@ -1325,6 +1304,48 @@ public class MapBannerDecoder {
             for (int p = 0; p < cur.length; p++)
                 cur[p] = (byte)(prev[p] ^ cur[p]);
         }
+    }
+
+    /**
+     * Extracts all animation frames from a decompressed payload, handling fixed-size,
+     * delta-encoded, and sparse formats.  Always returns raw (absolute) frame data.
+     *
+     * <p>Use this in preference to manual frame extraction anywhere frames need to be
+     * decoded for display, editing, or re-encoding.
+     */
+    public static byte[][] extractFrames(byte[] full, PayloadManifest manifest) {
+        int fc     = Math.max(1, manifest.frameCount);
+        int offset = manifest.headerSize;
+        byte[][] frames = new byte[fc][MAP_BYTES];
+
+        if (manifest.sparseFrames() && fc > 1) {
+            // Frame 0: raw.
+            System.arraycopy(full, offset, frames[0], 0, MAP_BYTES);
+            int off = offset + MAP_BYTES;
+            for (int f = 1; f < fc; f++) {
+                frames[f] = frames[f - 1].clone();
+                if (off + 2 > full.length) break;
+                int cc = ((full[off] & 0xFF) << 8) | (full[off + 1] & 0xFF);
+                off += 2;
+                for (int c = 0; c < cc && off + 3 <= full.length; c++, off += 3) {
+                    int pos = ((full[off] & 0xFF) << 8) | (full[off + 1] & 0xFF);
+                    frames[f][pos] = full[off + 2];
+                }
+            }
+        } else {
+            // Fixed-size frames (raw or delta).
+            for (int f = 0; f < fc; f++) {
+                int start = offset + f * MAP_BYTES;
+                if (start + MAP_BYTES > full.length) {
+                    frames = Arrays.copyOf(frames, Math.max(1, f));
+                    break;
+                }
+                System.arraycopy(full, start, frames[f], 0, MAP_BYTES);
+            }
+            if (manifest.deltaFrames() && frames.length > 1)
+                reconstructDeltaFrames(frames);
+        }
+        return frames;
     }
 
     // ── In-game metadata display ──────────────────────────────────────────

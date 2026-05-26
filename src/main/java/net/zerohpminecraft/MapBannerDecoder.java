@@ -40,6 +40,15 @@ public class MapBannerDecoder {
     private static final Map<Integer, AnimatedMapState> animatedMaps = new HashMap<>();
     private static int tickCounter = 0;
 
+    // ── Sync-group cache ──────────────────────────────────────────────────
+    // advanceAnimatedFrames groups map IDs by their sync key on every call.
+    // Rebuilding the map every rendered frame (60-144 Hz) allocates needlessly;
+    // instead we cache it and rebuild only when animatedMaps is mutated.
+    private static final Map<String, List<Integer>> animSyncGroups = new HashMap<>();
+    private static boolean animSyncGroupsDirty = false;
+
+    private static void markSyncGroupsDirty() { animSyncGroupsDirty = true; }
+
     /** Map IDs we've already logged a first-render-update for, to keep mixin logs cheap. */
     private static final Set<Integer> renderUpdateSeen = new HashSet<>();
     /** Map IDs we've already logged a first-scan for, to keep scanner logs cheap. */
@@ -121,14 +130,17 @@ public class MapBannerDecoder {
     public static void register() {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> clearCache());
 
+        // Animation runs on the render thread every frame so frame delays shorter
+        // than one game tick (50 ms) are honoured accurately.
+        net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents.END.register(context -> {
+            MinecraftClient client = MinecraftClient.getInstance();
+            if (client.world != null && client.player != null && !animatedMaps.isEmpty())
+                advanceAnimatedFrames(client);
+        });
+
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.world == null || client.player == null)
                 return;
-
-            // Animation tick runs every tick for smooth frame transitions.
-            if (!animatedMaps.isEmpty()) {
-                advanceAnimatedFrames(client);
-            }
 
             // Held-map check runs every tick: cheap for claimed maps, decodes once on first encounter.
             processHeldItem(client, client.player.getMainHandStack());
@@ -991,6 +1003,7 @@ public class MapBannerDecoder {
                     frameEntity.getBlockPos(), manifest.cols, manifest.rows,
                     manifest.username, manifest.title);
             animatedMaps.put(mapId.id(), animState);
+            markSyncGroupsDirty();
             paintMap(client, mapId, mapState, frames[0]);
         } else {
             paintMap(client, mapId, mapState,
@@ -1028,14 +1041,17 @@ public class MapBannerDecoder {
         long currentMs = System.currentTimeMillis();
         Vec3d playerPos = client.player.getPos();
 
-        // Group maps by sync key so sibling tiles in a mural advance together.
-        Map<String, List<Integer>> groups = new HashMap<>();
-        for (Map.Entry<Integer, AnimatedMapState> e : animatedMaps.entrySet()) {
-            groups.computeIfAbsent(e.getValue().syncKey(), k -> new ArrayList<>())
-                  .add(e.getKey());
+        // Rebuild the sync-group map only when animatedMaps has changed.
+        if (animSyncGroupsDirty) {
+            animSyncGroups.clear();
+            for (Map.Entry<Integer, AnimatedMapState> e : animatedMaps.entrySet()) {
+                animSyncGroups.computeIfAbsent(e.getValue().syncKey(), k -> new ArrayList<>())
+                              .add(e.getKey());
+            }
+            animSyncGroupsDirty = false;
         }
 
-        for (List<Integer> group : groups.values()) {
+        for (List<Integer> group : animSyncGroups.values()) {
             // Advance the group if any in-range member is due to advance.
             boolean anyDue = false;
             for (int id : group) {
@@ -1261,6 +1277,7 @@ public class MapBannerDecoder {
                     framePos, manifest.cols, manifest.rows,
                     manifest.username, manifest.title);
             animatedMaps.put(mapId.id(), animState);
+            markSyncGroupsDirty();
             claimedMaps.add(mapId.id()); // prevent scanner reset
         } catch (Exception e) {
             System.err.println(TAG + " registerAnimatedFromDecompressed failed for map "
@@ -1275,6 +1292,7 @@ public class MapBannerDecoder {
      */
     public static void unregisterAnimated(int mapId) {
         animatedMaps.remove(mapId);
+        markSyncGroupsDirty();
     }
 
     public static boolean isClaimed(int mapId) {
@@ -1284,6 +1302,8 @@ public class MapBannerDecoder {
     public static void clearCache() {
         claimedMaps.clear();
         animatedMaps.clear();
+        animSyncGroups.clear();
+        animSyncGroupsDirty = false;
         muxBuffers.clear();
         muxPendingOffsets.clear();
         muxPendingBytes.clear();

@@ -4,6 +4,31 @@
 
 ---
 
+## v1.18.0
+
+### Codec selection and LOOM carpet format (1.17.3 + fix)
+
+Adds `/loominary codec` to choose the encoding strategy for the session, and replaces the LC/LS banner header with a compact in-carpet LOOM header for all new carpet-mode tiles, freeing one banner slot per tile.
+
+**Codec modes** (`/loominary codec <mode>`):
+- `banner` — 63 hex-indexed CJK banner chunks; no carpet platform required
+- `carpet` — LOOM carpet + overflow banners; shade disabled
+- `carpet+shade` — LOOM carpet + shade + overflow banners **(default)**
+- `carpet-only` — LOOM carpet + shade; no overflow banners
+
+**LOOM header**: a 16-byte uncompressed prefix replaces the LC/LS banner, detected by `"LOOM"` magic in the first 4 carpet bytes. Frees one overflow banner slot per tile (63 vs 62 previously). Backward compatible — old LC/LS tiles still decode correctly.
+
+**Mux in all modes**: `/loominary mux` now works across all four codec modes. For `carpet-only`, routing descriptors are embedded in the LOOM header itself (10 bytes per guest), requiring no MG banners.
+
+**Bug fix**: `/loominary edit`, `palette`, `preview`, `reduce`, and `resalt` were incorrectly blocked on LOOM tiles that have no overflow banners, because those tiles have an empty chunk list (overflow banners are only written when the compressed payload exceeds the carpet+shade capacity). The guard now checks `carpetCompressedB64` for carpet tiles rather than the chunk list.
+
+- **`CodecMode` enum** — `BANNER`, `CARPET`, `CARPET_SHADE`, `CARPET_ONLY`; persisted in `loominary_state.json`
+- **`TileData.loomEncoded`** — tracks LOOM vs legacy LC/LS format for correct budget display and re-encoding
+- **`CarpetChannel` helpers** — `peekLoomMagic`, `decodeLoomHeader`, `buildLoomHeader`, updated capacity constants
+- **Decoder** — `processLoomCarpetFrame`, `processBannerMuxReceiver` (LB banner), `processBannerMuxDonor` (MG without carpet) added
+
+---
+
 ## v1.17.3
 
 ### Codec selection and LOOM carpet format

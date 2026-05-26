@@ -3360,152 +3360,140 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cActive tile has no data."));
             return 0;
         }
+        if (importInProgress) {
+            source.sendError(Text.literal("§cA long operation is already in progress."));
+            return 0;
+        }
 
-        try {
-            // ── Build the union and collect budget info ──────────────────────
-            final byte[] union;
-            final int fc;
-            final String header;
-            final String budgetLine;
-            List<Integer> perTileColors = null;
+        // Snapshot all state needed before going off-thread.
+        PayloadState.syncToActiveTile();
+        final int activeTileIdx  = PayloadState.activeTileIndex;
+        final int tileCount      = PayloadState.tiles.size();
+        final List<PayloadState.TileData> snapTiles   = new ArrayList<>(tileCount);
+        final List<List<String>>           snapChunks  = new ArrayList<>(tileCount);
+        for (int i = 0; i < tileCount; i++) {
+            snapTiles .add(snapshotTile(PayloadState.tiles.get(i)));
+            snapChunks.add(i == activeTileIdx
+                    ? new ArrayList<>(PayloadState.ACTIVE_CHUNKS)
+                    : new ArrayList<>(PayloadState.tiles.get(i).chunks));
+        }
+        final PngToMapColors.Strategy snapStrategy = reduceStrategy;
+        final boolean hasPreReduction = preReductionChunks.containsKey(activeTileIdx);
 
-            if (!all) {
-                int tileIdx = PayloadState.activeTileIndex;
-                PayloadState.TileData tileData = PayloadState.tiles.get(tileIdx);
-                byte[][] frames = resolveAllFramesForTile(tileData, PayloadState.ACTIVE_CHUNKS);
-                fc = frames.length;
-                union = mergeFrames(frames);
-                header = PayloadState.tileLabel(tileIdx);
+        importInProgress = true;
+        source.sendFeedback(Text.literal("§7Computing palette" + (all ? " (all tiles)" : "") + "…"));
+        MinecraftClient client = MinecraftClient.getInstance();
 
-                int bannerCount = PayloadState.ACTIVE_CHUNKS.size();
-                if (tileData.carpetEncoded) {
-                    int cb = carpetCompressedBytes(tileData);
-                    int cap = maxBytesForTile(tileData);
-                    boolean over = cb > cap;
-                    budgetLine = String.format("§7Compressed:      §f%d §7/ §f%d bytes%s",
-                            cb, cap,
-                            over ? " §c(OVER BUDGET by " + (cb - cap) + ")" : " §a✓");
-                } else {
-                    budgetLine = String.format("§7Banners needed:  §f%d §7/ §f%d%s",
-                            bannerCount, MAX_CHUNKS,
-                            bannerCount > MAX_CHUNKS
-                                    ? " §c(OVER BUDGET by " + (bannerCount - MAX_CHUNKS) + ")" : " §a✓");
-                }
-            } else {
-                PayloadState.syncToActiveTile();
-                int totalFrames = 0;
-                int overBudgetCount = 0;
-                int totalChunks = 0;
-                long totalCompressedBytes = 0;
-                boolean anyCarpet = false;
-                List<byte[]> allFramesList = new ArrayList<>();
+        Thread t = new Thread(() -> {
+            try {
+                // ── Build union and collect budget info ──────────────────
+                final byte[] union;
+                final int fc;
+                final String header;
+                final String budgetLine;
+                List<Integer> perTileColors = null;
 
-                for (int i = 0; i < PayloadState.tiles.size(); i++) {
-                    PayloadState.TileData td = PayloadState.tiles.get(i);
-                    List<String> chunks = (i == PayloadState.activeTileIndex)
-                            ? PayloadState.ACTIVE_CHUNKS : td.chunks;
-                    if (chunks.isEmpty()) continue;
-                    byte[][] tileFrames = resolveAllFramesForTile(td, chunks);
-                    for (byte[] f : tileFrames) allFramesList.add(f);
-                    totalFrames += tileFrames.length;
-                    if (td.carpetEncoded) {
-                        anyCarpet = true;
-                        int cb = carpetCompressedBytes(td);
-                        totalCompressedBytes += cb;
-                        if (cb > maxBytesForTile(td)) overBudgetCount++;
+                if (!all) {
+                    PayloadState.TileData tileData = snapTiles.get(activeTileIdx);
+                    byte[][] frames = resolveAllFramesForTile(tileData, snapChunks.get(activeTileIdx));
+                    fc    = frames.length;
+                    union = mergeFrames(frames);
+                    header = PayloadState.tileLabel(activeTileIdx);
+
+                    if (tileData.carpetEncoded) {
+                        int cb  = carpetCompressedBytes(tileData);
+                        int cap = maxBytesForTile(tileData);
+                        boolean over = cb > cap;
+                        budgetLine = String.format("§7Compressed:      §f%d §7/ §f%d bytes%s",
+                                cb, cap,
+                                over ? " §c(OVER BUDGET by " + (cb - cap) + ")" : " §a✓");
                     } else {
-                        totalChunks += chunks.size();
-                        if (chunks.size() > MAX_CHUNKS) overBudgetCount++;
+                        int bannerCount = snapChunks.get(activeTileIdx).size();
+                        budgetLine = String.format("§7Banners needed:  §f%d §7/ §f%d%s",
+                                bannerCount, MAX_CHUNKS,
+                                bannerCount > MAX_CHUNKS
+                                        ? " §c(OVER BUDGET by " + (bannerCount - MAX_CHUNKS) + ")" : " §a✓");
+                    }
+                } else {
+                    int totalFrames = 0;
+                    int overBudgetCount = 0, totalChunks2 = 0;
+                    long totalCompressedBytes = 0;
+                    boolean anyCarpet = false;
+                    List<byte[]> allFramesList = new ArrayList<>();
+
+                    for (int i = 0; i < tileCount; i++) {
+                        PayloadState.TileData td = snapTiles.get(i);
+                        List<String> chunks = snapChunks.get(i);
+                        if (chunks.isEmpty()) continue;
+                        byte[][] tileFrames = resolveAllFramesForTile(td, chunks);
+                        for (byte[] f2 : tileFrames) allFramesList.add(f2);
+                        totalFrames += tileFrames.length;
+                        if (td.carpetEncoded) {
+                            anyCarpet = true;
+                            int cb = carpetCompressedBytes(td);
+                            totalCompressedBytes += cb;
+                            if (cb > maxBytesForTile(td)) overBudgetCount++;
+                        } else {
+                            totalChunks2 += chunks.size();
+                            if (chunks.size() > MAX_CHUNKS) overBudgetCount++;
+                        }
+                    }
+
+                    byte[] combined2 = new byte[allFramesList.size() * MAP_BYTES];
+                    for (int i = 0; i < allFramesList.size(); i++)
+                        System.arraycopy(allFramesList.get(i), 0, combined2, i * MAP_BYTES, MAP_BYTES);
+                    union = combined2;
+                    fc    = totalFrames;
+                    header = String.format("all tiles (%d tile%s, %d frame%s)",
+                            tileCount, tileCount == 1 ? "" : "s",
+                            totalFrames, totalFrames == 1 ? "" : "s");
+
+                    List<Integer> perTileColorsTmp = new ArrayList<>();
+                    for (int i = 0; i < tileCount; i++) {
+                        PayloadState.TileData td2 = snapTiles.get(i);
+                        List<String> ch2 = snapChunks.get(i);
+                        if (ch2.isEmpty()) { perTileColorsTmp.add(0); continue; }
+                        byte[][] tf2 = resolveAllFramesForTile(td2, ch2);
+                        perTileColorsTmp.add(PngToMapColors.countDistinct(mergeFrames(tf2)));
+                    }
+                    perTileColors = perTileColorsTmp;
+
+                    if (anyCarpet) {
+                        budgetLine = String.format("§7Compressed:      §f%d §7bytes total%s",
+                                totalCompressedBytes,
+                                overBudgetCount > 0 ? " §c(" + overBudgetCount + " tile" + (overBudgetCount == 1 ? "" : "s") + " OVER BUDGET)" : " §a✓");
+                    } else {
+                        budgetLine = String.format("§7Banners needed:  §f%d §7total%s",
+                                totalChunks2,
+                                overBudgetCount > 0 ? " §c(" + overBudgetCount + " tile" + (overBudgetCount == 1 ? "" : "s") + " OVER BUDGET)" : " §a✓");
                     }
                 }
 
-                byte[] combined = new byte[allFramesList.size() * MAP_BYTES];
-                for (int i = 0; i < allFramesList.size(); i++)
-                    System.arraycopy(allFramesList.get(i), 0, combined, i * MAP_BYTES, MAP_BYTES);
-                union = combined;
-                fc = totalFrames;
+                // ── Statistics ───────────────────────────────────────────
+                int[] freq = new int[256];
+                for (byte b : union) freq[b & 0xFF]++;
+                int distinctColors = PngToMapColors.countDistinct(union);
+                int totalPixels = union.length - freq[0];
 
-                int tileCount = PayloadState.tiles.size();
-                header = String.format("all tiles (%d tile%s, %d frame%s)",
-                        tileCount, tileCount == 1 ? "" : "s",
-                        totalFrames, totalFrames == 1 ? "" : "s");
-                // Collect per-tile distinct color counts for the palette display
-                perTileColors = new ArrayList<>();
-                for (int i = 0; i < PayloadState.tiles.size(); i++) {
-                    PayloadState.TileData td2 = PayloadState.tiles.get(i);
-                    List<String> ch2 = (i == PayloadState.activeTileIndex)
-                            ? PayloadState.ACTIVE_CHUNKS : td2.chunks;
-                    if (ch2.isEmpty()) { perTileColors.add(0); continue; }
-                    byte[][] tf2 = resolveAllFramesForTile(td2, ch2);
-                    perTileColors.add(PngToMapColors.countDistinct(mergeFrames(tf2)));
-                }
+                List<int[]> colorsByFreq = new ArrayList<>();
+                for (int c = 1; c < 256; c++)
+                    if (freq[c] > 0) colorsByFreq.add(new int[]{c, freq[c]});
+                colorsByFreq.sort((a, b2) -> Integer.compare(a[1], b2[1]));
 
-                if (anyCarpet) {
-                    budgetLine = String.format("§7Compressed:      §f%d §7bytes total%s",
-                            totalCompressedBytes,
-                            overBudgetCount > 0 ? " §c(" + overBudgetCount + " tile" + (overBudgetCount == 1 ? "" : "s") + " OVER BUDGET)" : " §a✓");
-                } else {
-                    budgetLine = String.format("§7Banners needed:  §f%d §7total%s",
-                            totalChunks,
-                            overBudgetCount > 0 ? " §c(" + overBudgetCount + " tile" + (overBudgetCount == 1 ? "" : "s") + " OVER BUDGET)" : " §a✓");
-                }
-            }
-
-            int[] freq = new int[256];
-            for (byte b : union) freq[b & 0xFF]++;
-
-            int distinctColors = PngToMapColors.countDistinct(union);
-            int totalPixels = union.length - freq[0]; // exclude empty (color-0) pixels so percentages sum to 100%
-
-            List<int[]> colorsByFreq = new ArrayList<>();
-            for (int c = 1; c < 256; c++) {
-                if (freq[c] > 0)
-                    colorsByFreq.add(new int[] { c, freq[c] });
-            }
-            colorsByFreq.sort((a, b) -> Integer.compare(a[1], b[1]));
-
-            source.sendFeedback(Text.literal("§6=== Palette: " + header + " ==="));
-            String frameNote = fc > 1 ? String.format(" §8(across %d frames)", fc) : "";
-            source.sendFeedback(Text.literal(String.format(
-                    "§7Distinct colors: §f%d%s", distinctColors, frameNote)));
-            if (all && perTileColors != null) {
-                int maxPerTile = 0;
-                for (int n : perTileColors) if (n > maxPerTile) maxPerTile = n;
-                StringBuilder sb = new StringBuilder(String.format(
-                        "§7Per-tile colors:  §fmax=%d §8(reduce all operates per-tile)§r\n", maxPerTile));
-                for (int i = 0; i < perTileColors.size(); i++)
-                    sb.append(String.format("§7  %s: §f%d\n", PayloadState.tileLabel(i), perTileColors.get(i)));
-                source.sendFeedback(Text.literal(sb.toString().stripTrailing()));
-            }
-            source.sendFeedback(Text.literal(budgetLine));
-
-            if (!all && preReductionChunks.containsKey(PayloadState.activeTileIndex)) {
-                source.sendFeedback(Text.literal("§7Reduction:       §eactive §7(undo available)"));
-            }
-
-            // ── Rarity distribution histogram (sigmoid-based bucket boundaries) ───
-            // Compute 4 thresholds by mapping logistic quantiles at 20/40/60/80%
-            // through the log-normal distribution of frequencies.  This adapts the
-            // bucket boundaries to the actual range of the data rather than using
-            // hard-coded pixel counts that become meaningless for multi-frame tiles.
-            {
+                // ── Rarity histogram ─────────────────────────────────────
                 double sumL = 0, sumL2 = 0;
                 for (int[] e : colorsByFreq) {
                     double l = Math.log(Math.max(1, e[1]));
                     sumL += l; sumL2 += l * l;
                 }
                 int nC = colorsByFreq.size();
-                double mL = sumL / nC;
-                double sL = Math.sqrt(Math.max(1e-12, sumL2 / nC - mL * mL));
-
-                // logit(p) = log(p/(1-p)) at p = 0.2, 0.4, 0.6, 0.8
+                double mL  = sumL / nC;
+                double sL  = Math.sqrt(Math.max(1e-12, sumL2 / nC - mL * mL));
                 double[] logits = {-1.3863, -0.4055, 0.4055, 1.3863};
                 int[] th = new int[logits.length];
                 for (int i = 0; i < logits.length; i++)
                     th[i] = Math.max(1, (int) Math.round(Math.exp(mL + sL * logits[i])));
-                // Ensure strictly increasing
-                for (int i = 1; i < th.length; i++)
-                    th[i] = Math.max(th[i], th[i - 1] + 1);
+                for (int i = 1; i < th.length; i++) th[i] = Math.max(th[i], th[i - 1] + 1);
 
                 int nb = th.length + 1;
                 int[] bc = new int[nb], bp = new int[nb];
@@ -3514,93 +3502,129 @@ public class LoominaryCommand {
                     for (int i = 0; i < th.length; i++) if (e[1] <= th[i]) { bk = i; break; }
                     bc[bk]++; bp[bk] += e[1];
                 }
-
                 String[] lbls = new String[nb];
                 lbls[0] = "1-" + th[0] + "px";
-                for (int i = 1; i < th.length; i++)
-                    lbls[i] = (th[i - 1] + 1) + "-" + th[i] + "px";
+                for (int i = 1; i < th.length; i++) lbls[i] = (th[i - 1] + 1) + "-" + th[i] + "px";
                 lbls[nb - 1] = (th[th.length - 1] + 1) + "+px";
-
                 int maxLbl = 0;
                 for (String l : lbls) maxLbl = Math.max(maxLbl, l.length());
                 int maxBucket = 0;
                 for (int v : bc) maxBucket = Math.max(maxBucket, v);
 
-                source.sendFeedback(Text.literal("§7Color rarity distribution:"));
-                final int BAR_WIDTH = 16;
-                for (int b = 0; b < nb; b++) {
-                    if (bc[b] == 0) continue;
-                    int bars = maxBucket > 0 ? Math.max(1, bc[b] * BAR_WIDTH / maxBucket) : 0;
-                    String bar = "§a" + "█".repeat(bars) + "§8" + "░".repeat(BAR_WIDTH - bars);
-                    String lbl = String.format("%" + maxLbl + "s", lbls[b]);
-                    source.sendFeedback(Text.literal(String.format(
-                            "§7 %s §f%3d §7colors  %s §7%.1f%%",
-                            lbl, bc[b], bar, 100.0 * bp[b] / totalPixels)));
-                }
-            }
+                // ── Reduction simulation ─────────────────────────────────
+                List<String> simLines = new ArrayList<>();
+                if (distinctColors > 2) {
+                    int maxRemove = Math.min(distinctColors - 2, 40);
+                    int step = maxRemove <= 10 ? 1 : 5;
+                    List<Integer> threshList = new ArrayList<>();
+                    for (int t2 = step; t2 <= maxRemove; t2 += step) threshList.add(t2);
+                    int[] thresholds = threshList.stream().mapToInt(Integer::intValue).toArray();
 
-            // ── Removal cost simulation — all three strategies ─────────────
-            if (distinctColors > 2) {
-                // Dynamic thresholds: every 5 steps up to distinctColors-2, capped at 40.
-                int maxRemove = Math.min(distinctColors - 2, 40);
-                int step = maxRemove <= 10 ? 1 : 5;
-                List<Integer> threshList = new ArrayList<>();
-                for (int t = step; t <= maxRemove; t += step) threshList.add(t);
-                int[] thresholds = threshList.stream().mapToInt(Integer::intValue).toArray();
+                    int totalRows = union.length / 128;
+                    boolean[][] colorInRow = new boolean[256][totalRows];
+                    for (int p = 0; p < union.length; p++) {
+                        int c = union[p] & 0xFF;
+                        if (c > 0) colorInRow[c][p / 128] = true;
+                    }
 
-                // Per-color row membership for scatter tracking.
-                int totalRows = union.length / 128;
-                boolean[][] colorInRow = new boolean[256][totalRows];
-                for (int p = 0; p < union.length; p++) {
-                    int c = union[p] & 0xFF;
-                    if (c > 0) colorInRow[c][p / 128] = true;
-                }
+                    float[][] oklab   = PngToMapColors.buildOklabLookup();
+                    int       baseSize = PngToMapColors.estimateCompressedSize(union);
 
-                float[][] oklab  = PngToMapColors.buildOklabLookup();
-                int       baseSize = PngToMapColors.estimateCompressedSize(union);
+                    String colHdr = all ? "pixels/fr · Δcolor · rows/fr · est.Δbytes"
+                                        : "pixels · Δcolor · rows · est.Δbytes";
+                    simLines.add("§7Removal cost — §8" + colHdr + "§7:");
 
-                String colHdr = all ? "pixels/fr · Δcolor · rows/fr · est.Δbytes"
-                                    : "pixels · Δcolor · rows · est.Δbytes";
-                source.sendFeedback(Text.literal("§7Removal cost — §8" + colHdr + "§7:"));
-
-                PngToMapColors.Strategy[] strategies = {
-                    PngToMapColors.Strategy.RAREST,
-                    PngToMapColors.Strategy.CLOSEST,
-                    PngToMapColors.Strategy.WEIGHTED
-                };
-                String[][] stratMeta = {
-                    {"rarest",   "picks rarest color, merges to nearest neighbor"},
-                    {"closest",  "merges the most perceptually similar pair"},
-                    {"weighted", "similar pairs weighted by combined frequency"}
-                };
-
-                for (int si = 0; si < strategies.length; si++) {
-                    List<int[]> rows = runReductionSim(
-                            union, freq, colorInRow, totalRows,
-                            oklab, colorsByFreq, strategies[si], baseSize, thresholds);
-                    if (rows.isEmpty()) continue;
-                    source.sendFeedback(Text.literal(String.format(
-                            "§8── §f%s §8— %s", stratMeta[si][0], stratMeta[si][1])));
-                    for (int[] row : rows) {
-                        int   removed = row[0], cumPx = row[1];
-                        float dist    = row[2] / 1000f;
-                        int   cumR    = row[3], savedB = row[4];
-                        String rowStr = all
-                                ? String.format("%drow/fr", cumR / Math.max(1, fc))
-                                : String.format("%drows", cumR);
-                        source.sendFeedback(Text.literal(String.format(
-                                "§7  remove %2d: §f%4d§7px (§f%.1f%%§7)  Δ≤§f%.2f  §7%s  §f~%+dB",
-                                removed, cumPx / fc,
-                                100.0 * cumPx / totalPixels,
-                                dist, rowStr, -savedB)));
+                    PngToMapColors.Strategy[] strategies = {
+                        PngToMapColors.Strategy.RAREST,
+                        PngToMapColors.Strategy.CLOSEST,
+                        PngToMapColors.Strategy.WEIGHTED
+                    };
+                    String[][] stratMeta = {
+                        {"rarest",   "picks rarest color, merges to nearest neighbor"},
+                        {"closest",  "merges the most perceptually similar pair"},
+                        {"weighted", "similar pairs weighted by combined frequency"}
+                    };
+                    for (int si = 0; si < strategies.length; si++) {
+                        List<int[]> rows = runReductionSim(
+                                union, freq, colorInRow, totalRows,
+                                oklab, colorsByFreq, strategies[si], baseSize, thresholds);
+                        if (rows.isEmpty()) continue;
+                        simLines.add(String.format("§8── §f%s §8— %s",
+                                stratMeta[si][0], stratMeta[si][1]));
+                        for (int[] row : rows) {
+                            int   removed = row[0], cumPx = row[1];
+                            float dist    = row[2] / 1000f;
+                            int   cumR    = row[3], savedB = row[4];
+                            String rowStr = all
+                                    ? String.format("%drow/fr", cumR / Math.max(1, fc))
+                                    : String.format("%drows", cumR);
+                            simLines.add(String.format(
+                                    "§7  remove %2d: §f%4d§7px (§f%.1f%%§7)  Δ≤§f%.2f  §7%s  §f~%+dB",
+                                    removed, cumPx / fc,
+                                    100.0 * cumPx / totalPixels, dist, rowStr, -savedB));
+                        }
                     }
                 }
+
+                // Capture final values for lambda.
+                final int    fDistinctColors = distinctColors;
+                final int    fTotalPixels    = totalPixels;
+                final int    fNb = nb;
+                final int[]  fBc = bc, fBp = bp;
+                final String[] fLbls = lbls;
+                final int    fMaxLbl = maxLbl, fMaxBucket = maxBucket;
+                final List<Integer> fPerTileColors = perTileColors;
+                final List<String>  fSimLines      = simLines;
+                final int    fFc = fc;
+
+                client.execute(() -> {
+                    try {
+                        source.sendFeedback(Text.literal("§6=== Palette: " + header + " ==="));
+                        String frameNote = fFc > 1 ? String.format(" §8(across %d frames)", fFc) : "";
+                        source.sendFeedback(Text.literal(String.format(
+                                "§7Distinct colors: §f%d%s", fDistinctColors, frameNote)));
+                        if (all && fPerTileColors != null) {
+                            int maxPerTile = 0;
+                            for (int n : fPerTileColors) if (n > maxPerTile) maxPerTile = n;
+                            StringBuilder sb2 = new StringBuilder(String.format(
+                                    "§7Per-tile colors:  §fmax=%d §8(reduce all operates per-tile)§r\n", maxPerTile));
+                            for (int i = 0; i < fPerTileColors.size(); i++)
+                                sb2.append(String.format("§7  %s: §f%d\n",
+                                        PayloadState.tileLabel(i), fPerTileColors.get(i)));
+                            source.sendFeedback(Text.literal(sb2.toString().stripTrailing()));
+                        }
+                        source.sendFeedback(Text.literal(budgetLine));
+                        if (!all && hasPreReduction)
+                            source.sendFeedback(Text.literal("§7Reduction:       §eactive §7(undo available)"));
+
+                        source.sendFeedback(Text.literal("§7Color rarity distribution:"));
+                        final int BAR_WIDTH = 16;
+                        for (int b3 = 0; b3 < fNb; b3++) {
+                            if (fBc[b3] == 0) continue;
+                            int bars = fMaxBucket > 0 ? Math.max(1, fBc[b3] * BAR_WIDTH / fMaxBucket) : 0;
+                            String bar = "§a" + "█".repeat(bars) + "§8" + "░".repeat(BAR_WIDTH - bars);
+                            String lbl = String.format("%" + fMaxLbl + "s", fLbls[b3]);
+                            source.sendFeedback(Text.literal(String.format(
+                                    "§7 %s §f%3d §7colors  %s §7%.1f%%",
+                                    lbl, fBc[b3], bar, 100.0 * fBp[b3] / fTotalPixels)));
+                        }
+                        for (String line : fSimLines)
+                            source.sendFeedback(Text.literal(line));
+                    } finally {
+                        importInProgress = false;
+                    }
+                });
+
+            } catch (Exception e) {
+                client.execute(() -> {
+                    source.sendError(Text.literal("§cFailed to analyze palette: " + e.getMessage()));
+                    importInProgress = false;
+                });
             }
-            return 1;
-        } catch (Exception e) {
-            source.sendError(Text.literal("§cFailed to analyze palette: " + e.getMessage()));
-            return 0;
-        }
+        }, "loominary-palette");
+        t.setDaemon(true);
+        t.start();
+        return 1;
     }
 
     /** Concatenates all frames into a single flat byte array for union-based reduction. */

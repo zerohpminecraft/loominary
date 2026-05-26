@@ -142,6 +142,18 @@ public class LoominaryCommand {
         return maxBytesForMode(PayloadState.codecMode);
     }
 
+    /**
+     * Returns true if the active tile has payload data to work with.
+     * Carpet tiles carry their data in {@code carpetCompressedB64}, not in chunks, so the
+     * chunk list may be empty even when the tile has valid content (LOOM tiles with no overflow).
+     */
+    private static boolean activeTileHasContent() {
+        if (PayloadState.tiles.isEmpty()) return false;
+        PayloadState.TileData tile = PayloadState.tiles.get(PayloadState.activeTileIndex);
+        if (tile.carpetEncoded) return tile.carpetCompressedB64 != null;
+        return !PayloadState.ACTIVE_CHUNKS.isEmpty();
+    }
+
     /** Number of overflow banner chunks for a tile (excluding any LC/LS or LR header banner). */
     private static int overflowBannerCount(PayloadState.TileData tile, List<String> chunks) {
         if (!tile.carpetEncoded) return chunks.size();
@@ -2954,8 +2966,8 @@ public class LoominaryCommand {
                     "§cNo active batch. Run §f/loominary import§c first."));
             return 0;
         }
-        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
-            source.sendError(Text.literal("§cActive tile has no chunks."));
+        if (!activeTileHasContent()) {
+            source.sendError(Text.literal("§cActive tile has no data."));
             return 0;
         }
 
@@ -3118,8 +3130,8 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
         }
-        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
-            source.sendError(Text.literal("§cActive tile has no chunks."));
+        if (!activeTileHasContent()) {
+            source.sendError(Text.literal("§cActive tile has no data."));
             return 0;
         }
 
@@ -3510,8 +3522,8 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
         }
-        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
-            source.sendError(Text.literal("§cActive tile has no chunks."));
+        if (!activeTileHasContent()) {
+            source.sendError(Text.literal("§cActive tile has no data."));
             return 0;
         }
         if (importInProgress) {
@@ -3632,8 +3644,8 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
         }
-        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
-            source.sendError(Text.literal("§cActive tile has no chunks."));
+        if (!activeTileHasContent()) {
+            source.sendError(Text.literal("§cActive tile has no data."));
             return 0;
         }
         if (importInProgress) {
@@ -4587,8 +4599,8 @@ public class LoominaryCommand {
                     "§cNo active batch. Run §f/loominary import§c first."));
             return 0;
         }
-        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
-            source.sendError(Text.literal("§cActive tile has no chunks to edit."));
+        if (!activeTileHasContent()) {
+            source.sendError(Text.literal("§cActive tile has no data to edit."));
             return 0;
         }
         if (pendingSaves.get() > 0) {
@@ -5365,8 +5377,8 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
         }
-        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) {
-            source.sendError(Text.literal("§cActive tile has no chunks."));
+        if (!activeTileHasContent()) {
+            source.sendError(Text.literal("§cActive tile has no data."));
             return 0;
         }
         int tileIdx   = PayloadState.activeTileIndex;

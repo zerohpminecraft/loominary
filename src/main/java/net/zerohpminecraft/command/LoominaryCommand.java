@@ -108,6 +108,30 @@ public class LoominaryCommand {
     private static final int CHUNK_SIZE = 48;
     private static final int MAX_CHUNKS = 63; // hard limit observed on 2b2t
 
+    /**
+     * Chooses a zstd compression level appropriate for the payload size.
+     *
+     * <p>zstd level 22 requires native working memory proportional to the window size
+     * (which scales with input size), easily reaching 500 MB–2 GB for large animated
+     * payloads.  When that native allocation fails inside JNI, zstd-jni cannot raise a
+     * Java exception — the native thread crashes and takes the LWJGL window with it.
+     *
+     * <p>Level 9 and below use a fixed-size window (≤8 MB) regardless of input size,
+     * so native memory stays bounded.  The compression-ratio loss vs. level 22 on map
+     * color data is typically &lt;5%.
+     *
+     * <ul>
+     *   <li>&lt; 256 KB → level 22 (max; safe for small payloads)</li>
+     *   <li>256 KB – 4 MB → level 9</li>
+     *   <li>&gt; 4 MB → level 3 (fast; bounded native memory)</li>
+     * </ul>
+     */
+    private static int compressionLevel(int payloadBytes) {
+        if (payloadBytes < 256_000)  return Zstd.maxCompressionLevel(); // safe
+        if (payloadBytes < 4_000_000) return 9;
+        return 3;
+    }
+
     private static final ExecutorService SAVE_EXECUTOR = Executors.newFixedThreadPool(2, r -> {
         Thread t = new Thread(r, "loominary-save");
         t.setDaemon(true);
@@ -200,7 +224,7 @@ public class LoominaryCommand {
         byte[] combined = new byte[manifestBytes.length + mapColors.length];
         System.arraycopy(manifestBytes, 0, combined, 0, manifestBytes.length);
         System.arraycopy(mapColors, 0, combined, manifestBytes.length, mapColors.length);
-        byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+        byte[] compressed = Zstd.compress(combined, compressionLevel(combined.length));
         return CjkCodec.buildChunks(compressed);
     }
 
@@ -347,7 +371,7 @@ public class LoominaryCommand {
         byte[] combined = new byte[manifestBytes.length + mapColors.length];
         System.arraycopy(manifestBytes, 0, combined, 0,                 manifestBytes.length);
         System.arraycopy(mapColors,     0, combined, manifestBytes.length, mapColors.length);
-        byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+        byte[] compressed = Zstd.compress(combined, compressionLevel(combined.length));
 
         CodecMode mode = PayloadState.codecMode;
         int maxBytes = maxBytesForMode(mode);
@@ -2394,7 +2418,7 @@ public class LoominaryCommand {
                             byte[] combined = new byte[manifestBytes.length + mapColors.length];
                             System.arraycopy(manifestBytes, 0, combined, 0,                   manifestBytes.length);
                             System.arraycopy(mapColors,     0, combined, manifestBytes.length, mapColors.length);
-                            byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+                            byte[] compressed = Zstd.compress(combined, compressionLevel(combined.length));
                             enc = encodeLoomFromCompressed(compressed, col, row, PayloadState.codecMode);
                             note = "over budget — use /loominary reduce";
                         }
@@ -2568,7 +2592,7 @@ public class LoominaryCommand {
                     byte[] combined = new byte[manifestBytes.length + payloadBytes.length];
                     System.arraycopy(manifestBytes, 0, combined, 0,                    manifestBytes.length);
                     System.arraycopy(payloadBytes,  0, combined, manifestBytes.length, payloadBytes.length);
-                    byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+                    byte[] compressed = Zstd.compress(combined, compressionLevel(combined.length));
                     enc = encodeLoomFromCompressed(compressed, col, row, PayloadState.codecMode);
                     tileNote = "over budget — use /loominary reduce";
                 }
@@ -5098,7 +5122,7 @@ public class LoominaryCommand {
         byte[] combined = new byte[manifestBytes.length + blankColors.length];
         System.arraycopy(manifestBytes, 0, combined, 0,                 manifestBytes.length);
         System.arraycopy(blankColors,   0, combined, manifestBytes.length, blankColors.length);
-        byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+        byte[] compressed = Zstd.compress(combined, compressionLevel(combined.length));
 
         CarpetEncoding enc = encodeLoomFromCompressed(compressed, 0, 0, PayloadState.codecMode);
         PayloadState.TileData tile = new PayloadState.TileData();

@@ -150,8 +150,36 @@ public class LoominaryCommand {
     private static boolean activeTileHasContent() {
         if (PayloadState.tiles.isEmpty()) return false;
         PayloadState.TileData tile = PayloadState.tiles.get(PayloadState.activeTileIndex);
+        return tileHasContent(tile);
+    }
+
+    private static boolean tileHasContent(PayloadState.TileData tile) {
         if (tile.carpetEncoded) return tile.carpetCompressedB64 != null;
-        return !PayloadState.ACTIVE_CHUNKS.isEmpty();
+        return !tile.chunks.isEmpty();
+    }
+
+    /**
+     * Returns the compressed payload bytes for a tile regardless of encoding format.
+     * For carpet tiles reads {@code carpetCompressedB64}; for banner tiles reassembles
+     * from CJK chunks.  Returns null if the tile has no data.
+     */
+    private static byte[] getCompressedBytesForTile(PayloadState.TileData tile) {
+        if (tile.carpetEncoded) {
+            if (tile.carpetCompressedB64 == null) return null;
+            return Base64.getDecoder().decode(tile.carpetCompressedB64);
+        }
+        if (tile.chunks.isEmpty()) return null;
+        List<String> names = new ArrayList<>(tile.chunks);
+        names.sort(java.util.Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
+        if (names.get(0).length() > 2 && names.get(0).charAt(2) >= CjkCodec.ALPHA_BASE) {
+            StringBuilder sb = new StringBuilder();
+            for (String s : names) sb.append(s.substring(2));
+            return CjkCodec.decode(sb.toString());
+        }
+        StringBuilder b64 = new StringBuilder();
+        for (String s : names) b64.append(s.substring(2));
+        try { return Base64.getDecoder().decode(b64.toString()); }
+        catch (Exception e) { return null; }
     }
 
     /** Number of overflow banner chunks for a tile (excluding any LC/LS or LR header banner). */
@@ -615,6 +643,22 @@ public class LoominaryCommand {
                         PayloadState.activeChunkIndex = 0;
                     }
                     if (pendingSaves.decrementAndGet() == 0) PayloadState.save();
+
+                    if (mc.player != null) {
+                        String saveMsg;
+                        if (carpetEncoded && newCarpetB64 != null) {
+                            int bytes = Base64.getDecoder().decode(newCarpetB64).length;
+                            saveMsg = String.format("§aSaved %s — %d bytes.",
+                                    PayloadState.tileLabel(tileIdx), bytes);
+                        } else {
+                            List<String> saved = tileIdx == activeTileIdx
+                                    ? PayloadState.ACTIVE_CHUNKS : PayloadState.tiles.get(tileIdx).chunks;
+                            saveMsg = String.format("§aSaved %s — %d banner%s.",
+                                    PayloadState.tileLabel(tileIdx),
+                                    saved.size(), saved.size() == 1 ? "" : "s");
+                        }
+                        mc.player.sendMessage(Text.literal(saveMsg), false);
+                    }
 
                     if (carpetEncoded && newCarpetB64 != null && mc.player != null) {
                         byte[] dec = Base64.getDecoder().decode(newCarpetB64);
@@ -2239,6 +2283,10 @@ public class LoominaryCommand {
 
     private static int importFileCarpet(FabricClientCommandSource source,
             String filename, int columns, int rows, boolean allShades, boolean dither, boolean mux) {
+        if (PayloadState.codecMode == CodecMode.BANNER) {
+            // Codec is banner-only: carpet platform makes no sense — use the banner import path.
+            return importFile(source, filename, columns, rows, allShades, dither);
+        }
         if (filename.isEmpty()) {
             source.sendError(Text.literal("§cUsage: /loominary import <filename> carpet [cols] [rows] [mux] [allshades] [dither]"));
             return 0;
@@ -2311,11 +2359,11 @@ public class LoominaryCommand {
                             PayloadManifest.crc32(mapColors), playerName, capturedTitle);
                     CarpetEncoding enc;
                     String note = null;
-                    int maxChunksCarpet = (PayloadState.codecMode != CodecMode.BANNER)
-                            ? MAX_CHUNKS_CARPET_LOOM : MAX_CHUNKS_CARPET;
                     try {
                         enc = buildCarpetEncoding(manifestBytes, mapColors, col, row);
                     } catch (IllegalStateException overflow) {
+                        // Payload too large for the current codec — reduce colors to fit.
+                        int maxChunksCarpet = MAX_CHUNKS_CARPET_LOOM; // BANNER already redirected above
                         PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
                                 mapColors, manifestBytes, CHUNK_SIZE, maxChunksCarpet);
                         mapColors = fit.mapColors;
@@ -2437,6 +2485,9 @@ public class LoominaryCommand {
 
     private static int importGifCarpet(FabricClientCommandSource source, String filename,
             Path filePath, int columns, int rows, boolean allShades, boolean dither, boolean mux) {
+        if (PayloadState.codecMode == CodecMode.BANNER) {
+            return importGif(source, filename, filePath, columns, rows, allShades, dither);
+        }
         // title + importInProgress already set by importFileCarpet caller
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
@@ -2719,7 +2770,7 @@ public class LoominaryCommand {
         PayloadState.activeTileIndex = tileIdx;
         PayloadState.syncFromActiveTile();
 
-        int overflowBanners = tile.chunks.size() - 1;
+        int overflowBanners = overflowBannerCount(tile, tile.chunks);
         int totalBytes = enc.compressed().length;
         int carpetRows = (enc.carpetBytes() * 2 + 127) / 128;
 
@@ -2769,81 +2820,92 @@ public class LoominaryCommand {
             source.sendFeedback(Text.literal("§7Title: §f" + PayloadState.currentTitle));
         }
 
-        int totalDone = 0, totalChunks = 0;
+        // Per-tile status lines.  Carpet and banner tiles have very different progress models:
+        //   Carpet: no per-banner placement to track — show encoding state and byte budget.
+        //   Banner: each chunk is one anvil rename; show placement progress.
+        int bannerDone = 0, bannerTotal = 0;
+        boolean anyOverBudget = false;
+
         for (int i = 0; i < PayloadState.tiles.size(); i++) {
             PayloadState.TileData tile = PayloadState.tiles.get(i);
+            boolean active = (i == PayloadState.activeTileIndex);
+            String label = PayloadState.tileLabel(i);
+            String muxTag = tile.muxReceiver ? " §d[rx]" : tile.muxed ? " §d[donor]" : "";
 
-            int done, total;
-            if (i == PayloadState.activeTileIndex) {
-                done = PayloadState.activeChunkIndex;
-                total = PayloadState.ACTIVE_CHUNKS.size();
-            } else {
-                done = tile.currentIndex;
-                total = tile.chunks.size();
-            }
-
-            totalDone += done;
-            totalChunks += total;
-
-            String carpetTag = tile.carpetEncoded ? " §8[carpet]" : "";
-            String statusStr;
-            if (done >= total)
-                statusStr = "§a✓ done" + carpetTag;
-            else if (i == PayloadState.activeTileIndex)
-                statusStr = String.format("§e► %d/%d §7(active)%s", done, total, carpetTag);
-            else
-                statusStr = String.format("§7  %d/%d%s", done, total, carpetTag);
-
-            // Payload size / budget info
-            String budgetStr;
             if (tile.carpetEncoded) {
-                List<String> chunks = (i == PayloadState.activeTileIndex)
-                        ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
-                int compressedBytes = carpetCompressedBytes(tile);
-                int overflowBanners = overflowBannerCount(tile, chunks);
-                int cap = maxBytesForTile(tile);
-                boolean overBudget = !tile.muxed && compressedBytes > cap;
-                if (overBudget) {
-                    budgetStr = String.format(" §c[%d bytes, %d overflow — OVER BUDGET by %d]",
-                            compressedBytes, overflowBanners, compressedBytes - cap);
-                } else {
-                    budgetStr = String.format(" §8[%d bytes, %d overflow]",
-                            compressedBytes, overflowBanners);
-                }
+                List<String> chunks = active ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
+                int bytes = carpetCompressedBytes(tile);
+                int cap   = maxBytesForTile(tile);
+                int ovf   = overflowBannerCount(tile, chunks);
+                boolean over = !tile.muxed && bytes > cap;
+                if (over) anyOverBudget = true;
+
+                String encTag = tile.loomEncoded ? "loom" : "carpet";
+                String bytesStr = over
+                        ? String.format("§c%d/%d bytes [OVER BUDGET by %d]", bytes, cap, bytes - cap)
+                        : String.format("§8%d bytes", bytes);
+                String ovfStr = ovf > 0
+                        ? String.format(", §f%d§8 overflow banner%s", ovf, ovf == 1 ? "" : "s")
+                        : "";
+                String activeTag = active ? " §7(active)" : "";
+                String stateTag = over ? "§c✗" : "§a✓";
+                source.sendFeedback(Text.literal(String.format(
+                        "  %s: %s §8[%s] %s%s%s%s",
+                        label, stateTag, encTag, bytesStr, ovfStr, muxTag, activeTag)));
+
             } else {
-                boolean overBudget = total > MAX_CHUNKS;
-                if (overBudget) {
-                    budgetStr = String.format(" §c[%d/%d banners — OVER BUDGET by %d]",
-                            total, MAX_CHUNKS, total - MAX_CHUNKS);
+                int done, total;
+                if (active) {
+                    done  = PayloadState.activeChunkIndex;
+                    total = PayloadState.ACTIVE_CHUNKS.size();
                 } else {
-                    budgetStr = String.format(" §8[%d/%d banners]", total, MAX_CHUNKS);
+                    done  = tile.currentIndex;
+                    total = tile.chunks.size();
                 }
-            }
+                bannerDone  += done;
+                bannerTotal += total;
+                boolean over = total > MAX_CHUNKS;
+                if (over) anyOverBudget = true;
 
-            String muxTag = tile.muxReceiver ? " §d[mux receiver]"
-                    : tile.muxed ? " §d[mux donor]" : "";
-            source.sendFeedback(Text.literal(String.format("  %s: %s%s%s",
-                    PayloadState.tileLabel(i), statusStr, budgetStr, muxTag)));
+                String statusStr;
+                if (done >= total)
+                    statusStr = "§a✓";
+                else if (active)
+                    statusStr = String.format("§e► %d/%d §7(active)", done, total);
+                else
+                    statusStr = String.format("§7  %d/%d", done, total);
+
+                String budgetStr = over
+                        ? String.format(" §c[%d/%d — OVER BUDGET by %d]", total, MAX_CHUNKS, total - MAX_CHUNKS)
+                        : String.format(" §8[%d/%d banners]", total, MAX_CHUNKS);
+                source.sendFeedback(Text.literal(String.format(
+                        "  %s: %s%s%s", label, statusStr, budgetStr, muxTag)));
+            }
         }
 
-        boolean anyCarpet = PayloadState.tiles.stream().anyMatch(t -> t.carpetEncoded);
-        boolean anyOverBudget = false;
-        for (int i = 0; i < PayloadState.tiles.size(); i++) {
-            PayloadState.TileData t = PayloadState.tiles.get(i);
-            List<String> chunks = (i == PayloadState.activeTileIndex)
-                    ? PayloadState.ACTIVE_CHUNKS : t.chunks;
-            if (t.carpetEncoded) {
-                if (!t.muxed && carpetCompressedBytes(t) > maxBytesForTile(t)) {
-                    anyOverBudget = true; break;
-                }
-            } else if (chunks.size() > MAX_CHUNKS) {
-                anyOverBudget = true; break;
-            }
+        // Summary line.
+        boolean anyCarpet  = PayloadState.tiles.stream().anyMatch(t -> t.carpetEncoded);
+        boolean anyBanners = PayloadState.tiles.stream().anyMatch(t -> !t.carpetEncoded);
+        String budgetWarn = anyOverBudget ? " §c[some tiles over budget — /loominary reduce]" : "";
+        if (anyCarpet && !anyBanners) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§7%d carpet tile%s  §8[codec: %s]%s",
+                    PayloadState.totalTiles(),
+                    PayloadState.totalTiles() == 1 ? "" : "s",
+                    PayloadState.codecMode.label(), budgetWarn)));
+        } else if (anyBanners && !anyCarpet) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§7Overall: §f%d§7/§f%d §7banners placed%s",
+                    bannerDone, bannerTotal, budgetWarn)));
+        } else {
+            // Mixed batch
+            source.sendFeedback(Text.literal(String.format(
+                    "§7Overall: %d carpet + %d banner tile%s%s",
+                    (int) PayloadState.tiles.stream().filter(t -> t.carpetEncoded).count(),
+                    (int) PayloadState.tiles.stream().filter(t -> !t.carpetEncoded).count(),
+                    PayloadState.totalTiles() == 1 ? "" : "s", budgetWarn)));
         }
-        String overallBudget = anyOverBudget ? " §c[some tiles OVER BUDGET — use /loominary reduce]" : "";
-        source.sendFeedback(Text.literal(String.format(
-                "§7Overall: §f%d§7/§f%d §7banner%s%s",
-                totalDone, totalChunks, anyCarpet ? "s/LC chunks" : "s", overallBudget)));
+
         int whitelistCount = PayloadState.whitelistedBannerNames.size();
         if (whitelistCount > 0) {
             source.sendFeedback(Text.literal(String.format(
@@ -3006,7 +3068,7 @@ public class LoominaryCommand {
                 int tileIdx = cell.row() * expectedCols + cell.col();
                 if (tileIdx >= PayloadState.tiles.size()) continue;
                 PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-                if (tile.chunks.isEmpty()) continue;
+                if (!tileHasContent(tile)) continue;
 
                 byte[] mapColors = resolveMapColorsForTile(tile, tile.chunks);
 
@@ -4535,7 +4597,7 @@ public class LoominaryCommand {
                     }
 
                     int carpetRows = shadeBytes > 0 ? 128 : (carpetBytes * 2 + 127) / 128;
-                    int overflowBanners = tile.chunks.size() - 1;
+                    int overflowBanners = overflowBannerCount(tile, tile.chunks);
 
                     source.sendFeedback(Text.literal(String.format(
                             "§aExported §f%s §a(%s, %d bytes):",
@@ -4887,11 +4949,83 @@ public class LoominaryCommand {
     }
 
     private static int setCodec(FabricClientCommandSource source, CodecMode mode) {
+        CodecMode previous = PayloadState.codecMode;
         PayloadState.codecMode = mode;
         PayloadState.save();
-        source.sendFeedback(Text.literal("§aCodec set to: §f" + mode.label()
-                + "§r §7(takes effect on next import or re-encode)"));
+        source.sendFeedback(Text.literal("§aCodec set to: §f" + mode.label()));
+        if (!PayloadState.tiles.isEmpty() && previous != mode) {
+            reencodeAllTilesAsync(source, mode);
+        }
         return 1;
+    }
+
+    /**
+     * Re-encodes every tile in the current batch with {@code newMode} on a background thread.
+     * Carpet ↔ banner conversions are supported; mux state is cleared since it is
+     * invalidated by any re-encode.
+     */
+    private static void reencodeAllTilesAsync(FabricClientCommandSource source, CodecMode newMode) {
+        PayloadState.syncToActiveTile();
+        int tileCount = PayloadState.tiles.size();
+        int columns = PayloadState.gridColumns;
+
+        // Snapshot compressed bytes for every tile before releasing the game thread.
+        List<byte[]> compressedSnapshots = new ArrayList<>(tileCount);
+        for (PayloadState.TileData tile : PayloadState.tiles) {
+            compressedSnapshots.add(getCompressedBytesForTile(tile));
+        }
+
+        source.sendFeedback(Text.literal(
+                "§7Re-encoding " + tileCount + " tile(s) as §f" + newMode.label() + "§7..."));
+        MinecraftClient mc = MinecraftClient.getInstance();
+
+        Thread t = new Thread(() -> {
+            record TileResult(List<String> chunks, String carpetB64, boolean carpetEncoded, boolean loomEncoded) {}
+            List<TileResult> results = new ArrayList<>(tileCount);
+
+            for (int i = 0; i < tileCount; i++) {
+                byte[] compressed = compressedSnapshots.get(i);
+                if (compressed == null) { results.add(null); continue; }
+                int col = i % columns, row = i / columns;
+                if (newMode == CodecMode.BANNER) {
+                    List<String> chunks = CjkCodec.buildChunks(compressed);
+                    results.add(new TileResult(chunks, null, false, false));
+                } else {
+                    CarpetEncoding enc = encodeLoomFromCompressed(compressed, col, row, newMode);
+                    results.add(new TileResult(
+                            enc.allChunks(),
+                            Base64.getEncoder().encodeToString(compressed),
+                            true, true));
+                }
+            }
+
+            mc.execute(() -> {
+                int ok = 0, over = 0;
+                for (int i = 0; i < PayloadState.tiles.size() && i < results.size(); i++) {
+                    TileResult r = results.get(i);
+                    if (r == null) continue;
+                    PayloadState.TileData tile = PayloadState.tiles.get(i);
+                    tile.chunks.clear();
+                    tile.chunks.addAll(r.chunks());
+                    tile.currentIndex = 0;
+                    tile.carpetEncoded = r.carpetEncoded();
+                    tile.loomEncoded   = r.loomEncoded();
+                    tile.carpetCompressedB64 = r.carpetB64();
+                    tile.muxed = false; tile.muxReceiver = false; tile.muxCargoB64 = null;
+                    ok++;
+                    if (compressedSnapshots.get(i) != null
+                            && compressedSnapshots.get(i).length > maxBytesForMode(newMode)) over++;
+                }
+                PayloadState.syncFromActiveTile();
+                PayloadState.save();
+                String msg = String.format("§aRe-encoded %d tile(s) as %s.", ok, newMode.label());
+                if (over > 0) msg += String.format(" §e(%d tile%s over budget — use /loominary reduce.)",
+                        over, over == 1 ? "" : "s");
+                if (mc.player != null) mc.player.sendMessage(Text.literal(msg), false);
+            });
+        }, "loominary-reencode");
+        t.setDaemon(true);
+        t.start();
     }
 
     // ════════════════════════════════════════════════════════════════════

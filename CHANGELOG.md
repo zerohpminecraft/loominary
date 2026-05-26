@@ -4,6 +4,18 @@
 
 ---
 
+## v1.18.1
+
+Five bug fixes for the 1.18.0 codec/LOOM changes:
+
+- **Preview broken on LOOM tiles** — `tile.chunks.isEmpty()` was skipping all carpet tiles with no overflow banners; replaced with a content check that reads `carpetCompressedB64`
+- **Codec change now re-encodes immediately** — `/loominary codec <mode>` triggers a background re-encode of all tiles in the batch; over-budget tiles are reported but not blocked
+- **Editor save now prints a confirmation** — `saveEditorChangesAsync` now sends a `§aSaved tile … — N bytes/banners` message on completion
+- **Status facelift** — carpet tiles no longer show a meaningless `0/0` progress ratio; they show `§a✓ [loom] N bytes` (or `§c✗ over budget`); banner tiles keep the `done/total` progress; the summary line is codec-aware
+- **Banner codec import no longer fails on large images** — default import (`/loominary import <file>`) with codec set to `banner` now routes through the banner-only path rather than the carpet path, which was throwing when the payload exceeded the 63-banner capacity
+
+---
+
 ## v1.18.0
 
 ### Codec selection and LOOM carpet format (1.17.3 + fix)

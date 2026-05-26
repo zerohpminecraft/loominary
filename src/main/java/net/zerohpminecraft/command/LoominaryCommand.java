@@ -1447,7 +1447,12 @@ public class LoominaryCommand {
 
                             // ── status ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("status")
-                                    .executes(ctx -> status(ctx.getSource())))
+                                    .executes(ctx -> status(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("donors")
+                                            .executes(ctx -> statusDonors(ctx.getSource(), 1))
+                                            .then(ClientCommandManager.argument("page", IntegerArgumentType.integer(1))
+                                                    .executes(ctx -> statusDonors(ctx.getSource(),
+                                                            IntegerArgumentType.getInteger(ctx, "page"))))))
 
                             // ── seek ───────────────────────────────────────────
                             .then(ClientCommandManager.literal("seek")
@@ -2895,7 +2900,17 @@ public class LoominaryCommand {
             if (tile.isDonorOnly) continue; // shown in donor summary below
             boolean active = (i == PayloadState.activeTileIndex);
             String label = PayloadState.tileLabel(i);
-            String muxTag = tile.muxReceiver ? " §d[rx]" : "";
+            // For mux receivers show the full logical payload size (stored in carpetCompressedB64)
+            // alongside the own-segment size (in muxCargoB64) so the user can see how much the
+            // donor strand is carrying.
+            String muxTag = "";
+            if (tile.muxReceiver && tile.carpetCompressedB64 != null) {
+                // muxCargoB64 = own segment; carpetCompressedB64 = full logical payload.
+                String fullB64 = tile.carpetCompressedB64;
+                int fullBytes  = fullB64.length() * 3 / 4
+                        - (fullB64.endsWith("==") ? 2 : fullB64.endsWith("=") ? 1 : 0);
+                muxTag = String.format(" §d[mux rx — full payload: %d bytes → donors]", fullBytes);
+            }
 
             if (tile.carpetEncoded) {
                 List<String> chunks = active ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
@@ -2951,9 +2966,16 @@ public class LoominaryCommand {
         // Donor-tile summary (shown above the overall line when donors exist).
         long donorCount = PayloadState.tiles.stream().filter(t -> t.isDonorOnly).count();
         if (donorCount > 0) {
+            int donorBanners = PayloadState.tiles.stream()
+                    .filter(t -> t.isDonorOnly)
+                    .mapToInt(t -> overflowBannerCount(t, t.chunks))
+                    .sum();
             source.sendFeedback(Text.literal(String.format(
-                    "§8  + %d donor tile%s (overflow carriers, place within 32 blocks of art)",
-                    donorCount, donorCount == 1 ? "" : "s")));
+                    "§d  + %d donor tile%s, %d overflow banner%s total"
+                    + " §8— §f/loominary status donors§8 for per-tile progress"
+                    + " · place within 32 blocks of art",
+                    donorCount, donorCount == 1 ? "" : "s",
+                    donorBanners, donorBanners == 1 ? "" : "s")));
         }
 
         // Summary line.
@@ -2984,6 +3006,66 @@ public class LoominaryCommand {
             source.sendFeedback(Text.literal(String.format(
                     "§7Whitelist: §f%d§7 named banner%s reusable as raw material.",
                     whitelistCount, whitelistCount == 1 ? "" : "s")));
+        }
+        return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // status donors [page]
+    // ════════════════════════════════════════════════════════════════════
+
+    private static final int DONORS_PER_PAGE = 10;
+
+    /**
+     * Paged status for donor tiles.  Each page shows up to {@value #DONORS_PER_PAGE} donors
+     * with their tile index, overflow banner count, and placement progress.
+     */
+    private static int statusDonors(FabricClientCommandSource source, int page) {
+        List<Integer> donorIndices = new ArrayList<>();
+        for (int i = 0; i < PayloadState.tiles.size(); i++)
+            if (PayloadState.tiles.get(i).isDonorOnly) donorIndices.add(i);
+
+        if (donorIndices.isEmpty()) {
+            source.sendFeedback(Text.literal("§eNo donor tiles — run §f/loominary mux§e first."));
+            return 1;
+        }
+
+        int totalPages = (donorIndices.size() + DONORS_PER_PAGE - 1) / DONORS_PER_PAGE;
+        int p = Math.max(1, Math.min(page, totalPages));
+        int start = (p - 1) * DONORS_PER_PAGE;
+        int end   = Math.min(start + DONORS_PER_PAGE, donorIndices.size());
+
+        source.sendFeedback(Text.literal(String.format(
+                "§6=== Donor tiles (page %d/%d) ===", p, totalPages)));
+
+        int donorNum = 0;
+        for (int idx : donorIndices) {
+            donorNum++;
+            if (donorNum <= start || donorNum > end) continue;
+            PayloadState.TileData t = PayloadState.tiles.get(idx);
+            int done  = (idx == PayloadState.activeTileIndex)
+                    ? PayloadState.activeChunkIndex : t.currentIndex;
+            int total = (idx == PayloadState.activeTileIndex)
+                    ? PayloadState.ACTIVE_CHUNKS.size() : t.chunks.size();
+
+            String progress;
+            if (done >= total && total > 0) progress = "§a✓ done";
+            else if (idx == PayloadState.activeTileIndex)
+                progress = String.format("§e► %d/%d §7(active)", done, total);
+            else
+                progress = String.format("§7%d/%d", done, total);
+
+            source.sendFeedback(Text.literal(String.format(
+                    "  §8donor %03d §7(tile %d): %s §8[%d banner%s]",
+                    donorNum, idx, progress, total, total == 1 ? "" : "s")));
+        }
+
+        if (totalPages > 1) {
+            String nav = "";
+            if (p > 1) nav += "§f/loominary status donors " + (p - 1) + "§7 ← ";
+            nav += String.format("§8page %d/%d", p, totalPages);
+            if (p < totalPages) nav += " §7→ §f/loominary status donors " + (p + 1);
+            source.sendFeedback(Text.literal("§7" + nav));
         }
         return 1;
     }
@@ -4625,19 +4707,30 @@ public class LoominaryCommand {
             }
         }
 
-        boolean multiTile = PayloadState.totalTiles() > 1;
+        // Multi-art: more than one tile in the visual grid.
+        boolean multiArt = PayloadState.totalTiles() > 1;
+        // Any donor tiles present → they always get numbered names.
         int exported = 0;
+        int donorExportNum = 0;
         try {
-            // Resolve base name once; per-tile suffix appended below in multi-tile mode.
+            // Resolve base name once; per-tile suffix appended below.
             String baseName = (nameArg != null && !nameArg.isEmpty()) ? nameArg
                     : SchematicExporter.resolveSchematicName(
                             PayloadState.currentTitle != null ? PayloadState.currentTitle : null);
 
             for (int tileIdx = 0; tileIdx < PayloadState.tiles.size(); tileIdx++) {
                 PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-                if (tile.chunks.isEmpty()) continue;
+                if (!tileHasContent(tile)) continue;
 
-                String name = multiTile ? baseName + "_tile" + tileIdx : baseName;
+                // Art tiles: numbered only when the visual grid has multiple tiles.
+                // Donor tiles: always numbered sequentially with "_donor_NNN".
+                String name;
+                if (tile.isDonorOnly) {
+                    donorExportNum++;
+                    name = baseName + String.format("_donor_%03d", donorExportNum);
+                } else {
+                    name = multiArt ? baseName + "_tile" + tileIdx : baseName;
+                }
 
                 if (tile.carpetEncoded) {
                     if (tile.carpetCompressedB64 == null) {
@@ -4724,9 +4817,14 @@ public class LoominaryCommand {
             source.sendError(Text.literal("§cNo tiles with data to export."));
             return 0;
         }
-        if (multiTile) {
-            source.sendFeedback(Text.literal(String.format(
-                    "§7%d/%d tiles exported.", exported, PayloadState.totalTiles())));
+        if (exported > 1) {
+            int artExported = exported - donorExportNum;
+            String summary = donorExportNum > 0
+                    ? String.format("§7%d art tile%s + %d donor tile%s exported.",
+                            artExported,     artExported     == 1 ? "" : "s",
+                            donorExportNum, donorExportNum == 1 ? "" : "s")
+                    : String.format("§7%d/%d tiles exported.", exported, PayloadState.totalTiles());
+            source.sendFeedback(Text.literal(summary));
         }
         return 1;
     }

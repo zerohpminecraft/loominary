@@ -96,6 +96,11 @@ public class PayloadState {
         /** True when this tile is a mux receiver (its overflow payload is hosted by donor tiles). */
         public boolean muxReceiver = false;
         /**
+         * True when this tile was appended by {@code /loominary mux} solely to carry
+         * overflow bytes — it has no art of its own.  Removed by {@code /loominary mux undo}.
+         */
+        public boolean isDonorOnly = false;
+        /**
          * Physical carpet cargo bytes (base64) after mux: ownSeg for receivers,
          * ownFrame+guestBytes for donors. Null when not muxed or mux was cleared.
          * {@code carpetCompressedB64} always holds the full logical payload regardless.

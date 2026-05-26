@@ -98,8 +98,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * /loominary whitelist — show how many named banners are whitelisted for reuse
  * /loominary whitelist add — scan inventory + bundle contents, mark every named banner reusable
  * /loominary whitelist clear — empty the whitelist
- * /loominary mux — redistribute overflow bytes from over-budget tiles into spare carpet space
- * /loominary ring — add a ring of transparent tiles around the current grid (expands cols+2, rows+2)
+ * /loominary mux — append blank donor tiles to absorb overflow from over-budget art tiles
+ * /loominary mux undo — remove all donor tiles and reset mux state (may leave batch over-budget)
  * /loominary export [name] — write a Litematica .litematic for active tile
  * /loominary clear [memory|disk] — clear state
  */
@@ -754,6 +754,16 @@ public class LoominaryCommand {
      * @return number of over-budget tiles that could not be resolved (0 = fully resolved)
      */
     private static int poolMuxTiles(List<PayloadState.TileData> tiles, int columns, int rows) {
+        return poolMuxTiles(tiles, columns, rows, false);
+    }
+
+    /**
+     * @param donorOnlyMode when {@code true}, only tiles with {@code isDonorOnly=true} may
+     *                      serve as donors; art tiles are never used as donors even if they
+     *                      have spare capacity.
+     */
+    private static int poolMuxTiles(List<PayloadState.TileData> tiles, int columns, int rows,
+                                     boolean donorOnlyMode) {
         CodecMode mode = PayloadState.codecMode;
 
         // Reset every tile to plain (non-mux) encoding, clearing stale mux banners.
@@ -832,6 +842,7 @@ public class LoominaryCommand {
                 List<int[]> viable = new ArrayList<>();
                 for (int d = 0; d < tiles.size(); d++) {
                     if (tiles.get(d).muxReceiver) continue;
+                    if (donorOnlyMode && !tiles.get(d).isDonorOnly) continue;
                     int spare = donorSpare(d, cargoSize, guestMeta, mode);
                     if (spare > 0) viable.add(new int[]{d, spare});
                 }
@@ -1653,11 +1664,9 @@ public class LoominaryCommand {
 
                             // ── mux ────────────────────────────────────────────
                             .then(ClientCommandManager.literal("mux")
-                                    .executes(ctx -> applyMux(ctx.getSource())))
-
-                            // ── ring ────────────────────────────────────────────
-                            .then(ClientCommandManager.literal("ring")
-                                    .executes(ctx -> addTransparentRing(ctx.getSource())))
+                                    .executes(ctx -> applyMux(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("undo")
+                                            .executes(ctx -> unmuxTiles(ctx.getSource()))))
 
                             // ── clear ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("clear")
@@ -2859,9 +2868,10 @@ public class LoominaryCommand {
 
         for (int i = 0; i < PayloadState.tiles.size(); i++) {
             PayloadState.TileData tile = PayloadState.tiles.get(i);
+            if (tile.isDonorOnly) continue; // shown in donor summary below
             boolean active = (i == PayloadState.activeTileIndex);
             String label = PayloadState.tileLabel(i);
-            String muxTag = tile.muxReceiver ? " §d[rx]" : tile.muxed ? " §d[donor]" : "";
+            String muxTag = tile.muxReceiver ? " §d[rx]" : "";
 
             if (tile.carpetEncoded) {
                 List<String> chunks = active ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
@@ -2912,6 +2922,14 @@ public class LoominaryCommand {
                 source.sendFeedback(Text.literal(String.format(
                         "  %s: %s%s%s", label, statusStr, budgetStr, muxTag)));
             }
+        }
+
+        // Donor-tile summary (shown above the overall line when donors exist).
+        long donorCount = PayloadState.tiles.stream().filter(t -> t.isDonorOnly).count();
+        if (donorCount > 0) {
+            source.sendFeedback(Text.literal(String.format(
+                    "§8  + %d donor tile%s (overflow carriers, place within 32 blocks of art)",
+                    donorCount, donorCount == 1 ? "" : "s")));
         }
 
         // Summary line.
@@ -5070,6 +5088,36 @@ public class LoominaryCommand {
     // mux
     // ════════════════════════════════════════════════════════════════════
 
+    /**
+     * Builds a minimal blank-map payload (all-zero colors, no art) for use as a donor tile.
+     * Compresses very efficiently; the resulting tile carries only guest bytes.
+     */
+    private static PayloadState.TileData createBlankDonorTile() {
+        byte[] blankColors  = new byte[MAP_BYTES]; // all zeros
+        byte[] manifestBytes = PayloadManifest.toBytes(0, 1, 1, 0, 0, 0L, null, null);
+        byte[] combined = new byte[manifestBytes.length + blankColors.length];
+        System.arraycopy(manifestBytes, 0, combined, 0,                 manifestBytes.length);
+        System.arraycopy(blankColors,   0, combined, manifestBytes.length, blankColors.length);
+        byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+
+        CarpetEncoding enc = encodeLoomFromCompressed(compressed, 0, 0, PayloadState.codecMode);
+        PayloadState.TileData tile = new PayloadState.TileData();
+        tile.chunks.addAll(enc.allChunks());
+        tile.carpetEncoded = true;
+        tile.loomEncoded   = true;
+        tile.isDonorOnly   = true;
+        tile.carpetCompressedB64 = Base64.getEncoder().encodeToString(compressed);
+        return tile;
+    }
+
+    /**
+     * Appends the minimum number of blank donor tiles required to absorb all overflow
+     * from over-budget art tiles, then runs mux allocation using only those donor tiles.
+     *
+     * <p>Calling mux again (remux) removes existing donor tiles and recomputes the
+     * minimum needed, which may be fewer if the art was reduced in the interim.
+     * Use {@code /loominary mux undo} to remove donor tiles without adding new ones.
+     */
     private static int applyMux(FabricClientCommandSource source) {
         if (PayloadState.tiles.isEmpty()) {
             source.sendError(Text.literal("§cNo active batch."));
@@ -5077,235 +5125,161 @@ public class LoominaryCommand {
         }
         PayloadState.syncToActiveTile();
 
-        boolean priorSuccess = PayloadState.tiles.stream().anyMatch(t -> t.muxCargoB64 != null);
-        if (priorSuccess) {
-            source.sendError(Text.literal(
-                    "§cMux was already applied successfully. Re-import to start fresh."));
-            return 0;
-        }
+        // Remove existing donor tiles and reset mux state (remux support).
+        PayloadState.tiles.removeIf(t -> t.isDonorOnly);
         PayloadState.tiles.forEach(t -> { t.muxed = false; t.muxReceiver = false; t.muxCargoB64 = null; });
 
         CodecMode mode = PayloadState.codecMode;
         int budget = maxBytesForMode(mode);
-        boolean anyOverBudget = false;
-        for (int i = 0; i < PayloadState.tiles.size(); i++) {
-            PayloadState.TileData t = PayloadState.tiles.get(i);
-            int bytes = t.carpetEncoded ? carpetCompressedBytes(t)
-                    : (i == PayloadState.activeTileIndex
-                            ? PayloadState.ACTIVE_CHUNKS.size() * 84
-                            : t.chunks.size() * 84);
-            if (bytes > budget) { anyOverBudget = true; break; }
+
+        // Collect over-budget art tiles and compute total overflow bytes.
+        List<byte[]> payloads = new ArrayList<>();
+        for (PayloadState.TileData t : PayloadState.tiles) {
+            byte[] compressed = (t.carpetEncoded && t.carpetCompressedB64 != null)
+                    ? Base64.getDecoder().decode(t.carpetCompressedB64) : new byte[0];
+            payloads.add(compressed);
         }
-        if (!anyOverBudget) {
+
+        int receiverOwnMax = switch (mode) {
+            case BANNER       -> (MAX_CHUNKS - 1) * 84;
+            case CARPET       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
+            case CARPET_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
+            case CARPET_ONLY  -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
+        };
+
+        int totalOverflow = 0;
+        for (int i = 0; i < PayloadState.tiles.size(); i++) {
+            int len = payloads.get(i).length;
+            if (len > budget) totalOverflow += len - receiverOwnMax;
+        }
+        if (totalOverflow <= 0) {
             source.sendFeedback(Text.literal("§eNo tiles are over budget — mux not needed."));
             return 1;
         }
 
+        // Estimate how many bytes a single blank donor tile can absorb.
+        // Blank frame is tiny; most of the tile capacity is available for guest bytes.
+        // Subtract per-MG-banner overhead (84 bytes each, assume ≤4 segments per donor).
+        PayloadState.TileData sampleDonor = createBlankDonorTile();
+        int blankSize    = carpetCompressedBytes(sampleDonor);
+        int mgOverhead   = 84 * 4; // conservative: up to 4 guest segments per donor
+        int donorCapacity = budget - blankSize - mgOverhead;
+        if (donorCapacity <= 0) {
+            source.sendError(Text.literal(
+                    "§cDonor tile capacity is too small for codec " + mode.label() + "."));
+            return 0;
+        }
+
+        int numDonors = (totalOverflow + donorCapacity - 1) / donorCapacity;
+
         source.sendFeedback(Text.literal(String.format(
-                "§7Applying mux pooling across %d tiles [codec: %s]…",
-                PayloadState.tiles.size(), mode.label())));
+                "§7%d art tile%s over budget, %d bytes total overflow. "
+                + "Appending %d donor tile%s [codec: %s]…",
+                (int) payloads.stream().filter(p -> p.length > budget).count(),
+                payloads.stream().filter(p -> p.length > budget).count() == 1 ? "" : "s",
+                totalOverflow, numDonors, numDonors == 1 ? "" : "s", mode.label())));
+
+        for (int i = 0; i < numDonors; i++)
+            PayloadState.tiles.add(createBlankDonorTile());
+
+        // Re-collect payloads for the full (art + donor) list.
+        payloads.clear();
+        for (PayloadState.TileData t : PayloadState.tiles) {
+            byte[] compressed = (t.carpetEncoded && t.carpetCompressedB64 != null)
+                    ? Base64.getDecoder().decode(t.carpetCompressedB64) : new byte[0];
+            payloads.add(compressed);
+        }
+
+        // Run allocation: only blank donor tiles may serve as donors.
         int unresolved = poolMuxTiles(PayloadState.tiles,
-                PayloadState.gridColumns, PayloadState.gridRows);
+                PayloadState.gridColumns, PayloadState.gridRows, /* donorOnlyMode= */ true);
+
+        // Remove any donor tiles that ended up carrying nothing (allocation used fewer than estimated).
+        PayloadState.tiles.removeIf(t -> t.isDonorOnly && !t.muxed);
+
+        // Clamp active tile index.
+        if (PayloadState.activeTileIndex >= PayloadState.tiles.size())
+            PayloadState.activeTileIndex = Math.max(0, PayloadState.tiles.size() - 1);
         PayloadState.syncFromActiveTile();
         PayloadState.save();
 
-        for (int i = 0; i < PayloadState.tiles.size(); i++) {
-            PayloadState.TileData tile = PayloadState.tiles.get(i);
-            int totalBytes = carpetCompressedBytes(tile);
-            boolean overBudget = totalBytes > budget;
-            String muxTag = tile.muxReceiver ? " §d[mux receiver]"
-                    : tile.muxed ? " §d[mux donor]" : "";
-            String budgetTag = overBudget
-                    ? String.format(" §c[OVER BUDGET by %d — reduce further]", totalBytes - budget)
-                    : "";
-            source.sendFeedback(Text.literal(String.format(
-                    "  %s: §8%d bytes%s%s", PayloadState.tileLabel(i), totalBytes, muxTag, budgetTag)));
-        }
-        int donePlacements = PayloadState.tiles.stream().mapToInt(t -> t.currentIndex).sum();
-        if (donePlacements > 0) {
-            source.sendFeedback(Text.literal(
-                    "§e⚠ Some chunks were already placed — names changed. "
-                    + "Discard already-placed chunks before continuing."));
-        }
+        int artCount   = (int) PayloadState.tiles.stream().filter(t -> !t.isDonorOnly).count();
+        int donorCount = (int) PayloadState.tiles.stream().filter(t ->  t.isDonorOnly).count();
+        source.sendFeedback(Text.literal(String.format(
+                "§a%d art tile%s + %d donor tile%s.",
+                artCount,   artCount   == 1 ? "" : "s",
+                donorCount, donorCount == 1 ? "" : "s")));
+
         if (unresolved > 0) {
             source.sendFeedback(Text.literal(String.format(
-                    "§e%d tile%s still over budget — reduce those tiles, then run §f/loominary mux§e again.",
+                    "§c%d tile%s could not be resolved — try /loominary reduce first.",
                     unresolved, unresolved == 1 ? "" : "s")));
         } else {
             source.sendFeedback(Text.literal(
-                    "§aMux applied — run §f/loominary export§a to regenerate schematics for all tiles."));
+                    "§aMux applied. Place all tiles in item frames within 32 blocks of the art, "
+                    + "then run §f/loominary export§a to generate schematics."));
         }
         return 1;
     }
 
-    // ring
+    // mux undo
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * Expands the current grid by one tile in every direction, filling the new border
-     * positions with transparent (all-zero map color) tiles.  Each ring tile gets the
-     * same frame count as the busiest animated tile in the batch, giving mux pooling the
-     * maximum number of donor tiles to redistribute overflow into.
-     *
-     * <p>All existing tiles' manifests are re-encoded to reflect the new grid dimensions
-     * and shifted positions.  Because chunk names change, any partially-placed banners
-     * are invalidated; the command blocks if any placements are in progress.
+     * Removes all donor-only tiles that were appended by {@code /loominary mux},
+     * resets mux state on remaining art tiles, and re-encodes each art tile from
+     * its stored {@code carpetCompressedB64}.  The batch may be left over-budget
+     * — that is intentional; the user can re-mux or reduce as needed.
      */
-    private static int addTransparentRing(FabricClientCommandSource source) {
+    private static int unmuxTiles(FabricClientCommandSource source) {
         if (PayloadState.tiles.isEmpty()) {
             source.sendError(Text.literal("§cNo active batch."));
             return 0;
         }
-        boolean allCarpet = PayloadState.tiles.stream().allMatch(t -> t.carpetEncoded);
-        if (!allCarpet) {
-            source.sendError(Text.literal(
-                    "§cAll tiles must be carpet-encoded. Re-import with the §fcarpet§c keyword."));
-            return 0;
-        }
         PayloadState.syncToActiveTile();
-        long placed = PayloadState.tiles.stream().mapToLong(t -> t.currentIndex).sum();
-        if (placed > 0) {
-            source.sendError(Text.literal(
-                    "§c" + placed + " banner" + (placed == 1 ? "" : "s") + " already placed — "
-                    + "discard all placed banners before adding a ring."));
-            return 0;
+
+        boolean hadDonors = PayloadState.tiles.removeIf(t -> t.isDonorOnly);
+        if (!hadDonors) {
+            source.sendFeedback(Text.literal("§eNo donor tiles to remove — batch was not muxed."));
+            return 1;
         }
 
-        int oldCols = PayloadState.gridColumns;
-        int oldRows = PayloadState.gridRows;
-        int newCols = oldCols + 2;
-        int newRows = oldRows + 2;
-
-        int maxFrames = PayloadState.tiles.stream().mapToInt(t -> t.frameCount).max().orElse(1);
-        int[] delays;
-        if (maxFrames > 1) {
-            PayloadState.TileData maxTile = PayloadState.tiles.stream()
-                    .filter(t -> t.frameCount == maxFrames).findFirst().orElse(null);
-            if (maxTile != null && maxTile.frameDelays != null && !maxTile.frameDelays.isEmpty()) {
-                delays = Arrays.copyOf(
-                        maxTile.frameDelays.stream().mapToInt(Integer::intValue).toArray(),
-                        maxFrames);
-                for (int i = 0; i < delays.length; i++) if (delays[i] == 0) delays[i] = 100;
-            } else {
-                delays = new int[maxFrames];
-                Arrays.fill(delays, 100);
-            }
-        } else {
-            delays = null;
-        }
-
-        long transparentCrc = PayloadManifest.crc32(new byte[MAP_BYTES]);
-        MinecraftClient mc = MinecraftClient.getInstance();
-        String playerName = mc.player != null ? mc.player.getName().getString() : null;
-        int tileFlags = (PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0)
-                      | (maxFrames > 1 ? PayloadManifest.FLAG_ANIMATED : 0);
-        byte[] transparentFrames = new byte[maxFrames * MAP_BYTES]; // all zeros
-
-        List<PayloadState.TileData> newTiles = new ArrayList<>();
-        for (int r = 0; r < newRows; r++) {
-            for (int c = 0; c < newCols; c++) {
-                boolean isRing = (c == 0 || c == newCols - 1 || r == 0 || r == newRows - 1);
-                if (!isRing) {
-                    int oldIdx = (r - 1) * oldCols + (c - 1);
-                    newTiles.add(reencodeWithNewPosition(
-                            PayloadState.tiles.get(oldIdx), newCols, newRows, c, r));
-                } else {
-                    byte[] manifestBytes;
-                    try {
-                        manifestBytes = (maxFrames > 1)
-                                ? PayloadManifest.toBytes(tileFlags, newCols, newRows, c, r,
-                                        transparentCrc, playerName, PayloadState.currentTitle,
-                                        0, maxFrames, 0, delays)
-                                : PayloadManifest.toBytes(tileFlags, newCols, newRows, c, r,
-                                        transparentCrc, playerName, PayloadState.currentTitle);
-                    } catch (IllegalArgumentException e) {
-                        source.sendError(Text.literal(
-                                "§cFailed to build ring tile manifest: " + e.getMessage()));
-                        return 0;
-                    }
-                    byte[] payload = new byte[manifestBytes.length + transparentFrames.length];
-                    System.arraycopy(manifestBytes, 0, payload, 0, manifestBytes.length);
-                    System.arraycopy(transparentFrames, 0, payload,
-                            manifestBytes.length, transparentFrames.length);
-                    byte[] compressed = Zstd.compress(payload, Zstd.maxCompressionLevel());
-                    CarpetEncoding enc = encodeCarpetFromCompressed(compressed);
-
-                    PayloadState.TileData tile = new PayloadState.TileData();
-                    tile.chunks.addAll(enc.allChunks());
-                    tile.frameCount = maxFrames;
-                    if (delays != null) {
-                        tile.frameDelays = new ArrayList<>();
-                        for (int d : delays) tile.frameDelays.add(d);
-                    }
-                    tile.carpetEncoded = true;
-                    tile.carpetCompressedB64 = Base64.getEncoder().encodeToString(compressed);
-                    newTiles.add(tile);
-                }
+        int reset = 0;
+        for (int i = 0; i < PayloadState.tiles.size(); i++) {
+            PayloadState.TileData tile = PayloadState.tiles.get(i);
+            tile.muxed = false;
+            tile.muxReceiver = false;
+            tile.muxCargoB64 = null;
+            if (tile.carpetEncoded && tile.carpetCompressedB64 != null) {
+                byte[] compressed = Base64.getDecoder().decode(tile.carpetCompressedB64);
+                int col = PayloadState.tileCol(i), row = PayloadState.tileRow(i);
+                CarpetEncoding enc = encodeLoomFromCompressed(compressed, col, row, PayloadState.codecMode);
+                tile.chunks.clear();
+                tile.chunks.addAll(enc.allChunks());
+                tile.loomEncoded = true;
+                reset++;
             }
         }
 
-        int oldActiveCol = PayloadState.activeTileIndex % oldCols;
-        int oldActiveRow = PayloadState.activeTileIndex / oldCols;
-
-        PayloadState.tiles.clear();
-        PayloadState.tiles.addAll(newTiles);
-        PayloadState.gridColumns = newCols;
-        PayloadState.gridRows = newRows;
-        PayloadState.activeTileIndex = (oldActiveRow + 1) * newCols + (oldActiveCol + 1);
-        PayloadState.tiles.forEach(t -> { t.muxed = false; t.muxReceiver = false; t.muxCargoB64 = null; });
-
-        preReductionChunks.clear();
-        preReductionCarpetB64.clear();
-
+        // Clamp active tile index in case we removed tiles at the end.
+        if (PayloadState.activeTileIndex >= PayloadState.tiles.size())
+            PayloadState.activeTileIndex = Math.max(0, PayloadState.tiles.size() - 1);
         PayloadState.syncFromActiveTile();
         PayloadState.save();
 
-        int ringCount = newCols * newRows - oldCols * oldRows;
+        long overBudget = PayloadState.tiles.stream()
+                .filter(t -> t.carpetEncoded && carpetCompressedBytes(t) > maxBytesForTile(t))
+                .count();
+        String budgetNote = overBudget > 0
+                ? String.format(" §c(%d tile%s still over budget)", overBudget, overBudget == 1 ? "" : "s")
+                : "";
         source.sendFeedback(Text.literal(String.format(
-                "§aRing added: §f%d×%d §a→ §f%d×%d §a(%d transparent tile%s, %d frame%s each). "
-                + "Run §f/loominary mux§a to apply.",
-                oldCols, oldRows, newCols, newRows,
-                ringCount, ringCount == 1 ? "" : "s",
-                maxFrames, maxFrames == 1 ? "" : "s")));
+                "§aDonor tiles removed; %d art tile%s reset.%s",
+                reset, reset == 1 ? "" : "s", budgetNote)));
         return 1;
     }
 
-    /**
-     * Returns a copy of {@code old} with its manifest's cols/rows/tileCol/tileRow patched
-     * to the new grid position and FLAG_MUX cleared.  Recompresses and re-encodes into fresh
-     * carpet chunks.  {@code currentIndex} is reset to 0 because chunk names change.
-     */
-    private static PayloadState.TileData reencodeWithNewPosition(
-            PayloadState.TileData old, int newCols, int newRows, int newCol, int newRow) {
-        byte[] compressed = Base64.getDecoder().decode(old.carpetCompressedB64);
-        long decompSize = Zstd.getFrameContentSize(compressed);
-        byte[] decompressed = Zstd.decompress(compressed, (int) decompSize);
-
-        // Patch position bytes and clear FLAG_MUX — only when a manifest is present.
-        if (decompressed.length > MAP_BYTES && decompressed.length >= 7) {
-            decompressed[2] = (byte) (decompressed[2] & ~PayloadManifest.FLAG_MUX);
-            decompressed[3] = (byte) newCols;
-            decompressed[4] = (byte) newRows;
-            decompressed[5] = (byte) newCol;
-            decompressed[6] = (byte) newRow;
-        }
-
-        byte[] recompressed = Zstd.compress(decompressed, Zstd.maxCompressionLevel());
-        CarpetEncoding enc = encodeCarpetFromCompressed(recompressed);
-
-        PayloadState.TileData tile = new PayloadState.TileData();
-        tile.chunks.addAll(enc.allChunks());
-        tile.nonce = old.nonce;
-        tile.frameCount = old.frameCount;
-        tile.frameDelays = old.frameDelays != null ? new ArrayList<>(old.frameDelays) : null;
-        tile.frameSourceIndices = old.frameSourceIndices != null
-                ? new ArrayList<>(old.frameSourceIndices) : null;
-        tile.carpetEncoded = true;
-        tile.carpetCompressedB64 = Base64.getEncoder().encodeToString(recompressed);
-        return tile;
-    }
-
-    // requantize
+        // requantize
     // ════════════════════════════════════════════════════════════════════
 
     private static int setRequantizeMetric(FabricClientCommandSource source,

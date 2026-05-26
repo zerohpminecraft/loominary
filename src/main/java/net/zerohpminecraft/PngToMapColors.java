@@ -1152,11 +1152,16 @@ public class PngToMapColors {
     // ── Compression helpers ───────────────────────────────────────────────
 
     private static byte[] compressCombined(byte[] prefix, byte[] data) {
-        if (prefix.length == 0) return Zstd.compress(data, Zstd.maxCompressionLevel());
-        byte[] combined = new byte[prefix.length + data.length];
+        // Use adaptive level — level 22 on large payloads allocates gigabytes of native
+        // memory and crashes the JVM.  Same thresholds as LoominaryCommand.compressionLevel().
+        int totalLen = prefix.length + data.length;
+        int level = totalLen < 256_000 ? Zstd.maxCompressionLevel()
+                  : totalLen < 4_000_000 ? 9 : 3;
+        if (prefix.length == 0) return Zstd.compress(data, level);
+        byte[] combined = new byte[totalLen];
         System.arraycopy(prefix, 0, combined, 0, prefix.length);
-        System.arraycopy(data, 0, combined, prefix.length, data.length);
-        return Zstd.compress(combined, Zstd.maxCompressionLevel());
+        System.arraycopy(data,   0, combined, prefix.length, data.length);
+        return Zstd.compress(combined, level);
     }
 
     /** Fast size-only estimate for palette analysis (level 3, not for encoding). */

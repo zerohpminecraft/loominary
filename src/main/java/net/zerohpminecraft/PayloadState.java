@@ -44,6 +44,22 @@ public class PayloadState {
     /** Encoding strategy for new imports and re-encodes. */
     public static CodecMode codecMode = CodecMode.CARPET_SHADE;
 
+    // ── Author override ────────────────────────────────────────────────
+
+    /**
+     * Author name embedded in every tile's manifest.  {@code null} means use the
+     * player's in-game name at the time of import/re-encode.
+     */
+    public static String currentAuthor = null;
+
+    /**
+     * Returns the author name to embed in manifests: the explicit override if set,
+     * otherwise the player's IGN.
+     */
+    public static String effectiveAuthor(String playerIGN) {
+        return currentAuthor != null ? currentAuthor : playerIGN;
+    }
+
     // ── Manifest metadata ──────────────────────────────────────────────
 
     /** Whether the batch was encoded with allShades (FLAG_ALL_SHADES). */
@@ -118,7 +134,8 @@ public class PayloadState {
         boolean dither;
         String title;
         List<String> whitelist;
-        String codecMode; // null in old saves → defaults to CARPET_SHADE on load
+        String codecMode;   // null in old saves → defaults to CARPET_SHADE on load
+        String authorOverride; // null in old saves → use player IGN
     }
 
     public static int totalTiles() {
@@ -194,6 +211,7 @@ public class PayloadState {
             snap.title = currentTitle;
             snap.whitelist = new ArrayList<>(whitelistedBannerNames);
             snap.codecMode = codecMode.name();
+            snap.authorOverride = currentAuthor;
             Files.writeString(path, GSON.toJson(snap));
         } catch (IOException e) {
             System.err.println(TAG + " Failed to save to " + path.getFileName() + ": " + e.getMessage());
@@ -218,6 +236,7 @@ public class PayloadState {
         dither = snap.dither;
         currentTitle = snap.title;
         codecMode = snap.codecMode != null ? CodecMode.valueOf(snap.codecMode) : CodecMode.CARPET_SHADE;
+        currentAuthor = snap.authorOverride;
         tiles.clear();
         tiles.addAll(snap.tiles);
         whitelistedBannerNames.clear();
@@ -272,6 +291,7 @@ public class PayloadState {
             dither = snap.dither;
             currentTitle = snap.title;
             codecMode = snap.codecMode != null ? CodecMode.valueOf(snap.codecMode) : CodecMode.CARPET_SHADE;
+        currentAuthor = snap.authorOverride;
 
             tiles.clear();
             tiles.addAll(snap.tiles);
@@ -307,6 +327,7 @@ public class PayloadState {
         dither = false;
         currentTitle = null;
         codecMode = CodecMode.CARPET_SHADE;
+        currentAuthor = null;
         tiles.clear();
         whitelistedBannerNames.clear();
         ACTIVE_CHUNKS.clear();

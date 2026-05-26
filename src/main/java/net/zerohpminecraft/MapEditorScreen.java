@@ -387,7 +387,7 @@ public class MapEditorScreen extends Screen {
         }
 
         MinecraftClient mc = MinecraftClient.getInstance();
-        String playerName = mc.player != null ? mc.player.getGameProfile().getName() : "Player";
+        String playerName = PayloadState.effectiveAuthor(mc.player != null ? mc.player.getGameProfile().getName() : "Player");
 
         // Active tile
         boolean activeDirty = dirty || (tileDirty != null && tileIndex < tileDirty.length && tileDirty[tileIndex]);
@@ -3024,7 +3024,7 @@ public class MapEditorScreen extends Screen {
 
     private void commitGridRequantize() {
         MinecraftClient mc = MinecraftClient.getInstance();
-        String playerName = mc.player != null ? mc.player.getGameProfile().getName() : "Player";
+        String playerName = PayloadState.effectiveAuthor(mc.player != null ? mc.player.getGameProfile().getName() : "Player");
         int total = PayloadState.tiles.size();
 
         // Apply to active tile in-memory (saved on close as usual)
@@ -3261,7 +3261,7 @@ public class MapEditorScreen extends Screen {
 
     private void commitMergeAllTiles() {
         MinecraftClient mc = MinecraftClient.getInstance();
-        String playerName = mc.player != null ? mc.player.getGameProfile().getName() : "Player";
+        String playerName = PayloadState.effectiveAuthor(mc.player != null ? mc.player.getGameProfile().getName() : "Player");
         int totalTiles = PayloadState.tiles.size();
         int totalReplaced = 0;
 

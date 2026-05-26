@@ -63,6 +63,11 @@ public class MapBannerDecoder {
     private static final Map<Integer, byte[]> rawColors     = new HashMap<>();
     private static final Map<Integer, byte[]> decodedColors = new HashMap<>();
 
+    // ── Per-map metadata (title / author from the manifest) ───────────
+    private record MapMeta(String title, String author, int cols, int rows,
+                           int tileCol, int tileRow) {}
+    private static final Map<Integer, MapMeta> mapMeta = new HashMap<>();
+
     // ── Mux (cross-tile redistribution) state ────────────────────────────
 
     private static class MuxBuffer {
@@ -145,6 +150,9 @@ public class MapBannerDecoder {
             // Held-map check runs every tick: cheap for claimed maps, decodes once on first encounter.
             processHeldItem(client, client.player.getMainHandStack());
             processHeldItem(client, client.player.getOffHandStack());
+
+            // Show title/author in the action bar when looking at or holding a decoded map.
+            if (!mapMeta.isEmpty()) showMapMetaActionBar(client);
 
             // Frame scan runs every 20 ticks to discover new encoded maps.
             tickCounter++;
@@ -972,6 +980,11 @@ public class MapBannerDecoder {
                     + (manifest.username != null ? " by=" + manifest.username : "")
                     + (manifest.title    != null ? " title=\"" + manifest.title + "\"" : "")
                     + (manifest.animated() ? " frames=" + manifest.frameCount : ""));
+            // Store title/author for in-game display.
+            if (manifest.title != null || manifest.username != null) {
+                mapMeta.put(mapId.id(), new MapMeta(manifest.title, manifest.username,
+                        manifest.cols, manifest.rows, manifest.tileCol, manifest.tileRow));
+            }
         }
 
         if (manifest.colorCrc32 >= 0) {
@@ -1299,11 +1312,66 @@ public class MapBannerDecoder {
         return claimedMaps.contains(mapId);
     }
 
+    // ── In-game metadata display ──────────────────────────────────────────
+
+    /**
+     * Shows the title and author of a nearby Loominary map in the action bar.
+     * Checks the crosshair-targeted item frame first, then held items.
+     */
+    private static void showMapMetaActionBar(MinecraftClient client) {
+        Integer mapId = resolveMetaMapId(client);
+        if (mapId == null) return;
+        MapMeta meta = mapMeta.get(mapId);
+        if (meta == null) return;
+        String text = buildMetaText(meta);
+        if (text != null) client.player.sendMessage(Text.literal(text), true);
+    }
+
+    private static Integer resolveMetaMapId(MinecraftClient client) {
+        // Prefer crosshair-targeted frame.
+        if (client.crosshairTarget instanceof net.minecraft.util.hit.EntityHitResult hit
+                && hit.getEntity() instanceof ItemFrameEntity frame) {
+            ItemStack stack = frame.getHeldItemStack();
+            if (stack.getItem() instanceof FilledMapItem) {
+                MapIdComponent id = stack.get(DataComponentTypes.MAP_ID);
+                if (id != null && claimedMaps.contains(id.id())) return id.id();
+            }
+        }
+        // Fall back to held items.
+        for (ItemStack stack : new ItemStack[]{
+                client.player.getMainHandStack(), client.player.getOffHandStack()}) {
+            if (stack.getItem() instanceof FilledMapItem) {
+                MapIdComponent id = stack.get(DataComponentTypes.MAP_ID);
+                if (id != null && claimedMaps.contains(id.id())) return id.id();
+            }
+        }
+        return null;
+    }
+
+    private static String buildMetaText(MapMeta meta) {
+        if (meta.title() == null && meta.author() == null) return null;
+        StringBuilder sb = new StringBuilder();
+        if (meta.title() != null) {
+            sb.append("§e\"").append(meta.title()).append("\"");
+        }
+        if (meta.author() != null) {
+            if (meta.title() != null) sb.append(" §7by §e");
+            else sb.append("§7by §e");
+            sb.append(meta.author());
+        }
+        if (meta.cols() > 1 || meta.rows() > 1) {
+            sb.append(String.format(" §8(%d,%d of %d×%d)",
+                    meta.tileCol() + 1, meta.tileRow() + 1, meta.cols(), meta.rows()));
+        }
+        return sb.toString();
+    }
+
     public static void clearCache() {
         claimedMaps.clear();
         animatedMaps.clear();
         animSyncGroups.clear();
         animSyncGroupsDirty = false;
+        mapMeta.clear();
         muxBuffers.clear();
         muxPendingOffsets.clear();
         muxPendingBytes.clear();

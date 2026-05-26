@@ -1543,6 +1543,15 @@ public class LoominaryCommand {
                                             .executes(ctx -> titleSet(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "text")))))
 
+                            // ── author ─────────────────────────────────────────
+                            .then(ClientCommandManager.literal("author")
+                                    .executes(ctx -> authorShow(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("clear")
+                                            .executes(ctx -> authorClear(ctx.getSource())))
+                                    .then(ClientCommandManager.argument("name", StringArgumentType.greedyString())
+                                            .executes(ctx -> authorSet(ctx.getSource(),
+                                                    StringArgumentType.getString(ctx, "name")))))
+
                             // ── stride ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("stride")
                                     .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(2, 100))
@@ -1904,7 +1913,7 @@ public class LoominaryCommand {
 
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
-        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         source.sendFeedback(Text.literal("§7Encoding §f" + filename + "§7..."));
 
         Thread t = new Thread(() -> {
@@ -2043,7 +2052,7 @@ public class LoominaryCommand {
         // title already set by importFile caller
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
-        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         final MinecraftClient client = MinecraftClient.getInstance();
         source.sendFeedback(Text.literal("§7Importing §f" + filename + "§7 in background..."));
 
@@ -2369,7 +2378,7 @@ public class LoominaryCommand {
 
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
-        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         source.sendFeedback(Text.literal("§7Encoding §f" + filename + "§7..."));
 
         Thread t = new Thread(() -> {
@@ -2546,7 +2555,7 @@ public class LoominaryCommand {
         // title + importInProgress already set by importFileCarpet caller
         importInProgress = true;
         final String capturedTitle = PayloadState.currentTitle;
-        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         final MinecraftClient client = MinecraftClient.getInstance();
         source.sendFeedback(Text.literal("§7Importing §f" + filename + "§7 in background..."));
 
@@ -2738,7 +2747,7 @@ public class LoominaryCommand {
         }
 
         byte[] mapColors = fm.mapState.colors.clone();
-        String playerName = source.getPlayer().getGameProfile().getName();
+        String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         // Stolen tiles are standalone — use 1×1 grid, allShades=false (unknown origin)
         byte[] manifestForSizeCheck = PayloadManifest.toBytes(
                 0, 1, 1, 0, 0, 0L, playerName, PayloadState.currentTitle);
@@ -2798,7 +2807,7 @@ public class LoominaryCommand {
         }
 
         byte[] mapColors = fm.mapState.colors.clone();
-        String playerName = source.getPlayer().getGameProfile().getName();
+        String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         byte[] manifestBytes = PayloadManifest.toBytes(
                 0, 1, 1, 0, 0, PayloadManifest.crc32(mapColors), playerName,
                 PayloadState.currentTitle);
@@ -3772,7 +3781,7 @@ public class LoominaryCommand {
 
         final List<String> chunksSnap  = new ArrayList<>(PayloadState.ACTIVE_CHUNKS);
         final PayloadState.TileData tileSnap = snapshotTile(tile);
-        final String playerName        = source.getPlayer().getGameProfile().getName();
+        final String playerName        = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         final int flags                = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
 
         importInProgress = true;
@@ -3877,7 +3886,7 @@ public class LoominaryCommand {
         // Snapshot before going async.
         final List<String> chunksSnap  = new ArrayList<>(PayloadState.ACTIVE_CHUNKS);
         final PayloadState.TileData tileSnap = snapshotTile(tile);
-        final String playerName        = source.getPlayer().getGameProfile().getName();
+        final String playerName        = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         final int flags                = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
 
         importInProgress = true;
@@ -3981,7 +3990,7 @@ public class LoominaryCommand {
         PayloadState.syncToActiveTile();
 
         // Snapshot all tile data before releasing the game thread.
-        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         final int flags         = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
         final int tileCount     = PayloadState.tiles.size();
         final List<List<String>> allChunks   = new ArrayList<>();
@@ -4124,7 +4133,7 @@ public class LoominaryCommand {
         PayloadState.syncToActiveTile();
 
         // Snapshot all tile data before releasing the game thread.
-        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         final int flags         = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
         final int tileCount     = PayloadState.tiles.size();
         final List<List<String>> allChunks   = new ArrayList<>();
@@ -4471,7 +4480,7 @@ public class LoominaryCommand {
         }
 
         // Re-encode all existing tiles with the new title.
-        String playerName = source.getPlayer().getGameProfile().getName();
+        String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         PayloadState.syncToActiveTile();
         int reEncoded = 0;
         boolean anyCarpet = false;
@@ -4551,6 +4560,41 @@ public class LoominaryCommand {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // author [name|clear]
+    // ════════════════════════════════════════════════════════════════════
+
+    private static int authorShow(FabricClientCommandSource source) {
+        if (PayloadState.currentAuthor != null) {
+            source.sendFeedback(Text.literal("§7Author override: §f" + PayloadState.currentAuthor
+                    + " §8(use §f/loominary author clear§8 to revert to player IGN)"));
+        } else {
+            String ign = PayloadState.effectiveAuthor(
+                    source.getPlayer().getGameProfile().getName());
+            source.sendFeedback(Text.literal("§7Author: §f" + ign
+                    + " §8(player IGN — use §f/loominary author <name>§8 to override)"));
+        }
+        return 1;
+    }
+
+    private static int authorSet(FabricClientCommandSource source, String name) {
+        PayloadState.currentAuthor = name.isBlank() ? null : name;
+        PayloadState.save();
+        if (PayloadState.currentAuthor != null) {
+            source.sendFeedback(Text.literal("§aAuthor set to: §f" + PayloadState.currentAuthor));
+        } else {
+            source.sendFeedback(Text.literal("§aAuthor cleared — will use player IGN."));
+        }
+        return 1;
+    }
+
+    private static int authorClear(FabricClientCommandSource source) {
+        PayloadState.currentAuthor = null;
+        PayloadState.save();
+        source.sendFeedback(Text.literal("§aAuthor cleared — will use player IGN."));
+        return 1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // stride <n> / skip <n>  — direct operations on the active tile
     // ════════════════════════════════════════════════════════════════════
 
@@ -4575,7 +4619,7 @@ public class LoominaryCommand {
         PayloadState.syncToActiveTile();
 
         // Snapshot all animated tiles before releasing the game thread.
-        final String playerName = source.getPlayer().getGameProfile().getName();
+        final String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         final int tileCount = PayloadState.tiles.size();
         final List<List<String>> allChunks = new ArrayList<>();
         final List<PayloadState.TileData> allSnaps = new ArrayList<>();
@@ -4894,7 +4938,7 @@ public class LoominaryCommand {
         };
 
         PayloadState.syncToActiveTile();
-        String playerName = source.getPlayer().getGameProfile().getName();
+        String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
         int first = all ? 0 : PayloadState.activeTileIndex;
         int last  = all ? PayloadState.tiles.size() - 1 : PayloadState.activeTileIndex;
 
@@ -5010,7 +5054,7 @@ public class LoominaryCommand {
 
             PayloadState.syncToActiveTile();
 
-            String playerName = source.getPlayer().getGameProfile().getName();
+            String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
             int flags     = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
             boolean legal = !PayloadState.allShades;
 
@@ -5501,7 +5545,7 @@ public class LoominaryCommand {
             }
 
             PayloadState.syncToActiveTile();
-            String playerName = source.getPlayer().getGameProfile().getName();
+            String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
             int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
 
             for (int t = 0; t < PayloadState.tiles.size(); t++) {
@@ -5662,7 +5706,7 @@ public class LoominaryCommand {
             int nonce;
             do { nonce = ThreadLocalRandom.current().nextInt(); } while (nonce == 0);
 
-            String playerName = source.getPlayer().getGameProfile().getName();
+            String playerName = PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName());
             int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
             int[] delays = tileDelays(tile, fc);
             long crc = PayloadManifest.crc32(Arrays.copyOf(fullData, MAP_BYTES));

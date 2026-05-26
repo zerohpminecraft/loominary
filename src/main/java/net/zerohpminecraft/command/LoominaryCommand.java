@@ -148,12 +148,20 @@ public class LoominaryCommand {
         int len  = data.length;
         int level = compressionLevel(len);
         if (len >= 1 << 20) { // 1 MB+: enable long-range matching
-            // windowLog = ceil(log2(len)), capped at 27 (128 MB).
-            int windowLog = Math.min(27, 32 - Integer.numberOfLeadingZeros(len - 1));
-            try (ZstdCompressCtx ctx = new ZstdCompressCtx()) {
-                ctx.setLevel(level);
-                ctx.setLong(windowLog);
-                return ctx.compress(data);
+            // Long-range mode allocates ~128 MB of native memory and blocks for several
+            // seconds on large payloads.  Never run it on the render thread — it would
+            // freeze the LWJGL window long enough for the OS to kill it.
+            // Background threads (imports, reduce, dither) are safe.
+            // Detect render/game thread by name — Minecraft's thread is "Render thread".
+            boolean onRenderThread = Thread.currentThread().getName().startsWith("Render thread");
+            if (!onRenderThread) {
+                // windowLog = ceil(log2(len)), capped at 27 (128 MB).
+                int windowLog = Math.min(27, 32 - Integer.numberOfLeadingZeros(len - 1));
+                try (ZstdCompressCtx ctx = new ZstdCompressCtx()) {
+                    ctx.setLevel(level);
+                    ctx.setLong(windowLog);
+                    return ctx.compress(data);
+                }
             }
         }
         return Zstd.compress(data, level);
@@ -1192,6 +1200,57 @@ public class LoominaryCommand {
             }
         }
         return baos.toByteArray();
+    }
+
+    // ── Pre-encoding helper for background-thread safety ─────────────────
+    //
+    // saveTileData calls buildCarpetEncoding → compress(), which for large animated
+    // payloads uses the long-range ZstdCompressCtx.  This MUST NOT run on the render
+    // thread (it would block LWJGL for seconds and lose the window).
+    //
+    // Pattern: background thread calls preEncode() to produce a PreEncodedTile;
+    // client.execute() calls applySaveTile() which only touches PayloadState fields.
+
+    private record PreEncodedTile(List<String> chunks, String carpetB64, boolean loomEncoded) {}
+
+    /**
+     * Computes the encoding (compression + chunk building) for a tile on the calling thread.
+     * Safe to call from any background thread.  Returns a {@link PreEncodedTile} that can
+     * be applied to PayloadState on the main thread via {@link #applySaveTile}.
+     */
+    private static PreEncodedTile preEncode(int tileIdx, byte[] manifestBytes, byte[] payload,
+                                             boolean isCarpetEncoded) {
+        if (isCarpetEncoded) {
+            int col = PayloadState.tileCol(tileIdx), row = PayloadState.tileRow(tileIdx);
+            CarpetEncoding enc = buildCarpetEncoding(manifestBytes, payload, col, row);
+            return new PreEncodedTile(enc.allChunks(),
+                    Base64.getEncoder().encodeToString(enc.compressed()),
+                    enc.headerChunk() == null);
+        } else {
+            return new PreEncodedTile(buildChunks(manifestBytes, payload), null, false);
+        }
+    }
+
+    /**
+     * Applies a pre-encoded tile result to PayloadState on the main thread.
+     * No compression happens here.
+     */
+    private static int applySaveTile(int tileIdx, int frameCount, PreEncodedTile pre) {
+        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
+        tile.frameCount = frameCount;
+        tile.chunks.clear();
+        tile.chunks.addAll(pre.chunks());
+        tile.currentIndex = 0;
+        if (pre.carpetB64() != null) {
+            tile.carpetCompressedB64 = pre.carpetB64();
+            tile.loomEncoded = pre.loomEncoded();
+        }
+        if (tileIdx == PayloadState.activeTileIndex) {
+            PayloadState.ACTIVE_CHUNKS.clear();
+            PayloadState.ACTIVE_CHUNKS.addAll(pre.chunks());
+            PayloadState.activeChunkIndex = 0;
+        }
+        return pre.chunks().size();
     }
 
     // ── Caches for revert / reduce undo ────────────────────────────────
@@ -3906,12 +3965,15 @@ public class LoominaryCommand {
 
                 long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
+                // Encode on background thread — never compress large payloads on render thread.
+                byte[] payloadForSave = PayloadManifest.withTrailing(manifest, delays, fit.mapColors);
+                final PreEncodedTile preEnc = preEncode(tileIdx, manifest, payloadForSave,
+                        tileSnap.carpetEncoded);
 
                 client.execute(() -> {
                     try {
                         PayloadState.TileData liveTile = PayloadState.tiles.get(tileIdx);
-                        int newCount = saveTileData(tileIdx, manifest,
-                                PayloadManifest.withTrailing(manifest, delays, fit.mapColors));
+                        int newCount = applySaveTile(tileIdx, fc, preEnc);
                         liveTile.frameCount = fc;
                         PayloadState.syncFromActiveTile();
                         PayloadState.save();
@@ -4017,16 +4079,18 @@ public class LoominaryCommand {
 
                 long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
+                byte[] payload2 = PayloadManifest.withTrailing(manifest, delays, fit.mapColors);
+                final PreEncodedTile preEnc2 = preEncode(tileIdx, manifest, payload2,
+                        tileSnap.carpetEncoded);
 
                 client.execute(() -> {
                     try {
-                        // Save undo snapshot here so it's only written if we actually reduce.
                         preReductionChunks.put(tileIdx, new ArrayList<>(PayloadState.ACTIVE_CHUNKS));
                         PayloadState.TileData liveTile = PayloadState.tiles.get(tileIdx);
                         if (liveTile.carpetEncoded && liveTile.carpetCompressedB64 != null)
                             preReductionCarpetB64.put(tileIdx, liveTile.carpetCompressedB64);
 
-                        int newCount  = saveTileData(tileIdx, manifest, fit.mapColors);
+                        int newCount  = applySaveTile(tileIdx, fc, preEnc2);
                         liveTile.frameCount = fc;
                         int newColors = fit.originalDistinctColors - fit.colorsRemoved;
                         PayloadState.syncFromActiveTile();
@@ -4107,7 +4171,8 @@ public class LoominaryCommand {
         source.sendFeedback(Text.literal("§7Reducing all tiles §8[" + allBannerTag + "]§7..."));
 
         // Per-tile results: null = skipped, non-null = [manifest, mapColors, fc, note]
-        record TileResult(byte[] manifest, byte[] mapColors, int fc, String note) {}
+        record TileResult(byte[] manifest, byte[] mapColors, int fc, String note,
+                          PreEncodedTile preEnc) {}
 
         MinecraftClient client = MinecraftClient.getInstance();
         Thread t = new Thread(() -> {
@@ -4130,23 +4195,23 @@ public class LoominaryCommand {
                     byte[] union = mergeFrames(frames);
                     int[] delays = tileDelays(tileSnap, fc);
                     byte[] prefix = buildReduceManifest(i, 0L, playerName, flags, fc, delays);
-                    // Banner-count targeting always uses RAREST (see reduceOne for rationale).
                     PngToMapColors.FitResult fit = tileSnap.carpetEncoded
                             ? PngToMapColors.reduceToFit(union, prefix, CHUNK_SIZE, tileTarget, PngToMapColors.Strategy.RAREST, null)
                             : PngToMapColors.reduceToFitKJ(union, prefix, tileTarget, PngToMapColors.Strategy.RAREST, null);
                     long crc      = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
+                    byte[] payload = PayloadManifest.withTrailing(manifest, delays, fit.mapColors);
+                    PreEncodedTile pre = preEncode(i, manifest, payload, tileSnap.carpetEncoded);
                     int oldSz = oldSizes.get(i);
                     String note = tileSnap.carpetEncoded
                             ? String.format("carpet, %d colors merged (committing...)", fit.colorsRemoved)
                             : String.format("§e%d §7→ §a? §7banners, %d colors merged", oldSz, fit.colorsRemoved);
-                    results.add(new TileResult(manifest,
-                            PayloadManifest.withTrailing(manifest, delays, toDeltaFrames(fit.mapColors, fc)), fc, note));
+                    results.add(new TileResult(manifest, payload, fc, note, pre));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
                     totalPixelsAffected += fit.pixelsAffected;
                 } catch (Exception e) {
-                    results.add(new TileResult(null, null, 1, "§cfailed: " + e.getMessage()));
+                    results.add(new TileResult(null, null, 1, "§cfailed: " + e.getMessage(), null));
                 }
             }
 
@@ -4172,7 +4237,7 @@ public class LoominaryCommand {
                         if (r == null || r.manifest() == null) continue;
                         PayloadState.TileData liveTile = PayloadState.tiles.get(i);
                         int oldSz = oldSizes.get(i);
-                        int newCount = saveTileData(i, r.manifest(), r.mapColors());
+                        int newCount = applySaveTile(i, r.fc(), r.preEnc());
                         liveTile.frameCount = r.fc();
                         String note;
                         if (liveTile.carpetEncoded) {
@@ -4246,7 +4311,8 @@ public class LoominaryCommand {
         source.sendFeedback(Text.literal("§7Reducing all tiles §8[" + reduceStrategy.name().toLowerCase() + "]§7..."));
 
         record TileResult(byte[] manifest, byte[] mapColors, int fc,
-                          int origColors, int newColors, String noteExtra) {}
+                          int origColors, int newColors, String noteExtra,
+                          PreEncodedTile preEnc) {}
 
         MinecraftClient client = MinecraftClient.getInstance();
         Thread t = new Thread(() -> {
@@ -4270,14 +4336,15 @@ public class LoominaryCommand {
                             union, prefix, CHUNK_SIZE, targetColors, reduceStrategy, normFreq);
                     long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
-                    results.add(new TileResult(manifest,
-                            PayloadManifest.withTrailing(manifest, delays, toDeltaFrames(fit.mapColors, fc)),
-                            fc, current, current - fit.colorsRemoved, null));
+                    byte[] payload = PayloadManifest.withTrailing(manifest, delays, fit.mapColors);
+                    PreEncodedTile pre = preEncode(i, manifest, payload, tileSnap.carpetEncoded);
+                    results.add(new TileResult(manifest, payload,
+                            fc, current, current - fit.colorsRemoved, null, pre));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
                     totalPixelsAffected += fit.pixelsAffected;
                 } catch (Exception e) {
-                    results.add(new TileResult(null, null, 1, 0, 0, "§cfailed: " + e.getMessage()));
+                    results.add(new TileResult(null, null, 1, 0, 0, "§cfailed: " + e.getMessage(), null));
                 }
             }
 
@@ -4306,7 +4373,7 @@ public class LoominaryCommand {
                             continue;
                         }
                         PayloadState.TileData liveTile = PayloadState.tiles.get(i);
-                        int newCount = saveTileData(i, r.manifest(), r.mapColors());
+                        int newCount = applySaveTile(i, r.fc(), r.preEnc());
                         liveTile.frameCount = r.fc();
                         String note;
                         if (liveTile.carpetEncoded) {

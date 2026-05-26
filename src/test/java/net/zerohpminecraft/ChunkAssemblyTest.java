@@ -110,4 +110,77 @@ class ChunkAssemblyTest {
         assertThrows(IllegalStateException.class,
                 () -> MapBannerDecoder.reassemblePayload(new ArrayList<>(chunks)));
     }
+
+    // ── Delta frame encoding ──────────────────────────────────────────────
+
+    @Test
+    void deltaEncodeDecodeRoundTrip() {
+        int frameCount = 4;
+        // Build deterministic raw frames: frame 0 = alternating bytes, subsequent frames change ~10% of pixels.
+        byte[][] rawFrames = new byte[frameCount][MAP_BYTES];
+        for (int p = 0; p < MAP_BYTES; p++) rawFrames[0][p] = (byte)(p & 0xFF);
+        java.util.Random rng = new java.util.Random(42);
+        for (int f = 1; f < frameCount; f++) {
+            System.arraycopy(rawFrames[f - 1], 0, rawFrames[f], 0, MAP_BYTES);
+            // Change ~10% of pixels
+            for (int p = 0; p < MAP_BYTES; p++)
+                if (rng.nextInt(10) == 0) rawFrames[f][p] = (byte) rng.nextInt(256);
+        }
+
+        // Flatten to a single byte array as the encoder does.
+        byte[] flat = new byte[frameCount * MAP_BYTES];
+        for (int f = 0; f < frameCount; f++)
+            System.arraycopy(rawFrames[f], 0, flat, f * MAP_BYTES, MAP_BYTES);
+
+        // Apply delta encoding.
+        byte[] deltaFlat = net.zerohpminecraft.command.LoominaryCommand.toDeltaFrames(flat, frameCount);
+
+        // Frame 0 must be unchanged.
+        for (int p = 0; p < MAP_BYTES; p++)
+            assertEquals(rawFrames[0][p], deltaFlat[p], "frame 0 must be raw");
+
+        // Reconstruct via the decoder helper (in-place on byte[][]).
+        byte[][] deltaFrames = new byte[frameCount][MAP_BYTES];
+        for (int f = 0; f < frameCount; f++)
+            System.arraycopy(deltaFlat, f * MAP_BYTES, deltaFrames[f], 0, MAP_BYTES);
+        MapBannerDecoder.reconstructDeltaFrames(deltaFrames);
+
+        // After reconstruction every frame must match the original raw frame.
+        for (int f = 0; f < frameCount; f++)
+            assertArrayEquals(rawFrames[f], deltaFrames[f], "frame " + f + " mismatch after reconstruction");
+    }
+
+    @Test
+    void deltaCompressesBetterThanRaw() {
+        // Demonstrates delta benefit when the animation is long enough to exhaust zstd's
+        // back-reference window.  Zstd level 3 uses a ~512 KB window (≈ 31 map frames).
+        // With 60 frames, raw zstd can no longer back-reference frame 0 from frame 31+,
+        // so identical pixels in late frames must be stored as literals.  Delta frames are
+        // ~98% zeros throughout and remain highly compressible regardless of window size.
+        int frameCount = 60;
+        // Binary frames simulating Bad Apple: value 0 (black) vs value 119 (white-ish).
+        byte[] rawFrames0 = new byte[MAP_BYTES]; // all-zero base
+        // Pepper in ~20% foreground pixels.
+        java.util.Random rng = new java.util.Random(99);
+        for (int p = 0; p < MAP_BYTES; p++) if (rng.nextInt(5) == 0) rawFrames0[p] = 119;
+
+        byte[] flat = new byte[frameCount * MAP_BYTES];
+        System.arraycopy(rawFrames0, 0, flat, 0, MAP_BYTES);
+        // Each frame: copy previous, change ~2% of pixels.
+        for (int f = 1; f < frameCount; f++) {
+            System.arraycopy(flat, (f - 1) * MAP_BYTES, flat, f * MAP_BYTES, MAP_BYTES);
+            for (int p = 0; p < MAP_BYTES; p++) {
+                if (rng.nextInt(50) == 0)
+                    flat[f * MAP_BYTES + p] ^= 119; // toggle black ↔ white
+            }
+        }
+
+        byte[] deltaFlat = net.zerohpminecraft.command.LoominaryCommand.toDeltaFrames(flat, frameCount);
+
+        int rawSize   = Zstd.compress(flat,      3).length;
+        int deltaSize = Zstd.compress(deltaFlat, 3).length;
+        assertTrue(deltaSize < rawSize,
+                "delta should compress better than raw once the animation exceeds zstd's window "
+                + "(delta=" + deltaSize + " raw=" + rawSize + ")");
+    }
 }

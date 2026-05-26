@@ -500,7 +500,8 @@ public class LoominaryCommand {
                 } else {
                     delays = new int[]{100};
                 }
-                manifest = PayloadManifest.toBytes(flags,
+                manifest = PayloadManifest.toBytes(
+                        flags | PayloadManifest.FLAG_DELTA_FRAMES,
                         PayloadState.gridColumns, PayloadState.gridRows,
                         PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
                         PayloadManifest.crc32(allFrames[0]), playerName,
@@ -518,11 +519,12 @@ public class LoominaryCommand {
                 tile.frameCount = 1;
                 tile.frameDelays = null;
             }
-            // For v5 manifests the per-frame delay table is stored after the frame data.
             int[] delaysForTrailing = (tile.frameDelays != null)
                     ? tile.frameDelays.stream().mapToInt(Integer::intValue).toArray()
                     : new int[0];
-            saveTileData(tileIdx, manifest, PayloadManifest.withTrailing(manifest, delaysForTrailing, payloadBytes));
+            // Apply delta encoding; frame 0 stays raw, frames 1..N become XOR deltas.
+            byte[] encodedPayload = toDeltaFrames(payloadBytes, frameCount);
+            saveTileData(tileIdx, manifest, PayloadManifest.withTrailing(manifest, delaysForTrailing, encodedPayload));
 
             // Editing any tile invalidates the mux allocation across the whole batch.
             boolean hadMux = PayloadState.tiles.stream().anyMatch(t -> t.muxCargoB64 != null);
@@ -619,7 +621,8 @@ public class LoominaryCommand {
 
                 final byte[] manifest;
                 if (frameCount > 1) {
-                    manifest = PayloadManifest.toBytes(flags | PayloadManifest.FLAG_ANIMATED,
+                    manifest = PayloadManifest.toBytes(
+                            flags | PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_DELTA_FRAMES,
                             gridCols, gridRows, col, row,
                             PayloadManifest.crc32(framesCopy[0]),
                             playerName, title, nonce, frameCount, 0, delays);
@@ -630,8 +633,8 @@ public class LoominaryCommand {
                             playerName, title, nonce);
                 }
 
-                // Append v5 trailing delay table (empty for v4/global-delay manifests).
-                byte[] effectivePayload = PayloadManifest.withTrailing(manifest, delays, payloadBytes);
+                byte[] encodedPayload2 = toDeltaFrames(payloadBytes, frameCount);
+                byte[] effectivePayload = PayloadManifest.withTrailing(manifest, delays, encodedPayload2);
 
                 final List<String> allChunks;
                 final String newCarpetB64;
@@ -1126,7 +1129,27 @@ public class LoominaryCommand {
             }
             System.arraycopy(full, start, frames[f], 0, MAP_BYTES);
         }
+        // Reconstruct absolute frames from XOR-delta storage (v6+ tiles).
+        if (manifest.deltaFrames() && frames.length > 1)
+            MapBannerDecoder.reconstructDeltaFrames(frames);
         return frames;
+    }
+
+    /**
+     * Converts a flat array of raw animation frames into XOR-delta encoded frames.
+     * Frame 0 is preserved raw; each subsequent frame stores {@code frame[n] XOR frame[n-1]}.
+     * Returns {@code rawFrames} unchanged when {@code frameCount ≤ 1}.
+     */
+    public static byte[] toDeltaFrames(byte[] rawFrames, int frameCount) {
+        if (frameCount <= 1) return rawFrames;
+        byte[] out = new byte[rawFrames.length];
+        System.arraycopy(rawFrames, 0, out, 0, MAP_BYTES); // frame 0 is raw
+        for (int f = 1; f < frameCount; f++) {
+            int off = f * MAP_BYTES;
+            for (int p = 0; p < MAP_BYTES; p++)
+                out[off + p] = (byte)(rawFrames[off + p] ^ rawFrames[off - MAP_BYTES + p]);
+        }
+        return out;
     }
 
     // ── Caches for revert / reduce undo ────────────────────────────────
@@ -2067,7 +2090,8 @@ public class LoominaryCommand {
                 for (int d : rawDelays) if (d != rawDelays[0]) { uniformDelay = false; break; }
                 int[] manifestDelays = uniformDelay ? new int[]{rawDelays[0]} : rawDelays;
 
-                int tileFlags = (frameCount > 1 ? PayloadManifest.FLAG_ANIMATED : 0)
+                int tileFlags = (frameCount > 1
+                                ? PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_DELTA_FRAMES : 0)
                         | (allShades ? PayloadManifest.FLAG_ALL_SHADES : 0);
                 int totalTiles = columns * rows;
                 List<PayloadState.TileData> newTiles = new ArrayList<>();
@@ -2087,7 +2111,8 @@ public class LoominaryCommand {
                             tileFlags, columns, rows, col, row, crc, playerName, capturedTitle,
                             0, frameCount, 0, manifestDelays);
                     List<String> chunks = buildChunks(manifest,
-                            PayloadManifest.withTrailing(manifest, manifestDelays, allFramesBytes));
+                            PayloadManifest.withTrailing(manifest, manifestDelays,
+                                    toDeltaFrames(allFramesBytes, frameCount)));
                     String note = null;
                     if (chunks.size() > MAX_CHUNKS) {
                         note = String.format("OVERFLOW: %d chunks for %d frames (max %d)", chunks.size(), frameCount, MAX_CHUNKS);
@@ -2571,7 +2596,8 @@ public class LoominaryCommand {
             for (int d : rawDelays) if (d != rawDelays[0]) { uniformDelay = false; break; }
             int[] manifestDelays = uniformDelay ? new int[]{rawDelays[0]} : rawDelays;
 
-            int tileFlags = (frameCount > 1 ? PayloadManifest.FLAG_ANIMATED : 0)
+            int tileFlags = (frameCount > 1
+                            ? PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_DELTA_FRAMES : 0)
                     | (allShades ? PayloadManifest.FLAG_ALL_SHADES : 0);
 
             int totalTiles = columns * rows;
@@ -2594,7 +2620,8 @@ public class LoominaryCommand {
                         : PayloadManifest.toBytes(tileFlags, columns, rows, col, row,
                                 crc, playerName, capturedTitle);
                 byte[] payloadBytes = (frameCount > 1)
-                        ? PayloadManifest.withTrailing(manifestBytes, manifestDelays, allFramesBytes)
+                        ? PayloadManifest.withTrailing(manifestBytes, manifestDelays,
+                                toDeltaFrames(allFramesBytes, frameCount))
                         : allFramesBytes;
 
                 CarpetEncoding enc;
@@ -3735,14 +3762,14 @@ public class LoominaryCommand {
     }
 
     /**
-     * Builds a reduce manifest for a tile. Automatically adds FLAG_ANIMATED and the
-     * per-frame delay table when frameCount > 1.
+     * Builds a reduce manifest for a tile. Automatically adds FLAG_ANIMATED and
+     * FLAG_DELTA_FRAMES when frameCount &gt; 1, and the per-frame delay table.
      */
     private static byte[] buildReduceManifest(int tileIdx, long crc, String playerName,
             int flags, int frameCount, int[] delays) {
         if (frameCount > 1) {
             return PayloadManifest.toBytes(
-                    flags | PayloadManifest.FLAG_ANIMATED,
+                    flags | PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_DELTA_FRAMES,
                     PayloadState.gridColumns, PayloadState.gridRows,
                     PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
                     crc, playerName, PayloadState.currentTitle,
@@ -3840,7 +3867,7 @@ public class LoominaryCommand {
                     try {
                         PayloadState.TileData liveTile = PayloadState.tiles.get(tileIdx);
                         int newCount = saveTileData(tileIdx, manifest,
-                                PayloadManifest.withTrailing(manifest, delays, fit.mapColors));
+                                PayloadManifest.withTrailing(manifest, delays, toDeltaFrames(fit.mapColors, fc)));
                         liveTile.frameCount = fc;
                         PayloadState.syncFromActiveTile();
                         PayloadState.save();
@@ -4070,7 +4097,7 @@ public class LoominaryCommand {
                             ? String.format("carpet, %d colors merged (committing...)", fit.colorsRemoved)
                             : String.format("§e%d §7→ §a? §7banners, %d colors merged", oldSz, fit.colorsRemoved);
                     results.add(new TileResult(manifest,
-                            PayloadManifest.withTrailing(manifest, delays, fit.mapColors), fc, note));
+                            PayloadManifest.withTrailing(manifest, delays, toDeltaFrames(fit.mapColors, fc)), fc, note));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
                     totalPixelsAffected += fit.pixelsAffected;
@@ -4200,7 +4227,7 @@ public class LoominaryCommand {
                     long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
                     results.add(new TileResult(manifest,
-                            PayloadManifest.withTrailing(manifest, delays, fit.mapColors),
+                            PayloadManifest.withTrailing(manifest, delays, toDeltaFrames(fit.mapColors, fc)),
                             fc, current, current - fit.colorsRemoved, null));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
@@ -4535,12 +4562,17 @@ public class LoominaryCommand {
                     flags = manifest.flags;
                     long crc = PayloadManifest.crc32(Arrays.copyOf(payloadBytes, MAP_BYTES));
                     if (manifest.frameCount > 1) {
+                        // Upgrade old raw-frame tiles to delta encoding; v6 tiles pass through.
+                        int newFlags = flags | PayloadManifest.FLAG_DELTA_FRAMES;
+                        byte[] encodedFrames = manifest.deltaFrames()
+                                ? payloadBytes                                        // already delta
+                                : toDeltaFrames(payloadBytes, manifest.frameCount);  // apply delta
                         manifestBytes = PayloadManifest.toBytes(
-                                flags, PayloadState.gridColumns, PayloadState.gridRows,
+                                newFlags, PayloadState.gridColumns, PayloadState.gridRows,
                                 PayloadState.tileCol(i), PayloadState.tileRow(i),
                                 crc, playerName, text, tile.nonce,
                                 manifest.frameCount, manifest.loopCount, manifest.frameDelays);
-                        payloadBytes = PayloadManifest.withTrailing(manifestBytes, manifest.frameDelays, payloadBytes);
+                        payloadBytes = PayloadManifest.withTrailing(manifestBytes, manifest.frameDelays, encodedFrames);
                     } else {
                         manifestBytes = PayloadManifest.toBytes(
                                 flags, PayloadState.gridColumns, PayloadState.gridRows,
@@ -5613,7 +5645,8 @@ public class LoominaryCommand {
                 int[] delays = tileDelays(tile, fc);
                 long crc = PayloadManifest.crc32(Arrays.copyOf(allFramesBytes, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(t, crc, playerName, flags, fc, delays);
-                saveTileData(t, manifest, PayloadManifest.withTrailing(manifest, delays, allFramesBytes));
+                saveTileData(t, manifest, PayloadManifest.withTrailing(manifest, delays,
+                        toDeltaFrames(allFramesBytes, fc)));
             }
 
             PayloadState.syncFromActiveTile();
@@ -5737,7 +5770,7 @@ public class LoominaryCommand {
             tile.nonce = nonce; // must be set before buildReduceManifest reads it
             byte[] manifestBytes = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
             int newCount = saveTileData(tileIdx, manifestBytes,
-                    PayloadManifest.withTrailing(manifestBytes, delays, fullData));
+                    PayloadManifest.withTrailing(manifestBytes, delays, toDeltaFrames(fullData, fc)));
             tile.frameCount = fc;
             PayloadState.syncFromActiveTile();
             PayloadState.save();

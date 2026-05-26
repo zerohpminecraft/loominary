@@ -57,17 +57,27 @@ public class PayloadManifest {
      *
      * <p>v5 adds <em>trailing delays</em>: when a per-frame delay table would overflow the
      * 255-byte {@code header_size} field, {@code delay_mode=1} is written with no inline delay
-     * bytes and the table is appended after the last frame's map-color data.  The decoder
-     * reads it from {@code data[headerSize + frameCount × 16384]}.  Old decoders (v4 and
-     * earlier) seeing a v5 tile return a stub and render frame 0 as a static image.
+     * bytes and the table is appended after the last frame's map-color data.
+     *
+     * <p>v6 adds <em>delta frame encoding</em> ({@link #FLAG_DELTA_FRAMES}): frame 0 is stored
+     * raw; each subsequent frame is the XOR of itself and its predecessor.  For animations
+     * with sparse per-frame changes (typical Minecraft map art) this typically reduces the
+     * compressed payload by 5–20×.  Old decoders (≤v5) seeing a v6 tile return a stub and
+     * render frame 0 as a static image.
      */
-    public static final int CURRENT_VERSION = 5;
+    public static final int CURRENT_VERSION = 6;
 
-    public static final int FLAG_ALL_SHADES = 0x01;
+    public static final int FLAG_ALL_SHADES  = 0x01;
     /** Set when the payload contains multiple animation frames. */
-    public static final int FLAG_ANIMATED   = 0x02;
+    public static final int FLAG_ANIMATED    = 0x02;
     /** Set when the tile participates in cross-tile payload redistribution (mux pooling). */
-    public static final int FLAG_MUX        = 0x04;
+    public static final int FLAG_MUX         = 0x04;
+    /**
+     * Set when frames 1..N are stored as XOR deltas from their predecessor.
+     * Frame 0 is always stored raw.  Requires {@link #FLAG_ANIMATED}.
+     * Decoders must reconstruct: {@code frame[n] = frame[n−1] XOR stored[n]}.
+     */
+    public static final int FLAG_DELTA_FRAMES = 0x08;
 
     public final int manifestVersion;
     /** Total bytes consumed by this header; map colors begin at this offset. */
@@ -127,6 +137,10 @@ public class PayloadManifest {
 
     public boolean muxed() {
         return (flags & FLAG_MUX) != 0;
+    }
+
+    public boolean deltaFrames() {
+        return (flags & FLAG_DELTA_FRAMES) != 0;
     }
 
     // ── CRC helper ───────────────────────────────────────────────────────

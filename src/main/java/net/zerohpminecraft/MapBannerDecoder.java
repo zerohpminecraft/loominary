@@ -1011,6 +1011,7 @@ public class MapBannerDecoder {
                 }
                 System.arraycopy(full, start, frames[f], 0, MAP_BYTES);
             }
+            if (manifest.deltaFrames()) reconstructDeltaFrames(frames);
             AnimatedMapState animState = new AnimatedMapState(
                     mapId, frames, manifest.frameDelays, manifest.loopCount,
                     frameEntity.getBlockPos(), manifest.cols, manifest.rows,
@@ -1284,6 +1285,7 @@ public class MapBannerDecoder {
                 System.arraycopy(full, start, frames[f], 0, MAP_BYTES);
             }
             if (fc == 0) return;
+            if (manifest.deltaFrames()) reconstructDeltaFrames(frames);
 
             AnimatedMapState animState = new AnimatedMapState(
                     mapId, frames, manifest.frameDelays, manifest.loopCount,
@@ -1310,6 +1312,19 @@ public class MapBannerDecoder {
 
     public static boolean isClaimed(int mapId) {
         return claimedMaps.contains(mapId);
+    }
+
+    /**
+     * Reconstructs absolute frames in-place from XOR-delta storage.
+     * Frame 0 is always raw; each subsequent frame is XOR'd with its predecessor.
+     */
+    public static void reconstructDeltaFrames(byte[][] frames) {
+        for (int f = 1; f < frames.length; f++) {
+            byte[] prev = frames[f - 1];
+            byte[] cur  = frames[f];
+            for (int p = 0; p < cur.length; p++)
+                cur[p] = (byte)(prev[p] ^ cur[p]);
+        }
     }
 
     // ── In-game metadata display ──────────────────────────────────────────

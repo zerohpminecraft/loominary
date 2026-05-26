@@ -4,6 +4,16 @@
 
 ---
 
+## v1.19.2
+
+### Fix: `/loominary palette` no longer freezes the game on large animations
+
+For a 5000-frame tile the palette command was allocating ~600 MB (decompressed payload, union frame, `colorInRow` matrix, simulation clones) and running three `Zstd.compress` calls — all synchronously on the main render thread. The OS killed the LWJGL window when the render loop went unresponsive.
+
+The entire computation now runs on a `loominary-palette` daemon thread. State is snapshotted before dispatch, results are posted back via `client.execute()`, and `importInProgress` gates concurrent operations. The command immediately prints `Computing palette…` and completes asynchronously.
+
+---
+
 ## v1.19.1
 
 ### Author override and in-game title/author display

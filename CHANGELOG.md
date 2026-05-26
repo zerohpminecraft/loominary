@@ -4,6 +4,25 @@
 
 ---
 
+## v1.19.1
+
+### Author override and in-game title/author display
+
+Adds `/loominary author` to set a persistent author name embedded in every tile's manifest, and shows that name (plus the title) in the action bar when the player looks at or holds a decoded map.
+
+**`/loominary author [name|clear]`**
+- `/loominary author` — shows the current override or confirms the player's IGN is being used
+- `/loominary author <name>` — sets an override applied to all subsequent imports and re-encodes
+- `/loominary author clear` — removes the override and reverts to the player's IGN
+- Persisted in `loominary_state.json` alongside `title` and `codecMode`
+
+**In-game display**
+- When looking at (crosshair → item frame) or holding a Loominary-decoded map, its title and author appear in the action bar: `"Bad Apple" by ZeroHPMinecraft (1,1 of 2×3)`
+- Tile position is only shown for multi-tile murals
+- Disappears ~2 seconds after looking away (standard action bar timeout)
+
+---
+
 ## v1.19.0
 
 ### Sub-tick animation

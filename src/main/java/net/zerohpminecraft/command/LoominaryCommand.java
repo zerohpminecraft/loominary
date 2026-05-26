@@ -494,7 +494,11 @@ public class LoominaryCommand {
                 tile.frameCount = 1;
                 tile.frameDelays = null;
             }
-            saveTileData(tileIdx, manifest, payloadBytes);
+            // For v5 manifests the per-frame delay table is stored after the frame data.
+            int[] delaysForTrailing = (tile.frameDelays != null)
+                    ? tile.frameDelays.stream().mapToInt(Integer::intValue).toArray()
+                    : new int[0];
+            saveTileData(tileIdx, manifest, PayloadManifest.withTrailing(manifest, delaysForTrailing, payloadBytes));
 
             // Editing any tile invalidates the mux allocation across the whole batch.
             boolean hadMux = PayloadState.tiles.stream().anyMatch(t -> t.muxCargoB64 != null);
@@ -602,16 +606,19 @@ public class LoominaryCommand {
                             playerName, title, nonce);
                 }
 
+                // Append v5 trailing delay table (empty for v4/global-delay manifests).
+                byte[] effectivePayload = PayloadManifest.withTrailing(manifest, delays, payloadBytes);
+
                 final List<String> allChunks;
                 final String newCarpetB64;
                 final boolean newLoomEncoded;
                 if (carpetEncoded) {
-                    CarpetEncoding enc = buildCarpetEncoding(manifest, payloadBytes, col, row);
+                    CarpetEncoding enc = buildCarpetEncoding(manifest, effectivePayload, col, row);
                     allChunks = enc.allChunks();
                     newCarpetB64 = Base64.getEncoder().encodeToString(enc.compressed());
                     newLoomEncoded = (enc.headerChunk() == null);
                 } else {
-                    allChunks = buildChunks(manifest, payloadBytes);
+                    allChunks = buildChunks(manifest, effectivePayload);
                     newCarpetB64 = null;
                     newLoomEncoded = false;
                 }
@@ -2032,7 +2039,8 @@ public class LoominaryCommand {
                     byte[] manifest = PayloadManifest.toBytes(
                             tileFlags, columns, rows, col, row, crc, playerName, capturedTitle,
                             0, frameCount, 0, manifestDelays);
-                    List<String> chunks = buildChunks(manifest, allFramesBytes);
+                    List<String> chunks = buildChunks(manifest,
+                            PayloadManifest.withTrailing(manifest, manifestDelays, allFramesBytes));
                     String note = null;
                     if (chunks.size() > MAX_CHUNKS) {
                         note = String.format("OVERFLOW: %d chunks for %d frames (max %d)", chunks.size(), frameCount, MAX_CHUNKS);
@@ -2362,16 +2370,25 @@ public class LoominaryCommand {
                     try {
                         enc = buildCarpetEncoding(manifestBytes, mapColors, col, row);
                     } catch (IllegalStateException overflow) {
-                        // Payload too large for the current codec — reduce colors to fit.
-                        int maxChunksCarpet = MAX_CHUNKS_CARPET_LOOM; // BANNER already redirected above
-                        PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
-                                mapColors, manifestBytes, CHUNK_SIZE, maxChunksCarpet);
-                        mapColors = fit.mapColors;
-                        manifestBytes = PayloadManifest.toBytes(tileFlags, columns, rows, col, row,
-                                PayloadManifest.crc32(mapColors), playerName, capturedTitle);
-                        enc = buildCarpetEncoding(manifestBytes, mapColors, col, row);
-                        note = String.format("reduced %d→%d colors to fit",
-                                fit.originalDistinctColors, fit.originalDistinctColors - fit.colorsRemoved);
+                        // Try to auto-reduce colors to fit.
+                        try {
+                            PngToMapColors.FitResult fit = PngToMapColors.reduceToFit(
+                                    mapColors, manifestBytes, CHUNK_SIZE, MAX_CHUNKS_CARPET_LOOM);
+                            mapColors = fit.mapColors;
+                            manifestBytes = PayloadManifest.toBytes(tileFlags, columns, rows, col, row,
+                                    PayloadManifest.crc32(mapColors), playerName, capturedTitle);
+                            enc = buildCarpetEncoding(manifestBytes, mapColors, col, row);
+                            note = String.format("reduced %d→%d colors to fit",
+                                    fit.originalDistinctColors, fit.originalDistinctColors - fit.colorsRemoved);
+                        } catch (Exception overflow2) {
+                            // Still over budget — import anyway, user can reduce manually.
+                            byte[] combined = new byte[manifestBytes.length + mapColors.length];
+                            System.arraycopy(manifestBytes, 0, combined, 0,                   manifestBytes.length);
+                            System.arraycopy(mapColors,     0, combined, manifestBytes.length, mapColors.length);
+                            byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+                            enc = encodeLoomFromCompressed(compressed, col, row, PayloadState.codecMode);
+                            note = "over budget — use /loominary reduce";
+                        }
                     }
                     PayloadState.TileData tile = new PayloadState.TileData();
                     tile.chunks.addAll(enc.allChunks());
@@ -2529,9 +2546,23 @@ public class LoominaryCommand {
                                 crc, playerName, capturedTitle, 0, frameCount, 0, manifestDelays)
                         : PayloadManifest.toBytes(tileFlags, columns, rows, col, row,
                                 crc, playerName, capturedTitle);
+                byte[] payloadBytes = (frameCount > 1)
+                        ? PayloadManifest.withTrailing(manifestBytes, manifestDelays, allFramesBytes)
+                        : allFramesBytes;
 
-                CarpetEncoding enc = buildCarpetEncoding(manifestBytes, allFramesBytes, col, row);
+                CarpetEncoding enc;
                 String tileNote = null;
+                try {
+                    enc = buildCarpetEncoding(manifestBytes, payloadBytes, col, row);
+                } catch (Exception overflow) {
+                    // Payload too large for codec — import anyway, user can reduce later.
+                    byte[] combined = new byte[manifestBytes.length + payloadBytes.length];
+                    System.arraycopy(manifestBytes, 0, combined, 0,                    manifestBytes.length);
+                    System.arraycopy(payloadBytes,  0, combined, manifestBytes.length, payloadBytes.length);
+                    byte[] compressed = Zstd.compress(combined, Zstd.maxCompressionLevel());
+                    enc = encodeLoomFromCompressed(compressed, col, row, PayloadState.codecMode);
+                    tileNote = "over budget — use /loominary reduce";
+                }
                 int encCap = maxBytesForMode(PayloadState.codecMode);
                 if (enc.compressed().length > encCap) {
                     anyOverflow = true;
@@ -3651,7 +3682,8 @@ public class LoominaryCommand {
                 client.execute(() -> {
                     try {
                         PayloadState.TileData liveTile = PayloadState.tiles.get(tileIdx);
-                        int newCount = saveTileData(tileIdx, manifest, fit.mapColors);
+                        int newCount = saveTileData(tileIdx, manifest,
+                                PayloadManifest.withTrailing(manifest, delays, fit.mapColors));
                         liveTile.frameCount = fc;
                         PayloadState.syncFromActiveTile();
                         PayloadState.save();
@@ -3880,7 +3912,8 @@ public class LoominaryCommand {
                     String note = tileSnap.carpetEncoded
                             ? String.format("carpet, %d colors merged (committing...)", fit.colorsRemoved)
                             : String.format("§e%d §7→ §a? §7banners, %d colors merged", oldSz, fit.colorsRemoved);
-                    results.add(new TileResult(manifest, fit.mapColors, fc, note));
+                    results.add(new TileResult(manifest,
+                            PayloadManifest.withTrailing(manifest, delays, fit.mapColors), fc, note));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
                     totalPixelsAffected += fit.pixelsAffected;
@@ -4009,8 +4042,9 @@ public class LoominaryCommand {
                             union, prefix, CHUNK_SIZE, targetColors, reduceStrategy, normFreq);
                     long crc       = PayloadManifest.crc32(Arrays.copyOf(fit.mapColors, MAP_BYTES));
                     byte[] manifest = buildReduceManifest(i, crc, playerName, flags, fc, delays);
-                    results.add(new TileResult(manifest, fit.mapColors, fc,
-                            current, current - fit.colorsRemoved, null));
+                    results.add(new TileResult(manifest,
+                            PayloadManifest.withTrailing(manifest, delays, fit.mapColors),
+                            fc, current, current - fit.colorsRemoved, null));
                     tilesReduced++;
                     totalColorsRemoved  += fit.colorsRemoved;
                     totalPixelsAffected += fit.pixelsAffected;
@@ -4337,7 +4371,10 @@ public class LoominaryCommand {
                             PayloadManifest.crc32(payloadBytes), playerName, text);
                 } else {
                     PayloadManifest manifest = PayloadManifest.fromBytes(full);
-                    payloadBytes = Arrays.copyOfRange(full, manifest.headerSize, full.length);
+                    // Extract frame bytes only (strip any old trailing delay table).
+                    int frameEnd = manifest.headerSize + manifest.frameCount * MAP_BYTES;
+                    payloadBytes = Arrays.copyOfRange(full, manifest.headerSize,
+                            Math.min(frameEnd, full.length));
                     flags = manifest.flags;
                     long crc = PayloadManifest.crc32(Arrays.copyOf(payloadBytes, MAP_BYTES));
                     if (manifest.frameCount > 1) {
@@ -4346,6 +4383,7 @@ public class LoominaryCommand {
                                 PayloadState.tileCol(i), PayloadState.tileRow(i),
                                 crc, playerName, text, tile.nonce,
                                 manifest.frameCount, manifest.loopCount, manifest.frameDelays);
+                        payloadBytes = PayloadManifest.withTrailing(manifestBytes, manifest.frameDelays, payloadBytes);
                     } else {
                         manifestBytes = PayloadManifest.toBytes(
                                 flags, PayloadState.gridColumns, PayloadState.gridRows,
@@ -5411,7 +5449,7 @@ public class LoominaryCommand {
                 int[] delays = tileDelays(tile, fc);
                 long crc = PayloadManifest.crc32(Arrays.copyOf(allFramesBytes, MAP_BYTES));
                 byte[] manifest = buildReduceManifest(t, crc, playerName, flags, fc, delays);
-                saveTileData(t, manifest, allFramesBytes);
+                saveTileData(t, manifest, PayloadManifest.withTrailing(manifest, delays, allFramesBytes));
             }
 
             PayloadState.syncFromActiveTile();
@@ -5534,7 +5572,8 @@ public class LoominaryCommand {
             long crc = PayloadManifest.crc32(Arrays.copyOf(fullData, MAP_BYTES));
             tile.nonce = nonce; // must be set before buildReduceManifest reads it
             byte[] manifestBytes = buildReduceManifest(tileIdx, crc, playerName, flags, fc, delays);
-            int newCount = saveTileData(tileIdx, manifestBytes, fullData);
+            int newCount = saveTileData(tileIdx, manifestBytes,
+                    PayloadManifest.withTrailing(manifestBytes, delays, fullData));
             tile.frameCount = fc;
             PayloadState.syncFromActiveTile();
             PayloadState.save();

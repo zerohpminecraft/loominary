@@ -243,22 +243,47 @@ class PayloadManifestTest {
     }
 
     @Test
-    void v4_tooManyFrames_perFrameDelayThrows() {
+    void v5_tooManyFrames_producesTrailingDelays() {
         // Per-frame delays of N frames add N×2 bytes; combined with max strings
         // this overflows the u8 header_size (max 255 bytes).
-        // With no strings (v4 base = 22 bytes): 22 + 77*2 = 176 bytes < 255.
-        // With max strings (16 + 64 = 80 extra): 22 + 80 + 77*2 = 256 bytes — over.
+        // With max strings (16+64=80 extra): 22 + 80 + 77*2 = 256 bytes — over.
+        // v5 should be produced: compact header, delay table appended after frames.
         String maxUsername = "A".repeat(16);
         String maxTitle    = "B".repeat(64);
-        int[] manyDelays   = new int[77];
-        java.util.Arrays.fill(manyDelays, 100);
+        // Use variable delays so normalization doesn't collapse them to a global value.
+        int[] manyDelays = new int[77];
+        for (int f = 0; f < 77; f++) manyDelays[f] = 80 + (f % 3) * 20; // 80, 100, 120, 80, ...
 
-        assertThrows(IllegalArgumentException.class, () ->
-                PayloadManifest.toBytes(
-                        PayloadManifest.FLAG_ANIMATED,
-                        1, 1, 0, 0, 0L,
-                        maxUsername, maxTitle, 0,
-                        77, 0, manyDelays));
+        byte[] manifest = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED,
+                1, 1, 0, 0, 0L,
+                maxUsername, maxTitle, 0,
+                77, 0, manyDelays);
+
+        assertEquals(5, manifest[0] & 0xFF, "should produce v5 manifest");
+        assertTrue(manifest[1] <= 255, "header_size must fit in u8");
+        assertTrue(manifest.length <= 255, "compact header must fit");
+
+        byte[] trailing = PayloadManifest.trailingDelayBytes(manifest, manyDelays);
+        assertEquals(77 * 2, trailing.length, "trailing delay table must be frameCount×2 bytes");
+
+        // Verify round-trip: fromBytes should recover the delays from the trailing table.
+        int MAP_BYTES = 128 * 128;
+        byte[] fakeFrames = new byte[77 * MAP_BYTES];
+        byte[] full = PayloadManifest.withTrailing(manifest, manyDelays, fakeFrames);
+        // Prepend manifest to form the full decompressed payload:
+        byte[] decompressed = new byte[manifest.length + full.length];
+        System.arraycopy(manifest, 0, decompressed, 0,               manifest.length);
+        System.arraycopy(full,     0, decompressed, manifest.length, full.length);
+        // fromBytes expects the manifest at the start of data:
+        PayloadManifest parsed = PayloadManifest.fromBytes(decompressed);
+        assertEquals(5, parsed.manifestVersion);
+        assertEquals(77, parsed.frameCount);
+        assertNotNull(parsed.frameDelays);
+        assertEquals(77, parsed.frameDelays.length, "should have per-frame delay table");
+        assertEquals(80,  parsed.frameDelays[0]);  // (0  % 3) == 0 → 80
+        assertEquals(80,  parsed.frameDelays[75]); // (75 % 3) == 0 → 80
+        assertEquals(100, parsed.frameDelays[76]); // (76 % 3) == 1 → 100
     }
 
     @Test

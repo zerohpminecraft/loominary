@@ -52,8 +52,16 @@ import java.util.zip.CRC32;
  */
 public class PayloadManifest {
 
-    /** Highest manifest version this client can decode. */
-    public static final int CURRENT_VERSION = 4;
+    /**
+     * Highest manifest version this client can decode.
+     *
+     * <p>v5 adds <em>trailing delays</em>: when a per-frame delay table would overflow the
+     * 255-byte {@code header_size} field, {@code delay_mode=1} is written with no inline delay
+     * bytes and the table is appended after the last frame's map-color data.  The decoder
+     * reads it from {@code data[headerSize + frameCount × 16384]}.  Old decoders (v4 and
+     * earlier) seeing a v5 tile return a stub and render frame 0 as a static image.
+     */
+    public static final int CURRENT_VERSION = 5;
 
     public static final int FLAG_ALL_SHADES = 0x01;
     /** Set when the payload contains multiple animation frames. */
@@ -207,11 +215,19 @@ public class PayloadManifest {
     }
 
     /**
-     * Produces a v3 manifest with animation metadata.
+     * Produces a v4 or v5 manifest with animation metadata.
+     *
+     * <p>If all frame delays are equal they are collapsed to a single global delay
+     * (saves space and avoids unnecessary per-frame tables).
+     *
+     * <p>If after normalization the delay table would overflow the 255-byte
+     * {@code header_size} field, a <b>v5</b> manifest is produced: {@code delay_mode=1}
+     * is written with no inline delay bytes.  The caller must append the delay table
+     * after all frame data using {@link #trailingDelayBytes(byte[], int[])}.
      *
      * @param nonce       0 = no salt; non-zero = /loominary resalt value
      * @param frameCount  total animation frames (≥1)
-     * @param loopCount   0 = loop forever; >0 = stop after N loops
+     * @param loopCount   0 = loop forever; &gt;0 = stop after N loops
      * @param frameDelays delay(s) in ms — length 1 = global shared delay,
      *                    length frameCount = per-frame delay table
      */
@@ -225,23 +241,31 @@ public class PayloadManifest {
             throw new IllegalArgumentException(
                     "frameCount must be 1–65535, got " + frameCount);
         }
+
+        // ── Normalize: collapse a uniform per-frame array to a single global delay ──
         boolean perFrame = frameDelays.length > 1;
-        int delayBytes = perFrame ? frameCount * 2 : 2;
-
-        // 7 fixed + 4 crc32 + 1 username_len + username + 1 title_len + title
-        // + 4 nonce + 2 frame_count (v4 u16) + 2 loop_count + 1 delay_mode + delayBytes
-        int totalSize = 22 + usernameBytes.length + titleBytes.length + delayBytes;
-
-        if (totalSize > 255) {
-            throw new IllegalArgumentException(
-                    "v4 manifest header exceeds 255 bytes (" + totalSize + ") — "
-                    + "reduce frame count or shorten username/title");
+        if (perFrame) {
+            int first = frameDelays[0];
+            boolean allSame = true;
+            for (int d : frameDelays) if (d != first) { allSame = false; break; }
+            if (allSame) { perFrame = false; frameDelays = new int[]{first}; }
         }
+
+        // ── Decide whether delay table is inline (v4) or trailing (v5) ──
+        // Fixed overhead: 7 (header) + 4 (crc32) + 1 (usernameLen) + username
+        //                 + 1 (titleLen) + title + 4 (nonce) + 2 (frameCount u16)
+        //                 + 2 (loopCount) + 1 (delayMode) = 22 bytes.
+        int fixedSize   = 22 + usernameBytes.length + titleBytes.length;
+        int inlineDelay = perFrame ? frameCount * 2 : 2;
+        boolean trailing = perFrame && (fixedSize + inlineDelay > 255);
+
+        int totalSize = fixedSize + (trailing ? 0 : inlineDelay);
+        // totalSize ≤ 255 is now guaranteed by construction.
 
         byte[] out = new byte[totalSize];
         int i = 0;
-        out[i++] = 4;                  // manifest_version = 4
-        out[i++] = (byte) totalSize;   // header_size
+        out[i++] = (byte) (trailing ? 5 : 4);  // manifest_version
+        out[i++] = (byte) totalSize;             // header_size — always ≤255
         out[i++] = (byte) flags;
         out[i++] = (byte) cols;
         out[i++] = (byte) rows;
@@ -257,18 +281,19 @@ public class PayloadManifest {
         out[i++] = (byte) titleBytes.length;
         System.arraycopy(titleBytes, 0, out, i, titleBytes.length);
         i += titleBytes.length;
-        // nonce big-endian u32
         out[i++] = (byte) ((nonce >> 24) & 0xFF);
         out[i++] = (byte) ((nonce >> 16) & 0xFF);
         out[i++] = (byte) ((nonce >>  8) & 0xFF);
         out[i++] = (byte) ( nonce        & 0xFF);
-        // animation fields (v4: frame_count is u16)
         out[i++] = (byte) (frameCount >>> 8);
         out[i++] = (byte)  frameCount;
         out[i++] = (byte) ((loopCount >> 8) & 0xFF);
         out[i++] = (byte)  (loopCount       & 0xFF);
-        out[i++] = (byte) (perFrame ? 1 : 0);  // delay_mode
-        if (perFrame) {
+        out[i++] = (byte) (perFrame || trailing ? 1 : 0); // delay_mode
+
+        if (trailing) {
+            // No delay bytes here; caller appends table after frame data via trailingDelayBytes().
+        } else if (perFrame) {
             for (int f = 0; f < frameCount; f++) {
                 int d = f < frameDelays.length ? frameDelays[f] : 100;
                 out[i++] = (byte) ((d >> 8) & 0xFF);
@@ -279,6 +304,39 @@ public class PayloadManifest {
             out[i++] = (byte) ((d >> 8) & 0xFF);
             out[i  ] = (byte)  (d       & 0xFF);
         }
+        return out;
+    }
+
+    /**
+     * Returns the per-frame delay table that must be appended <em>after all frame data</em>
+     * when the manifest produced by {@link #toBytes} is a v5 manifest (byte 0 == 5).
+     * Returns an empty array for v4 manifests (table is already inline) and for
+     * global-delay manifests (no table needed).
+     */
+    public static byte[] trailingDelayBytes(byte[] manifest, int[] frameDelays) {
+        if (manifest.length < 1 || (manifest[0] & 0xFF) < 5) return new byte[0];
+        if (frameDelays.length <= 1) return new byte[0];
+        byte[] out = new byte[frameDelays.length * 2];
+        for (int f = 0; f < frameDelays.length; f++) {
+            int d = frameDelays[f];
+            out[f * 2]     = (byte) ((d >> 8) & 0xFF);
+            out[f * 2 + 1] = (byte)  (d       & 0xFF);
+        }
+        return out;
+    }
+
+    /**
+     * Appends a trailing delay table to {@code frameData} when required by a v5 manifest.
+     * Returns {@code frameData} unchanged for v4 manifests or global-delay payloads.
+     * Use this at every call site that constructs {@code payload = manifest + frameData}
+     * before compressing, so the delay table is included inside the zstd frame.
+     */
+    public static byte[] withTrailing(byte[] manifest, int[] frameDelays, byte[] frameData) {
+        byte[] trailing = trailingDelayBytes(manifest, frameDelays);
+        if (trailing.length == 0) return frameData;
+        byte[] out = new byte[frameData.length + trailing.length];
+        System.arraycopy(frameData,  0, out, 0,               frameData.length);
+        System.arraycopy(trailing,   0, out, frameData.length, trailing.length);
         return out;
     }
 
@@ -360,7 +418,7 @@ public class PayloadManifest {
         int[] frameDelays = {100};
         if (ver >= 3 && i < data.length) {
             if (ver >= 4 && i + 2 <= data.length) {
-                // v4: frame_count is u16
+                // v4+: frame_count is u16
                 frameCount = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
                 i += 2;
             } else {
@@ -376,9 +434,19 @@ public class PayloadManifest {
                 if (delayMode == 0 && i + 2 <= data.length) {
                     frameDelays = new int[]{((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF)};
                 } else if (delayMode == 1) {
-                    frameDelays = new int[frameCount];
-                    for (int f = 0; f < frameCount && i + 2 <= data.length; f++, i += 2) {
-                        frameDelays[f] = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
+                    if (ver >= 5) {
+                        // v5 trailing: delay table lives after all frame data.
+                        // Location: headerSize + frameCount * MAP_BYTES.
+                        int MAP_BYTES = 128 * 128;
+                        int dt = headerSize + frameCount * MAP_BYTES;
+                        frameDelays = new int[frameCount];
+                        for (int f = 0; f < frameCount && dt + 2 <= data.length; f++, dt += 2)
+                            frameDelays[f] = ((data[dt] & 0xFF) << 8) | (data[dt + 1] & 0xFF);
+                    } else {
+                        // v3/v4: per-frame inline
+                        frameDelays = new int[frameCount];
+                        for (int f = 0; f < frameCount && i + 2 <= data.length; f++, i += 2)
+                            frameDelays[f] = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
                     }
                 }
             }

@@ -411,8 +411,11 @@ public class LoominaryCommand {
         CodecMode mode = PayloadState.codecMode;
         int maxBytes = maxBytesForMode(mode);
         if (compressed.length > maxBytes) {
-            throw new IllegalStateException("Compressed payload " + compressed.length
-                    + " bytes exceeds " + mode.label() + " capacity " + maxBytes);
+            // Over budget — encode anyway and let the tile be marked over-budget.
+            // Mux pooling (/loominary mux) can distribute the overflow across donor tiles.
+            System.out.println("[Loominary] buildCarpetEncoding: " + compressed.length
+                    + " bytes exceeds " + mode.label() + " capacity " + maxBytes
+                    + " — tile will be over-budget");
         }
         return encodeLoomFromCompressed(compressed, col, row, mode);
     }

@@ -31,6 +31,7 @@ import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CodecMode;
 import net.zerohpminecraft.MapBannerDecoder;
+import net.zerohpminecraft.MapEncryption;
 import net.zerohpminecraft.PayloadManifest;
 import net.zerohpminecraft.PayloadState;
 import net.zerohpminecraft.PngToMapColors;
@@ -252,15 +253,53 @@ public class LoominaryCommand {
 
     /**
      * Prepends the given manifest bytes to mapColors, compresses the combined
-     * payload with zstd, and splits it into CJK-encoded indexed banner name
-     * chunks (U+4E00-alphabet, 14 bits/char, 84 bytes per banner).
+     * payload with zstd, and splits it into CJK-encoded indexed banner name chunks.
+     * Encryption is never applied here — tiles are stored as plain compressed bytes
+     * and encrypted only at output time (export or anvil placement).
      */
     private static List<String> buildChunks(byte[] manifestBytes, byte[] mapColors) {
         byte[] combined = new byte[manifestBytes.length + mapColors.length];
         System.arraycopy(manifestBytes, 0, combined, 0, manifestBytes.length);
         System.arraycopy(mapColors, 0, combined, manifestBytes.length, mapColors.length);
-        byte[] compressed = compress(combined);
-        return CjkCodec.buildChunks(compressed);
+        return CjkCodec.buildChunks(compress(combined));
+    }
+
+    /**
+     * Applies encryption at output time, embedding the given author and title as
+     * plaintext metadata (v3 envelope). Either may be null.
+     */
+    public static List<String> buildEncryptedChunksForOutput(byte[] compressed,
+                                                               String author, String title) {
+        String pw = encryptPassword;
+        if (pw == null || pw.isEmpty()) return CjkCodec.buildChunks(compressed);
+        List<String> slots = buildEncryptPasswords(pw);
+        try {
+            return CjkCodec.buildChunks(MapEncryption.encrypt(compressed, slots, author, title));
+        } catch (Exception e) {
+            throw new RuntimeException("Encryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** Overload with no metadata — produces a v2 envelope. */
+    public static List<String> buildEncryptedChunksForOutput(byte[] compressed) {
+        return buildEncryptedChunksForOutput(compressed, null, null);
+    }
+
+    /** Applies encryption with metadata at output time. Either string may be null. */
+    public static byte[] encryptForOutput(byte[] compressed, String author, String title) {
+        String pw = encryptPassword;
+        if (pw == null || pw.isEmpty()) return compressed;
+        List<String> slots = buildEncryptPasswords(pw);
+        try {
+            return MapEncryption.encrypt(compressed, slots, author, title);
+        } catch (Exception e) {
+            throw new RuntimeException("Encryption failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** Overload with no metadata — produces a v2 envelope. */
+    public static byte[] encryptForOutput(byte[] compressed) {
+        return encryptForOutput(compressed, null, null);
     }
 
     /**
@@ -407,6 +446,7 @@ public class LoominaryCommand {
         System.arraycopy(manifestBytes, 0, combined, 0,                 manifestBytes.length);
         System.arraycopy(mapColors,     0, combined, manifestBytes.length, mapColors.length);
         byte[] compressed = compress(combined);
+        // Encryption is deferred to output time; store plain compressed bytes here.
 
         CodecMode mode = PayloadState.codecMode;
         int maxBytes = maxBytesForMode(mode);
@@ -753,12 +793,25 @@ public class LoominaryCommand {
     }
 
     /** Decodes map-color bytes for any tile (carpet or banner). */
+    /**
+     * Decrypts {@code data} if it is an encrypted envelope, returning the
+     * underlying compressed bytes. Returns {@code data} unchanged if not encrypted.
+     * Used by tile-decode paths in commands that run synchronously (not on a tick thread).
+     */
+    private static byte[] decryptIfNeeded(byte[] data) {
+        if (!MapEncryption.isEncrypted(data)) return data;
+        byte[] dec = MapEncryption.tryDecrypt(data, -1);
+        if (dec == null) throw new IllegalStateException(
+                "Encrypted tile — add the decryption password with /loominary password add <pw>");
+        return dec;
+    }
+
     private static byte[] resolveMapColorsForTile(PayloadState.TileData tile, java.util.Collection<String> chunks) {
         if (tile.carpetEncoded) {
             if (tile.carpetCompressedB64 == null) {
                 throw new IllegalStateException("Carpet tile has no stored compressed data — re-import.");
             }
-            byte[] compressed = Base64.getDecoder().decode(tile.carpetCompressedB64);
+            byte[] compressed = decryptIfNeeded(Base64.getDecoder().decode(tile.carpetCompressedB64));
             long size = Zstd.getFrameContentSize(compressed);
             if (size < 0) throw new IllegalStateException("Invalid compressed data in carpet tile.");
             byte[] full = Zstd.decompress(compressed, (int) size);
@@ -1116,7 +1169,7 @@ public class LoominaryCommand {
         if (tile.carpetEncoded) {
             if (tile.carpetCompressedB64 == null)
                 throw new IllegalStateException("Carpet tile has no stored compressed data — re-import.");
-            byte[] compressed = Base64.getDecoder().decode(tile.carpetCompressedB64);
+            byte[] compressed = decryptIfNeeded(Base64.getDecoder().decode(tile.carpetCompressedB64));
             long size = Zstd.getFrameContentSize(compressed);
             if (size < 0) throw new IllegalStateException("Invalid compressed data in carpet tile.");
             return Zstd.decompress(compressed, (int) size);
@@ -1135,6 +1188,7 @@ public class LoominaryCommand {
             for (String s : names) b64.append(s.substring(2));
             compressed = Base64.getDecoder().decode(b64.toString());
         }
+        compressed = decryptIfNeeded(compressed);
         long originalSize = Zstd.getFrameContentSize(compressed);
         if (originalSize < 0) throw new IllegalStateException("Missing zstd frame size in banner payload.");
         return Zstd.decompress(compressed, (int) originalSize);
@@ -1838,6 +1892,30 @@ public class LoominaryCommand {
                                     .executes(ctx -> applySparse(ctx.getSource(), false))
                                     .then(ClientCommandManager.literal("all")
                                             .executes(ctx -> applySparse(ctx.getSource(), true))))
+
+                            // ── password ────────────────────────────────────────
+                            .then(ClientCommandManager.literal("password")
+                                    .executes(ctx -> passwordList(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("list")
+                                            .executes(ctx -> passwordList(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("clear")
+                                            .executes(ctx -> passwordClearAll(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("add")
+                                            .then(ClientCommandManager.argument("pw", StringArgumentType.string())
+                                                    .executes(ctx -> passwordAdd(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "pw")))))
+                                    .then(ClientCommandManager.literal("remove")
+                                            .then(ClientCommandManager.argument("pw", StringArgumentType.string())
+                                                    .executes(ctx -> passwordRemove(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "pw")))))
+                                    .then(ClientCommandManager.literal("encrypt")
+                                            .executes(ctx -> encryptOff(ctx.getSource()))
+                                            .then(ClientCommandManager.literal("off")
+                                                    .executes(ctx -> encryptOff(ctx.getSource())))
+                                            .then(ClientCommandManager.argument("pw", StringArgumentType.string())
+                                                    .executes(ctx -> encryptSet(ctx.getSource(),
+                                                            StringArgumentType.getString(ctx, "pw")))))
+                                    )
 
                             // ── clear ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("clear")
@@ -4760,6 +4838,102 @@ public class LoominaryCommand {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // /loominary password  — decrypt-password list management
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * Password applied to all tiles encoded by future import commands.
+     * Null means no encryption. Set by /loominary password encrypt <pw>.
+     */
+    public static String encryptPassword = null;
+
+    /** Returns the full list of passwords to use for a new encrypted import:
+     *  [encryptPassword] union [stored passwords], deduplicated, encryptPassword first. */
+    static List<String> buildEncryptPasswords(String primary) {
+        List<String> result = new ArrayList<>();
+        if (primary != null && !primary.isEmpty()) result.add(primary);
+        for (String p : MapEncryption.passwords) {
+            if (!result.contains(p)) result.add(p);
+        }
+        return result;
+    }
+
+    private static int passwordList(FabricClientCommandSource source) {
+        List<String> pws = MapEncryption.passwords;
+        if (pws.isEmpty()) {
+            source.sendFeedback(Text.literal("§7No passwords stored. Use §f/loominary password add <pw>§7 to add one."));
+        } else {
+            source.sendFeedback(Text.literal("§7Stored passwords (" + pws.size() + "):"));
+            for (int i = 0; i < pws.size(); i++) {
+                source.sendFeedback(Text.literal("§8  " + (i + 1) + ". §f" + pws.get(i)));
+            }
+        }
+        if (encryptPassword != null) {
+            source.sendFeedback(Text.literal("§7Import encryption: §f" + encryptPassword
+                    + " §8(+ stored passwords as additional slots)"));
+        } else {
+            source.sendFeedback(Text.literal("§7Import encryption: §8off (use §f/loominary password encrypt <pw>§8 to enable)"));
+        }
+        return 1;
+    }
+
+    private static int passwordAdd(FabricClientCommandSource source, String pw) {
+        if (pw.isBlank()) {
+            source.sendError(Text.literal("§cPassword cannot be blank."));
+            return 0;
+        }
+        if (MapEncryption.passwords.contains(pw)) {
+            source.sendFeedback(Text.literal("§ePassword already in list."));
+            return 1;
+        }
+        MapEncryption.passwords.add(pw);
+        MapEncryption.savePasswords();
+        // Clear per-map fail cache so the new password is tried on all known encrypted maps,
+        // then kick the frame scanner so the retry happens on the very next tick.
+        MapEncryption.clearCache();
+        MapBannerDecoder.forceRescanOnNextTick();
+        source.sendFeedback(Text.literal("§aPassword added. Total: " + MapEncryption.passwords.size() + " password(s)."));
+        return 1;
+    }
+
+    private static int passwordRemove(FabricClientCommandSource source, String pw) {
+        if (MapEncryption.passwords.remove(pw)) {
+            MapEncryption.savePasswords();
+            source.sendFeedback(Text.literal("§aPassword removed. Total: " + MapEncryption.passwords.size() + " password(s)."));
+        } else {
+            source.sendFeedback(Text.literal("§ePassword not found in list."));
+        }
+        return 1;
+    }
+
+    private static int passwordClearAll(FabricClientCommandSource source) {
+        int n = MapEncryption.passwords.size();
+        MapEncryption.passwords.clear();
+        MapEncryption.savePasswords();
+        source.sendFeedback(Text.literal("§aCleared " + n + " password(s)."));
+        return 1;
+    }
+
+    private static int encryptSet(FabricClientCommandSource source, String pw) {
+        if (pw.isBlank()) {
+            source.sendError(Text.literal("§cPassword cannot be blank."));
+            return 0;
+        }
+        encryptPassword = pw;
+        List<String> slots = buildEncryptPasswords(pw);
+        source.sendFeedback(Text.literal("§aImport encryption enabled: §f" + slots.size()
+                + " slot(s) per tile §8(primary + " + (slots.size() - 1) + " stored)."));
+        return 1;
+    }
+
+    private static int encryptOff(FabricClientCommandSource source) {
+        encryptPassword = null;
+        source.sendFeedback(Text.literal("§aImport encryption disabled — future imports will be unencrypted."));
+        return 1;
+    }
+
+
+    // ════════════════════════════════════════════════════════════════════
     // stride <n> / skip <n>  — direct operations on the active tile
     // ════════════════════════════════════════════════════════════════════
 
@@ -4948,18 +5122,34 @@ public class LoominaryCommand {
                         continue;
                     }
                     String exportB64 = tile.muxCargoB64 != null ? tile.muxCargoB64 : tile.carpetCompressedB64;
-                    byte[] compressed = Base64.getDecoder().decode(exportB64);
-                    int totalBytes = compressed.length;
-                    int carpetBytes = Math.min(totalBytes, CarpetChannel.MAX_CARPET_BYTES);
-                    int shadeBytes  = totalBytes > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES
-                            ? Math.min(totalBytes - carpetBytes, CarpetChannel.MAX_SHADE_BYTES) : 0;
-                    byte[] nibbles = CarpetChannel.encodeNibbles(compressed, carpetBytes);
+                    String exportAuthor = PayloadState.effectiveAuthor(
+                            source.getPlayer().getGameProfile().getName());
+                    byte[] toExport = encryptForOutput(
+                            decryptIfNeeded(Base64.getDecoder().decode(exportB64)),
+                            exportAuthor, PayloadState.currentTitle);
+
+                    // For LOOM tiles: use encodeLoomFromCompressed so the schematic carries a
+                    // proper LOOM header. This is essential when toExport is encrypted — the
+                    // encryption magic starts with "LOOM" which peekLoomMagic would misread as
+                    // a carpet LOOM header unless the real header precedes the payload.
+                    // For legacy LC/LS tiles: fall back to the old manual nibble path.
+                    CarpetEncoding encForExport;
+                    if (tile.loomEncoded) {
+                        encForExport = encodeLoomFromCompressed(toExport,
+                                PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx),
+                                PayloadState.codecMode);
+                    } else {
+                        encForExport = encodeCarpetFromCompressed(toExport);
+                    }
+
+                    byte[] nibbles    = encForExport.nibbles();
+                    int carpetBytes   = encForExport.carpetBytes();
+                    int shadeBytes    = encForExport.shadeBytes();
+                    int[][] heights   = encForExport.heights();
+                    int totalBytes    = toExport.length;
 
                     Path output;
                     if (shadeBytes > 0) {
-                        byte[] shadeData = new byte[shadeBytes];
-                        System.arraycopy(compressed, carpetBytes, shadeData, 0, shadeBytes);
-                        int[][] heights = CarpetChannel.computeHeights(shadeData, shadeBytes);
                         output = SchematicExporter.exportCarpetStaircase(nibbles, carpetBytes, heights, name);
                     } else {
                         output = SchematicExporter.exportCarpetTile(nibbles, carpetBytes, name);
@@ -4969,7 +5159,7 @@ public class LoominaryCommand {
                     boolean migrated = false;
                     String firstChunk = tile.chunks.isEmpty() ? "" : tile.chunks.get(0);
                     if (shadeBytes > 0 && firstChunk.startsWith("LC")) {
-                        List<String> newChunks = rebuildCarpetChunks(compressed, totalBytes, carpetBytes, shadeBytes);
+                        List<String> newChunks = encForExport.allChunks();
                         tile.chunks.clear();
                         tile.chunks.addAll(newChunks);
                         tile.currentIndex = 0;
@@ -4997,12 +5187,23 @@ public class LoominaryCommand {
                                 "§7  + %d overflow banner%s still needed (rename at anvil).",
                                 overflowBanners, overflowBanners == 1 ? "" : "s")));
                 } else {
-                    // Legacy banner schematic.
-                    int count = tile.chunks.size();
+                    // Banner schematic: apply encryption at export time if configured.
+                    List<String> exportChunks;
+                    if (encryptPassword != null && !encryptPassword.isEmpty()) {
+                        // Reassemble plain compressed bytes, then encrypt, then rebuild chunks.
+                        byte[] plain = decryptIfNeeded(MapBannerDecoder.assembleCompressedFromChunks(
+                                new ArrayList<>(tile.chunks)));
+                        exportChunks = buildEncryptedChunksForOutput(plain,
+                                PayloadState.effectiveAuthor(source.getPlayer().getGameProfile().getName()),
+                                PayloadState.currentTitle);
+                    } else {
+                        exportChunks = new ArrayList<>(tile.chunks);
+                    }
+                    int count = exportChunks.size();
                     String description = String.format(
                             "Loominary tile %d (col %d, row %d) — %d named banners.",
                             tileIdx, PayloadState.tileCol(tileIdx), PayloadState.tileRow(tileIdx), count);
-                    Path output = SchematicExporter.exportTile(new ArrayList<>(tile.chunks), name, description);
+                    Path output = SchematicExporter.exportTile(exportChunks, name, description);
                     int gridH = (count + 15) / 16;
                     source.sendFeedback(Text.literal(String.format(
                             "§aExported §f%s §a(%d banners, 16×%d grid):",

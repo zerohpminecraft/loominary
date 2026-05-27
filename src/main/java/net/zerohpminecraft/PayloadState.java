@@ -157,11 +157,20 @@ public class PayloadState {
 
     // ── Active tile sync ───────────────────────────────────────────────
 
+    /**
+     * True when ACTIVE_CHUNKS holds encrypted-for-placement chunks that must not
+     * be written back to TileData.chunks. Cleared by syncFromActiveTile() and
+     * by AnvilAutoFillHandler when a placement session ends.
+     */
+    public static boolean placementEncrypted = false;
+
     public static void syncToActiveTile() {
         if (activeTileIndex < 0 || activeTileIndex >= tiles.size()) return;
         TileData tile = tiles.get(activeTileIndex);
-        tile.chunks.clear();
-        tile.chunks.addAll(ACTIVE_CHUNKS);
+        if (!placementEncrypted) {
+            tile.chunks.clear();
+            tile.chunks.addAll(ACTIVE_CHUNKS);
+        }
         tile.currentIndex = activeChunkIndex;
     }
 
@@ -171,6 +180,7 @@ public class PayloadState {
         ACTIVE_CHUNKS.clear();
         ACTIVE_CHUNKS.addAll(tile.chunks);
         activeChunkIndex = tile.currentIndex;
+        placementEncrypted = false; // plain chunks are now active
     }
 
     public static void switchTile(int newIndex) {

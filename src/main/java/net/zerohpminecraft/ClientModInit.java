@@ -1,6 +1,7 @@
 package net.zerohpminecraft;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.zerohpminecraft.MapEncryption;
 import net.zerohpminecraft.command.LoominaryCommand;
 
 public class ClientModInit implements ClientModInitializer {
@@ -16,6 +17,8 @@ public class ClientModInit implements ClientModInitializer {
 
         CarpetChannel.init();
         PayloadState.load();
+        MapEncryption.loadPasswords();
+        MapEncryption.tryLoadKeyFile();
         LoominaryCommand.register();
         LoominaryKeybindings.register();
         AnvilAutoFillHandler.register();

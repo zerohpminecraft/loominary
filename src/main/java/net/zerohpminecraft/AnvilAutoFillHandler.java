@@ -2,6 +2,7 @@ package net.zerohpminecraft;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.zerohpminecraft.command.LoominaryCommand;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.AnvilScreen;
 import net.minecraft.component.DataComponentTypes;
@@ -90,6 +91,12 @@ public class AnvilAutoFillHandler {
             batchDoneLogged    = false;
             // haltedForResalt is intentionally preserved across screen opens;
             // only /loominary resalt clears it.
+
+            // If encryption is configured, apply it now to the active tile's
+            // plain chunks and load the result into ACTIVE_CHUNKS.
+            // Encryption is deferred to this point so editing never touches
+            // encrypted bytes. The tile's canonical chunks stay plain.
+            applyEncryptionForPlacement();
         });
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
@@ -731,5 +738,56 @@ public class AnvilAutoFillHandler {
         extractedNamed   = false;
         extractedOldName = null;
         cooldown = ACTION_COOLDOWN_TICKS;
+    }
+
+    /**
+     * Called when the anvil screen opens. If encryption is configured and the
+     * active tile is a plain-byte banner tile, rebuilds ACTIVE_CHUNKS with
+     * encrypted chunk names for this placement session.
+     *
+     * The tile's canonical chunks (TileData.chunks) are never modified —
+     * PayloadState.placementEncrypted prevents syncToActiveTile from writing
+     * encrypted chunks back to the tile.
+     */
+    private static void applyEncryptionForPlacement() {
+        // Reset any previous encrypted session so plain chunks are active again.
+        PayloadState.placementEncrypted = false;
+
+        String pw = LoominaryCommand.encryptPassword;
+        if (pw == null || pw.isEmpty()) return;
+        if (PayloadState.tiles.isEmpty()) return;
+
+        PayloadState.TileData tile = PayloadState.tiles.get(PayloadState.activeTileIndex);
+        // Carpet tiles are encrypted at schematic-export time, not here.
+        if (tile.carpetEncoded) return;
+        if (PayloadState.ACTIVE_CHUNKS.isEmpty()) return;
+
+        try {
+            // Assemble plain compressed bytes from the current chunks.
+            java.util.List<String> plainChunks = new java.util.ArrayList<>(PayloadState.ACTIVE_CHUNKS);
+            byte[] plain = MapBannerDecoder.assembleCompressedFromChunks(plainChunks);
+            // Decrypt first in case the tile was imported before the deferred-encrypt fix.
+            if (MapEncryption.isEncrypted(plain)) {
+                plain = MapEncryption.tryDecrypt(plain, -1);
+                if (plain == null) {
+                    System.err.println(TAG + " Cannot encrypt for placement: decryption of stored payload failed.");
+                    return;
+                }
+            }
+            String placementAuthor = PayloadState.effectiveAuthor(
+                    net.minecraft.client.MinecraftClient.getInstance()
+                            .player.getGameProfile().getName());
+            java.util.List<String> encrypted = LoominaryCommand.buildEncryptedChunksForOutput(
+                    plain, placementAuthor, PayloadState.currentTitle);
+            PayloadState.ACTIVE_CHUNKS.clear();
+            PayloadState.ACTIVE_CHUNKS.addAll(encrypted);
+            PayloadState.activeChunkIndex = 0; // encrypted run always starts fresh
+            PayloadState.placementEncrypted = true;
+            System.out.println(TAG + " Encrypted " + encrypted.size()
+                    + " chunks for placement (was " + plainChunks.size() + " plain).");
+        } catch (Exception e) {
+            System.err.println(TAG + " Encryption for placement failed: " + e.getMessage());
+            PayloadState.placementEncrypted = false;
+        }
     }
 }

@@ -28,6 +28,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MapBannerDecoder {
 
@@ -39,6 +41,19 @@ public class MapBannerDecoder {
     private static final Set<Integer> claimedMaps = new HashSet<>();
     private static final Map<Integer, AnimatedMapState> animatedMaps = new HashMap<>();
     private static int tickCounter = 0;
+
+    // ── Encrypted-map handling ────────────────────────────────────────────
+    // Maps pending async decryption (claimed to prevent re-scan but not yet decoded).
+    private static final Set<Integer> pendingDecrypts = new HashSet<>();
+    // Maps seen as encrypted when the password list was empty (suppress repeat log).
+    private static final Set<Integer> encryptedNoPass = new HashSet<>();
+
+    private static final ExecutorService DECRYPT_EXECUTOR =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "loominary-decrypt");
+                t.setDaemon(true);
+                return t;
+            });
 
     // ── Sync-group cache ──────────────────────────────────────────────────
     // advanceAnimatedFrames groups map IDs by their sync key on every call.
@@ -60,12 +75,19 @@ public class MapBannerDecoder {
     private static final Set<Integer> unlockLogged = new HashSet<>();
 
     public static boolean decodingEnabled = true;
+
+    /** Force the frame scanner to run on the very next tick. */
+    public static void forceRescanOnNextTick() {
+        tickCounter = SCAN_INTERVAL_TICKS;
+    }
     private static final Map<Integer, byte[]> rawColors     = new HashMap<>();
     private static final Map<Integer, byte[]> decodedColors = new HashMap<>();
 
     // ── Per-map metadata (title / author from the manifest) ───────────
+    // encrypted=true while the tile has metadata from the plaintext envelope header
+    // but has not yet been decrypted; set to false once processDecompressedPayload runs.
     private record MapMeta(String title, String author, int cols, int rows,
-                           int tileCol, int tileRow) {}
+                           int tileCol, int tileRow, boolean encrypted) {}
     private static final Map<Integer, MapMeta> mapMeta = new HashMap<>();
 
     // ── Mux (cross-tile redistribution) state ────────────────────────────
@@ -228,7 +250,12 @@ public class MapBannerDecoder {
         System.out.println(TAG + " Decoding held map id=" + mapId.id()
                 + " from " + names.size() + " banner markers");
         try {
-            byte[] full = assembleAndDecompress(names);
+            byte[] compressed = assembleCompressed(names);
+            if (MapEncryption.isEncrypted(compressed)) {
+                submitDecryptAndProcess(client, mapId, mapState, null, compressed, decorations);
+                return;
+            }
+            byte[] full = decompressPayload(compressed);
             processDecompressedPayload(client, mapId, mapState, null, full);
             claimedMaps.add(mapId.id());
             decorations.clear();
@@ -359,7 +386,12 @@ public class MapBannerDecoder {
                 + " from " + names.size() + " banner markers");
 
         try {
-            byte[] full = assembleAndDecompress(names);
+            byte[] compressed = assembleCompressed(names);
+            if (MapEncryption.isEncrypted(compressed)) {
+                submitDecryptAndProcess(client, mapId, mapState, frame, compressed, decorations);
+                return;
+            }
+            byte[] full = decompressPayload(compressed);
             processDecompressedPayload(client, mapId, mapState, frame, full);
             claimedMaps.add(mapId.id());
             decorations.clear();
@@ -446,6 +478,11 @@ public class MapBannerDecoder {
             System.arraycopy(carpetData,  0, compressed, 0,                              carpetBytes);
             System.arraycopy(shadeData,   0, compressed, carpetBytes,                    shadeData.length);
             System.arraycopy(overflowData, 0, compressed, carpetBytes + shadeData.length, overflowData.length);
+
+            if (MapEncryption.isEncrypted(compressed)) {
+                submitDecryptAndProcess(client, mapId, mapState, frame, compressed, decorations);
+                return;
+            }
 
             long frameSize = Zstd.getFrameContentSize(compressed);
             if (frameSize < 0) throw new IllegalStateException("Missing zstd frame size");
@@ -609,10 +646,21 @@ public class MapBannerDecoder {
             MapIdComponent mapId, MapState mapState,
             Map<String, MapDecoration> decorations, ItemFrameEntity frame) {
         try {
-            // Decode LOOM header from carpet bytes.
-            // Always read MAX_CARPET_BYTES so the header is fully present.
-            byte[] carpetFull = CarpetChannel.decodeBytes(mapState.colors, CarpetChannel.MAX_CARPET_BYTES);
-            CarpetChannel.LoomHeader header = CarpetChannel.decodeLoomHeader(carpetFull);
+            // Two-pass read: first decode just the fixed LOOM header (16 bytes = 32 nibbles)
+            // to learn the actual cargo size, then decode only as many bytes as the header
+            // says exist. Reading MAX_CARPET_BYTES upfront would fail on small tiles where
+            // only a fraction of the map is covered by carpet blocks.
+            //
+            // Peek guestCount from byte 15 directly — do NOT call decodeLoomHeader on the
+            // 16-byte slice when guestCount > 0, because decodeLoomHeader immediately tries
+            // to parse guest descriptors that aren't in those 16 bytes.
+            byte[] fixedHeader = CarpetChannel.decodeBytes(mapState.colors, CarpetChannel.LOOM_FIXED_HEADER);
+            int guestCount = fixedHeader[15] & 0xFF;
+            int fullHeaderSize = CarpetChannel.LOOM_FIXED_HEADER + guestCount * CarpetChannel.LOOM_GUEST_DESC;
+            byte[] headerBytes = guestCount > 0
+                    ? CarpetChannel.decodeBytes(mapState.colors, fullHeaderSize)
+                    : fixedHeader;
+            CarpetChannel.LoomHeader header = CarpetChannel.decodeLoomHeader(headerBytes);
 
             // Total cargo size = dataOffset (header+descriptors) + ownBytes + guest bytes.
             int guestTotal = 0;
@@ -621,7 +669,8 @@ public class MapBannerDecoder {
 
             // --- Assemble full cargo from all channels ---
             int carpetBytes = Math.min(totalCargoForOwnAndGuests, CarpetChannel.MAX_CARPET_BYTES);
-            // carpetFull already has MAX_CARPET_BYTES; trim if cargo is smaller
+            // Read exactly as many carpet bytes as the header says — no more.
+            byte[] carpetFull = CarpetChannel.decodeBytes(mapState.colors, carpetBytes);
             byte[] carpet = Arrays.copyOf(carpetFull, carpetBytes);
 
             byte[] shade = new byte[0];
@@ -705,6 +754,10 @@ public class MapBannerDecoder {
                 // Non-receiver: decode own zstd frame at cargo[dataOffset..dataOffset+ownBytes).
                 byte[] compressed = Arrays.copyOfRange(cargo, header.dataOffset,
                         header.dataOffset + header.ownBytes);
+                if (MapEncryption.isEncrypted(compressed)) {
+                    submitDecryptAndProcess(client, mapId, mapState, frame, compressed, decorations);
+                    return;
+                }
                 long frameSize = Zstd.getFrameContentSize(compressed);
                 if (frameSize < 0)
                     throw new IllegalStateException("Invalid zstd frame in LOOM tile (map " + mapId.id() + ")");
@@ -931,16 +984,23 @@ public class MapBannerDecoder {
         if (buf == null || buf.received < buf.data.length) return;
         muxBuffers.remove(key);
         try {
-            long frameSize = Zstd.getFrameContentSize(buf.data);
+            byte[] data = buf.data;
+            if (MapEncryption.isEncrypted(data)) {
+                Map<String, MapDecoration> decs = buf.mapState != null
+                        ? ((MapStateAccessor) buf.mapState).getDecorations() : null;
+                submitDecryptAndProcess(client, buf.mapId, buf.mapState, buf.frame, data, decs);
+                return;
+            }
+            long frameSize = Zstd.getFrameContentSize(data);
             if (frameSize < 0) {
                 System.err.println(TAG + " Mux completion: bad zstd frame for receiver " + key);
                 return;
             }
-            byte[] full = Zstd.decompress(buf.data, (int) frameSize);
+            byte[] full = Zstd.decompress(data, (int) frameSize);
             processDecompressedPayload(client, buf.mapId, buf.mapState, buf.frame, full);
             if (buf.mapState != null) ((MapStateAccessor) buf.mapState).getDecorations().clear();
             System.out.println(TAG + " Mux-decoded receiver " + key
-                    + " (map id=" + buf.mapId.id() + ", " + buf.data.length + " bytes)");
+                    + " (map id=" + buf.mapId.id() + ", " + data.length + " bytes)");
         } catch (Exception e) {
             System.err.println(TAG + " Mux completion failed for " + key + ": " + e.getMessage());
             e.printStackTrace();
@@ -983,7 +1043,7 @@ public class MapBannerDecoder {
             // Store title/author for in-game display.
             if (manifest.title != null || manifest.username != null) {
                 mapMeta.put(mapId.id(), new MapMeta(manifest.title, manifest.username,
-                        manifest.cols, manifest.rows, manifest.tileCol, manifest.tileRow));
+                        manifest.cols, manifest.rows, manifest.tileCol, manifest.tileRow, false));
             }
         }
 
@@ -1094,23 +1154,27 @@ public class MapBannerDecoder {
     }
 
     /**
-     * Assembles banner-name chunks into a compressed payload and decompresses it.
-     * Returns the full decompressed bytes: for v0 payloads this is 16,384 bytes of
-     * raw map colors; for v1+ payloads this is the manifest header followed by one
-     * or more 16,384-byte frame arrays.
+     * Assembles a list of banner-name chunks (CJK or base64) into raw compressed bytes
+     * without decompressing. Used by the export path to get plain bytes for re-encryption.
      */
-    private static byte[] assembleAndDecompress(List<String> names) {
+    public static byte[] assembleCompressedFromChunks(List<String> names) {
+        return assembleCompressed(names);
+    }
+
+    /**
+     * Assembles banner-name chunks into compressed (or encrypted) bytes.
+     * Does NOT decompress — the caller decides whether to decrypt first.
+     */
+    private static byte[] assembleCompressed(List<String> names) {
         names.sort(Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
 
-        // Detect encoding: CJK payload chars are ≥ U+4E00; base64 chars are all ASCII (≤ 0x7F).
         boolean cjk = !names.isEmpty() && names.get(0).length() > 2
                 && names.get(0).charAt(2) >= CjkCodec.ALPHA_BASE;
 
-        byte[] compressed;
         if (cjk) {
             StringBuilder sb = new StringBuilder();
             for (String s : names) sb.append(s.substring(2));
-            compressed = CjkCodec.decode(sb.toString());
+            return CjkCodec.decode(sb.toString());
         } else {
             StringBuilder b64 = new StringBuilder();
             int expectedIndex = 0;
@@ -1122,9 +1186,15 @@ public class MapBannerDecoder {
                 expectedIndex++;
                 b64.append(s.substring(2));
             }
-            compressed = Base64.getDecoder().decode(b64.toString());
+            return Base64.getDecoder().decode(b64.toString());
         }
+    }
 
+    /**
+     * Decompresses a zstd-compressed payload, validating minimum size.
+     * Must not be called on encrypted bytes — decrypt first.
+     */
+    private static byte[] decompressPayload(byte[] compressed) {
         long originalSize = Zstd.getFrameContentSize(compressed);
         if (originalSize < 0)
             throw new IllegalStateException("Missing zstd frame content size — corrupt payload?");
@@ -1132,6 +1202,26 @@ public class MapBannerDecoder {
             throw new IllegalStateException("Decompressed size " + originalSize
                     + " is smaller than MAP_BYTES — corrupt payload?");
         return Zstd.decompress(compressed, (int) originalSize);
+    }
+
+    /**
+     * Assembles banner-name chunks into a compressed payload and decompresses it.
+     * Returns the full decompressed bytes: for v0 payloads this is 16,384 bytes of
+     * raw map colors; for v1+ payloads this is the manifest header followed by one
+     * or more 16,384-byte frame arrays.
+     *
+     * Callers that need async decryption should use {@link #assembleCompressed} directly.
+     */
+    private static byte[] assembleAndDecompress(List<String> names) {
+        byte[] compressed = assembleCompressed(names);
+        if (MapEncryption.isEncrypted(compressed)) {
+            byte[] decrypted = MapEncryption.tryDecrypt(compressed, -1);
+            if (decrypted == null)
+                throw new IllegalStateException(
+                        "Encrypted payload — add a password with /loominary password add <pw>");
+            compressed = decrypted;
+        }
+        return decompressPayload(compressed);
     }
 
     public static byte[] reassemblePayload(List<String> names) {
@@ -1364,13 +1454,15 @@ public class MapBannerDecoder {
     }
 
     private static Integer resolveMetaMapId(MinecraftClient client) {
+        // Show metadata for any map that has it — claimed (decoded) or not (encrypted,
+        // metadata readable from plaintext envelope header without the password).
         // Prefer crosshair-targeted frame.
         if (client.crosshairTarget instanceof net.minecraft.util.hit.EntityHitResult hit
                 && hit.getEntity() instanceof ItemFrameEntity frame) {
             ItemStack stack = frame.getHeldItemStack();
             if (stack.getItem() instanceof FilledMapItem) {
                 MapIdComponent id = stack.get(DataComponentTypes.MAP_ID);
-                if (id != null && claimedMaps.contains(id.id())) return id.id();
+                if (id != null && mapMeta.containsKey(id.id())) return id.id();
             }
         }
         // Fall back to held items.
@@ -1378,7 +1470,7 @@ public class MapBannerDecoder {
                 client.player.getMainHandStack(), client.player.getOffHandStack()}) {
             if (stack.getItem() instanceof FilledMapItem) {
                 MapIdComponent id = stack.get(DataComponentTypes.MAP_ID);
-                if (id != null && claimedMaps.contains(id.id())) return id.id();
+                if (id != null && mapMeta.containsKey(id.id())) return id.id();
             }
         }
         return null;
@@ -1399,7 +1491,79 @@ public class MapBannerDecoder {
             sb.append(String.format(" §8(%d,%d of %d×%d)",
                     meta.tileCol() + 1, meta.tileRow() + 1, meta.cols(), meta.rows()));
         }
+        if (meta.encrypted()) sb.append(" §8[enc]");
         return sb.toString();
+    }
+
+    /**
+     * Submits an async task to decrypt {@code encrypted} with stored passwords, then
+     * processes the decompressed payload on the game thread.
+     * Claims the map immediately to prevent concurrent re-scan attempts.
+     *
+     * @param decorations the map's decoration map to clear on success; may be null
+     */
+    private static void submitDecryptAndProcess(MinecraftClient client,
+            MapIdComponent mapId, MapState mapState,
+            ItemFrameEntity frame, byte[] encrypted,
+            Map<String, MapDecoration> decorations) {
+        int id = mapId.id();
+        if (pendingDecrypts.contains(id)) return;
+
+        // Read plaintext metadata from the envelope header immediately so the
+        // action bar can show author/title even before decryption completes.
+        String[] meta = MapEncryption.readMeta(encrypted);
+        if (meta != null) {
+            mapMeta.put(id, new MapMeta(meta[1], meta[0], 1, 1, 0, 0, true));
+        }
+
+        if (MapEncryption.passwords.isEmpty()) {
+            if (encryptedNoPass.add(id))
+                System.out.println(TAG + " Encrypted map id=" + id
+                        + " — add a password with /loominary password add <pw>");
+            return;
+        }
+
+        pendingDecrypts.add(id);
+        claimedMaps.add(id); // prevent re-scan while decrypt is in progress
+
+        DECRYPT_EXECUTOR.submit(() -> {
+            try {
+                byte[] decrypted = MapEncryption.tryDecrypt(encrypted, id);
+                if (decrypted == null) {
+                    System.out.println(TAG + " Encrypted map id=" + id
+                            + " — no matching password");
+                    // Un-claim so a future password add can trigger another attempt.
+                    client.execute(() -> {
+                        claimedMaps.remove(id);
+                        pendingDecrypts.remove(id);
+                    });
+                    return;
+                }
+                long sz = Zstd.getFrameContentSize(decrypted);
+                if (sz < 0) throw new IllegalStateException("Invalid zstd frame after decrypt");
+                byte[] full = Zstd.decompress(decrypted, (int) sz);
+
+                client.execute(() -> {
+                    try {
+                        processDecompressedPayload(client, mapId, mapState, frame, full);
+                        if (decorations != null) decorations.clear();
+                        System.out.println(TAG + " Decrypted and claimed map id=" + id);
+                    } catch (Exception e) {
+                        System.err.println(TAG + " Post-decrypt process error for map " + id
+                                + ": " + e.getMessage());
+                        claimedMaps.remove(id);
+                    } finally {
+                        pendingDecrypts.remove(id);
+                    }
+                });
+            } catch (Exception e) {
+                System.err.println(TAG + " Decrypt error for map " + id + ": " + e.getMessage());
+                client.execute(() -> {
+                    claimedMaps.remove(id);
+                    pendingDecrypts.remove(id);
+                });
+            }
+        });
     }
 
     public static void clearCache() {
@@ -1417,5 +1581,8 @@ public class MapBannerDecoder {
         scanSeen.clear();
         paintLogCount.clear();
         unlockLogged.clear();
+        pendingDecrypts.clear();
+        encryptedNoPass.clear();
+        MapEncryption.clearCache();
     }
 }

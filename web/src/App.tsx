@@ -66,7 +66,7 @@ function GridInput({ value, onChange }: GridInputProps) {
   useEffect(() => setDraft(String(value)), [value]);
 
   function commit() {
-    const n = Math.max(1, Math.min(8, parseInt(draft, 10) || 1));
+    const n = Math.max(1, Math.min(128, parseInt(draft, 10) || 1));
     setDraft(String(n));
     if (n !== value) onChange(n);
   }
@@ -75,7 +75,7 @@ function GridInput({ value, onChange }: GridInputProps) {
     <input
       type="number"
       min={1}
-      max={8}
+      max={128}
       value={draft}
       onInput={e => setDraft((e.target as HTMLInputElement).value)}
       onBlur={commit}
@@ -143,14 +143,12 @@ export function App() {
       const bmp = await createImageBitmap(file);
       setSourceBitmap(bmp);
 
-      // Auto-detect the best grid layout from the image's aspect ratio,
-      // but only when the grid is unlocked.
-      let cols = gridCols, rows = gridRows;
-      if (!gridLocked) {
-        [cols, rows] = bestGridSize(bmp.width, bmp.height);
-        setGridCols(cols);
-        setGridRows(rows);
-      }
+      // Always auto-detect the best grid layout from the image's aspect ratio.
+      // The lock only controls whether *manual* grid-input changes trigger a
+      // reimport — it does not suppress auto-sizing on initial import.
+      const [cols, rows] = bestGridSize(bmp.width, bmp.height);
+      setGridCols(cols);
+      setGridRows(rows);
 
       await reimportImage(bmp, cols, rows);
     } catch (err) {

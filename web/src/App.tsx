@@ -95,6 +95,7 @@ export function App() {
   const [gridRows,     setGridRows]    = useState(1);
   /** Source bitmap kept in memory so grid changes can reimport at the new size. */
   const [sourceBitmap, setSourceBitmap] = useState<ImageBitmap | null>(null);
+  const [showGridLines, setShowGridLines] = useState(true);
   /** Live quantize params from Editor — updated whenever the user changes a setting. */
   const importParamsRef = useRef<QuantizeParams>({
     legalOnly: true, targetColors: 0, dither: 'NONE',
@@ -216,6 +217,20 @@ export function App() {
           </span>
         )}
 
+        {/* Grid line toggle */}
+        <button
+          onClick={() => setShowGridLines(v => !v)}
+          title={showGridLines ? 'Hide tile grid lines' : 'Show tile grid lines'}
+          style={{
+            ...BTN,
+            background:  showGridLines ? '#1b3556' : '#252525',
+            borderColor: showGridLines ? '#4a9eff' : '#444',
+            color:       showGridLines ? '#8cf'    : '#666',
+          }}
+        >
+          ⊞ Grid
+        </button>
+
         <div style={{ width:1, height:16, background:'#333', margin:'0 4px' }} />
 
         <button onClick={handleNew} style={BTN}>New</button>
@@ -249,6 +264,7 @@ export function App() {
             gridCols={gridCols}
             gridRows={gridRows}
             sourceBitmap={sourceBitmap}
+            showGridLines={showGridLines}
             onImportParamsChange={p => { importParamsRef.current = p; }}
           />
         ) : (

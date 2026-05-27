@@ -64,6 +64,9 @@ export class MapCanvas {
   ditherMask: Float32Array | null = null;
   showDitherMask = false;
 
+  // Tile grid lines
+  showGridLines = true;
+
   // Wand / lasso / rect hover preview (same size as selMask).
   // When wandPreviewSubtract=true the preview is orange (deselect) instead of blue (select).
   wandPreview: Uint8Array | null = null;
@@ -195,8 +198,8 @@ export class MapCanvas {
       );
     }
 
-    // Tile grid lines (visible when scale >= 2).
-    if (scale >= 2) {
+    // Tile grid lines (visible when scale >= 2 and showGridLines is true).
+    if (this.showGridLines && scale >= 2) {
       ctx.strokeStyle = 'rgba(255,255,255,0.15)';
       ctx.lineWidth = 1;
       for (let tc = 1; tc < comp.gridCols; tc++) {

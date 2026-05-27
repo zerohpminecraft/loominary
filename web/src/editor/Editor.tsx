@@ -155,6 +155,7 @@ export interface EditorProps {
   gridCols?:              number;
   gridRows?:              number;
   sourceBitmap?:          ImageBitmap | null;
+  showGridLines?:         boolean;
   /** Called whenever the user changes a quantize param so App can use it for reimport. */
   onImportParamsChange?:  (p: import('../quantize.js').QuantizeParams) => void;
 }
@@ -163,6 +164,7 @@ export interface EditorProps {
 
 export function Editor({
   initialComp, gridCols: propCols, gridRows: propRows, sourceBitmap,
+  showGridLines = true,
   onImportParamsChange,
 }: EditorProps) {
   const canvasElRef = useRef<HTMLCanvasElement>(null);
@@ -350,6 +352,13 @@ export function Editor({
   // ── Heatmap ─────────────────────────────────────────────────────────────────
   const [heatmapOn, setHeatmapOn] = useState(false);
   const heatmapOnRef = useRef(false);
+
+  // ── Grid lines visibility (driven by App toolbar) ───────────────────────────
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    canvasRef.current.showGridLines = showGridLines;
+    canvasRef.current.markDirty();
+  }, [showGridLines]);
 
   // ── Status / display state ──────────────────────────────────────────────────
   const [cursorGx,   setCursorGx]   = useState(-1);

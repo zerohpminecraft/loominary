@@ -49,6 +49,8 @@ export function App() {
       const n       = ps.columns * ps.rows;
       // Create blank pixel data (tiles without carpetCompressedB64 start blank).
       const pixelData: Uint8Array[][] = Array.from({ length: n }, () => [new Uint8Array(128 * 128)]);
+      setGridCols(ps.columns);
+      setGridRows(ps.rows);
       setComp(compositionFromState(ps, pixelData));
     } catch (err) {
       alert(`Failed to load state: ${err}`);
@@ -144,7 +146,7 @@ export function App() {
 
         {comp && (
           <span style={{ fontSize:11, color:'#555' }}>
-            {comp.gridCols}×{comp.gridRows} tile{comp.gridCols * comp.gridRows !== 1 ? 's' : ''}
+            {gridCols}×{gridRows} tile{gridCols * gridRows !== 1 ? 's' : ''}
           </span>
         )}
       </div>
@@ -152,7 +154,7 @@ export function App() {
       {/* Editor or placeholder */}
       <div style={{ flex:1, overflow:'hidden' }}>
         {comp ? (
-          <Editor initialComp={comp} />
+          <Editor initialComp={comp} gridCols={gridCols} gridRows={gridRows} />
         ) : (
           <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100%', gap:16 }}>
             <p style={{ color:'#555', fontSize:14, margin:0 }}>No composition loaded.</p>

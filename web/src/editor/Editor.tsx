@@ -53,6 +53,32 @@ function makeEmptyComp(cols = 1, rows = 1): CompositionState {
   return compositionFromState(ps, pixelData);
 }
 
+/**
+ * Resize a composition to new grid dimensions.
+ * Existing tiles are preserved in place; new tiles are blank.
+ * Shrinking drops tiles that fall outside the new bounds.
+ */
+function resizeComposition(comp: CompositionState, newCols: number, newRows: number): CompositionState {
+  const frameCount = Math.max(...comp.frames.map(t => t.length), 1);
+  const newFrames:      Uint8Array[][] = [];
+  const newFrameDelays: number[][]     = [];
+
+  for (let row = 0; row < newRows; row++) {
+    for (let col = 0; col < newCols; col++) {
+      const oldTi = row * comp.gridCols + col;
+      if (col < comp.gridCols && row < comp.gridRows && comp.frames[oldTi]) {
+        newFrames.push(comp.frames[oldTi]);
+        newFrameDelays.push(comp.frameDelays[oldTi] ?? new Array(comp.frames[oldTi].length).fill(100));
+      } else {
+        newFrames.push(Array.from({ length: frameCount }, () => new Uint8Array(128 * 128)));
+        newFrameDelays.push(new Array(frameCount).fill(100));
+      }
+    }
+  }
+
+  return { ...comp, gridCols: newCols, gridRows: newRows, frames: newFrames, frameDelays: newFrameDelays };
+}
+
 // Pre-built OKLab lookup — computed once.
 const OKLAB = buildOklabLookup();
 
@@ -60,11 +86,14 @@ const OKLAB = buildOklabLookup();
 
 export interface EditorProps {
   initialComp?: CompositionState;
+  /** When changed by the parent toolbar, the composition is resized immediately. */
+  gridCols?: number;
+  gridRows?: number;
 }
 
 // ─── Editor ───────────────────────────────────────────────────────────────────
 
-export function Editor({ initialComp }: EditorProps) {
+export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: EditorProps) {
   const canvasElRef = useRef<HTMLCanvasElement>(null);
   const canvasRef   = useRef<MapCanvas | null>(null);
   const historyRef  = useRef(new EditHistory());
@@ -83,6 +112,26 @@ export function Editor({ initialComp }: EditorProps) {
     if (initialComp) syncComp(initialComp);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialComp]);
+
+  // Resize instantly when the parent changes gridCols/gridRows.
+  useEffect(() => {
+    if (propCols === undefined || propRows === undefined) return;
+    const c = compRef.current;
+    if (c.gridCols === propCols && c.gridRows === propRows) return;
+    const resized = resizeComposition(c, propCols, propRows);
+    syncComp(resized);
+    // Clear selection — it was sized for the old grid.
+    setSelMask(null);
+    // Re-fit the viewport to show all tiles.
+    if (canvasRef.current) {
+      canvasRef.current.resize();
+      canvasRef.current.fitToView(resized);
+    }
+    // Resize is a major structural change; clear undo history.
+    historyRef.current.clear();
+    setUndoState({ canUndo: false, canRedo: false });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [propCols, propRows]);
 
   // ── Tool state (refs for event handlers, state for render) ─────────────────
   const [activeToolId, _setActiveToolId] = useState('brush');

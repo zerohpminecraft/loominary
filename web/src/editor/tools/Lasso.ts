@@ -1,0 +1,130 @@
+/**
+ * Lasso tool (L) — freehand polygon selection.
+ *
+ * Left-click adds vertices to a polygon.  Double-click closes the polygon and
+ * rasterizes it to the selection mask via browser-native Path2D.isPointInPath().
+ * Right-click cancels the current path.
+ */
+
+import type { Tool, ToolContext } from './Tool.js';
+import { MAP_SIZE } from './Tool.js';
+
+export class LassoTool implements Tool {
+  readonly id     = 'lasso';
+  readonly name   = 'Lasso';
+  readonly cursor = 'crosshair';
+
+  private points: Array<[number, number]> = [];
+  private lastClickTime = 0;
+
+  onPointerEvent(gx: number, gy: number, button: number, _buttons: number, ctx: ToolContext): void {
+    if (button === 2) {
+      // Right-click → cancel
+      this.points = [];
+      ctx.canvas.wandPreview = null;
+      ctx.canvas.markDirty();
+      return;
+    }
+
+    if (button !== 0) return;
+
+    const now = Date.now();
+    const dblClick = now - this.lastClickTime < 350 && this.points.length >= 2;
+    this.lastClickTime = now;
+
+    if (dblClick) {
+      // Close polygon and rasterize
+      this.commit(ctx);
+      this.points = [];
+      ctx.canvas.wandPreview = null;
+      ctx.canvas.markDirty();
+      return;
+    }
+
+    this.points.push([gx, gy]);
+    this.updatePreview(ctx);
+  }
+
+  /** Rasterize the Path2D polygon into the selection mask. */
+  private commit(ctx: ToolContext): void {
+    if (this.points.length < 3) return;
+
+    const gridW = ctx.comp.gridCols * MAP_SIZE;
+    const gridH = ctx.comp.gridRows * MAP_SIZE;
+
+    // Build a Path2D in global-pixel space (each pixel is 1×1).
+    const path = new Path2D();
+    path.moveTo(this.points[0][0] + 0.5, this.points[0][1] + 0.5);
+    for (let i = 1; i < this.points.length; i++) {
+      path.lineTo(this.points[i][0] + 0.5, this.points[i][1] + 0.5);
+    }
+    path.closePath();
+
+    // Use an OffscreenCanvas for isPointInPath hit-testing.
+    const osc = new OffscreenCanvas(gridW, gridH);
+    const octx = osc.getContext('2d')!;
+
+    const existing = ctx.getSelMask();
+    const newMask  = existing ? existing.slice() : new Uint8Array(gridW * gridH);
+
+    // Bounding box of the polygon to limit iteration cost.
+    const xs = this.points.map(p => p[0]);
+    const ys = this.points.map(p => p[1]);
+    const x0 = Math.max(0, Math.floor(Math.min(...xs)));
+    const y0 = Math.max(0, Math.floor(Math.min(...ys)));
+    const x1 = Math.min(gridW - 1, Math.ceil(Math.max(...xs)));
+    const y1 = Math.min(gridH - 1, Math.ceil(Math.max(...ys)));
+
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        if (octx.isPointInPath(path, x + 0.5, y + 0.5)) {
+          newMask[y * gridW + x] = 1;
+        }
+      }
+    }
+
+    ctx.setSelMask(newMask);
+    ctx.canvas.selMask = newMask;
+  }
+
+  private updatePreview(ctx: ToolContext): void {
+    if (this.points.length < 2) { ctx.canvas.wandPreview = null; return; }
+
+    const gridW = ctx.comp.gridCols * MAP_SIZE;
+    const gridH = ctx.comp.gridRows * MAP_SIZE;
+
+    const path = new Path2D();
+    path.moveTo(this.points[0][0] + 0.5, this.points[0][1] + 0.5);
+    for (let i = 1; i < this.points.length; i++) {
+      path.lineTo(this.points[i][0] + 0.5, this.points[i][1] + 0.5);
+    }
+    path.closePath();
+
+    const osc = new OffscreenCanvas(gridW, gridH);
+    const octx = osc.getContext('2d')!;
+
+    const preview = new Uint8Array(gridW * gridH);
+    const xs = this.points.map(p => p[0]);
+    const ys = this.points.map(p => p[1]);
+    const x0 = Math.max(0, Math.floor(Math.min(...xs)));
+    const y0 = Math.max(0, Math.floor(Math.min(...ys)));
+    const x1 = Math.min(gridW - 1, Math.ceil(Math.max(...xs)));
+    const y1 = Math.min(gridH - 1, Math.ceil(Math.max(...ys)));
+
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        if (octx.isPointInPath(path, x + 0.5, y + 0.5)) {
+          preview[y * gridW + x] = 1;
+        }
+      }
+    }
+    ctx.canvas.wandPreview = preview;
+    ctx.canvas.markDirty();
+  }
+
+  deactivate(ctx: ToolContext): void {
+    this.points = [];
+    ctx.canvas.wandPreview = null;
+    ctx.canvas.markDirty();
+  }
+}

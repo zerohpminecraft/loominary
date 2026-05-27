@@ -1,0 +1,23 @@
+{
+  "name": "loominary-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "preact": "^10.26.4",
+    "pako": "^2.1.0",
+    "zstd-codec": "^0.1.4"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.9.4",
+    "@types/pako": "^2.0.3",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}

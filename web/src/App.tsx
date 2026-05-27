@@ -1,12 +1,12 @@
 /**
  * App — top-level shell.
  *
- * Shows a thin import/export toolbar at the top and the Editor below.
+ * Shows a thin toolbar at the top and the Editor below.
  * The editor occupies all remaining height.
  */
 
 import { h } from 'preact';
-import { useState, useCallback } from 'preact/hooks';
+import { useState, useCallback, useEffect } from 'preact/hooks';
 import { Editor } from './editor/Editor.js';
 import type { CompositionState } from './payload-state.js';
 import {
@@ -17,11 +17,7 @@ import {
   saveState,
 } from './payload-state.js';
 
-// ─── Image import helpers ─────────────────────────────────────────────────────
-
-async function loadImageFromFile(file: File): Promise<ImageBitmap> {
-  return createImageBitmap(file);
-}
+// ─── Image scaling helper ─────────────────────────────────────────────────────
 
 async function scaleImageTo(bmp: ImageBitmap, w: number, h: number): Promise<ImageData> {
   const osc  = new OffscreenCanvas(w, h);
@@ -32,67 +28,134 @@ async function scaleImageTo(bmp: ImageBitmap, w: number, h: number): Promise<Ima
   return octx.getImageData(0, 0, w, h);
 }
 
+// ─── GridInput ────────────────────────────────────────────────────────────────
+// A number input that shows a draft value while typing and only commits
+// on blur or Enter, so the grid doesn't change on every keystroke.
+
+interface GridInputProps {
+  value:    number;
+  onChange: (v: number) => void;
+}
+
+function GridInput({ value, onChange }: GridInputProps) {
+  const [draft, setDraft] = useState(String(value));
+
+  // Keep draft in sync when value changes externally (e.g. state file load).
+  useEffect(() => setDraft(String(value)), [value]);
+
+  function commit() {
+    const n = Math.max(1, Math.min(128, parseInt(draft, 10) || 1));
+    setDraft(String(n));
+    if (n !== value) onChange(n);
+  }
+
+  return (
+    <input
+      type="number"
+      min={1}
+      max={128}
+      value={draft}
+      onInput={e => setDraft((e.target as HTMLInputElement).value)}
+      onBlur={commit}
+      onKeyDown={e => { if (e.key === 'Enter') commit(); }}
+      style={NUM_INPUT_STYLE}
+    />
+  );
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export function App() {
-  const [comp,      setComp]      = useState<CompositionState | null>(null);
-  const [importing, setImporting] = useState(false);
-  const [gridCols,  setGridCols]  = useState(1);
-  const [gridRows,  setGridRows]  = useState(1);
+  const [comp,         setComp]        = useState<CompositionState | null>(null);
+  const [importing,    setImporting]   = useState(false);
+  const [gridCols,     setGridCols]    = useState(1);
+  const [gridRows,     setGridRows]    = useState(1);
+  /** Source bitmap kept in memory so grid changes can reimport without re-reading the file. */
+  const [sourceBitmap, setSourceBitmap] = useState<ImageBitmap | null>(null);
+  /** When locked, grid changes only resize; they do NOT reimport the image. */
+  const [gridLocked,   setGridLocked]  = useState(true);
 
-  // ─── Import state JSON ────────────────────────────────────────────────────
+  // ─── Core reimport ─────────────────────────────────────────────────────────
+  // Called both on initial image import and on grid-size changes when unlocked.
+  const reimportImage = useCallback(async (bitmap: ImageBitmap, cols: number, rows: number) => {
+    setImporting(true);
+    try {
+      const { convertTwoPassGrid } = await import('./quantize.js');
+      const img   = await scaleImageTo(bitmap, cols * 128, rows * 128);
+      const tiles = convertTwoPassGrid(img, cols, rows, {
+        legalOnly:    true,
+        targetColors: 0,
+        dither:       'FS',
+      });
+      const ps = emptyPayloadState(cols, rows);
+      setComp(compositionFromState(ps, tiles.map(t => [t])));
+    } catch (err) {
+      alert(`Failed to import image: ${err}`);
+    } finally {
+      setImporting(false);
+    }
+  }, []);
+
+  // ─── Grid dimension change ──────────────────────────────────────────────────
+  // When unlocked and a source image exists, reimport at the new size.
+  // When locked (or no source), only resize the existing composition.
+  const handleColsChange = useCallback((cols: number) => {
+    setGridCols(cols);
+    if (!gridLocked && sourceBitmap) {
+      reimportImage(sourceBitmap, cols, gridRows);
+    }
+  }, [gridLocked, sourceBitmap, gridRows, reimportImage]);
+
+  const handleRowsChange = useCallback((rows: number) => {
+    setGridRows(rows);
+    if (!gridLocked && sourceBitmap) {
+      reimportImage(sourceBitmap, gridCols, rows);
+    }
+  }, [gridLocked, sourceBitmap, gridCols, reimportImage]);
+
+  // ─── Import image ───────────────────────────────────────────────────────────
+  const handleImageImport = useCallback(async (e: Event) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    try {
+      const bmp = await createImageBitmap(file);
+      setSourceBitmap(bmp);
+      await reimportImage(bmp, gridCols, gridRows);
+    } catch (err) {
+      alert(`Failed to import image: ${err}`);
+    }
+    // Reset the input so the same file can be re-selected.
+    (e.target as HTMLInputElement).value = '';
+  }, [gridCols, gridRows, reimportImage]);
+
+  // ─── Import state JSON ──────────────────────────────────────────────────────
   const handleStateImport = useCallback(async (e: Event) => {
     const file = (e.target as HTMLInputElement).files?.[0];
     if (!file) return;
     try {
       const ps      = await importStateFile(file);
       const n       = ps.columns * ps.rows;
-      // Create blank pixel data (tiles without carpetCompressedB64 start blank).
       const pixelData: Uint8Array[][] = Array.from({ length: n }, () => [new Uint8Array(128 * 128)]);
       setGridCols(ps.columns);
       setGridRows(ps.rows);
+      setSourceBitmap(null); // state files don't have a source image
       setComp(compositionFromState(ps, pixelData));
     } catch (err) {
       alert(`Failed to load state: ${err}`);
     }
+    (e.target as HTMLInputElement).value = '';
   }, []);
 
-  // ─── Import image ─────────────────────────────────────────────────────────
-  const handleImageImport = useCallback(async (e: Event) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
-    if (!file) return;
-    setImporting(true);
-    try {
-      const { convertTwoPassGrid } = await import('./quantize.js');
-      const bmp   = await loadImageFromFile(file);
-      const imgW  = gridCols * 128;
-      const imgH  = gridRows * 128;
-      const img   = await scaleImageTo(bmp, imgW, imgH);
-      const tiles = convertTwoPassGrid(img, gridCols, gridRows, {
-        legalOnly:    true,
-        targetColors: 0,
-        dither:       'FS',
-      });
-      const pixelData: Uint8Array[][] = tiles.map(t => [t]);
-      const ps = emptyPayloadState(gridCols, gridRows);
-      ps.sourceFilename = file.name;
-      setComp(compositionFromState(ps, pixelData));
-    } catch (err) {
-      alert(`Failed to import image: ${err}`);
-    } finally {
-      setImporting(false);
-    }
-  }, [gridCols, gridRows]);
-
-  // ─── New blank composition ────────────────────────────────────────────────
+  // ─── New blank ─────────────────────────────────────────────────────────────
   const handleNew = useCallback(() => {
-    const n = gridCols * gridRows;
+    const n  = gridCols * gridRows;
     const ps = emptyPayloadState(gridCols, gridRows);
-    const pixelData: Uint8Array[][] = Array.from({ length: n }, () => [new Uint8Array(128 * 128)]);
-    setComp(compositionFromState(ps, pixelData));
+    const pd: Uint8Array[][] = Array.from({ length: n }, () => [new Uint8Array(128 * 128)]);
+    setSourceBitmap(null);
+    setComp(compositionFromState(ps, pd));
   }, [gridCols, gridRows]);
 
-  // ─── Export state JSON ────────────────────────────────────────────────────
+  // ─── Export state JSON ──────────────────────────────────────────────────────
   const handleExport = useCallback(() => {
     if (!comp) return;
     const ps = emptyPayloadState(comp.gridCols, comp.gridRows);
@@ -104,43 +167,62 @@ export function App() {
     saveState(ps);
   }, [comp]);
 
+  // ─── Render ─────────────────────────────────────────────────────────────────
+  const lockTitle = gridLocked
+    ? 'Grid locked — changes only resize. Click to unlock and allow reimport.'
+    : 'Grid unlocked — changing size will reimport the image. Click to lock.';
+
   return (
     <div style={{ display:'flex', flexDirection:'column', width:'100%', height:'100%', background:'#111', color:'#ccc', fontFamily:'system-ui,sans-serif' }}>
-      {/* Toolbar */}
-      <div style={{
-        display:'flex', alignItems:'center', gap:8,
-        padding:'4px 8px', background:'#1a1a1a', borderBottom:'1px solid #333',
-        fontSize:13, flexShrink:0,
-      }}>
+
+      {/* ── Toolbar ── */}
+      <div style={TOOLBAR_STYLE}>
         <span style={{ fontWeight:'bold', color:'#5af', marginRight:8 }}>🧵 Loominary</span>
 
-        {/* Grid size selector */}
-        <label style={{ color:'#aaa', fontSize:12 }}>Grid:</label>
-        <select value={gridCols} onChange={e => setGridCols(+(e.target as HTMLSelectElement).value)} style={SELECT_STYLE}>
-          {[1,2,3,4].map(n => <option key={n} value={n}>{n}</option>)}
-        </select>
+        {/* Grid size */}
+        <label style={LABEL}>Grid:</label>
+        <GridInput value={gridCols} onChange={handleColsChange} />
         <span style={{ color:'#555' }}>×</span>
-        <select value={gridRows} onChange={e => setGridRows(+(e.target as HTMLSelectElement).value)} style={SELECT_STYLE}>
-          {[1,2,3,4].map(n => <option key={n} value={n}>{n}</option>)}
-        </select>
+        <GridInput value={gridRows} onChange={handleRowsChange} />
+
+        {/* Lock button */}
+        <button
+          onClick={() => setGridLocked(l => !l)}
+          title={lockTitle}
+          style={{
+            ...BTN,
+            padding:     '3px 7px',
+            fontSize:     15,
+            background:   gridLocked ? '#1e3a1e' : '#3a1e1e',
+            borderColor:  gridLocked ? '#3a6b3a' : '#6b3a3a',
+            color:        gridLocked ? '#7c7'    : '#f87',
+          }}
+        >
+          {gridLocked ? '🔒' : '🔓'}
+        </button>
+
+        {/* Source image indicator */}
+        {!gridLocked && sourceBitmap && (
+          <span style={{ fontSize:11, color:'#f87', fontStyle:'italic' }}>
+            ⚠ live reimport
+          </span>
+        )}
+
+        <div style={{ width:1, height:16, background:'#333', margin:'0 4px' }} />
 
         <button onClick={handleNew} style={BTN}>New</button>
 
-        {/* Image import */}
         <label style={{ ...BTN, cursor:'pointer' }}>
           {importing ? 'Loading…' : 'Import Image'}
           <input type="file" accept="image/*" onChange={handleImageImport} style={{ display:'none' }} />
         </label>
 
-        {/* State import */}
         <label style={{ ...BTN, cursor:'pointer' }}>
           Load State
           <input type="file" accept=".json" onChange={handleStateImport} style={{ display:'none' }} />
         </label>
 
-        {comp && (
-          <button onClick={handleExport} style={BTN}>Export State</button>
-        )}
+        {comp && <button onClick={handleExport} style={BTN}>Export State</button>}
 
         <div style={{ flex:1 }} />
 
@@ -151,20 +233,37 @@ export function App() {
         )}
       </div>
 
-      {/* Editor or placeholder */}
+      {/* ── Editor / placeholder ── */}
       <div style={{ flex:1, overflow:'hidden' }}>
         {comp ? (
           <Editor initialComp={comp} gridCols={gridCols} gridRows={gridRows} />
         ) : (
           <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100%', gap:16 }}>
             <p style={{ color:'#555', fontSize:14, margin:0 }}>No composition loaded.</p>
-            <p style={{ color:'#444', fontSize:12, margin:0 }}>Choose a grid size above, then click <b>New</b> or <b>Import Image</b>.</p>
+            <p style={{ color:'#444', fontSize:12, margin:0 }}>
+              Choose a grid size, then click <b>New</b> or <b>Import Image</b>.
+            </p>
           </div>
         )}
       </div>
     </div>
   );
 }
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const TOOLBAR_STYLE: h.JSX.CSSProperties = {
+  display:    'flex',
+  alignItems: 'center',
+  gap:         6,
+  padding:    '4px 8px',
+  background: '#1a1a1a',
+  borderBottom: '1px solid #333',
+  fontSize:    13,
+  flexShrink:  0,
+};
+
+const LABEL: h.JSX.CSSProperties = { color:'#aaa', fontSize:12 };
 
 const BTN: h.JSX.CSSProperties = {
   background:   '#252525',
@@ -176,11 +275,13 @@ const BTN: h.JSX.CSSProperties = {
   fontSize:       12,
 };
 
-const SELECT_STYLE: h.JSX.CSSProperties = {
+const NUM_INPUT_STYLE: h.JSX.CSSProperties = {
+  width:        44,
   background:   '#252525',
   border:       '1px solid #444',
   borderRadius:  3,
   color:         '#ccc',
   fontSize:       12,
   padding:       '2px 4px',
+  textAlign:     'center',
 };

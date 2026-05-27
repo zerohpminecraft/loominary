@@ -95,6 +95,48 @@ export function PalettePanel({ comp, activeColor, selMask, onColorPick }: Palett
         ))}
       </div>
 
+      {/* Eraser / transparent swatch — always pinned at top */}
+      <div
+        onClick={() => onColorPick(0)}
+        title="Transparent / erase (byte 0)"
+        style={{
+          position:      'relative',
+          width:         '100%',
+          height:         22,
+          marginBottom:   6,
+          cursor:        'pointer',
+          outline:        activeColor === 0 ? '2px solid #fff' : '1px solid #333',
+          outlineOffset:  activeColor === 0 ? -2 : -1,
+          boxSizing:     'border-box',
+          overflow:      'hidden',
+          borderRadius:   2,
+          // Checkerboard via CSS gradient — matches the canvas transparent fill
+          backgroundImage: 'linear-gradient(45deg,#555 25%,transparent 25%),' +
+                           'linear-gradient(-45deg,#555 25%,transparent 25%),' +
+                           'linear-gradient(45deg,transparent 75%,#555 75%),' +
+                           'linear-gradient(-45deg,transparent 75%,#555 75%)',
+          backgroundSize:   '8px 8px',
+          backgroundPosition: '0 0, 0 4px, 4px -4px, -4px 0px',
+          backgroundColor: '#333',
+        }}
+      >
+        <span style={{
+          position:   'absolute', inset: 0,
+          display:    'flex', alignItems: 'center', justifyContent: 'center',
+          fontSize:    10, color: 'rgba(255,255,255,0.7)',
+          textShadow: '0 0 3px #000',
+        }}>
+          eraser
+        </span>
+        {freq[0] > 0 && (
+          <div style={{
+            position:'absolute', bottom:0, left:0,
+            width: `${Math.round(freq[0] / maxFreq * 100)}%`, height: 3,
+            background: 'rgba(255,255,255,0.5)',
+          }} />
+        )}
+      </div>
+
       {/* Swatch grid */}
       <div style={SWATCH_GRID}>
         {colors.map(c => {
@@ -138,7 +180,7 @@ export function PalettePanel({ comp, activeColor, selMask, onColorPick }: Palett
 
       {/* Active colour info */}
       <div style={{ marginTop:8, fontSize:11, color:'#aaa', textAlign:'center' }}>
-        Byte {activeColor}
+        {activeColor === 0 ? 'Transparent (byte 0)' : `Byte ${activeColor}`}
         {freq[activeColor] > 0 && ` · ${freq[activeColor].toLocaleString()} px`}
       </div>
     </div>

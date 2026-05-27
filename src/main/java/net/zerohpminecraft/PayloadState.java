@@ -42,7 +42,7 @@ public class PayloadState {
     // ── Codec ──────────────────────────────────────────────────────────
 
     /** Encoding strategy for new imports and re-encodes. */
-    public static CodecMode codecMode = CodecMode.CARPET_SHADE;
+    public static CodecMode codecMode = CodecMode.CARPET_BANNERS_SHADE;
 
     // ── Author override ────────────────────────────────────────────────
 
@@ -245,7 +245,7 @@ public class PayloadState {
         allShades = snap.allShades;
         dither = snap.dither;
         currentTitle = snap.title;
-        codecMode = snap.codecMode != null ? CodecMode.valueOf(snap.codecMode) : CodecMode.CARPET_SHADE;
+        codecMode = migrateCodecMode(snap.codecMode);
         currentAuthor = snap.authorOverride;
         tiles.clear();
         tiles.addAll(snap.tiles);
@@ -255,6 +255,27 @@ public class PayloadState {
         String src = snap.sourceFilename != null ? snap.sourceFilename : "<unknown>";
         return src + " (" + gridColumns + "×" + gridRows + " grid, "
                 + tiles.size() + " tile" + (tiles.size() == 1 ? "" : "s") + ")";
+    }
+
+    /**
+     * Maps a persisted codec mode name to the current {@link CodecMode} enum value.
+     * Handles migration from old names (pre-rename) as well as new names.
+     *
+     * <p>Old → New mapping:
+     * <ul>
+     *   <li>{@code CARPET}       → {@code CARPET_BANNERS}</li>
+     *   <li>{@code CARPET_SHADE} → {@code CARPET_BANNERS_SHADE}</li>
+     *   <li>{@code CARPET_ONLY}  → {@code CARPET_SHADE}</li>
+     * </ul>
+     */
+    private static CodecMode migrateCodecMode(String saved) {
+        if (saved == null) return CodecMode.CARPET_BANNERS_SHADE;
+        return switch (saved) {
+            case "CARPET"       -> CodecMode.CARPET_BANNERS;
+            case "CARPET_SHADE" -> CodecMode.CARPET_BANNERS_SHADE;
+            case "CARPET_ONLY"  -> CodecMode.CARPET_SHADE;
+            default             -> CodecMode.valueOf(saved); // BANNER, CARPET_BANNERS, CARPET_BANNERS_SHADE, new CARPET
+        };
     }
 
     public static void save() {
@@ -300,7 +321,7 @@ public class PayloadState {
             allShades = snap.allShades;
             dither = snap.dither;
             currentTitle = snap.title;
-            codecMode = snap.codecMode != null ? CodecMode.valueOf(snap.codecMode) : CodecMode.CARPET_SHADE;
+            codecMode = migrateCodecMode(snap.codecMode);
         currentAuthor = snap.authorOverride;
 
             tiles.clear();
@@ -336,7 +357,7 @@ public class PayloadState {
         allShades = false;
         dither = false;
         currentTitle = null;
-        codecMode = CodecMode.CARPET_SHADE;
+        codecMode = CodecMode.CARPET_BANNERS_SHADE;
         currentAuthor = null;
         tiles.clear();
         whitelistedBannerNames.clear();

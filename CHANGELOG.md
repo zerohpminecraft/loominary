@@ -4,6 +4,34 @@
 
 ---
 
+## v1.20.0
+
+### Fix: mux now works for BANNER codec; donor count correctly estimates overhead
+
+Two bugs in `/loominary mux` caused mux to silently fail for certain codec configurations.
+
+- **BANNER codec mux broken entirely** — `applyMux()` extracted payloads via `carpetCompressedB64`, which is only populated for carpet tiles. BANNER tiles have `carpetEncoded=false`, so all payloads were treated as empty and the algorithm exited early with "no tiles are over budget". Fixed by reassembling the payload from the raw CJK chunks when `carpetEncoded` is false.
+- **Last receiver unallocated with many receivers** — `mgOverhead` was hardcoded to `84 * 4` (enough for four guests), but the correct value scales with the number of receivers. With ≥5 receivers the donor capacity was overestimated, leaving the last receiver(s) unresolved. Fixed by computing `mgOverhead = numReceivers * overheadPerGuest` (84 bytes per guest for CARPET_BANNERS modes, `LOOM_GUEST_DESC` bytes for CARPET/CARPET_SHADE modes), with a retry loop that appends blank donors when the initial donor count proves insufficient.
+- **`/loominary mux undo` for BANNER** — receiver tiles were left with their mux-encoded chunks rather than restored to their original CJK encoding. Fixed by restoring from `muxCargoB64` (the receiver's own segment) via `CjkCodec.buildChunks()` when `carpetEncoded=false`.
+
+### Feat: codec renamed to channel-list style; new pure CARPET mode
+
+Codec names now reflect exactly which output channels are enabled. Channel priority is fixed: carpet > banners > shade.
+
+| Old name | New name | Channels |
+|---|---|---|
+| — | `CARPET` | carpet only |
+| `CARPET_ONLY` | `CARPET_SHADE` | carpet + shade |
+| `CARPET` | `CARPET_BANNERS` | carpet + banners |
+| `CARPET_SHADE` | `CARPET_BANNERS_SHADE` | carpet + banners + shade (default) |
+| `BANNER` | `BANNER` | banners only (unchanged) |
+
+- **New `CARPET` mode** — encodes the payload entirely in the carpet channel (up to 8176 bytes). No overflow banners, no shade channel. Mux pooling supported.
+- **Existing save files migrate automatically** — old enum names in `loominary_state.json` (`CARPET`, `CARPET_SHADE`, `CARPET_ONLY`) are mapped to their new names on first load; the file is rewritten in the new format on the next save.
+- **`/loominary codec`** — help text updated to list all five modes with their channel descriptions.
+
+---
+
 ## v1.19.2
 
 ### Fix: `/loominary palette` no longer freezes the game on large animations

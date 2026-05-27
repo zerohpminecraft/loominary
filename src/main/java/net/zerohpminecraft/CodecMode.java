@@ -7,39 +7,47 @@ package net.zerohpminecraft;
  * extra overflow banner slot freed).  Banner-only mode is unchanged from the
  * original hex-indexed CJK chunk format.
  *
+ * <p>Channels are listed in priority order: carpet &gt; banners &gt; shade.
+ * Each mode name reflects exactly which channels it enables.
+ *
  * <ul>
- *   <li>{@link #BANNER}       – 63 hex-indexed CJK banner chunks; no carpet platform.</li>
- *   <li>{@link #CARPET}       – LOOM carpet channel + overflow banners; shade disabled.</li>
- *   <li>{@link #CARPET_SHADE} – LOOM carpet + shade + overflow banners (default).</li>
- *   <li>{@link #CARPET_ONLY}  – LOOM carpet + shade; no overflow banners.</li>
+ *   <li>{@link #BANNER}              – 63 hex-indexed CJK banner chunks; no carpet platform.</li>
+ *   <li>{@link #CARPET}              – LOOM carpet channel only; no shade, no overflow banners.</li>
+ *   <li>{@link #CARPET_SHADE}        – LOOM carpet + shade channels; no overflow banners.</li>
+ *   <li>{@link #CARPET_BANNERS}      – LOOM carpet + overflow banners; no shade.</li>
+ *   <li>{@link #CARPET_BANNERS_SHADE}– LOOM carpet + overflow banners + shade (default).</li>
  * </ul>
  *
- * Mux pooling is supported in all four modes.
+ * Mux pooling is supported in all five modes.
  */
 public enum CodecMode {
     BANNER,
     CARPET,
     CARPET_SHADE,
-    CARPET_ONLY;
+    CARPET_BANNERS,
+    CARPET_BANNERS_SHADE;
 
     /** Human-readable label for /loominary codec output. */
     public String label() {
         return switch (this) {
-            case BANNER       -> "banner-only";
-            case CARPET       -> "carpet (no shade)";
-            case CARPET_SHADE -> "carpet + shade (default)";
-            case CARPET_ONLY  -> "carpet-only (no overflow banners)";
+            case BANNER               -> "banners";
+            case CARPET               -> "carpet";
+            case CARPET_SHADE         -> "carpet+shade";
+            case CARPET_BANNERS       -> "carpet+banners";
+            case CARPET_BANNERS_SHADE -> "carpet+banners+shade (default)";
         };
     }
 
     public static CodecMode fromString(String s) {
         return switch (s.toLowerCase()) {
-            case "banner"        -> BANNER;
-            case "carpet"        -> CARPET;
+            case "banner"                        -> BANNER;
+            case "carpet"                        -> CARPET;
             case "carpet+shade",
-                 "carpet_shade"  -> CARPET_SHADE;
-            case "carpet-only",
-                 "carpet_only"   -> CARPET_ONLY;
+                 "carpet_shade"                  -> CARPET_SHADE;
+            case "carpet+banners",
+                 "carpet_banners"                -> CARPET_BANNERS;
+            case "carpet+banners+shade",
+                 "carpet_banners_shade"          -> CARPET_BANNERS_SHADE;
             default -> null;
         };
     }

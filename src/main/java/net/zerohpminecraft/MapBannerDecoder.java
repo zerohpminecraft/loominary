@@ -628,8 +628,8 @@ public class MapBannerDecoder {
     // ── LOOM-format carpet decode ─────────────────────────────────────────
 
     /**
-     * Decodes a tile encoded with the LOOM-header carpet format (all new codec modes:
-     * CARPET, CARPET_SHADE, CARPET_ONLY).  The first 4 bytes of the carpet channel
+     * Decodes a tile encoded with the LOOM-header carpet format (all carpet codec modes:
+     * CARPET, CARPET_SHADE, CARPET_BANNERS, CARPET_BANNERS_SHADE).  The first 4 bytes of the carpet channel
      * must already have been verified as LOOM magic by the caller.
      *
      * <p>Handles four sub-cases via LOOM header flags:

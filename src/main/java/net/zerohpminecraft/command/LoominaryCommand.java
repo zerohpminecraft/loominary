@@ -188,10 +188,11 @@ public class LoominaryCommand {
     /** Returns the maximum compressed-payload bytes a tile can hold given the current codec mode. */
     private static int maxBytesForMode(CodecMode mode) {
         return switch (mode) {
-            case BANNER       -> MAX_CHUNKS * 84 - 2;
-            case CARPET       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
-            case CARPET_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
-            case CARPET_ONLY  -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
+            case BANNER               -> MAX_CHUNKS * 84 - 2;
+            case CARPET               -> CarpetChannel.MAX_CARPET_PAYLOAD;
+            case CARPET_SHADE         -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
+            case CARPET_BANNERS       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
+            case CARPET_BANNERS_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
         };
     }
 
@@ -413,8 +414,8 @@ public class LoominaryCommand {
      */
     private static CarpetEncoding encodeLoomFromCompressed(
             byte[] compressed, int col, int row, CodecMode mode) {
-        boolean useShade   = (mode == CodecMode.CARPET_SHADE || mode == CodecMode.CARPET_ONLY);
-        boolean useBanners = (mode != CodecMode.CARPET_ONLY);
+        boolean useShade   = (mode == CodecMode.CARPET_BANNERS_SHADE || mode == CodecMode.CARPET_SHADE);
+        boolean useBanners = (mode == CodecMode.CARPET_BANNERS || mode == CodecMode.CARPET_BANNERS_SHADE);
 
         int flags = (useShade ? CarpetChannel.LOOM_FLAG_SHADE : 0)
                   | (useBanners ? CarpetChannel.LOOM_FLAG_BANNERS : 0);
@@ -859,9 +860,9 @@ public class LoominaryCommand {
      * <ul>
      *   <li>BANNER: receiver uses LB banner + payload banners; donor uses
      *       CJK payload banners + MG routing banners.</li>
-     *   <li>CARPET / CARPET_SHADE: receiver uses LOOM header (MUX_RX) in carpet;
+     *   <li>CARPET_BANNERS / CARPET_BANNERS_SHADE: receiver uses LOOM header (MUX_RX) in carpet;
      *       donor uses LOOM header in carpet + MG routing banners.</li>
-     *   <li>CARPET_ONLY: receiver uses LOOM header (MUX_RX) in carpet;
+     *   <li>CARPET / CARPET_SHADE: receiver uses LOOM header (MUX_RX) in carpet;
      *       donor uses LOOM header with guest descriptors in carpet (no MG banners).</li>
      * </ul>
      *
@@ -921,10 +922,11 @@ public class LoominaryCommand {
 
         // Max own-segment bytes a receiver can hold in its own tile channels.
         int receiverOwnMax = switch (mode) {
-            case BANNER       -> (MAX_CHUNKS - 1) * 84; // 62 payload banners (1 LB slot)
-            case CARPET       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
-            case CARPET_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
-            case CARPET_ONLY  -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
+            case BANNER               -> (MAX_CHUNKS - 1) * 84; // 62 payload banners (1 LB slot)
+            case CARPET               -> CarpetChannel.MAX_CARPET_PAYLOAD;
+            case CARPET_SHADE         -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
+            case CARPET_BANNERS       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
+            case CARPET_BANNERS_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
         };
 
         // Budget threshold: payload bytes that exceed this make a tile a receiver.
@@ -1010,9 +1012,11 @@ public class LoominaryCommand {
                 tile.chunks.addAll(chunks);
                 tile.muxCargoB64 = Base64.getEncoder().encodeToString(ownSeg);
 
-            } else if (mode == CodecMode.CARPET_ONLY) {
-                // LOOM header (MUX_RX) in carpet; own segment in carpet+shade.
-                boolean useShade = ownSeg.length > CarpetChannel.MAX_CARPET_PAYLOAD;
+            } else if (mode == CodecMode.CARPET || mode == CodecMode.CARPET_SHADE) {
+                // No overflow banners; guest descriptors embedded in LOOM header.
+                // CARPET: carpet channel only. CARPET_SHADE: carpet + shade when needed.
+                boolean useShade = (mode == CodecMode.CARPET_SHADE)
+                        && ownSeg.length > CarpetChannel.MAX_CARPET_PAYLOAD;
                 int loomFlags = CarpetChannel.LOOM_FLAG_MUX_RX
                         | (useShade ? CarpetChannel.LOOM_FLAG_SHADE : 0);
                 byte[] loomHeader = CarpetChannel.buildLoomHeader(
@@ -1027,8 +1031,9 @@ public class LoominaryCommand {
                 tile.muxCargoB64 = Base64.getEncoder().encodeToString(ownSeg);
 
             } else {
-                // CARPET / CARPET_SHADE: LOOM header (MUX_RX) + own segment in carpet+shade+overflow.
-                boolean needShade = (mode == CodecMode.CARPET_SHADE)
+                // CARPET_BANNERS / CARPET_BANNERS_SHADE: LOOM header (MUX_RX) + own segment
+                // in carpet + optional shade + overflow banners.
+                boolean needShade = (mode == CodecMode.CARPET_BANNERS_SHADE)
                         && ownSeg.length > CarpetChannel.MAX_CARPET_PAYLOAD + CarpetChannel.MAX_OVERFLOW_BYTES_LOOM;
                 int loomFlags = CarpetChannel.LOOM_FLAG_BANNERS | CarpetChannel.LOOM_FLAG_MUX_RX
                         | (needShade ? CarpetChannel.LOOM_FLAG_SHADE : 0);
@@ -1075,8 +1080,9 @@ public class LoominaryCommand {
                 tile.chunks.addAll(chunks);
                 tile.muxCargoB64 = Base64.getEncoder().encodeToString(cargoData);
 
-            } else if (mode == CodecMode.CARPET_ONLY) {
-                // LOOM header with MUX_DONOR + guest descriptors in carpet.
+            } else if (mode == CodecMode.CARPET || mode == CodecMode.CARPET_SHADE) {
+                // No overflow banners; guest descriptors embedded in LOOM header.
+                // CARPET: cargo in carpet only. CARPET_SHADE: spills into shade when needed.
                 int[][] guestDescs = new int[guestMeta[dIdx].size()][4];
                 for (int g = 0; g < guestMeta[dIdx].size(); g++) {
                     int[] m = guestMeta[dIdx].get(g);
@@ -1085,9 +1091,10 @@ public class LoominaryCommand {
                     guestDescs[g][2] = m[1];
                     guestDescs[g][3] = m[2];
                 }
-                boolean useShade = cargoData.length + CarpetChannel.LOOM_FIXED_HEADER
-                        + guestMeta[dIdx].size() * CarpetChannel.LOOM_GUEST_DESC
-                        > CarpetChannel.MAX_CARPET_BYTES;
+                boolean useShade = (mode == CodecMode.CARPET_SHADE)
+                        && (cargoData.length + CarpetChannel.LOOM_FIXED_HEADER
+                            + guestMeta[dIdx].size() * CarpetChannel.LOOM_GUEST_DESC
+                            > CarpetChannel.MAX_CARPET_BYTES);
                 int loomFlags = CarpetChannel.LOOM_FLAG_MUX_DONOR
                         | (useShade ? CarpetChannel.LOOM_FLAG_SHADE : 0);
                 byte[] loomHeader = CarpetChannel.buildLoomHeader(
@@ -1102,17 +1109,17 @@ public class LoominaryCommand {
                 tile.muxCargoB64 = Base64.getEncoder().encodeToString(cargoData);
 
             } else {
-                // CARPET / CARPET_SHADE: LOOM header in cargo + MG routing banners.
+                // CARPET_BANNERS / CARPET_BANNERS_SHADE: LOOM header in cargo + MG routing banners.
                 // ownLen in MG banner = LOOM_FIXED_HEADER + ownFrame.length (where guest data starts).
                 int mgOwnLen = CarpetChannel.LOOM_FIXED_HEADER + ownFrame.length;
                 int loomFlags = CarpetChannel.LOOM_FLAG_BANNERS
-                        | ((mode == CodecMode.CARPET_SHADE) ? CarpetChannel.LOOM_FLAG_SHADE : 0);
+                        | ((mode == CodecMode.CARPET_BANNERS_SHADE) ? CarpetChannel.LOOM_FLAG_SHADE : 0);
                 byte[] loomHeader = CarpetChannel.buildLoomHeader(
                         loomFlags, col, row, ownFrame.length, ownFrame.length, null);
                 byte[] cargo = new byte[loomHeader.length + cargoData.length];
                 System.arraycopy(loomHeader, 0, cargo, 0,               loomHeader.length);
                 System.arraycopy(cargoData,  0, cargo, loomHeader.length, cargoData.length);
-                boolean useShade = (mode == CodecMode.CARPET_SHADE)
+                boolean useShade = (mode == CodecMode.CARPET_BANNERS_SHADE)
                         && cargo.length > CarpetChannel.MAX_CARPET_BYTES + CarpetChannel.MAX_OVERFLOW_BYTES_LOOM;
                 CarpetEncoding enc = encodeLoomCargoToChannels(cargo, useShade, true);
                 List<String> chunks = new ArrayList<>(enc.allChunks());
@@ -1141,15 +1148,21 @@ public class LoominaryCommand {
                 // Spare = remaining banner slots (minus one new MG slot) × 84 bytes
                 (MAX_CHUNKS - gc - 1) * 84 - cargoSize[d];
             case CARPET ->
-                CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM
-                        - (gc + 1) * 84 - cargoSize[d];
+                // Carpet only; guest descriptors in LOOM header (10 bytes each)
+                CarpetChannel.MAX_CARPET_PAYLOAD
+                        - (gc + 1) * CarpetChannel.LOOM_GUEST_DESC - cargoSize[d];
             case CARPET_SHADE ->
-                CarpetChannel.MAX_TOTAL_BYTES_LOOM
-                        - (gc + 1) * 84 - cargoSize[d];
-            case CARPET_ONLY ->
-                // Spare = total carpet+shade capacity minus header (fixed + descriptors) minus cargo
+                // Carpet + shade; guest descriptors in LOOM header (10 bytes each)
                 CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM
                         - (gc + 1) * CarpetChannel.LOOM_GUEST_DESC - cargoSize[d];
+            case CARPET_BANNERS ->
+                // Carpet + overflow banners; one MG routing banner (84 bytes) per guest
+                CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM
+                        - (gc + 1) * 84 - cargoSize[d];
+            case CARPET_BANNERS_SHADE ->
+                // Carpet + shade + overflow banners; one MG routing banner (84 bytes) per guest
+                CarpetChannel.MAX_TOTAL_BYTES_LOOM
+                        - (gc + 1) * 84 - cargoSize[d];
         };
     }
 
@@ -1878,8 +1891,10 @@ public class LoominaryCommand {
                                             .executes(ctx -> setCodec(ctx.getSource(), CodecMode.CARPET)))
                                     .then(ClientCommandManager.literal("carpet+shade")
                                             .executes(ctx -> setCodec(ctx.getSource(), CodecMode.CARPET_SHADE)))
-                                    .then(ClientCommandManager.literal("carpet-only")
-                                            .executes(ctx -> setCodec(ctx.getSource(), CodecMode.CARPET_ONLY))))
+                                    .then(ClientCommandManager.literal("carpet+banners")
+                                            .executes(ctx -> setCodec(ctx.getSource(), CodecMode.CARPET_BANNERS)))
+                                    .then(ClientCommandManager.literal("carpet+banners+shade")
+                                            .executes(ctx -> setCodec(ctx.getSource(), CodecMode.CARPET_BANNERS_SHADE))))
 
                             // ── mux ────────────────────────────────────────────
                             .then(ClientCommandManager.literal("mux")
@@ -5528,10 +5543,11 @@ public class LoominaryCommand {
     private static int showCodec(FabricClientCommandSource source) {
         source.sendFeedback(Text.literal(String.format(
                 "§7Current codec: §f%s§r\n"
-                + "§7  banner        §8— 63 CJK banner chunks, no carpet\n"
-                + "§7  carpet        §8— LOOM carpet + overflow banners, no shade\n"
-                + "§7  carpet+shade  §8— LOOM carpet + shade + overflow banners §a(default)\n"
-                + "§7  carpet-only   §8— LOOM carpet + shade, no overflow banners",
+                + "§7  banner               §8— 63 CJK banner chunks, no carpet\n"
+                + "§7  carpet               §8— LOOM carpet channel only\n"
+                + "§7  carpet+shade         §8— LOOM carpet + shade channels\n"
+                + "§7  carpet+banners       §8— LOOM carpet + overflow banners\n"
+                + "§7  carpet+banners+shade §8— LOOM carpet + shade + overflow banners §a(default)",
                 PayloadState.codecMode.label())));
         return 1;
     }
@@ -5790,13 +5806,22 @@ public class LoominaryCommand {
         System.arraycopy(blankColors,   0, combined, manifestBytes.length, blankColors.length);
         byte[] compressed = compress(combined);
 
-        CarpetEncoding enc = encodeLoomFromCompressed(compressed, 0, 0, PayloadState.codecMode);
         PayloadState.TileData tile = new PayloadState.TileData();
-        tile.chunks.addAll(enc.allChunks());
-        tile.carpetEncoded = true;
-        tile.loomEncoded   = true;
-        tile.isDonorOnly   = true;
-        tile.carpetCompressedB64 = Base64.getEncoder().encodeToString(compressed);
+        tile.isDonorOnly = true;
+
+        if (PayloadState.codecMode == CodecMode.BANNER) {
+            // Banner-only donor: CJK chunks, no carpet platform.
+            tile.chunks.addAll(CjkCodec.buildChunks(compressed));
+            tile.carpetEncoded = false;
+            tile.loomEncoded   = false;
+            // carpetCompressedB64 intentionally left null for banner tiles.
+        } else {
+            CarpetEncoding enc = encodeLoomFromCompressed(compressed, 0, 0, PayloadState.codecMode);
+            tile.chunks.addAll(enc.allChunks());
+            tile.carpetEncoded = true;
+            tile.loomEncoded   = true;
+            tile.carpetCompressedB64 = Base64.getEncoder().encodeToString(compressed);
+        }
         return tile;
     }
 
@@ -5822,25 +5847,41 @@ public class LoominaryCommand {
         CodecMode mode = PayloadState.codecMode;
         int budget = maxBytesForMode(mode);
 
-        // Collect over-budget art tiles and compute total overflow bytes.
+        // Collect compressed payloads for art tiles — handle both carpet and banner tiles.
         List<byte[]> payloads = new ArrayList<>();
         for (PayloadState.TileData t : PayloadState.tiles) {
-            byte[] compressed = (t.carpetEncoded && t.carpetCompressedB64 != null)
-                    ? Base64.getDecoder().decode(t.carpetCompressedB64) : new byte[0];
+            byte[] compressed;
+            if (t.carpetEncoded && t.carpetCompressedB64 != null) {
+                compressed = Base64.getDecoder().decode(t.carpetCompressedB64);
+            } else {
+                // Banner tile: reassemble compressed bytes from CJK chunks.
+                List<String> names = new ArrayList<>(t.chunks);
+                names.sort(java.util.Comparator.comparingInt(s -> Integer.parseInt(s.substring(0, 2), 16)));
+                if (!names.isEmpty() && names.get(0).length() > 2
+                        && names.get(0).charAt(2) >= CjkCodec.ALPHA_BASE) {
+                    StringBuilder sb = new StringBuilder();
+                    for (String s : names) sb.append(s.substring(2));
+                    compressed = CjkCodec.decode(sb.toString());
+                } else {
+                    compressed = new byte[0];
+                }
+            }
             payloads.add(compressed);
         }
 
         int receiverOwnMax = switch (mode) {
-            case BANNER       -> (MAX_CHUNKS - 1) * 84;
-            case CARPET       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
-            case CARPET_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
-            case CARPET_ONLY  -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
+            case BANNER               -> (MAX_CHUNKS - 1) * 84;
+            case CARPET               -> CarpetChannel.MAX_CARPET_PAYLOAD;
+            case CARPET_SHADE         -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
+            case CARPET_BANNERS       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
+            case CARPET_BANNERS_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
         };
 
         int totalOverflow = 0;
+        int numReceivers = 0;
         for (int i = 0; i < PayloadState.tiles.size(); i++) {
             int len = payloads.get(i).length;
-            if (len > budget) totalOverflow += len - receiverOwnMax;
+            if (len > budget) { totalOverflow += len - receiverOwnMax; numReceivers++; }
         }
         if (totalOverflow <= 0) {
             source.sendFeedback(Text.literal("§eNo tiles are over budget — mux not needed."));
@@ -5848,16 +5889,19 @@ public class LoominaryCommand {
         }
 
         // Estimate how many bytes a single blank donor tile can absorb.
-        // Blank frame is tiny; most of the tile capacity is available for guest bytes.
-        // Subtract per-MG-banner overhead (84 bytes each, assume ≤4 segments per donor).
+        // Overhead per guest: 84 bytes (MG banner) for BANNER/CARPET_BANNERS/CARPET_BANNERS_SHADE,
+        // or LOOM_GUEST_DESC bytes (header descriptor) for CARPET/CARPET_SHADE.
         PayloadState.TileData sampleDonor = createBlankDonorTile();
-        int blankSize    = carpetCompressedBytes(sampleDonor);
-        int mgOverhead   = 84 * 4; // conservative: up to 4 guest segments per donor
+        byte[] sampleCompressed = getCompressedBytesForTile(sampleDonor);
+        int blankSize = sampleCompressed != null ? sampleCompressed.length : 0;
+        int overheadPerGuest = (mode == CodecMode.CARPET || mode == CodecMode.CARPET_SHADE)
+                ? CarpetChannel.LOOM_GUEST_DESC : 84;
+        // Reserve overhead for at least 4 guests or as many receivers as exist, whichever is larger.
+        int mgOverhead = Math.max(overheadPerGuest * 4, numReceivers * overheadPerGuest);
         int donorCapacity = budget - blankSize - mgOverhead;
         if (donorCapacity <= 0) {
-            source.sendError(Text.literal(
-                    "§cDonor tile capacity is too small for codec " + mode.label() + "."));
-            return 0;
+            // Fall back: one donor per receiver.
+            donorCapacity = Math.max(1, budget - blankSize - overheadPerGuest);
         }
 
         int numDonors = (totalOverflow + donorCapacity - 1) / donorCapacity;
@@ -5865,24 +5909,23 @@ public class LoominaryCommand {
         source.sendFeedback(Text.literal(String.format(
                 "§7%d art tile%s over budget, %d bytes total overflow. "
                 + "Appending %d donor tile%s [codec: %s]…",
-                (int) payloads.stream().filter(p -> p.length > budget).count(),
-                payloads.stream().filter(p -> p.length > budget).count() == 1 ? "" : "s",
+                numReceivers, numReceivers == 1 ? "" : "s",
                 totalOverflow, numDonors, numDonors == 1 ? "" : "s", mode.label())));
 
         for (int i = 0; i < numDonors; i++)
             PayloadState.tiles.add(createBlankDonorTile());
 
-        // Re-collect payloads for the full (art + donor) list.
-        payloads.clear();
-        for (PayloadState.TileData t : PayloadState.tiles) {
-            byte[] compressed = (t.carpetEncoded && t.carpetCompressedB64 != null)
-                    ? Base64.getDecoder().decode(t.carpetCompressedB64) : new byte[0];
-            payloads.add(compressed);
-        }
-
         // Run allocation: only blank donor tiles may serve as donors.
         int unresolved = poolMuxTiles(PayloadState.tiles,
                 PayloadState.gridColumns, PayloadState.gridRows, /* donorOnlyMode= */ true);
+
+        // If the initial donor estimate was too low, retry with extra donors (up to 3 attempts).
+        for (int retry = 0; unresolved > 0 && retry < 3; retry++) {
+            for (int i = 0; i < unresolved; i++)
+                PayloadState.tiles.add(createBlankDonorTile());
+            unresolved = poolMuxTiles(PayloadState.tiles,
+                    PayloadState.gridColumns, PayloadState.gridRows, true);
+        }
 
         // Remove any donor tiles that ended up carrying nothing (allocation used fewer than estimated).
         PayloadState.tiles.removeIf(t -> t.isDonorOnly && !t.muxed);
@@ -5939,6 +5982,7 @@ public class LoominaryCommand {
             PayloadState.TileData tile = PayloadState.tiles.get(i);
             tile.muxed = false;
             tile.muxReceiver = false;
+            String savedMuxCargo = tile.muxCargoB64;
             tile.muxCargoB64 = null;
             if (tile.carpetEncoded && tile.carpetCompressedB64 != null) {
                 byte[] compressed = Base64.getDecoder().decode(tile.carpetCompressedB64);
@@ -5947,6 +5991,13 @@ public class LoominaryCommand {
                 tile.chunks.clear();
                 tile.chunks.addAll(enc.allChunks());
                 tile.loomEncoded = true;
+                reset++;
+            } else if (!tile.carpetEncoded && savedMuxCargo != null) {
+                // BANNER mux receiver: restore plain CJK chunks from the stored own segment.
+                // Note: only ownSeg is recoverable; the tile will be over-budget until re-imported.
+                byte[] ownSeg = Base64.getDecoder().decode(savedMuxCargo);
+                tile.chunks.clear();
+                tile.chunks.addAll(CjkCodec.buildChunks(ownSeg));
                 reset++;
             }
         }

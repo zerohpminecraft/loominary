@@ -62,10 +62,10 @@ public class CarpetChannel {
     /** Total payload capacity for LOOM carpet+shade+overflow (CARPET_SHADE mode). */
     public static final int MAX_TOTAL_BYTES_LOOM =
             MAX_CARPET_PAYLOAD + MAX_SHADE_BYTES + MAX_OVERFLOW_BYTES_LOOM; // 15482
-    /** Total payload capacity for LOOM carpet+overflow (CARPET mode, no shade). */
+    /** Total payload capacity for LOOM carpet+overflow (CARPET_BANNERS mode, no shade). */
     public static final int MAX_CARPET_OVERFLOW_BYTES_LOOM =
             MAX_CARPET_PAYLOAD + MAX_OVERFLOW_BYTES_LOOM;               // 13466
-    /** Total payload capacity for LOOM carpet+shade (CARPET_ONLY mode, no overflow). */
+    /** Total payload capacity for LOOM carpet+shade (CARPET_SHADE mode, no overflow). */
     public static final int MAX_CARPET_SHADE_ONLY_BYTES_LOOM =
             MAX_CARPET_PAYLOAD + MAX_SHADE_BYTES;                       // 10192
 

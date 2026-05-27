@@ -13,11 +13,20 @@
 import { h, type ComponentChildren } from 'preact';
 import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 
-import { MapCanvas } from './Canvas.js';
-import { EditHistory } from './history.js';
+import { MapCanvas }    from './Canvas.js';
+import { EditHistory }  from './history.js';
 import { PalettePanel } from './PalettePanel.js';
-import { StatusBar } from './StatusBar.js';
-import { buildOklabLookup } from '../quantize.js';
+import { StatusBar }    from './StatusBar.js';
+import {
+  buildOklabLookup,
+  requantizeGrid,
+  mapBytesToImageData,
+  scaleImage,
+  DitherAlgo,
+  MatchMetric,
+  DEFAULT_REQ_PARAMS,
+  type RequantizeParams,
+} from '../quantize.js';
 import type { CompositionState } from '../payload-state.js';
 import { emptyPayloadState, compositionFromState } from '../payload-state.js';
 
@@ -59,7 +68,7 @@ function makeEmptyComp(cols = 1, rows = 1): CompositionState {
  * Shrinking drops tiles that fall outside the new bounds.
  */
 function resizeComposition(comp: CompositionState, newCols: number, newRows: number): CompositionState {
-  const frameCount = Math.max(...comp.frames.map(t => t.length), 1);
+  const frameCount     = Math.max(...comp.frames.map(t => t.length), 1);
   const newFrames:      Uint8Array[][] = [];
   const newFrameDelays: number[][]     = [];
 
@@ -85,20 +94,22 @@ const OKLAB = buildOklabLookup();
 // ─── Editor props ─────────────────────────────────────────────────────────────
 
 export interface EditorProps {
-  initialComp?: CompositionState;
+  initialComp?:  CompositionState;
   /** When changed by the parent toolbar, the composition is resized immediately. */
-  gridCols?: number;
-  gridRows?: number;
+  gridCols?:     number;
+  gridRows?:     number;
+  /** Source bitmap kept in App for re-quantize; null when no image has been imported. */
+  sourceBitmap?: ImageBitmap | null;
 }
 
 // ─── Editor ───────────────────────────────────────────────────────────────────
 
-export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: EditorProps) {
+export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, sourceBitmap }: EditorProps) {
   const canvasElRef = useRef<HTMLCanvasElement>(null);
   const canvasRef   = useRef<MapCanvas | null>(null);
   const historyRef  = useRef(new EditHistory());
 
-  // ── Composition (React state + mutable ref for tools) ──────────────────────
+  // ── Composition ────────────────────────────────────────────────────────────
   const [comp, setComp] = useState<CompositionState>(() => initialComp ?? makeEmptyComp());
   const compRef = useRef(comp);
   const syncComp = useCallback((next: CompositionState) => {
@@ -107,33 +118,28 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
     canvasRef.current?.setComposition(next);
   }, []);
 
-  // Re-sync if parent passes a new initialComp (e.g. after image import).
   useEffect(() => {
     if (initialComp) syncComp(initialComp);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialComp]);
 
-  // Resize instantly when the parent changes gridCols/gridRows.
   useEffect(() => {
     if (propCols === undefined || propRows === undefined) return;
     const c = compRef.current;
     if (c.gridCols === propCols && c.gridRows === propRows) return;
     const resized = resizeComposition(c, propCols, propRows);
     syncComp(resized);
-    // Clear selection — it was sized for the old grid.
     setSelMask(null);
-    // Re-fit the viewport to show all tiles.
     if (canvasRef.current) {
       canvasRef.current.resize();
       canvasRef.current.fitToView(resized);
     }
-    // Resize is a major structural change; clear undo history.
     historyRef.current.clear();
     setUndoState({ canUndo: false, canRedo: false });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [propCols, propRows]);
 
-  // ── Tool state (refs for event handlers, state for render) ─────────────────
+  // ── Tool state ──────────────────────────────────────────────────────────────
   const [activeToolId, _setActiveToolId] = useState('brush');
   const activeToolIdRef = useRef('brush');
   function setActiveToolId(id: string) {
@@ -174,15 +180,49 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
     if (canvasRef.current) { canvasRef.current.selMask = m; canvasRef.current.markDirty(); }
   }
 
-  // ── Status bar state ────────────────────────────────────────────────────────
-  const [cursorGx,   setCursorGx]  = useState(-1);
-  const [cursorGy,   setCursorGy]  = useState(-1);
-  const [hoverColor, setHoverColor] = useState(0);
-  const [scale,      setScale]     = useState(4);
-  const [undoState,  setUndoState] = useState({ canUndo: false, canRedo: false });
+  // ── Requantize params ───────────────────────────────────────────────────────
+  const [reqAlgo,       setReqAlgo]       = useState<typeof DitherAlgo[keyof typeof DitherAlgo]>(DEFAULT_REQ_PARAMS.dither);
+  const [reqMetric,     setReqMetric]     = useState<typeof MatchMetric[keyof typeof MatchMetric]>(DEFAULT_REQ_PARAMS.metric);
+  const [reqFsStr,      setReqFsStr]      = useState(DEFAULT_REQ_PARAMS.fsStrength);
+  const [reqAtkStr,     setReqAtkStr]     = useState(DEFAULT_REQ_PARAMS.atkStrength);
+  const [reqBayer,      setReqBayer]      = useState(DEFAULT_REQ_PARAMS.bayerScale);
+  const [reqChroma,     setReqChroma]     = useState(DEFAULT_REQ_PARAMS.chromaBoost);
+  const [reqTilePal,    setReqTilePal]    = useState(DEFAULT_REQ_PARAMS.tilePalette);
+  const [reqCustomMask, setReqCustomMask] = useState(DEFAULT_REQ_PARAMS.useCustomDither);
+  const [reqRunning,    setReqRunning]    = useState(false);
+  const [reqStatus,     setReqStatus]     = useState<string | null>(null);
 
-  // ── Build a ToolContext from current ref values ─────────────────────────────
-  // This closure is stable (no re-creation) because it reads from refs.
+  // Refs for the R key handler (reads current values without stale closure).
+  const reqAlgoRef       = useRef(reqAlgo);
+  const reqMetricRef     = useRef(reqMetric);
+  const reqFsStrRef      = useRef(reqFsStr);
+  const reqAtkStrRef     = useRef(reqAtkStr);
+  const reqBayerRef      = useRef(reqBayer);
+  const reqChromaRef     = useRef(reqChroma);
+  const reqTilePalRef    = useRef(reqTilePal);
+  const reqCustomMaskRef = useRef(reqCustomMask);
+  // Keep refs in sync.
+  useEffect(() => { reqAlgoRef.current       = reqAlgo;       }, [reqAlgo]);
+  useEffect(() => { reqMetricRef.current     = reqMetric;     }, [reqMetric]);
+  useEffect(() => { reqFsStrRef.current      = reqFsStr;      }, [reqFsStr]);
+  useEffect(() => { reqAtkStrRef.current     = reqAtkStr;     }, [reqAtkStr]);
+  useEffect(() => { reqBayerRef.current      = reqBayer;      }, [reqBayer]);
+  useEffect(() => { reqChromaRef.current     = reqChroma;     }, [reqChroma]);
+  useEffect(() => { reqTilePalRef.current    = reqTilePal;    }, [reqTilePal]);
+  useEffect(() => { reqCustomMaskRef.current = reqCustomMask; }, [reqCustomMask]);
+
+  // Source bitmap ref — updated from prop each render.
+  const sourceBitmapRef = useRef<ImageBitmap | null>(sourceBitmap ?? null);
+  useEffect(() => { sourceBitmapRef.current = sourceBitmap ?? null; }, [sourceBitmap]);
+
+  // ── Status bar state ────────────────────────────────────────────────────────
+  const [cursorGx,   setCursorGx]   = useState(-1);
+  const [cursorGy,   setCursorGy]   = useState(-1);
+  const [hoverColor, setHoverColor] = useState(0);
+  const [scale,      setScale]      = useState(4);
+  const [undoState,  setUndoState]  = useState({ canUndo: false, canRedo: false });
+
+  // ── ToolContext ─────────────────────────────────────────────────────────────
   const getCtx = useRef((): ToolContext => ({
     comp:          compRef.current,
     canvas:        canvasRef.current!,
@@ -193,10 +233,8 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
     brushShape:    brushShapeRef.current,
     fillTolerance: fillTolRef.current,
     wandTolerance: wandTolRef.current,
-    allShades:     compRef.current.allShades,
     setColor: (b: number) => {
       setActiveColor(b);
-      // Return from eyedropper to the previous tool.
       if (activeToolIdRef.current === 'eyedropper') {
         const returnId = eyedropper.returnToToolId ?? 'brush';
         eyedropper.returnToToolId = null;
@@ -205,7 +243,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
     },
     setSelMask,
     getSelMask: () => selMaskRef.current,
-  })).current; // .current = the function itself (stable reference)
+  })).current;
 
   // ── Tool switching ──────────────────────────────────────────────────────────
   function doSwitchTool(id: string) {
@@ -217,7 +255,60 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
     next.activate?.(ctx);
   }
 
-  // ── Canvas init (runs once) ─────────────────────────────────────────────────
+  // ── Requantize ──────────────────────────────────────────────────────────────
+  const doRequantize = useCallback(async () => {
+    if (reqRunning) return;
+    setReqRunning(true);
+    setReqStatus('Computing…');
+
+    const c = compRef.current;
+    const { gridCols, gridRows, frames, activeFrame, allShades } = c;
+
+    try {
+      // Obtain source ImageData.
+      let source: ImageData;
+      if (sourceBitmapRef.current) {
+        source = await scaleImage(sourceBitmapRef.current, gridCols * MAP_SIZE, gridRows * MAP_SIZE);
+      } else {
+        source = mapBytesToImageData(frames, activeFrame, gridCols, gridRows);
+      }
+
+      const params: RequantizeParams = {
+        legalOnly:       !allShades,
+        dither:          reqAlgoRef.current,
+        metric:          reqMetricRef.current,
+        fsStrength:      reqFsStrRef.current,
+        atkStrength:     reqAtkStrRef.current,
+        bayerScale:      reqBayerRef.current,
+        chromaBoost:     reqChromaRef.current,
+        tilePalette:     reqTilePalRef.current,
+        useCustomDither: reqCustomMaskRef.current && !!canvasRef.current?.ditherMask,
+        ditherMask:      reqCustomMaskRef.current ? (canvasRef.current?.ditherMask ?? null) : null,
+      };
+
+      const newTiles = requantizeGrid(source, c, selMaskRef.current, params);
+
+      // Snapshot before writing.
+      historyRef.current.snapshot(frames);
+      setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+
+      // Write new tile data back into frames (replaces activeFrame for each tile).
+      const newFrames: Uint8Array[][] = frames.map((tileFrames, ti) => {
+        const updated = tileFrames.map((f, fi) => fi === activeFrame ? newTiles[ti] : f);
+        return updated;
+      });
+
+      syncComp({ ...c, frames: newFrames });
+      setReqStatus(sourceBitmapRef.current ? 'Done ✓' : 'Done ✓ (from current pixels)');
+    } catch (err) {
+      setReqStatus(`Error: ${err}`);
+    } finally {
+      setReqRunning(false);
+      setTimeout(() => setReqStatus(null), 3000);
+    }
+  }, [reqRunning, syncComp]);
+
+  // ── Canvas init ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const el = canvasElRef.current!;
 
@@ -226,7 +317,6 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
         const ctx  = getCtx();
         const tool = TOOL_MAP.get(activeToolIdRef.current) ?? brushTool;
         tool.onPointerEvent?.(gx, gy, button, buttons, ctx);
-        // Tools mutate compRef.current.frames in place; trigger a re-render.
         setComp({ ...compRef.current });
         setUndoState({
           canUndo: historyRef.current.canUndo,
@@ -238,18 +328,15 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
       },
       onPointerHover: (gx, gy) => {
         setCursorGx(gx); setCursorGy(gy);
-        // Read colour under cursor.
-        const c = compRef.current;
+        const c  = compRef.current;
         const tx = (gx / MAP_SIZE) | 0;
         const ty = (gy / MAP_SIZE) | 0;
         const ti = ty * c.gridCols + tx;
         const frame = c.frames[ti]?.[c.activeFrame];
         setHoverColor(frame ? frame[(gx % MAP_SIZE) + (gy % MAP_SIZE) * MAP_SIZE] : 0);
-        // Magic wand hover preview.
         if (activeToolIdRef.current === 'wand') {
           magicWand.updateHover(gx, gy, getCtx());
         }
-        // Track scale.
         setScale(canvas.scale);
       },
       onWheel: (e) => {
@@ -260,9 +347,9 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
 
     canvasRef.current = canvas;
     canvas.setComposition(compRef.current);
-    canvas.selMask      = selMaskRef.current;
-    canvas.brushRadius  = brushRadiusRef.current;
-    canvas.brushShape   = brushShapeRef.current;
+    canvas.selMask     = selMaskRef.current;
+    canvas.brushRadius = brushRadiusRef.current;
+    canvas.brushShape  = brushShapeRef.current;
 
     const ro = new ResizeObserver(() => {
       canvas.resize();
@@ -276,7 +363,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
 
     return () => { canvas.stop(); ro.disconnect(); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // init once — all mutable state accessed through refs
+  }, []);
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -317,9 +404,9 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
         setSelMask(null);
         return;
       }
-      if (ctrl) return; // other ctrl combos: ignore
+      if (ctrl) return;
 
-      const c = compRef.current;
+      const c  = compRef.current;
       const gw = c.gridCols * MAP_SIZE, gh = c.gridRows * MAP_SIZE;
 
       switch (e.key) {
@@ -331,16 +418,20 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
           break;
         case '[': setBrushRadius(r => Math.max(0, r - 1)); break;
         case ']': setBrushRadius(r => Math.min(64, r + 1)); break;
-        case 'b': case 'B': doSwitchTool('brush');      break;
-        case 'f': case 'F': doSwitchTool('fill');       break;
+        case 'b': case 'B': doSwitchTool('brush');       break;
+        case 'f': case 'F': doSwitchTool('fill');        break;
         case 'e': case 'E':
           eyedropper.returnToToolId = activeToolIdRef.current;
           doSwitchTool('eyedropper');
           break;
-        case 's': case 'S': doSwitchTool('select');     break;
-        case 'l': case 'L': doSwitchTool('lasso');      break;
-        case 'w': case 'W': doSwitchTool('wand');       break;
+        case 's': case 'S': doSwitchTool('select');      break;
+        case 'l': case 'L': doSwitchTool('lasso');       break;
+        case 'w': case 'W': doSwitchTool('wand');        break;
         case 't': case 'T': doSwitchTool('ditherbrush'); break;
+        case 'r': case 'R':
+          e.preventDefault();
+          void doRequantize();
+          break;
         case 'm': case 'M':
           if (canvasRef.current) {
             canvasRef.current.showDitherMask = !canvasRef.current.showDitherMask;
@@ -361,7 +452,16 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // stable — uses refs throughout
+  }, [doRequantize]);
+
+  // ─── Dither brush strength display ───────────────────────────────────────────
+  const [ditherStrDisplay, setDitherStrDisplay] = useState(ditherBrush.strength);
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDitherStrDisplay(ditherBrush.strength);
+    }, 200);
+    return () => clearInterval(interval);
+  }, []);
 
   // ─── Tool guide list ─────────────────────────────────────────────────────────
   const TOOL_DEFS = [
@@ -375,12 +475,15 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
   ] as const;
 
   const activeTool = TOOL_MAP.get(activeToolId) ?? brushTool;
+  const hasDitherMask = !!canvasRef.current?.ditherMask;
 
   // ─── Render ───────────────────────────────────────────────────────────────────
   return (
     <div style={ROOT_STYLE}>
-      {/* Left sidebar — tool list + params */}
+      {/* Left sidebar */}
       <div style={LEFT_PANEL}>
+
+        {/* Tool list */}
         {TOOL_DEFS.map(({ id, label, key }) => (
           <button key={id} onClick={() => doSwitchTool(id)} title={`${label} (${key})`}
             style={id === activeToolId ? TOOL_BTN_ON : TOOL_BTN_OFF}>
@@ -389,23 +492,40 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
           </button>
         ))}
 
-        <div style={{ borderTop:'1px solid #333', margin:'6px 0' }} />
+        <div style={DIVIDER} />
 
-        {/* Brush / dither brush params */}
+        {/* Tool-specific params */}
         {(activeToolId === 'brush' || activeToolId === 'ditherbrush') && (
-          <Param label={`Radius: ${brushRadius}`}>
-            <input type="range" min={0} max={32} value={brushRadius}
-              onInput={(e) => setBrushRadius(+(e.target as HTMLInputElement).value)}
-              style={{ width:'100%' }} />
-            <div style={{ display:'flex', gap:4, marginTop:4 }}>
-              {(['circle','square'] as const).map(s => (
-                <button key={s} onClick={() => setBrushShape(s)}
-                  style={s === brushShape ? SHAPE_ON : SHAPE_OFF}>
-                  {s === 'circle' ? '◯' : '□'}
-                </button>
-              ))}
-            </div>
-          </Param>
+          <>
+            <Param label={`Radius: ${brushRadius}`}>
+              <input type="range" min={0} max={32} value={brushRadius}
+                onInput={(e) => setBrushRadius(+(e.target as HTMLInputElement).value)}
+                style={{ width:'100%' }} />
+              <div style={{ display:'flex', gap:4, marginTop:4 }}>
+                {(['circle','square'] as const).map(s => (
+                  <button key={s} onClick={() => setBrushShape(s)}
+                    style={s === brushShape ? SHAPE_ON : SHAPE_OFF}>
+                    {s === 'circle' ? '◯' : '□'}
+                  </button>
+                ))}
+              </div>
+            </Param>
+            {activeToolId === 'ditherbrush' && (
+              <Param label={`Strength: ${ditherStrDisplay.toFixed(1)}`}>
+                <input type="range" min={0.1} max={1} step={0.1}
+                  value={ditherStrDisplay}
+                  onInput={(e) => {
+                    const v = +(e.target as HTMLInputElement).value;
+                    ditherBrush.strength = v;
+                    setDitherStrDisplay(v);
+                  }}
+                  style={{ width:'100%' }} />
+                <span style={{ fontSize:10, color:'#666' }}>
+                  left-drag: paint · right-drag: erase · M: toggle heatmap
+                </span>
+              </Param>
+            )}
+          </>
         )}
 
         {activeToolId === 'fill' && (
@@ -427,7 +547,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
         {/* Selection ops */}
         {selMask && (
           <>
-            <div style={{ borderTop:'1px solid #333', margin:'6px 0' }} />
+            <div style={DIVIDER} />
             <button style={SEL_BTN} onClick={() => setSelMask(null)}>✕ Desel</button>
             <button style={SEL_BTN} onClick={() => {
               const { gridCols, gridRows } = compRef.current;
@@ -438,6 +558,98 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
               setSelMask(erodeSelMask(selMask, gridCols * MAP_SIZE, gridRows * MAP_SIZE));
             }}>− Shrink</button>
           </>
+        )}
+
+        <div style={DIVIDER} />
+
+        {/* ── Requantize section ──────────────────────────────────────────── */}
+        <div style={SECTION_LABEL}>Requantize (R)</div>
+
+        {/* Dither algorithm */}
+        <div style={MICRO_LABEL}>Dither</div>
+        <div style={CHIP_ROW}>
+          {(['NONE','FS','ATKINSON','BAYER'] as const).map(a => (
+            <ChipBtn key={a} active={reqAlgo === a} onClick={() => setReqAlgo(a)}>
+              {a === 'FS' ? 'FS' : a === 'ATKINSON' ? 'Atk' : a === 'BAYER' ? 'Bayer' : 'None'}
+            </ChipBtn>
+          ))}
+        </div>
+
+        {/* Per-algo slider */}
+        {reqAlgo === 'FS' && (
+          <Param label={`FS Error: ${reqFsStr.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqFsStr}
+              onInput={(e) => setReqFsStr(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        {reqAlgo === 'ATKINSON' && (
+          <Param label={`Atk Error: ${reqAtkStr.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqAtkStr}
+              onInput={(e) => setReqAtkStr(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        {reqAlgo === 'BAYER' && (
+          <Param label={`Bayer Scale: ${reqBayer.toFixed(2)}`}>
+            <input type="range" min={0.02} max={0.20} step={0.02} value={reqBayer}
+              onInput={(e) => setReqBayer(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+
+        {/* Match metric */}
+        <div style={MICRO_LABEL}>Metric</div>
+        <div style={CHIP_ROW}>
+          {(['OKLAB','CHROMA_FIRST','LUMA_FIRST','HUE_ONLY','RGB'] as const).map(m => (
+            <ChipBtn key={m} active={reqMetric === m} onClick={() => setReqMetric(m)}>
+              {m === 'OKLAB' ? 'OKLab' : m === 'CHROMA_FIRST' ? 'Chr+' : m === 'LUMA_FIRST' ? 'Lum+' : m === 'HUE_ONLY' ? 'Hue' : 'RGB'}
+            </ChipBtn>
+          ))}
+        </div>
+
+        {/* Chroma boost */}
+        <Param label={`Chroma: ${reqChroma.toFixed(2)}×`}>
+          <input type="range" min={0.25} max={4} step={0.05} value={reqChroma}
+            onInput={(e) => setReqChroma(+(e.target as HTMLInputElement).value)}
+            style={{ width:'100%' }} />
+        </Param>
+
+        {/* Tile palette + custom mask */}
+        <label style={TOGGLE_ROW}>
+          <input type="checkbox" checked={reqTilePal}
+            onChange={(e) => setReqTilePal((e.target as HTMLInputElement).checked)} />
+          <span style={{ fontSize:11 }}>Tile palette</span>
+        </label>
+
+        {reqAlgo === 'FS' && (
+          <label style={{ ...TOGGLE_ROW, opacity: hasDitherMask ? 1 : 0.4 }}>
+            <input type="checkbox" checked={reqCustomMask}
+              disabled={!hasDitherMask}
+              onChange={(e) => setReqCustomMask((e.target as HTMLInputElement).checked)} />
+            <span style={{ fontSize:11 }}>Custom mask (T)</span>
+          </label>
+        )}
+
+        {/* Apply button */}
+        <button
+          onClick={() => void doRequantize()}
+          disabled={reqRunning}
+          style={{ ...SEL_BTN, marginTop:4, textAlign:'center', color: reqRunning ? '#555' : '#8cf' }}
+        >
+          {reqRunning ? 'Running…' : 'Apply (R)'}
+        </button>
+
+        {reqStatus && (
+          <div style={{ fontSize:10, color: reqStatus.startsWith('Error') ? '#f77' : '#7f7', marginTop:2 }}>
+            {reqStatus}
+          </div>
+        )}
+
+        {!sourceBitmap && (
+          <div style={{ fontSize:10, color:'#555', marginTop:2, fontStyle:'italic' }}>
+            No source image — will requantize from current pixels
+          </div>
         )}
       </div>
 
@@ -454,7 +666,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows }: 
         onColorPick={setActiveColor}
       />
 
-      {/* Status bar — spans all columns */}
+      {/* Status bar */}
       <div style={{ gridColumn:'1 / -1' }}>
         <StatusBar
           comp={comp}
@@ -483,11 +695,29 @@ function Param({ label, children }: { label: string; children: ComponentChildren
   );
 }
 
+function ChipBtn({ active, onClick, children }: { active: boolean; onClick: () => void; children: ComponentChildren }) {
+  return (
+    <button onClick={onClick} style={{
+      flex:          1,
+      background:    active ? '#1b3556' : 'transparent',
+      border:        `1px solid ${active ? '#4a9eff' : '#444'}`,
+      borderRadius:   3,
+      color:         active ? '#8cf' : '#888',
+      cursor:        'pointer',
+      fontSize:       10,
+      padding:       '2px 0',
+      textAlign:     'center',
+    }}>
+      {children}
+    </button>
+  );
+}
+
 // ─── Styles ───────────────────────────────────────────────────────────────────
 
 const ROOT_STYLE: h.JSX.CSSProperties = {
   display:             'grid',
-  gridTemplateColumns: '112px 1fr 160px',
+  gridTemplateColumns: '128px 1fr 160px',
   gridTemplateRows:    '1fr auto',
   width:               '100%',
   height:              '100%',
@@ -549,4 +779,36 @@ const SEL_BTN: h.JSX.CSSProperties = {
   padding:       '3px 6px',
   fontSize:       11,
   textAlign:     'left',
+};
+
+const DIVIDER: h.JSX.CSSProperties = {
+  borderTop: '1px solid #333',
+  margin:    '4px 0',
+};
+
+const SECTION_LABEL: h.JSX.CSSProperties = {
+  fontSize:    11,
+  color:       '#5af',
+  fontWeight:  'bold',
+  marginTop:    2,
+  marginBottom: 2,
+};
+
+const MICRO_LABEL: h.JSX.CSSProperties = {
+  fontSize: 10,
+  color:    '#666',
+  marginTop: 3,
+};
+
+const CHIP_ROW: h.JSX.CSSProperties = {
+  display: 'flex',
+  gap:      2,
+};
+
+const TOGGLE_ROW: h.JSX.CSSProperties = {
+  display:    'flex',
+  alignItems: 'center',
+  gap:         5,
+  cursor:     'pointer',
+  marginTop:   2,
 };

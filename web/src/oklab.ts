@@ -9,13 +9,19 @@ export type OKLab = [L: number, a: number, b: number];
 
 // ─── sRGB gamma ──────────────────────────────────────────────────────────────
 
-function linearize(c: number): number {
+export function srgbToLinear(c: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-function delinearize(c: number): number {
+export function linearToSrgb(c: number): number {
+  if (c <= 0) return 0;
+  if (c >= 1) return 1;
   return c <= 0.0031308 ? 12.92 * c : 1.055 * Math.pow(c, 1.0 / 2.4) - 0.055;
 }
+
+// Private aliases kept for internal use
+const linearize   = srgbToLinear;
+const delinearize = linearToSrgb;
 
 // ─── RGB (0–255 ints) → OKLab ────────────────────────────────────────────────
 

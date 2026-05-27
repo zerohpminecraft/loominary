@@ -1,10 +1,13 @@
 /**
  * Dither Brush tool (T) — paint the dither-strength mask.
  *
- * Left-drag increases the dither strength (0→1) at the brush location.
- * Right-drag decreases it.
- * The dither mask is a Float32Array (values 0–1) that `computeDitherStrength`
- * uses to mix between nearest-neighbour and full dither per pixel.
+ * Left-drag  stamps `strength` (0–1) at every pixel under the brush.
+ * Right-drag stamps 0 (erase — reverts to nearest-neighbour in that region).
+ * Scroll / onWheel adjusts `strength` in 0.1 steps.
+ *
+ * The mask is consumed by requantize (R): pixels with high strength get full
+ * error-diffusion; pixels with zero get pure nearest-neighbour.
+ *
  * Pressing M toggles the heatmap overlay; the Editor manages that flag.
  */
 
@@ -16,11 +19,13 @@ export class DitherBrushTool implements Tool {
   readonly name   = 'Dither Brush';
   readonly cursor = 'crosshair';
 
-  private dragging  = false;
-  private dragSign  = 1;   // +1 paint, -1 erase
-  private lastGx    = -1;
-  private lastGy    = -1;
-  private strength  = 0.1; // delta per pixel per stamp
+  /** Value stamped by left-drag (0.0–1.0). Adjusted by scroll wheel. */
+  strength = 1.0;
+
+  private dragging = false;
+  private dragSign = 1;    // +1 paint strength, -1 paint 0
+  private lastGx   = -1;
+  private lastGy   = -1;
 
   onPointerEvent(gx: number, gy: number, button: number, _buttons: number, ctx: ToolContext): void {
     if (button === 0 || button === 2) {
@@ -39,26 +44,29 @@ export class DitherBrushTool implements Tool {
     this.lastGx = -1; this.lastGy = -1;
   }
 
+  onWheel(delta: number, _ctx: ToolContext): void {
+    this.strength = Math.round(Math.min(1, Math.max(0.1, this.strength + delta * 0.1)) * 10) / 10;
+  }
+
   private stamp(gx: number, gy: number, ctx: ToolContext): void {
     const { comp } = ctx;
     const gridW = comp.gridCols * 128;
     const gridH = comp.gridRows * 128;
     const r     = ctx.brushRadius;
+    const value = this.dragSign > 0 ? this.strength : 0;
 
     if (!ctx.canvas.ditherMask) {
       ctx.canvas.ditherMask = new Float32Array(gridW * gridH);
     }
     const mask = ctx.canvas.ditherMask;
-    const delta = this.strength * this.dragSign;
 
     const r2 = (r + 0.5) * (r + 0.5);
     for (let dy = -r; dy <= r; dy++) {
       for (let dx = -r; dx <= r; dx++) {
-        if (dx * dx + dy * dy > r2) continue;
+        if (ctx.brushShape === 'circle' && dx * dx + dy * dy > r2) continue;
         const nx = gx + dx, ny = gy + dy;
         if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) continue;
-        const i = ny * gridW + nx;
-        mask[i] = Math.min(1, Math.max(0, mask[i] + delta));
+        mask[ny * gridW + nx] = value;
       }
     }
 

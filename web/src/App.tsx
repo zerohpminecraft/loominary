@@ -236,7 +236,7 @@ export function App() {
       {/* ── Editor / placeholder ── */}
       <div style={{ flex:1, overflow:'hidden' }}>
         {comp ? (
-          <Editor initialComp={comp} gridCols={gridCols} gridRows={gridRows} />
+          <Editor initialComp={comp} gridCols={gridCols} gridRows={gridRows} sourceBitmap={sourceBitmap} />
         ) : (
           <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100%', gap:16 }}>
             <p style={{ color:'#555', fontSize:14, margin:0 }}>No composition loaded.</p>

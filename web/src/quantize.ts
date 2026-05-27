@@ -1,24 +1,24 @@
 /**
  * Image quantization to Minecraft map-colour bytes.
  *
- * Port of PngToMapColors.java.  The primary entry point for the editor is
- * `convertTwoPassGrid()` which processes the full grid in a single pass so
- * that dither error diffuses naturally across tile seams.
- *
- * All functions operate on RGBA ImageData (browser Canvas API) rather than
- * Java BufferedImage, but the algorithms are unchanged.
+ * Port of PngToMapColors.java.  The primary entry points:
+ *   convertTwoPassGrid()  — import path: full grid in one seamless pass
+ *   requantizeGrid()      — editor R key: re-quantize with full param set
  */
 
 import { MC_PALETTE, IS_VALID, IS_LEGAL } from './palette.js';
-import { rgbToOklab, oklabDistSq } from './oklab.js';
+import { rgbToOklab, oklabToLinearRgb, oklabDistSq, srgbToLinear, linearToSrgb } from './oklab.js';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 export const MAP_SIZE  = 128;
 export const MAP_BYTES = MAP_SIZE * MAP_SIZE; // 16384
 
-/** Squared OKLab error below which diffusion is suppressed. */
+/** Squared OKLab error below which FS diffusion is suppressed. */
 const ERROR_FLOOR_SQ = 0.015 * 0.015;
+
+/** Squared OKLab chroma below which a colour is considered achromatic (for HUE_ONLY). */
+const ACHROMATIC_SQ = 0.04 * 0.04;
 
 const BAYER_MATRIX: readonly number[][] = [
   [ 0,  8,  2, 10],
@@ -26,33 +26,54 @@ const BAYER_MATRIX: readonly number[][] = [
   [ 3, 11,  1,  9],
   [15,  7, 13,  5],
 ] as const;
-const BAYER_SCALE = 0.08;
+const DEFAULT_BAYER_SCALE = 0.08;
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+export const DitherAlgo = {
+  NONE:     'NONE',
+  FS:       'FS',       // Floyd-Steinberg
+  ATKINSON: 'ATKINSON',
+  BAYER:    'BAYER',
+} as const;
+export type DitherAlgo = typeof DitherAlgo[keyof typeof DitherAlgo];
+
+/** Distance metric used during nearest-colour matching.
+ *
+ *  OKLAB        — standard perceptual Euclidean (default)
+ *  CHROMA_FIRST — 4× weight on a,b components (pushes saturated palette use)
+ *  LUMA_FIRST   — 4× weight on L (preserves luminosity over hue)
+ *  HUE_ONLY     — angular hue distance in OKLab a-b plane; achromatic falls back to OKLab
+ *  RGB          — sRGB Euclidean (matches what most colour pickers show)
+ */
+export const MatchMetric = {
+  OKLAB:        'OKLAB',
+  CHROMA_FIRST: 'CHROMA_FIRST',
+  LUMA_FIRST:   'LUMA_FIRST',
+  HUE_ONLY:     'HUE_ONLY',
+  RGB:          'RGB',
+} as const;
+export type MatchMetric = typeof MatchMetric[keyof typeof MatchMetric];
+
+// ─── Lookup table types ───────────────────────────────────────────────────────
+
+export type PaletteFlag    = Uint8Array;                                    // length 256, non-zero = in palette
+export type OklabLookup    = Array<[number, number, number] | null>;        // [L, a, b] per map-byte
+export type LinearRgbLookup = Array<[number, number, number] | null>;       // [r, g, b] linear per map-byte
 
 // ─── Palette helpers ──────────────────────────────────────────────────────────
 
-export type PaletteFlag = Uint8Array; // length 256, non-zero = in palette
-
-/** Build a palette flag array from an existing map-colour tile. */
 export function buildPaletteFromTile(mapColors: Uint8Array): PaletteFlag {
   const p = new Uint8Array(256);
   for (let i = 0; i < mapColors.length; i++) p[mapColors[i]] = 1;
+  p[0] = 0;
   return p;
 }
 
-/** Full legal palette (shades 0–2, colorIds 1–61). */
-export function fullLegalPalette(): PaletteFlag {
-  return IS_LEGAL.slice();
-}
+export function fullLegalPalette(): PaletteFlag  { return IS_LEGAL.slice(); }
+export function fullAllShadesPalette(): PaletteFlag { return IS_VALID.slice(); }
 
-/** Full all-shades palette (includes unobtainable shade 3). */
-export function fullAllShadesPalette(): PaletteFlag {
-  return IS_VALID.slice();
-}
-
-// ─── OKLab lookup table ───────────────────────────────────────────────────────
-
-/** Pre-computed OKLab [L, a, b] for every valid map byte. Null entries = invalid. */
-export type OklabLookup = Array<[number, number, number] | null>;
+// ─── OKLab lookup ────────────────────────────────────────────────────────────
 
 export function buildOklabLookup(): OklabLookup {
   const out: OklabLookup = new Array(256).fill(null);
@@ -64,9 +85,36 @@ export function buildOklabLookup(): OklabLookup {
   return out;
 }
 
+// ─── Linear RGB lookup (for RGB metric) ──────────────────────────────────────
+
+export function buildLinearRgbLookup(): LinearRgbLookup {
+  const out: LinearRgbLookup = new Array(256).fill(null);
+  for (let b = 1; b < 256; b++) {
+    if (!IS_VALID[b]) continue;
+    const p = MC_PALETTE[b];
+    out[b] = [
+      srgbToLinear(((p >> 16) & 0xff) / 255),
+      srgbToLinear(((p >>  8) & 0xff) / 255),
+      srgbToLinear(( p        & 0xff) / 255),
+    ];
+  }
+  return out;
+}
+
+// ─── Palette hues (for HUE_ONLY metric) ──────────────────────────────────────
+
+export function buildPaletteHues(palette: PaletteFlag, oklab: OklabLookup): Float32Array {
+  const hues = new Float32Array(256);
+  for (let c = 1; c < 256; c++) {
+    if (!palette[c] || !oklab[c]) continue;
+    hues[c] = Math.atan2(oklab[c]![2], oklab[c]![1]);
+  }
+  return hues;
+}
+
 // ─── Nearest-match in palette ─────────────────────────────────────────────────
 
-/** Find the map byte in `palette` with the smallest OKLab distance to (L,a,b). */
+/** OKLAB-only nearest match (fast path). */
 export function findClosestInPalette(
   L: number, a: number, b: number,
   palette: PaletteFlag,
@@ -84,50 +132,137 @@ export function findClosestInPalette(
   return bestByte;
 }
 
-/** Find the nearest palette neighbour of `color` (excluding itself). */
-function findNearestNeighbor(color: number, freq: Int32Array, oklab: OklabLookup): number {
-  const entry = oklab[color];
-  if (!entry) return color;
-  let bestDist = Infinity, bestC = color;
+/** Metric-aware nearest match.  Falls through to the fast path for OKLAB. */
+export function findClosestInPaletteWithMetric(
+  L: number, a: number, b: number,
+  palette:  PaletteFlag,
+  oklab:    OklabLookup,
+  metric:   MatchMetric,
+  rgbLookup: LinearRgbLookup | null,
+  palHues:   Float32Array | null,
+): number {
+  if (metric === 'OKLAB') return findClosestInPalette(L, a, b, palette, oklab);
+
+  let bestDist = Infinity;
+  let bestByte = 0;
+
+  const inputChromaSq = a * a + b * b;
+  const inputHue      = metric === 'HUE_ONLY' ? Math.atan2(b, a) : 0;
+  const inputLinRgb   = metric === 'RGB' ? oklabToLinearRgb(L, a, b) : null;
+
   for (let c = 1; c < 256; c++) {
-    if (c === color || freq[c] === 0) continue;
-    const e = oklab[c];
-    if (!e) continue;
-    const d = oklabDistSq(entry[0], entry[1], entry[2], e[0], e[1], e[2]);
-    if (d < bestDist) { bestDist = d; bestC = c; }
+    if (!palette[c]) continue;
+    const entry = oklab[c];
+    if (!entry) continue;
+
+    const [cL, ca, cb] = entry;
+    const dL = L - cL, da = a - ca, db = b - cb;
+
+    let dist: number;
+    if (metric === 'CHROMA_FIRST') {
+      dist = dL * dL + 4 * da * da + 4 * db * db;
+    } else if (metric === 'LUMA_FIRST') {
+      dist = 4 * dL * dL + da * da + db * db;
+    } else if (metric === 'HUE_ONLY') {
+      const palChromaSq = ca * ca + cb * cb;
+      if (inputChromaSq < ACHROMATIC_SQ) {
+        dist = dL * dL + da * da + db * db;
+      } else if (palChromaSq < ACHROMATIC_SQ) {
+        dist = 2.01;
+      } else {
+        const ph = palHues ? palHues[c] : Math.atan2(cb, ca);
+        let hDiff = inputHue - ph;
+        if (hDiff >  Math.PI) hDiff -= 2 * Math.PI;
+        if (hDiff < -Math.PI) hDiff += 2 * Math.PI;
+        dist = 1.0 - Math.cos(hDiff);
+      }
+    } else if (metric === 'RGB') {
+      const rl = rgbLookup?.[c];
+      if (!rl || !inputLinRgb) {
+        dist = dL * dL + da * da + db * db;
+      } else {
+        const dr = inputLinRgb[0] - rl[0];
+        const dg = inputLinRgb[1] - rl[1];
+        const db2 = inputLinRgb[2] - rl[2];
+        dist = dr * dr + dg * dg + db2 * db2;
+      }
+    } else {
+      dist = dL * dL + da * da + db * db;
+    }
+
+    if (dist < bestDist) { bestDist = dist; bestByte = c; }
   }
-  return bestC;
+  return bestByte;
 }
 
-// ─── Dither algorithms ────────────────────────────────────────────────────────
-
-export const DitherAlgo = {
-  NONE:     'NONE',
-  FS:       'FS',       // Floyd-Steinberg
-  ATKINSON: 'ATKINSON',
-  BAYER:    'BAYER',
-} as const;
-export type DitherAlgo = typeof DitherAlgo[keyof typeof DitherAlgo];
-
-// ─── Two-pass grid quantization (primary path) ────────────────────────────────
-
-export interface QuantizeParams {
-  legalOnly:    boolean;   // restrict to obtainable shades 0–2
-  targetColors: number;    // 0 = no limit; >0 = reduce to this many
-  dither:       DitherAlgo;
-  diffuseAmount?: number;  // FS / Atkinson error scale (default 1.0)
-  bayerScale?:    number;  // Bayer threshold amplitude (default BAYER_SCALE)
-}
+// ─── Chroma boost ─────────────────────────────────────────────────────────────
 
 /**
- * Full two-pass quantization.  Operates on the entire multi-tile grid image
- * as a unit so that palette, dither strength, and error diffusion are
- * consistent across tile seams.
- *
- * @param imageData  Source image already scaled to `cols*128 × rows*128` pixels.
- * @param cols       Grid columns.
- * @param rows       Grid rows.
- * @returns  `Uint8Array[cols*rows]` — one 16384-byte tile array per tile, row-major.
+ * Scale OKLab a,b (chroma) components of every pixel in `img` by `boost`.
+ * Values > 1 saturate; < 1 desaturate.  Out-of-gamut results are clamped.
+ */
+export function boostChromaImageData(img: ImageData, boost: number): ImageData {
+  if (boost === 1) return img;
+  const out = new ImageData(img.width, img.height);
+  const src = img.data, dst = out.data;
+  for (let i = 0; i < src.length; i += 4) {
+    const alpha = src[i + 3];
+    dst[i + 3] = alpha;
+    if (alpha < 128) continue;
+    const [L, aOk, bOk] = rgbToOklab(src[i], src[i + 1], src[i + 2]);
+    const [rl, gl, bl] = oklabToLinearRgb(L, aOk * boost, bOk * boost);
+    dst[i]     = Math.round(Math.min(1, Math.max(0, linearToSrgb(rl))) * 255);
+    dst[i + 1] = Math.round(Math.min(1, Math.max(0, linearToSrgb(gl))) * 255);
+    dst[i + 2] = Math.round(Math.min(1, Math.max(0, linearToSrgb(bl))) * 255);
+  }
+  return out;
+}
+
+// ─── Params ───────────────────────────────────────────────────────────────────
+
+/** Parameters for the image-import path (convertTwoPassGrid). */
+export interface QuantizeParams {
+  legalOnly:     boolean;
+  targetColors:  number;           // 0 = no limit
+  dither:        DitherAlgo;
+  diffuseAmount?: number;          // FS / Atkinson error scale (default 1.0)
+  bayerScale?:    number;
+  metric?:        MatchMetric;     // default OKLAB
+  chromaBoost?:   number;          // default 1.0
+}
+
+/** Full parameter set for the editor requantize (R key). */
+export interface RequantizeParams {
+  legalOnly:        boolean;
+  dither:           DitherAlgo;
+  metric:           MatchMetric;
+  fsStrength:       number;        // FS error diffusion scale 0.1–1.0
+  atkStrength:      number;        // Atkinson error diffusion scale 0.1–1.0
+  bayerScale:       number;        // Bayer threshold amplitude 0.02–0.20
+  chromaBoost:      number;        // OKLab a,b multiplier 0.25–4.0 (1.0 = off)
+  tilePalette:      boolean;       // restrict palette to colors already in the tile
+  useCustomDither:  boolean;       // use ditherMask for per-pixel FS strength
+  ditherMask:       Float32Array | null; // per-pixel strength (gridW*gridH); null = all 1.0
+}
+
+export const DEFAULT_REQ_PARAMS: RequantizeParams = {
+  legalOnly:       true,
+  dither:          'FS',
+  metric:          'OKLAB',
+  fsStrength:      1.0,
+  atkStrength:     1.0,
+  bayerScale:      DEFAULT_BAYER_SCALE,
+  chromaBoost:     1.0,
+  tilePalette:     false,
+  useCustomDither: false,
+  ditherMask:      null,
+};
+
+// ─── Two-pass grid quantization (import path) ─────────────────────────────────
+
+/**
+ * Full two-pass quantization on the entire multi-tile grid.
+ * Seamless across tile seams (dither error diffuses grid-wide).
  */
 export function convertTwoPassGrid(
   imageData: ImageData,
@@ -137,19 +272,22 @@ export function convertTwoPassGrid(
 ): Uint8Array[] {
   const totalW = cols * MAP_SIZE;
   const totalH = rows * MAP_SIZE;
-  const oklab  = buildOklabLookup();
+  const metric  = params.metric ?? 'OKLAB';
+  const boost   = params.chromaBoost ?? 1;
+  const oklab   = buildOklabLookup();
   const palette: PaletteFlag = params.legalOnly ? IS_LEGAL.slice() : IS_VALID.slice();
 
-  // Pass 1: nearest-neighbor to build global colour set.
+  const src = boost !== 1 ? boostChromaImageData(imageData, boost) : imageData;
+
+  // Pass 1: nearest-neighbour to build global colour set.
   const firstPass = new Uint8Array(totalW * totalH);
   for (let y = 0; y < totalH; y++) {
     for (let x = 0; x < totalW; x++) {
-      const i  = (y * totalW + x) * 4;
-      const d  = imageData.data;
-      const alpha = d[i + 3];
-      if (alpha < 128) { firstPass[y * totalW + x] = 0; continue; }
+      const i = (y * totalW + x) * 4;
+      const d = src.data;
+      if (d[i + 3] < 128) { firstPass[y * totalW + x] = 0; continue; }
       const [L, a, b] = rgbToOklab(d[i], d[i + 1], d[i + 2]);
-      firstPass[y * totalW + x] = findClosestInPalette(L, a, b, palette, oklab);
+      firstPass[y * totalW + x] = findClosestInPaletteWithMetric(L, a, b, palette, oklab, metric, null, null);
     }
   }
 
@@ -160,53 +298,311 @@ export function convertTwoPassGrid(
 
   const activePalette = buildPaletteFromTile(firstPass);
 
-  // Pass 2: render with chosen dither algorithm.
+  // Pass 2: dither.
   let fullResult: Uint8Array;
   switch (params.dither) {
     case 'FS': {
-      const strength = computeDitherStrength(imageData, totalW, totalH, oklab);
-      fullResult = renderDithered(imageData, activePalette, oklab, strength, totalW, totalH,
-        params.diffuseAmount ?? 1.0);
+      const strength = computeDitherStrength(src, totalW, totalH, oklab);
+      fullResult = renderDithered(src, activePalette, oklab, strength, totalW, totalH,
+        params.diffuseAmount ?? 1.0, metric);
       break;
     }
     case 'ATKINSON':
-      fullResult = renderAtkinson(imageData, activePalette, oklab, totalW, totalH,
-        params.diffuseAmount ?? 1.0);
+      fullResult = renderAtkinson(src, activePalette, oklab, totalW, totalH,
+        params.diffuseAmount ?? 1.0, metric);
       break;
     case 'BAYER':
-      fullResult = renderBayer4x4(imageData, activePalette, oklab, totalW, totalH,
-        params.bayerScale ?? BAYER_SCALE);
+      fullResult = renderBayer4x4(src, activePalette, oklab, totalW, totalH,
+        params.bayerScale ?? DEFAULT_BAYER_SCALE, metric);
       break;
     default:
-      fullResult = renderNearest(imageData, activePalette, oklab, totalW, totalH);
+      fullResult = renderNearest(src, activePalette, oklab, totalW, totalH, metric);
   }
 
   return splitIntoTiles(fullResult, totalW, cols, rows);
 }
 
-/** Single-tile convenience wrapper (1×1 grid). */
-export function convertSingleTile(
-  imageData: ImageData,
-  params: QuantizeParams,
-): Uint8Array {
+export function convertSingleTile(imageData: ImageData, params: QuantizeParams): Uint8Array {
   return convertTwoPassGrid(imageData, 1, 1, params)[0];
 }
 
-// ─── Re-quantize a selection ──────────────────────────────────────────────────
+// ─── Re-quantize (editor R key) ───────────────────────────────────────────────
 
 /**
- * Re-quantize a sub-region of an existing grid from a source image.
- *
- * The quantization runs on the full source image (to keep dither calibration
- * global), but only pixels covered by `selMask` are written back to `current`.
- *
- * @param current   Existing flat pixel array (gridW × gridH, one byte per pixel).
- * @param source    Source image scaled to gridW × gridH.
- * @param selMask   Selection mask of size gridW × gridH (0 = not selected).
- * @param gridW     gridCols * 128
- * @param gridH     gridRows * 128
- * @returns New flat pixel array with selected pixels re-quantized.
+ * Reconstruct an RGBA ImageData from the current map-byte grid.
+ * Used when no source image is available — re-quantizes from the visible appearance.
  */
+export function mapBytesToImageData(
+  frames: Uint8Array[][],
+  activeFrame: number,
+  cols: number,
+  rows: number,
+): ImageData {
+  const totalW = cols * MAP_SIZE;
+  const totalH = rows * MAP_SIZE;
+  const img    = new ImageData(totalW, totalH);
+  const d      = img.data;
+  for (let tileRow = 0; tileRow < rows; tileRow++) {
+    for (let tileCol = 0; tileCol < cols; tileCol++) {
+      const ti    = tileRow * cols + tileCol;
+      const frame = frames[ti]?.[Math.min(activeFrame, (frames[ti]?.length ?? 1) - 1)];
+      if (!frame) continue;
+      for (let ly = 0; ly < MAP_SIZE; ly++) {
+        for (let lx = 0; lx < MAP_SIZE; lx++) {
+          const mapByte = frame[lx + ly * MAP_SIZE];
+          const gx = tileCol * MAP_SIZE + lx;
+          const gy = tileRow * MAP_SIZE + ly;
+          const di = (gy * totalW + gx) * 4;
+          if (mapByte === 0) {
+            d[di + 3] = 0;
+          } else {
+            const rgb = MC_PALETTE[mapByte];
+            d[di]     = (rgb >> 16) & 0xff;
+            d[di + 1] = (rgb >>  8) & 0xff;
+            d[di + 2] =  rgb        & 0xff;
+            d[di + 3] = 255;
+          }
+        }
+      }
+    }
+  }
+  return img;
+}
+
+/**
+ * Extract a single 128×128 tile's worth of ImageData from the full grid image.
+ */
+function extractTileImageData(full: ImageData, tileCol: number, tileRow: number, cols: number): ImageData {
+  const tile  = new ImageData(MAP_SIZE, MAP_SIZE);
+  const totalW = cols * MAP_SIZE;
+  for (let y = 0; y < MAP_SIZE; y++) {
+    const srcBase = ((tileRow * MAP_SIZE + y) * totalW + tileCol * MAP_SIZE) * 4;
+    tile.data.set(full.data.subarray(srcBase, srcBase + MAP_SIZE * 4), y * MAP_SIZE * 4);
+  }
+  return tile;
+}
+
+/**
+ * Re-quantize the full grid (or selection) with the given parameters.
+ *
+ * Returns a new flat tile array (one `Uint8Array` per tile, 16384 bytes each)
+ * representing the result for `comp.activeFrame`.  Tiles outside `selMask`
+ * are untouched (original data is returned as-is).
+ *
+ * `source` must already be scaled to `gridCols*128 × gridRows*128`.
+ */
+export function requantizeGrid(
+  source: ImageData,
+  comp: { gridCols: number; gridRows: number; frames: Uint8Array[][]; activeFrame: number },
+  selMask: Uint8Array | null,
+  p: RequantizeParams,
+): Uint8Array[] {
+  const { gridCols: cols, gridRows: rows } = comp;
+  const totalW = cols * MAP_SIZE;
+  const totalH = rows * MAP_SIZE;
+  const oklab  = buildOklabLookup();
+  const palette: PaletteFlag = p.legalOnly ? IS_LEGAL.slice() : IS_VALID.slice();
+
+  const src = p.chromaBoost !== 1 ? boostChromaImageData(source, p.chromaBoost) : source;
+
+  // Build extra lookup tables needed for some metrics.
+  const rgbLookup = p.metric === 'RGB'      ? buildLinearRgbLookup() : null;
+
+  // Decide whether to use the fast seamless grid path or per-tile.
+  // Seamless grid FS only works for OKLAB + no tilePalette + no custom dither mask.
+  const useGridPass = p.dither === 'FS'
+    && p.metric === 'OKLAB'
+    && !p.tilePalette
+    && !p.useCustomDither;
+
+  // ── Seamless grid FS path ───────────────────────────────────────────────
+  if (useGridPass) {
+    // First pass: build the global palette.
+    const firstPass = new Uint8Array(totalW * totalH);
+    for (let y = 0; y < totalH; y++) {
+      for (let x = 0; x < totalW; x++) {
+        const i = (y * totalW + x) * 4;
+        const d = src.data;
+        if (d[i + 3] < 128) { firstPass[y * totalW + x] = 0; continue; }
+        const [L, a, b] = rgbToOklab(d[i], d[i + 1], d[i + 2]);
+        firstPass[y * totalW + x] = findClosestInPalette(L, a, b, palette, oklab);
+      }
+    }
+    const activePalette = buildPaletteFromTile(firstPass);
+
+    // Dither strength: custom mask if provided, else Otsu-adaptive.
+    let strength: Float32Array;
+    if (p.useCustomDither && p.ditherMask) {
+      strength = p.ditherMask;
+    } else {
+      strength = computeDitherStrength(src, totalW, totalH, oklab);
+    }
+
+    const full    = renderDithered(src, activePalette, oklab, strength, totalW, totalH, p.fsStrength, 'OKLAB');
+    const newTiles = splitIntoTiles(full, totalW, cols, rows);
+
+    return applySelectionMask(newTiles, comp.frames, comp.activeFrame, selMask, cols, rows);
+  }
+
+  // ── Per-tile path (all other algo/metric combinations) ─────────────────
+  const result: Uint8Array[] = [];
+
+  for (let tileRow = 0; tileRow < rows; tileRow++) {
+    for (let tileCol = 0; tileCol < cols; tileCol++) {
+      const ti      = tileRow * cols + tileCol;
+      const tileImg = extractTileImageData(src, tileCol, tileRow, cols);
+
+      // Check whether any selected pixels exist in this tile (if selection active).
+      const localSel = selMask ? localSelMaskForTile(selMask, tileCol, tileRow, cols) : null;
+      if (selMask && !localSel) {
+        // Nothing selected in this tile — return existing data unchanged.
+        result.push(comp.frames[ti]?.[comp.activeFrame]?.slice() ?? new Uint8Array(MAP_BYTES));
+        continue;
+      }
+
+      // Build palette.
+      let tilePalette: PaletteFlag;
+      if (p.tilePalette) {
+        // Use only colours already present in the tile.
+        const existingFrame = comp.frames[ti]?.[comp.activeFrame];
+        const src2 = existingFrame ?? new Uint8Array(MAP_BYTES);
+        tilePalette = buildPaletteFromTile(selectionFilteredColors(src2, localSel));
+        // Fall back to full palette if tile has no colours yet.
+        if (!tilePalette.some(v => v)) tilePalette = palette;
+      } else {
+        // Build from first-pass NN on this tile.
+        const firstPassTile = new Uint8Array(MAP_BYTES);
+        for (let y = 0; y < MAP_SIZE; y++) {
+          for (let x = 0; x < MAP_SIZE; x++) {
+            const i = (y * MAP_SIZE + x) * 4;
+            const d = tileImg.data;
+            if (d[i + 3] < 128) { firstPassTile[y * MAP_SIZE + x] = 0; continue; }
+            const [L, a, b] = rgbToOklab(d[i], d[i + 1], d[i + 2]);
+            firstPassTile[y * MAP_SIZE + x] = findClosestInPaletteWithMetric(L, a, b, palette, oklab, p.metric, rgbLookup, null);
+          }
+        }
+        tilePalette = buildPaletteFromTile(firstPassTile);
+      }
+
+      // Build metric helpers.
+      const palHues = p.metric === 'HUE_ONLY' ? buildPaletteHues(tilePalette, oklab) : null;
+
+      // Render.
+      let rendered: Uint8Array;
+      switch (p.dither) {
+        case 'FS': {
+          let sm: Float32Array;
+          if (p.useCustomDither && p.ditherMask) {
+            // Extract tile-local slice of the global dither mask.
+            sm = extractTileMask(p.ditherMask, tileCol, tileRow, cols);
+          } else {
+            sm = new Float32Array(MAP_BYTES).fill(1);
+          }
+          rendered = renderDithered(tileImg, tilePalette, oklab, sm, MAP_SIZE, MAP_SIZE, p.fsStrength, p.metric, rgbLookup, palHues);
+          break;
+        }
+        case 'ATKINSON':
+          rendered = renderAtkinson(tileImg, tilePalette, oklab, MAP_SIZE, MAP_SIZE, p.atkStrength, p.metric, rgbLookup, palHues);
+          break;
+        case 'BAYER':
+          rendered = renderBayer4x4(tileImg, tilePalette, oklab, MAP_SIZE, MAP_SIZE, p.bayerScale, p.metric, rgbLookup, palHues);
+          break;
+        default:
+          rendered = renderNearest(tileImg, tilePalette, oklab, MAP_SIZE, MAP_SIZE, p.metric, rgbLookup, palHues);
+      }
+
+      // Blend back with existing data using selection mask.
+      if (localSel) {
+        const existing = comp.frames[ti]?.[comp.activeFrame] ?? new Uint8Array(MAP_BYTES);
+        const blended  = existing.slice();
+        for (let i = 0; i < MAP_BYTES; i++) {
+          if (localSel[i]) blended[i] = rendered[i];
+        }
+        result.push(blended);
+      } else {
+        result.push(rendered);
+      }
+    }
+  }
+  return result;
+}
+
+// ─── Selection helpers ────────────────────────────────────────────────────────
+
+/** Extract the 128×128 local selection mask for a tile (returns null if nothing selected). */
+function localSelMaskForTile(
+  globalSel: Uint8Array, tileCol: number, tileRow: number, cols: number,
+): Uint8Array | null {
+  const gridW = cols * MAP_SIZE;
+  const local = new Uint8Array(MAP_BYTES);
+  let any = false;
+  for (let ly = 0; ly < MAP_SIZE; ly++) {
+    for (let lx = 0; lx < MAP_SIZE; lx++) {
+      const gx = tileCol * MAP_SIZE + lx;
+      const gy = tileRow * MAP_SIZE + ly;
+      if (globalSel[gy * gridW + gx]) {
+        local[lx + ly * MAP_SIZE] = 1;
+        any = true;
+      }
+    }
+  }
+  return any ? local : null;
+}
+
+/** Filter a map-byte array to only include colours in the selection. */
+function selectionFilteredColors(mapColors: Uint8Array, sel: Uint8Array | null): Uint8Array {
+  if (!sel) return mapColors;
+  const out = new Uint8Array(MAP_BYTES);
+  for (let i = 0; i < MAP_BYTES; i++) if (sel[i]) out[i] = mapColors[i];
+  return out;
+}
+
+/** Apply a selection mask: only overwrite pixels that are selected. */
+function applySelectionMask(
+  newTiles:  Uint8Array[],
+  oldFrames: Uint8Array[][],
+  frameIdx:  number,
+  selMask:   Uint8Array | null,
+  cols:      number,
+  rows:      number,
+): Uint8Array[] {
+  if (!selMask) return newTiles;
+  const result: Uint8Array[] = [];
+  for (let tileRow = 0; tileRow < rows; tileRow++) {
+    for (let tileCol = 0; tileCol < cols; tileCol++) {
+      const ti       = tileRow * cols + tileCol;
+      const localSel = localSelMaskForTile(selMask, tileCol, tileRow, cols);
+      if (!localSel) {
+        result.push(oldFrames[ti]?.[frameIdx]?.slice() ?? new Uint8Array(MAP_BYTES));
+        continue;
+      }
+      const existing = oldFrames[ti]?.[frameIdx] ?? new Uint8Array(MAP_BYTES);
+      const blended  = existing.slice();
+      for (let i = 0; i < MAP_BYTES; i++) {
+        if (localSel[i]) blended[i] = newTiles[ti][i];
+      }
+      result.push(blended);
+    }
+  }
+  return result;
+}
+
+/** Extract a tile-local 128×128 slice of the global dither mask. */
+function extractTileMask(globalMask: Float32Array, tileCol: number, tileRow: number, cols: number): Float32Array {
+  const gridW = cols * MAP_SIZE;
+  const local = new Float32Array(MAP_BYTES);
+  for (let ly = 0; ly < MAP_SIZE; ly++) {
+    for (let lx = 0; lx < MAP_SIZE; lx++) {
+      const gx = tileCol * MAP_SIZE + lx;
+      const gy = tileRow * MAP_SIZE + ly;
+      local[lx + ly * MAP_SIZE] = globalMask[gy * gridW + gx];
+    }
+  }
+  return local;
+}
+
+// ─── Re-quantize a selection (simple single-pass wrapper) ────────────────────
+
 export function requantizeSelection(
   current: Uint8Array,
   source: ImageData,
@@ -215,20 +611,14 @@ export function requantizeSelection(
   gridH: number,
   params: QuantizeParams,
 ): Uint8Array {
-  const cols = gridW / MAP_SIZE;
-  const rows = gridH / MAP_SIZE;
+  const cols  = gridW / MAP_SIZE;
+  const rows  = gridH / MAP_SIZE;
   const tiles = convertTwoPassGrid(source, cols, rows, params);
-
-  // Flatten the per-tile result back to a single grid array.
-  const full = new Uint8Array(gridW * gridH);
+  const full  = new Uint8Array(gridW * gridH);
   flattenTiles(tiles, full, cols, rows);
-
   if (!selMask) return full;
-
   const result = current.slice();
-  for (let i = 0; i < result.length; i++) {
-    if (selMask[i]) result[i] = full[i];
-  }
+  for (let i = 0; i < result.length; i++) if (selMask[i]) result[i] = full[i];
   return result;
 }
 
@@ -237,15 +627,18 @@ export function requantizeSelection(
 function renderNearest(
   img: ImageData, palette: PaletteFlag, oklab: OklabLookup,
   width: number, height: number,
+  metric: MatchMetric = 'OKLAB',
+  rgbLookup: LinearRgbLookup | null = null,
+  palHues:   Float32Array | null = null,
 ): Uint8Array {
   const out = new Uint8Array(width * height);
-  const d = img.data;
+  const d   = img.data;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const si = (y * width + x) * 4;
       if (d[si + 3] < 128) { out[y * width + x] = 0; continue; }
       const [L, a, b] = rgbToOklab(d[si], d[si + 1], d[si + 2]);
-      out[y * width + x] = findClosestInPalette(L, a, b, palette, oklab);
+      out[y * width + x] = findClosestInPaletteWithMetric(L, a, b, palette, oklab, metric, rgbLookup, palHues);
     }
   }
   return out;
@@ -256,14 +649,16 @@ function renderDithered(
   ditherStrength: Float32Array,
   width: number, height: number,
   diffuseAmount: number,
+  metric: MatchMetric = 'OKLAB',
+  rgbLookup: LinearRgbLookup | null = null,
+  palHues:   Float32Array | null = null,
 ): Uint8Array {
   const out = new Uint8Array(width * height);
-  const d = img.data;
+  const d   = img.data;
   let errCur = new Float32Array(width * 3);
   let errNxt = new Float32Array(width * 3);
 
   for (let y = 0; y < height; y++) {
-    // Swap row buffers.
     const tmp = errCur; errCur = errNxt; errNxt = tmp;
     errNxt.fill(0);
 
@@ -273,11 +668,11 @@ function renderDithered(
 
       const [sL, sa, sb] = rgbToOklab(d[si], d[si + 1], d[si + 2]);
       const ei = x * 3;
-      const L = sL + errCur[ei    ];
-      const a = sa + errCur[ei + 1];
-      const b = sb + errCur[ei + 2];
+      const L  = sL + errCur[ei    ];
+      const a  = sa + errCur[ei + 1];
+      const b  = sb + errCur[ei + 2];
 
-      const chosen = findClosestInPalette(L, a, b, palette, oklab);
+      const chosen = findClosestInPaletteWithMetric(L, a, b, palette, oklab, metric, rgbLookup, palHues);
       out[y * width + x] = chosen;
 
       const cl = oklab[chosen]!;
@@ -312,9 +707,12 @@ function renderAtkinson(
   img: ImageData, palette: PaletteFlag, oklab: OklabLookup,
   width: number, height: number,
   diffuseAmount: number,
+  metric: MatchMetric = 'OKLAB',
+  rgbLookup: LinearRgbLookup | null = null,
+  palHues:   Float32Array | null = null,
 ): Uint8Array {
   const out = new Uint8Array(width * height);
-  const d = img.data;
+  const d   = img.data;
   let errCur  = new Float32Array(width * 3);
   let errNxt  = new Float32Array(width * 3);
   let errNxt2 = new Float32Array(width * 3);
@@ -329,15 +727,15 @@ function renderAtkinson(
 
       const [sL, sa, sb] = rgbToOklab(d[si], d[si + 1], d[si + 2]);
       const ei = x * 3;
-      const L = sL + errCur[ei];
-      const a = sa + errCur[ei + 1];
-      const b = sb + errCur[ei + 2];
+      const L  = sL + errCur[ei];
+      const a  = sa + errCur[ei + 1];
+      const b  = sb + errCur[ei + 2];
 
-      const chosen = findClosestInPalette(L, a, b, palette, oklab);
+      const chosen = findClosestInPaletteWithMetric(L, a, b, palette, oklab, metric, rgbLookup, palHues);
       out[y * width + x] = chosen;
 
-      const cl = oklab[chosen]!;
-      const sc = diffuseAmount / 8;
+      const cl  = oklab[chosen]!;
+      const sc  = diffuseAmount / 8;
       const seL = (L - cl[0]) * sc;
       const sea = (a - cl[1]) * sc;
       const seb = (b - cl[2]) * sc;
@@ -357,17 +755,21 @@ function renderBayer4x4(
   img: ImageData, palette: PaletteFlag, oklab: OklabLookup,
   width: number, height: number,
   bayerScale: number,
+  metric: MatchMetric = 'OKLAB',
+  rgbLookup: LinearRgbLookup | null = null,
+  palHues:   Float32Array | null = null,
 ): Uint8Array {
   const out = new Uint8Array(width * height);
-  const d = img.data;
+  const d   = img.data;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const si = (y * width + x) * 4;
       if (d[si + 3] < 128) { out[y * width + x] = 0; continue; }
       const [L, a, b] = rgbToOklab(d[si], d[si + 1], d[si + 2]);
-      const t = (BAYER_MATRIX[y & 3][x & 3] + 0.5) / 16.0 - 0.5;
+      const t      = (BAYER_MATRIX[y & 3][x & 3] + 0.5) / 16.0 - 0.5;
       const offset = t * bayerScale;
-      out[y * width + x] = findClosestInPalette(L + offset, a + offset, b + offset, palette, oklab);
+      out[y * width + x] = findClosestInPaletteWithMetric(
+        L + offset, a + offset, b + offset, palette, oklab, metric, rgbLookup, palHues);
     }
   }
   return out;
@@ -379,14 +781,14 @@ export function computeDitherStrength(
   img: ImageData,
   width: number,
   height: number,
-  oklab: OklabLookup,
+  _oklab: OklabLookup,
 ): Float32Array {
   const total = width * height;
-  const d = img.data;
+  const d     = img.data;
 
-  const okL = new Float32Array(total);
-  const okA = new Float32Array(total);
-  const okB = new Float32Array(total);
+  const okL    = new Float32Array(total);
+  const okA    = new Float32Array(total);
+  const okB    = new Float32Array(total);
   const opaque = new Uint8Array(total);
 
   for (let y = 0; y < height; y++) {
@@ -415,8 +817,8 @@ export function computeDitherStrength(
     }
   }
 
-  const T = otsuThreshold(contrast);
-  const lower = T * 0.5, upper = T * 1.5, range = upper - lower;
+  const T      = otsuThreshold(contrast);
+  const lower  = T * 0.5, upper = T * 1.5, range = upper - lower;
 
   const strength = new Float32Array(total);
   for (let i = 0; i < total; i++) {
@@ -429,7 +831,7 @@ export function computeDitherStrength(
 }
 
 function otsuThreshold(values: Float32Array): number {
-  const N = values.length;
+  const N      = values.length;
   const sorted = values.slice().sort();
   if (sorted[0] === sorted[N - 1]) return sorted[N >> 1];
 
@@ -457,10 +859,6 @@ export const Strategy = {
 } as const;
 export type Strategy = typeof Strategy[keyof typeof Strategy];
 
-/**
- * Reduce the distinct colour count in `mapColors` to `targetColors` in-place.
- * Returns `[colorsRemoved, pixelsAffected]`.
- */
 export function reduceColorsInPlace(
   mapColors: Uint8Array,
   targetColors: number,
@@ -498,6 +896,20 @@ export function reduceColorsInPlace(
   return [colorsRemoved, pixelsAffected];
 }
 
+function findNearestNeighbor(color: number, freq: Int32Array, oklab: OklabLookup): number {
+  const entry = oklab[color];
+  if (!entry) return color;
+  let bestDist = Infinity, bestC = color;
+  for (let c = 1; c < 256; c++) {
+    if (c === color || freq[c] === 0) continue;
+    const e = oklab[c];
+    if (!e) continue;
+    const d = oklabDistSq(entry[0], entry[1], entry[2], e[0], e[1], e[2]);
+    if (d < bestDist) { bestDist = d; bestC = c; }
+  }
+  return bestC;
+}
+
 function findClosestPairForMerge(
   freq: Int32Array,
   oklab: OklabLookup,
@@ -531,7 +943,6 @@ export function countDistinct(mapColors: Uint8Array): number {
   return n;
 }
 
-/** Split a flat grid pixel array into per-tile 16384-byte arrays. */
 export function splitIntoTiles(full: Uint8Array, totalW: number, cols: number, rows: number): Uint8Array[] {
   const tiles: Uint8Array[] = [];
   for (let tileRow = 0; tileRow < rows; tileRow++) {
@@ -547,7 +958,6 @@ export function splitIntoTiles(full: Uint8Array, totalW: number, cols: number, r
   return tiles;
 }
 
-/** Inverse of splitIntoTiles: write tiles back into a flat grid array. */
 export function flattenTiles(tiles: Uint8Array[], out: Uint8Array, cols: number, rows: number): void {
   const totalW = cols * MAP_SIZE;
   for (let tileRow = 0; tileRow < rows; tileRow++) {
@@ -563,14 +973,9 @@ export function flattenTiles(tiles: Uint8Array[], out: Uint8Array, cols: number,
   }
 }
 
-/** Scale an ImageBitmap to a target size using a canvas (bicubic via browser). */
-export async function scaleImage(
-  bitmap: ImageBitmap,
-  targetW: number,
-  targetH: number,
-): Promise<ImageData> {
+export async function scaleImage(bitmap: ImageBitmap, targetW: number, targetH: number): Promise<ImageData> {
   const canvas = new OffscreenCanvas(targetW, targetH);
-  const ctx = canvas.getContext('2d')!;
+  const ctx    = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(bitmap, 0, 0, targetW, targetH);

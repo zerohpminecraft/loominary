@@ -73,6 +73,15 @@ export class MapCanvas {
   brushRadius = 0;
   brushShape: 'circle' | 'square' = 'circle';
 
+  // Requantize preview — renders this comp instead of the real one when set.
+  previewComp: CompositionState | null = null;
+
+  // Paste ghost — clipboard pixels rendered semi-transparently at cursor.
+  pasteGhost: { pixels: Uint8Array; mask: Uint8Array; w: number; h: number } | null = null;
+
+  // Heatmap LUT — packed 0x00RRGGBB per map-byte; when set, replaces MC_PALETTE.
+  heatmapLut: Uint32Array | null = null;
+
   private raf: number | null = null;
   private opts: CanvasOptions;
 
@@ -151,8 +160,8 @@ export class MapCanvas {
     ctx.fillStyle = '#1a1a1a';
     ctx.fillRect(0, 0, w, h);
 
-    if (!this._comp) return;
-    const comp = this._comp;
+    const comp = this.previewComp ?? this._comp;
+    if (!comp) return;
     const gridW = comp.gridCols * MAP_SIZE;
     const gridH = comp.gridRows * MAP_SIZE;
 
@@ -208,6 +217,16 @@ export class MapCanvas {
 
     // Brush ring overlay.
     if (this.brushX >= 0) this.drawBrushOverlay(ctx);
+
+    // Paste ghost (rendered last so it appears on top).
+    if (this.pasteGhost && this.brushX >= 0) this.drawPasteGhost(ctx);
+
+    // Preview border — thin cyan outline around canvas when preview is active.
+    if (this.previewComp) {
+      ctx.strokeStyle = 'rgba(80,200,255,0.55)';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(2, 2, w - 4, h - 4);
+    }
   }
 
   private _comp: CompositionState | null = null;
@@ -248,7 +267,7 @@ export class MapCanvas {
               d[di + 2] =  checkered        & 0xff;
               d[di + 3] = 255;
             } else {
-              const rgb = MC_PALETTE[mapByte];
+              const rgb = this.heatmapLut ? this.heatmapLut[mapByte] : MC_PALETTE[mapByte];
               d[di    ] = (rgb >> 16) & 0xff;
               d[di + 1] = (rgb >>  8) & 0xff;
               d[di + 2] =  rgb        & 0xff;
@@ -330,6 +349,40 @@ export class MapCanvas {
         }
       }
     }
+  }
+
+  private drawPasteGhost(ctx: CanvasRenderingContext2D): void {
+    const { scale, translateX, translateY, pasteGhost, brushX, brushY } = this;
+    if (!pasteGhost) return;
+    const { pixels, mask, w, h } = pasteGhost;
+    const ox = brushX - Math.floor(w / 2);
+    const oy = brushY - Math.floor(h / 2);
+
+    for (let py = 0; py < h; py++) {
+      for (let px = 0; px < w; px++) {
+        const ci = py * w + px;
+        if (!mask[ci]) continue;
+        const rgb = MC_PALETTE[pixels[ci]] ?? 0;
+        const r = (rgb >> 16) & 0xff;
+        const g = (rgb >>  8) & 0xff;
+        const b =  rgb        & 0xff;
+        ctx.fillStyle = `rgba(${r},${g},${b},0.72)`;
+        ctx.fillRect(
+          translateX + (ox + px) * scale,
+          translateY + (oy + py) * scale,
+          scale, scale,
+        );
+      }
+    }
+    // Outline around the bounding box
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(
+      translateX + ox * scale - 0.5,
+      translateY + oy * scale - 0.5,
+      w * scale + 1,
+      h * scale + 1,
+    );
   }
 
   private drawBrushOverlay(ctx: CanvasRenderingContext2D): void {

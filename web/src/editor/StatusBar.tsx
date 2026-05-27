@@ -7,19 +7,25 @@ import { MC_PALETTE } from '../palette.js';
 import type { CompositionState } from '../payload-state.js';
 
 interface StatusBarProps {
-  comp:        CompositionState;
-  cursorGx:    number;
-  cursorGy:    number;
-  hoverColor:  number;  // map byte under cursor
-  activeColor: number;
-  activeTool:  string;
-  scale:       number;
-  canUndo:     boolean;
-  canRedo:     boolean;
+  comp:           CompositionState;
+  cursorGx:       number;
+  cursorGy:       number;
+  hoverColor:     number;  // map byte under cursor
+  activeColor:    number;
+  activeTool:     string;
+  scale:          number;
+  canUndo:        boolean;
+  canRedo:        boolean;
+  maxFrames:      number;
+  frameDelay:     number;
+  distinctCount:  number;
+  inPreview:      boolean;
+  mergeQueueSize: number;
 }
 
 export function StatusBar({
-  comp, cursorGx, cursorGy, hoverColor, activeColor, activeTool, scale, canUndo, canRedo,
+  comp, cursorGx, cursorGy, hoverColor, activeColor, activeTool, scale,
+  canUndo, canRedo, maxFrames, frameDelay, distinctCount, inPreview, mergeQueueSize,
 }: StatusBarProps) {
   const inBounds = cursorGx >= 0 && cursorGy >= 0
     && cursorGx < comp.gridCols * 128
@@ -42,6 +48,14 @@ export function StatusBar({
 
   return (
     <div style={BAR_STYLE}>
+      {/* Preview indicator */}
+      {inPreview && (
+        <>
+          <span style={{ ...SEG, color:'#5cf', fontWeight:'bold' }}>PREVIEW</span>
+          <Sep />
+        </>
+      )}
+
       {/* Tool */}
       <span style={SEG}>{activeTool}</span>
       <Sep />
@@ -68,13 +82,31 @@ export function StatusBar({
       <ColorChip r={ar} g={ag} b={ab} label={`fg ${activeColor}`} />
       <Sep />
 
+      {/* Distinct color count */}
+      <span style={{ ...SEG, color: distinctCount > 180 ? '#f77' : distinctCount > 120 ? '#fa5' : '#aaa' }}
+        title="Distinct map colors in current frame">
+        {distinctCount} colors
+      </span>
+      <Sep />
+
+      {/* Merge queue */}
+      {mergeQueueSize > 0 && (
+        <>
+          <span style={{ ...SEG, color:'#f93' }} title="Colors in merge queue — C to commit">
+            {mergeQueueSize} queued
+          </span>
+          <Sep />
+        </>
+      )}
+
       {/* Zoom */}
       <span style={SEG}>{scale}×</span>
       <Sep />
 
       {/* Frame */}
       <span style={SEG}>
-        Frame {comp.activeFrame + 1}/{Math.max(...comp.frames.map(f => f.length), 1)}
+        Frame {comp.activeFrame + 1}/{maxFrames}
+        {maxFrames > 1 && <span style={{ color:'#666' }}> · {frameDelay}ms</span>}
       </span>
       <Sep />
 

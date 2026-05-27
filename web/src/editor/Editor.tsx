@@ -26,25 +26,33 @@ import {
   MatchMetric,
   DEFAULT_REQ_PARAMS,
   type RequantizeParams,
+  countDistinct,
+  reduceColorsInPlace,
+  type Strategy,
 } from '../quantize.js';
+import { MC_PALETTE }  from '../palette.js';
 import type { CompositionState } from '../payload-state.js';
 import { emptyPayloadState, compositionFromState } from '../payload-state.js';
+import { FilterType, applyFilter } from '../filters.js';
 
-import { BrushTool }       from './tools/Brush.js';
-import { FillTool }        from './tools/Fill.js';
-import { RectSelectTool }  from './tools/Select.js';
-import { LassoTool }       from './tools/Lasso.js';
-import { MagicWandTool }   from './tools/MagicWand.js';
+import { BrushTool }      from './tools/Brush.js';
+import { FillTool }       from './tools/Fill.js';
+import { RectSelectTool } from './tools/Select.js';
+import { LassoTool }      from './tools/Lasso.js';
+import { MagicWandTool }  from './tools/MagicWand.js';
 import type { Tool, ToolContext } from './tools/Tool.js';
-import { dilateSelMask, erodeSelMask, writePixel, MAP_SIZE } from './tools/Tool.js';
+import {
+  dilateSelMask, erodeSelMask,
+  readPixel, writePixel, MAP_SIZE,
+} from './tools/Tool.js';
 
 // ─── Tool registry ────────────────────────────────────────────────────────────
 
-const brushTool   = new BrushTool();
-const fillTool    = new FillTool();
-const rectSelect  = new RectSelectTool();
-const lasso       = new LassoTool();
-const magicWand = new MagicWandTool();
+const brushTool  = new BrushTool();
+const fillTool   = new FillTool();
+const rectSelect = new RectSelectTool();
+const lasso      = new LassoTool();
+const magicWand  = new MagicWandTool();
 
 const ALL_TOOLS: Tool[] = [brushTool, fillTool, rectSelect, lasso, magicWand];
 const TOOL_MAP = new Map(ALL_TOOLS.map(t => [t.id, t]));
@@ -81,7 +89,7 @@ function resizeComposition(comp: CompositionState, newCols: number, newRows: num
 
 const OKLAB = buildOklabLookup();
 
-// ─── Metric / algo cycle helpers ─────────────────────────────────────────────
+// ─── Metric / algo / filter / strategy cycle helpers ─────────────────────────
 
 const METRIC_CYCLE: Array<typeof MatchMetric[keyof typeof MatchMetric]> =
   ['OKLAB', 'CHROMA_FIRST', 'LUMA_FIRST', 'HUE_ONLY', 'RGB'];
@@ -93,6 +101,52 @@ const DITHER_CYCLE: DitherAlgo[] = ['NONE', 'FS', 'ATKINSON', 'BAYER'];
 const DITHER_LABEL: Record<string, string> = {
   NONE: 'None', FS: 'FS', ATKINSON: 'Atk', BAYER: 'Bayer',
 };
+
+const FILTER_CYCLE: FilterType[] = ['SMOOTH', 'MEDIAN', 'SHARPEN', 'POSTERIZE'];
+const FILTER_LABEL: Record<string, string> = {
+  SMOOTH: 'Smooth', MEDIAN: 'Median', SHARPEN: 'Sharpen', POSTERIZE: 'Poster',
+};
+
+const STRATEGY_CYCLE: Strategy[] = ['RAREST', 'CLOSEST', 'WEIGHTED'];
+const STRATEGY_LABEL: Record<string, string> = {
+  RAREST: 'Rarest', CLOSEST: 'Closest', WEIGHTED: 'Weighted',
+};
+
+// ─── Heatmap LUT builder ──────────────────────────────────────────────────────
+
+function buildHeatmapLut(comp: CompositionState): Uint32Array {
+  const freq = new Int32Array(256);
+  for (const tf of comp.frames) {
+    const f = tf[comp.activeFrame];
+    if (!f) continue;
+    for (let i = 0; i < f.length; i++) freq[f[i] & 0xFF]++;
+  }
+  let minF = Infinity, maxF = 0;
+  for (let c = 1; c < 256; c++) {
+    if (freq[c] > 0) { if (freq[c] < minF) minF = freq[c]; if (freq[c] > maxF) maxF = freq[c]; }
+  }
+  const lut = new Uint32Array(256);
+  for (let c = 1; c < 256; c++) {
+    if (!freq[c]) { lut[c] = 0x222222; continue; }
+    // t=0 → rarest (expensive, red)   t=1 → commonest (cheap, blue)
+    const t = maxF === minF ? 0.5 : (freq[c] - minF) / (maxF - minF);
+    const h = (240 * t) / 360; // hue 0=red, 0.667=blue
+    const s = 0.9, l = 0.45;
+    const cv = (1 - Math.abs(2*l - 1)) * s;
+    const x  = cv * (1 - Math.abs((h * 6) % 2 - 1));
+    const m  = l - cv/2;
+    let r=0, g=0, b=0;
+    const h6 = h * 6;
+    if      (h6 < 1) { r=cv; g=x;  b=0;  }
+    else if (h6 < 2) { r=x;  g=cv; b=0;  }
+    else if (h6 < 3) { r=0;  g=cv; b=x;  }
+    else if (h6 < 4) { r=0;  g=x;  b=cv; }
+    else if (h6 < 5) { r=x;  g=0;  b=cv; }
+    else             { r=cv; g=0;  b=x;  }
+    lut[c] = (Math.round((r+m)*255) << 16) | (Math.round((g+m)*255) << 8) | Math.round((b+m)*255);
+  }
+  return lut;
+}
 
 // ─── Editor props ─────────────────────────────────────────────────────────────
 
@@ -173,6 +227,14 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
     _setFillTol(next);
   }
 
+  const [wandTol, _setWandTol] = useState(0.15);
+  const wandTolRef = useRef(0.15);
+  function setWandTol(fn: number | ((t: number) => number)) {
+    const next = typeof fn === 'function' ? fn(wandTolRef.current) : fn;
+    wandTolRef.current = next;
+    _setWandTol(next);
+  }
+
   const [selMask, _setSelMask] = useState<Uint8Array | null>(null);
   const selMaskRef = useRef<Uint8Array | null>(null);
   function setSelMask(m: Uint8Array | null) {
@@ -182,34 +244,81 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
   }
 
   // ── Requantize params ───────────────────────────────────────────────────────
-  const [reqAlgo,       setReqAlgo]       = useState<DitherAlgo>(DEFAULT_REQ_PARAMS.dither);
-  const [reqMetric,     setReqMetric]     = useState<typeof MatchMetric[keyof typeof MatchMetric]>(DEFAULT_REQ_PARAMS.metric);
-  const [reqFsStr,      setReqFsStr]      = useState(DEFAULT_REQ_PARAMS.fsStrength);
-  const [reqAtkStr,     setReqAtkStr]     = useState(DEFAULT_REQ_PARAMS.atkStrength);
-  const [reqBayer,      setReqBayer]      = useState(DEFAULT_REQ_PARAMS.bayerScale);
-  const [reqChroma,     setReqChroma]     = useState(DEFAULT_REQ_PARAMS.chromaBoost);
-  const [reqTilePal,    setReqTilePal]    = useState(DEFAULT_REQ_PARAMS.tilePalette);
-  // Custom dither mask removed (dither brush tool removed)
-  const [reqRunning,    setReqRunning]    = useState(false);
-  const [reqStatus,     setReqStatus]     = useState<string | null>(null);
+  const [reqAlgo,    setReqAlgo]    = useState<DitherAlgo>(DEFAULT_REQ_PARAMS.dither);
+  const [reqMetric,  setReqMetric]  = useState<typeof MatchMetric[keyof typeof MatchMetric]>(DEFAULT_REQ_PARAMS.metric);
+  const [reqFsStr,   setReqFsStr]   = useState(DEFAULT_REQ_PARAMS.fsStrength);
+  const [reqAtkStr,  setReqAtkStr]  = useState(DEFAULT_REQ_PARAMS.atkStrength);
+  const [reqBayer,   setReqBayer]   = useState(DEFAULT_REQ_PARAMS.bayerScale);
+  const [reqChroma,  setReqChroma]  = useState(DEFAULT_REQ_PARAMS.chromaBoost);
+  const [reqTilePal, setReqTilePal] = useState(DEFAULT_REQ_PARAMS.tilePalette);
+  const [reqRunning, setReqRunning] = useState(false);
+  const [reqStatus,  setReqStatus]  = useState<string | null>(null);
 
-  const reqAlgoRef       = useRef(reqAlgo);
-  const reqMetricRef     = useRef(reqMetric);
-  const reqFsStrRef      = useRef(reqFsStr);
-  const reqAtkStrRef     = useRef(reqAtkStr);
-  const reqBayerRef      = useRef(reqBayer);
-  const reqChromaRef     = useRef(reqChroma);
-  const reqTilePalRef    = useRef(reqTilePal);
-  useEffect(() => { reqAlgoRef.current       = reqAlgo;       }, [reqAlgo]);
-  useEffect(() => { reqMetricRef.current     = reqMetric;     }, [reqMetric]);
-  useEffect(() => { reqFsStrRef.current      = reqFsStr;      }, [reqFsStr]);
-  useEffect(() => { reqAtkStrRef.current     = reqAtkStr;     }, [reqAtkStr]);
-  useEffect(() => { reqBayerRef.current      = reqBayer;      }, [reqBayer]);
-  useEffect(() => { reqChromaRef.current     = reqChroma;     }, [reqChroma]);
-  useEffect(() => { reqTilePalRef.current    = reqTilePal;    }, [reqTilePal]);
+  const reqAlgoRef    = useRef(reqAlgo);
+  const reqMetricRef  = useRef(reqMetric);
+  const reqFsStrRef   = useRef(reqFsStr);
+  const reqAtkStrRef  = useRef(reqAtkStr);
+  const reqBayerRef   = useRef(reqBayer);
+  const reqChromaRef  = useRef(reqChroma);
+  const reqTilePalRef = useRef(reqTilePal);
+  useEffect(() => { reqAlgoRef.current    = reqAlgo;    }, [reqAlgo]);
+  useEffect(() => { reqMetricRef.current  = reqMetric;  }, [reqMetric]);
+  useEffect(() => { reqFsStrRef.current   = reqFsStr;   }, [reqFsStr]);
+  useEffect(() => { reqAtkStrRef.current  = reqAtkStr;  }, [reqAtkStr]);
+  useEffect(() => { reqBayerRef.current   = reqBayer;   }, [reqBayer]);
+  useEffect(() => { reqChromaRef.current  = reqChroma;  }, [reqChroma]);
+  useEffect(() => { reqTilePalRef.current = reqTilePal; }, [reqTilePal]);
 
   const sourceBitmapRef = useRef<ImageBitmap | null>(sourceBitmap ?? null);
   useEffect(() => { sourceBitmapRef.current = sourceBitmap ?? null; }, [sourceBitmap]);
+
+  // ── Requantize preview ──────────────────────────────────────────────────────
+  const [previewComp, _setPreviewComp] = useState<CompositionState | null>(null);
+  const previewCompRef = useRef<CompositionState | null>(null);
+  function setPreviewComp(c: CompositionState | null) {
+    previewCompRef.current = c;
+    _setPreviewComp(c);
+    if (canvasRef.current) { canvasRef.current.previewComp = c; canvasRef.current.markDirty(); }
+  }
+
+  // ── Clipboard / paste mode ──────────────────────────────────────────────────
+  const clipWRef   = useRef(0);
+  const clipHRef   = useRef(0);
+  const clipPixRef = useRef<Uint8Array | null>(null);
+  const clipMskRef = useRef<Uint8Array | null>(null);
+
+  const [inPasteMode, _setInPasteMode] = useState(false);
+  const inPasteModeRef = useRef(false);
+  function setInPasteMode(v: boolean) {
+    inPasteModeRef.current = v;
+    _setInPasteMode(v);
+    if (!v && canvasRef.current) { canvasRef.current.pasteGhost = null; canvasRef.current.markDirty(); }
+  }
+
+  // ── Merge queue ─────────────────────────────────────────────────────────────
+  const mergeQueueRef = useRef<Set<number>>(new Set());
+  const [mergeQueueVer, setMergeQueueVer] = useState(0); // bumped to trigger re-render
+  const [mergeScope, _setMergeScope] = useState<'frame' | 'all'>('frame');
+  const mergeScopeRef = useRef<'frame' | 'all'>('frame');
+  function setMergeScope(s: 'frame' | 'all') { mergeScopeRef.current = s; _setMergeScope(s); }
+
+  // ── Filter ──────────────────────────────────────────────────────────────────
+  const [filterType, _setFilterType] = useState<FilterType>('SMOOTH');
+  const filterTypeRef = useRef<FilterType>('SMOOTH');
+  function setFilterType(ft: FilterType) { filterTypeRef.current = ft; _setFilterType(ft); }
+
+  const [filterStrength, _setFilterStrength] = useState(1.0);
+  const filterStrengthRef = useRef(1.0);
+  function setFilterStrength(s: number) { filterStrengthRef.current = s; _setFilterStrength(s); }
+
+  // ── Reduction strategy ──────────────────────────────────────────────────────
+  const [reductionStrategy, _setReductionStrategy] = useState<Strategy>('RAREST');
+  const reductionStrategyRef = useRef<Strategy>('RAREST');
+  function setReductionStrategy(s: Strategy) { reductionStrategyRef.current = s; _setReductionStrategy(s); }
+
+  // ── Heatmap ─────────────────────────────────────────────────────────────────
+  const [heatmapOn, setHeatmapOn] = useState(false);
+  const heatmapOnRef = useRef(false);
 
   // ── Status / display state ──────────────────────────────────────────────────
   const [cursorGx,   setCursorGx]   = useState(-1);
@@ -219,13 +328,19 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
   const [undoState,  setUndoState]  = useState({ canUndo: false, canRedo: false });
   const [statusMsg,  setStatusMsg]  = useState<string | null>(null);
 
-  const [wandTol, _setWandTol] = useState(0.15);
-  const wandTolRef = useRef(0.15);
-  function setWandTol(fn: number | ((t: number) => number)) {
-    const next = typeof fn === 'function' ? fn(wandTolRef.current) : fn;
-    wandTolRef.current = next;
-    _setWandTol(next);
-  }
+  // ── Heatmap effect: rebuild LUT and push to canvas ──────────────────────────
+  useEffect(() => {
+    heatmapOnRef.current = heatmapOn;
+    const c = canvasRef.current;
+    if (!c) return;
+    if (heatmapOn) {
+      c.heatmapLut = buildHeatmapLut(compRef.current);
+    } else {
+      c.heatmapLut = null;
+    }
+    c.markDirty();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [heatmapOn, comp.frames, comp.activeFrame]);
 
   // ── ToolContext ─────────────────────────────────────────────────────────────
   const getCtx = useRef((): ToolContext => ({
@@ -253,11 +368,276 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
     next.activate?.(ctx);
   }
 
+  // ── Clipboard helpers ───────────────────────────────────────────────────────
+  function doCopySelection(): boolean {
+    const sel = selMaskRef.current;
+    if (!sel) { setStatusMsg('No selection — use S / L / W first'); return false; }
+    const c = compRef.current;
+    const gw = c.gridCols * MAP_SIZE, gh = c.gridRows * MAP_SIZE;
+    let x0 = gw, y0 = gh, x1 = -1, y1 = -1;
+    for (let gy = 0; gy < gh; gy++)
+      for (let gx = 0; gx < gw; gx++)
+        if (sel[gy * gw + gx]) {
+          if (gx < x0) x0 = gx; if (gy < y0) y0 = gy;
+          if (gx > x1) x1 = gx; if (gy > y1) y1 = gy;
+        }
+    if (x1 < 0) { setStatusMsg('Selection is empty'); return false; }
+    const cw = x1-x0+1, ch = y1-y0+1;
+    const pix  = new Uint8Array(cw * ch);
+    const mask = new Uint8Array(cw * ch);
+    for (let gy = y0; gy <= y1; gy++)
+      for (let gx = x0; gx <= x1; gx++) {
+        const ci = (gy-y0)*cw + (gx-x0);
+        if (sel[gy*gw+gx]) { pix[ci] = readPixel(c, gx, gy); mask[ci] = 1; }
+      }
+    clipWRef.current = cw; clipHRef.current = ch;
+    clipPixRef.current = pix; clipMskRef.current = mask;
+    setStatusMsg(`Copied ${cw}×${ch} — Ctrl+V to paste`);
+    return true;
+  }
+
+  function doCutSelection(): void {
+    if (!doCopySelection()) return;
+    const c   = compRef.current;
+    const sel = selMaskRef.current!;
+    const gw  = c.gridCols * MAP_SIZE, gh = c.gridRows * MAP_SIZE;
+    historyRef.current.snapshot(c.frames);
+    for (let gy = 0; gy < gh; gy++)
+      for (let gx = 0; gx < gw; gx++)
+        if (sel[gy*gw+gx]) writePixel(c, gx, gy, 0, null);
+    syncComp({ ...c });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setStatusMsg(`Cut — Ctrl+V to paste`);
+  }
+
+  function startPaste(): void {
+    if (!clipPixRef.current) { setStatusMsg('Nothing to paste — copy a selection first (Ctrl+C)'); return; }
+    setInPasteMode(true);
+    if (canvasRef.current) {
+      canvasRef.current.pasteGhost = {
+        pixels: clipPixRef.current!,
+        mask:   clipMskRef.current!,
+        w:      clipWRef.current,
+        h:      clipHRef.current,
+      };
+      canvasRef.current.markDirty();
+    }
+    setStatusMsg('Paste — click to stamp · Enter to stamp at cursor · Esc to cancel');
+  }
+
+  function commitPasteAt(gx: number, gy: number): void {
+    if (!clipPixRef.current || !clipMskRef.current) return;
+    const c  = compRef.current;
+    const cw = clipWRef.current, ch = clipHRef.current;
+    const ox = gx - Math.floor(cw / 2);
+    const oy = gy - Math.floor(ch / 2);
+    historyRef.current.snapshot(c.frames);
+    const newSel = new Uint8Array(c.gridCols * MAP_SIZE * c.gridRows * MAP_SIZE);
+    let placed = 0;
+    for (let py = 0; py < ch; py++) {
+      for (let px = 0; px < cw; px++) {
+        const ci = py * cw + px;
+        if (!clipMskRef.current[ci]) continue;
+        const tgx = ox + px, tgy = oy + py;
+        if (writePixel(c, tgx, tgy, clipPixRef.current[ci], null)) {
+          newSel[tgy * c.gridCols * MAP_SIZE + tgx] = 1;
+          placed++;
+        }
+      }
+    }
+    syncComp({ ...c });
+    setSelMask(placed > 0 ? newSel : selMaskRef.current);
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setInPasteMode(false);
+    setStatusMsg(`Pasted ${placed} pixel${placed !== 1 ? 's' : ''}`);
+  }
+
+  // ── Merge helpers ───────────────────────────────────────────────────────────
+  function toggleMergeColor(color: number): void {
+    if (color === 0) return;
+    const q = mergeQueueRef.current;
+    if (q.has(color)) q.delete(color); else q.add(color);
+    setMergeQueueVer(v => v + 1);
+    if (q.size > 0) setStatusMsg(`Merge queue: ${q.size} color${q.size>1?'s':''} — C commits → active color`);
+    else setStatusMsg('Removed from merge queue');
+  }
+
+  function commitMerge(): void {
+    const q = mergeQueueRef.current;
+    if (q.size === 0) { setStatusMsg('Queue empty — Ctrl+click swatches or canvas pixels to add'); return; }
+    const target  = activeColorRef.current;
+    const sources = new Set(q); sources.delete(target);
+    if (sources.size === 0) { setStatusMsg('Queued colors match target — nothing to merge'); return; }
+    const c   = compRef.current;
+    const sel = selMaskRef.current;
+    const gw  = c.gridCols * MAP_SIZE;
+    historyRef.current.snapshot(c.frames);
+    let replaced = 0;
+    for (let ti = 0; ti < c.frames.length; ti++) {
+      const tileCol = ti % c.gridCols;
+      const tileRow = Math.floor(ti / c.gridCols);
+      const tileFrames = c.frames[ti];
+      const frameIdxs = mergeScopeRef.current === 'all'
+        ? tileFrames.map((_, fi) => fi)
+        : [c.activeFrame];
+      for (const fi of frameIdxs) {
+        const frame = tileFrames[fi]; if (!frame) continue;
+        for (let ly = 0; ly < MAP_SIZE; ly++) {
+          for (let lx = 0; lx < MAP_SIZE; lx++) {
+            if (sel) {
+              const gx = tileCol * MAP_SIZE + lx;
+              const gy = tileRow * MAP_SIZE + ly;
+              if (!sel[gy * gw + gx]) continue;
+            }
+            const idx   = lx + ly * MAP_SIZE;
+            const color = frame[idx] & 0xFF;
+            if (sources.has(color)) { frame[idx] = target; replaced++; }
+          }
+        }
+      }
+    }
+    mergeQueueRef.current.clear();
+    setMergeQueueVer(v => v + 1);
+    syncComp({ ...c });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    const scopeLbl = mergeScopeRef.current === 'all' ? ' (all frames)' : '';
+    setStatusMsg(`Merged ${sources.size} color${sources.size>1?'s':''} → byte ${target}: ${replaced} px${scopeLbl}`);
+  }
+
+  // ── Reduce ──────────────────────────────────────────────────────────────────
+  function applyReduction(): void {
+    const c = compRef.current;
+    historyRef.current.snapshot(c.frames);
+    let totalRemoved = 0;
+    for (const tf of c.frames) {
+      const frame = tf[c.activeFrame]; if (!frame) continue;
+      const d = countDistinct(frame); if (d <= 1) continue;
+      const [removed] = reduceColorsInPlace(frame.slice() as Uint8Array, d - 1, OKLAB, reductionStrategyRef.current);
+      // reduceColorsInPlace mutates in-place, so use the original
+      reduceColorsInPlace(frame, d - 1, OKLAB, reductionStrategyRef.current);
+      totalRemoved += removed;
+    }
+    syncComp({ ...c });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setStatusMsg(totalRemoved > 0
+      ? `Reduced ${totalRemoved} color${totalRemoved>1?'s':''} (${reductionStrategyRef.current})`
+      : 'Already at minimum (1 color or less)');
+  }
+
+  // ── Filter ──────────────────────────────────────────────────────────────────
+  async function applyEditorFilter(): Promise<void> {
+    if (reqRunning) return;
+    const c = compRef.current;
+    setStatusMsg(`Applying ${filterTypeRef.current}…`);
+    try {
+      // Build ImageData from current frame
+      const source   = mapBytesToImageData(c.frames, c.activeFrame, c.gridCols, c.gridRows);
+      const filtered = applyFilter(source, { type: filterTypeRef.current, strength: filterStrengthRef.current });
+
+      // Re-quantize with NONE dither + current palette/metric settings
+      const params: RequantizeParams = {
+        ...DEFAULT_REQ_PARAMS,
+        dither:          'NONE',
+        metric:          reqMetricRef.current,
+        legalOnly:       !c.allShades,
+        tilePalette:     reqTilePalRef.current,
+        chromaBoost:     reqChromaRef.current,
+        useCustomDither: false,
+        ditherMask:      null,
+      };
+      const newTiles = requantizeGrid(filtered, c, selMaskRef.current, params);
+      historyRef.current.snapshot(c.frames);
+      const newFrames = c.frames.map((tf, ti) =>
+        tf.map((f, fi) => fi === c.activeFrame ? newTiles[ti] : f),
+      );
+      syncComp({ ...c, frames: newFrames });
+      setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+      setStatusMsg(`Filter: ${filterTypeRef.current} applied`);
+    } catch (err) {
+      setStatusMsg(`Filter error: ${err}`);
+    }
+  }
+
+  // ── Frame management ────────────────────────────────────────────────────────
+  function dropCurrentFrame(): void {
+    const c = compRef.current;
+    const maxF = Math.max(...c.frames.map(t => t.length), 1);
+    if (maxF <= 1) { setStatusMsg('Only 1 frame — cannot drop'); return; }
+    historyRef.current.snapshot(c.frames);
+    const fi = c.activeFrame;
+    const newFrames = c.frames.map(tf => {
+      if (tf.length <= 1) return tf;
+      const next = [...tf]; next.splice(fi, 1); return next;
+    });
+    const newDelays = c.frameDelays.map(dd => {
+      if (dd.length <= 1) return dd;
+      const next = [...dd]; next.splice(fi, 1); return next;
+    });
+    const newActive = Math.min(fi, maxF - 2);
+    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: newActive });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setStatusMsg(`Dropped frame ${fi + 1}`);
+  }
+
+  function cloneCurrentFrame(): void {
+    const c = compRef.current;
+    historyRef.current.snapshot(c.frames);
+    const fi = c.activeFrame;
+    const newFrames = c.frames.map(tf => {
+      const next  = [...tf];
+      const clone = (tf[fi] ?? new Uint8Array(MAP_SIZE * MAP_SIZE)).slice() as Uint8Array;
+      next.splice(fi + 1, 0, clone);
+      return next;
+    });
+    const newDelays = c.frameDelays.map(dd => {
+      const next = [...dd];
+      next.splice(fi + 1, 0, dd[fi] ?? 100);
+      return next;
+    });
+    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: fi + 1 });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setStatusMsg(`Cloned frame ${fi + 1} → frame ${fi + 2}`);
+  }
+
+  function addBlankFrame(): void {
+    const c = compRef.current;
+    historyRef.current.snapshot(c.frames);
+    const fi = c.activeFrame;
+    const newFrames = c.frames.map(tf => {
+      const next = [...tf];
+      next.splice(fi + 1, 0, new Uint8Array(MAP_SIZE * MAP_SIZE));
+      return next;
+    });
+    const newDelays = c.frameDelays.map(dd => {
+      const next = [...dd];
+      next.splice(fi + 1, 0, 100);
+      return next;
+    });
+    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: fi + 1 });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setStatusMsg(`Added blank frame ${fi + 2}`);
+  }
+
+  function adjustFrameDelay(delta: number): void {
+    const c = compRef.current;
+    const fi = c.activeFrame;
+    const newDelays = c.frameDelays.map(dd => {
+      const next = [...dd];
+      next[fi] = Math.max(10, Math.min(10000, (dd[fi] ?? 100) + delta));
+      return next;
+    });
+    syncComp({ ...c, frameDelays: newDelays });
+    const delay = newDelays[0]?.[fi] ?? 100;
+    setStatusMsg(`Frame ${fi+1} delay: ${delay} ms`);
+  }
+
   // ── Requantize ──────────────────────────────────────────────────────────────
   const doRequantize = useCallback(async () => {
     if (reqRunning) return;
+    // Clear any existing preview
+    if (previewCompRef.current) { setPreviewComp(null); }
     setReqRunning(true);
-    setReqStatus('Computing…');
+    setReqStatus('⏳ Computing…');
 
     const c = compRef.current;
     const { gridCols, gridRows, frames, activeFrame, allShades } = c;
@@ -283,26 +663,25 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
         ditherMask:      null,
       };
 
-      const newTiles = requantizeGrid(source, c, selMaskRef.current, params);
-
-      historyRef.current.snapshot(frames);
-      setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
-
-      const newFrames: Uint8Array[][] = frames.map((tileFrames, ti) =>
+      const newTiles  = requantizeGrid(source, c, selMaskRef.current, params);
+      const newFrames = frames.map((tileFrames, ti) =>
         tileFrames.map((f, fi) => fi === activeFrame ? newTiles[ti] : f),
       );
 
-      syncComp({ ...c, frames: newFrames });
-      setReqStatus(sourceBitmapRef.current ? 'Done ✓' : 'Done ✓ (from pixels)');
+      // Show as preview — user must press Enter/Y to commit.
+      const preview: CompositionState = { ...c, frames: newFrames };
+      setPreviewComp(preview);
+      setReqStatus(sourceBitmapRef.current
+        ? '🔍 Preview — Enter/Y: commit  ·  Esc: cancel'
+        : '🔍 Preview (from pixels) — Enter/Y: commit  ·  Esc: cancel');
     } catch (err) {
       setReqStatus(`Error: ${err}`);
+      setTimeout(() => setReqStatus(null), 3500);
     } finally {
       setReqRunning(false);
-      setTimeout(() => setReqStatus(null), 3000);
     }
-  }, [reqRunning, syncComp]);
+  }, [reqRunning]);
 
-  // Keep requantize in a ref so the keyboard effect ([] deps) can call it stably.
   const doRequantizeRef = useRef(doRequantize);
   useEffect(() => { doRequantizeRef.current = doRequantize; }, [doRequantize]);
 
@@ -311,12 +690,37 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
     const el = canvasElRef.current!;
 
     const canvas = new MapCanvas(el, {
-      onPixelEvent: (gx, gy, button, buttons, _e) => {
+      onPixelEvent: (gx, gy, button, buttons, e) => {
+        // Paste mode: left-click stamps, right-click cancels
+        if (inPasteModeRef.current) {
+          if (button === 0) commitPasteAt(gx, gy);
+          else if (button === 2) setInPasteMode(false);
+          return;
+        }
+
+        // Any interaction cancels the requantize preview
+        if (previewCompRef.current && button !== -1) {
+          setPreviewComp(null);
+          setReqStatus(null);
+        }
+
+        // Ctrl+click: toggle color in merge queue
+        if ((e.ctrlKey || e.metaKey) && button === 0) {
+          const color = readPixel(compRef.current, gx, gy);
+          if (color > 0) toggleMergeColor(color);
+          return;
+        }
+
         const ctx  = getCtx();
         const tool = TOOL_MAP.get(activeToolIdRef.current) ?? brushTool;
         tool.onPointerEvent?.(gx, gy, button, buttons, ctx);
         setComp({ ...compRef.current });
         setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+
+        // Rebuild heatmap after paint operations
+        if (heatmapOnRef.current && canvasRef.current) {
+          canvasRef.current.heatmapLut = buildHeatmapLut(compRef.current);
+        }
       },
       onPointerUp: () => {
         TOOL_MAP.get(activeToolIdRef.current)?.onPointerUp?.(getCtx());
@@ -333,6 +737,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
         if (activeToolIdRef.current === 'wand') {
           magicWand.updateHover(gx, gy, getCtx());
         }
+        // Paste ghost always follows cursor (canvas brushX/Y already updated by Canvas.ts)
       },
       onWheel: (e) => {
         // Shift+scroll: adjust the active tool's primary parameter.
@@ -344,8 +749,8 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
             break;
           }
           case 'wand': {
-            const step  = e.ctrlKey ? 0.005 : 0.025;
-            const sc    = e.ctrlKey ? 200   : 40;
+            const step = e.ctrlKey ? 0.005 : 0.025;
+            const sc   = e.ctrlKey ? 200   : 40;
             setWandTol(t => Math.round(Math.max(0, Math.min(0.5, t + delta * step)) * sc) / sc);
             break;
           }
@@ -393,7 +798,11 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
         e.preventDefault();
         const h = historyRef.current;
         const res = h.undo(compRef.current.frames);
-        if (res) { syncComp({ ...compRef.current, frames: res }); setUndoState({ canUndo: h.canUndo, canRedo: h.canRedo }); }
+        if (res) {
+          syncComp({ ...compRef.current, frames: res });
+          setUndoState({ canUndo: h.canUndo, canRedo: h.canRedo });
+          setPreviewComp(null); setReqStatus(null);
+        }
         return;
       }
       if (ctrl && (e.key === 'y' || (shift && e.key === 'z'))) {
@@ -428,35 +837,63 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
         setSelMask(any ? inv : null);
         return;
       }
-      // Let Ctrl+[ and Ctrl+] (frame nav) fall through to the switch below.
-      // Block all other Ctrl combos.
+      if (ctrl && e.key === 'c') { e.preventDefault(); doCopySelection(); return; }
+      if (ctrl && e.key === 'x') { e.preventDefault(); doCutSelection();  return; }
+      if (ctrl && e.key === 'v') { e.preventDefault(); startPaste();      return; }
+      // Let Ctrl+[ and Ctrl+] (frame nav) fall through.
       if (ctrl && e.key !== '[' && e.key !== ']') return;
 
-      // ── Non-Ctrl / frame nav ─────────────────────────────────────────────
+      // ── Non-Ctrl ─────────────────────────────────────────────────────────
       const c  = compRef.current;
       const gw = c.gridCols * MAP_SIZE;
       const gh = c.gridRows * MAP_SIZE;
+      const maxFrames = Math.max(...c.frames.map(t => t.length), 1);
 
       switch (e.key) {
 
         // ─ Escape ────────────────────────────────────────────────────────
         case 'Escape':
           e.preventDefault();
-          if (activeToolIdRef.current === 'lasso' && lasso.hasPath()) {
-            const ctx = getCtx();
-            lasso.deactivate(ctx);
-            // Re-activates cleanly — lasso has no activate() but deactivate() clears the path
-          } else if (selMaskRef.current) {
-            setSelMask(null);
+          if (inPasteModeRef.current) { setInPasteMode(false); break; }
+          if (previewCompRef.current) { setPreviewComp(null); setReqStatus(null); setStatusMsg('Preview cancelled'); break; }
+          if (activeToolIdRef.current === 'lasso' && lasso.hasPath()) { lasso.deactivate(getCtx()); break; }
+          if (selMaskRef.current) { setSelMask(null); break; }
+          break;
+
+        // ─ Commit requantize preview / paste ─────────────────────────────
+        case 'Enter': {
+          e.preventDefault();
+          if (previewCompRef.current) {
+            historyRef.current.snapshot(compRef.current.frames);
+            syncComp(previewCompRef.current);
+            setPreviewComp(null);
+            setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+            setReqStatus(null);
+            setStatusMsg('Requantize applied ✓');
+          } else if (inPasteModeRef.current) {
+            const cv = canvasRef.current;
+            if (cv) commitPasteAt(cv.brushX, cv.brushY);
+          }
+          break;
+        }
+
+        case 'y': case 'Y':
+          if (!ctrl && previewCompRef.current) {
+            historyRef.current.snapshot(compRef.current.frames);
+            syncComp(previewCompRef.current);
+            setPreviewComp(null);
+            setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+            setReqStatus(null);
+            setStatusMsg('Requantize applied ✓');
           }
           break;
 
         // ─ Tool keys ─────────────────────────────────────────────────────
-        case 'b': case 'B': doSwitchTool('brush');       break;
-        case 'f': case 'F': doSwitchTool('fill');        break;
-        case 's': case 'S': doSwitchTool('select');      break;
-        case 'l': case 'L': doSwitchTool('lasso');       break;
-        case 'w': case 'W': doSwitchTool('wand');       break;
+        case 'b': case 'B': doSwitchTool('brush');  break;
+        case 'f': case 'F': doSwitchTool('fill');   break;
+        case 's': case 'S': doSwitchTool('select'); break;
+        case 'l': case 'L': doSwitchTool('lasso');  break;
+        case 'w': case 'W': doSwitchTool('wand');   break;
 
         // ─ Brush shape / radius ───────────────────────────────────────────
         case 'x': case 'X':
@@ -465,19 +902,15 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
         case '[':
           if (!ctrl) setBrushRadius(r => Math.max(0, r - 1));
           else {
-            // Ctrl+[ = prev frame
             e.preventDefault();
-            const maxF = Math.max(...c.frames.map(t => t.length), 1);
-            syncComp({ ...c, activeFrame: (c.activeFrame - 1 + maxF) % maxF });
+            syncComp({ ...c, activeFrame: (c.activeFrame - 1 + maxFrames) % maxFrames });
           }
           break;
         case ']':
           if (!ctrl) setBrushRadius(r => Math.min(64, r + 1));
           else {
-            // Ctrl+] = next frame
             e.preventDefault();
-            const maxF = Math.max(...c.frames.map(t => t.length), 1);
-            syncComp({ ...c, activeFrame: (c.activeFrame + 1) % maxF });
+            syncComp({ ...c, activeFrame: (c.activeFrame + 1) % maxFrames });
           }
           break;
 
@@ -491,8 +924,8 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
             setSelMask(mask);
           } else if (activeToolIdRef.current === 'fill') {
             const step  = ctrl ? 0.005 : 0.025;
-            const scale = ctrl ? 200   : 40;
-            setFillTol(t => Math.round(Math.min(0.5, t + step) * scale) / scale);
+            const sc    = ctrl ? 200   : 40;
+            setFillTol(t => Math.round(Math.min(0.5, t + step) * sc) / sc);
           } else if (activeToolIdRef.current === 'wand') {
             const step = ctrl ? 0.005 : 0.025;
             const sc   = ctrl ? 200   : 40;
@@ -509,8 +942,8 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
             setSelMask(mask);
           } else if (activeToolIdRef.current === 'fill') {
             const step  = ctrl ? 0.005 : 0.025;
-            const scale = ctrl ? 200   : 40;
-            setFillTol(t => Math.round(Math.max(0, t - step) * scale) / scale);
+            const sc    = ctrl ? 200   : 40;
+            setFillTol(t => Math.round(Math.max(0, t - step) * sc) / sc);
           } else if (activeToolIdRef.current === 'wand') {
             const step = ctrl ? 0.005 : 0.025;
             const sc   = ctrl ? 200   : 40;
@@ -519,27 +952,35 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           break;
         }
 
-        // ─ Delete: clear selection to transparent ─────────────────────────
+        // ─ Delete: clear selection → transparent, or drop frame ──────────
         case 'Delete': case 'Backspace': {
-          const sel = selMaskRef.current;
-          if (!sel) break;
-          e.preventDefault();
-          historyRef.current.snapshot(c.frames);
-          let cleared = 0;
-          for (let gy2 = 0; gy2 < gh; gy2++) {
-            for (let gx2 = 0; gx2 < gw; gx2++) {
-              if (sel[gy2 * gw + gx2]) {
-                writePixel(c, gx2, gy2, 0, null);
-                cleared++;
-              }
+          if (selMaskRef.current) {
+            e.preventDefault();
+            historyRef.current.snapshot(c.frames);
+            let cleared = 0;
+            const sel = selMaskRef.current!;
+            for (let gy = 0; gy < gh; gy++)
+              for (let gx = 0; gx < gw; gx++)
+                if (sel[gy * gw + gx]) { writePixel(c, gx, gy, 0, null); cleared++; }
+            if (cleared > 0) {
+              syncComp({ ...c });
+              setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+              setStatusMsg(`Cleared ${cleared} selected pixel${cleared!==1?'s':''}`);
             }
-          }
-          if (cleared > 0) {
-            syncComp({ ...c });
-            setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+          } else if (maxFrames > 1) {
+            e.preventDefault();
+            dropCurrentFrame();
           }
           break;
         }
+
+        // ─ Frame delay (,/.) — only when multi-frame ──────────────────────
+        case ',':
+          if (maxFrames > 1) { e.preventDefault(); adjustFrameDelay(shift ? -100 : -10); }
+          break;
+        case '.':
+          if (maxFrames > 1) { e.preventDefault(); adjustFrameDelay(shift ? 100 : 10); }
+          break;
 
         // ─ Requantize ─────────────────────────────────────────────────────
         case 'r': case 'R':
@@ -578,6 +1019,15 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           break;
         }
 
+        // ─ Toggle heatmap (H) ─────────────────────────────────────────────
+        case 'h': case 'H':
+          setHeatmapOn(on => {
+            const next = !on;
+            setStatusMsg(next ? 'Heatmap: red=rarest, blue=most common' : 'Heatmap off');
+            return next;
+          });
+          break;
+
         // ─ Toggle dither mask overlay (M) ─────────────────────────────────
         case 'm': case 'M':
           if (canvasRef.current) {
@@ -586,41 +1036,83 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           }
           break;
 
-        // ─ Frame navigation (,/.) ─────────────────────────────────────────
-        case ',': {
-          syncComp({ ...c, activeFrame: Math.max(0, c.activeFrame - 1) });
+        // ─ Color merge (C = commit, V = cycle scope) ──────────────────────
+        case 'c': case 'C':
+          if (!ctrl) {
+            if (mergeQueueRef.current.size > 0) commitMerge();
+            else setStatusMsg('Queue empty — Ctrl+click swatches or canvas pixels');
+          }
           break;
-        }
-        case '.': {
-          const maxF = Math.max(...c.frames.map(t => t.length), 1);
-          syncComp({ ...c, activeFrame: Math.min(maxF - 1, c.activeFrame + 1) });
+        case 'v': case 'V':
+          if (!ctrl) {
+            setMergeScope(mergeScopeRef.current === 'frame' ? 'all' : 'frame');
+            setStatusMsg(`Merge scope: ${mergeScopeRef.current === 'frame' ? 'frame → all frames' : 'all frames → frame'}`);
+          }
           break;
-        }
+
+        // ─ Apply filter (P), cycle filter (Shift+P) ───────────────────────
+        case 'p': case 'P':
+          if (shift) {
+            const nextFilter = FILTER_CYCLE[(FILTER_CYCLE.indexOf(filterTypeRef.current) + 1) % FILTER_CYCLE.length];
+            setFilterType(nextFilter);
+            setStatusMsg(`Filter: ${FILTER_LABEL[nextFilter]} (P to apply)`);
+          } else {
+            void applyEditorFilter();
+          }
+          break;
+
+        // ─ Color reduce (K), cycle strategy (Shift+K) ────────────────────
+        case 'k': case 'K':
+          if (shift) {
+            const nextStrat = STRATEGY_CYCLE[(STRATEGY_CYCLE.indexOf(reductionStrategyRef.current) + 1) % STRATEGY_CYCLE.length];
+            setReductionStrategy(nextStrat);
+            setStatusMsg(`Reduce strategy: ${STRATEGY_LABEL[nextStrat]}`);
+          } else {
+            applyReduction();
+          }
+          break;
+
+        // ─ Frame navigation (,/.) handled above; Ctrl+[/] also above ─────
+
       }
     };
 
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // stable — all mutable state accessed through refs, doRequantize via doRequantizeRef
+  }, []);
 
   // Auto-clear status message
   useEffect(() => {
     if (!statusMsg) return;
-    const t = setTimeout(() => setStatusMsg(null), 2000);
+    const t = setTimeout(() => setStatusMsg(null), 2500);
     return () => clearTimeout(t);
   }, [statusMsg]);
 
-  // ─── Tool guide list ─────────────────────────────────────────────────────────
+  // ─── Computed display values ──────────────────────────────────────────────────
   const TOOL_DEFS = [
-    { id:'brush',       label:'Brush',    key:'B', hint:'right-click: pick' },
-    { id:'fill',        label:'Fill',     key:'F', hint:'right-click: pick' },
-    { id:'select',      label:'Select',   key:'S', hint:'drag: marquee' },
-    { id:'lasso',       label:'Lasso',    key:'L', hint:'dbl-click: close' },
-    { id:'wand',        label:'Wand',     key:'W', hint:'click: add, right: subtract' },
+    { id:'brush',  label:'Brush',  key:'B', hint:'right-click: pick' },
+    { id:'fill',   label:'Fill',   key:'F', hint:'right-click: pick' },
+    { id:'select', label:'Select', key:'S', hint:'drag: marquee' },
+    { id:'lasso',  label:'Lasso',  key:'L', hint:'dbl-click: close' },
+    { id:'wand',   label:'Wand',   key:'W', hint:'click: add, right: subtract' },
   ] as const;
 
-  const activeTool = TOOL_MAP.get(activeToolId) ?? brushTool;
+  const activeTool   = TOOL_MAP.get(activeToolId) ?? brushTool;
+  const maxFrames    = Math.max(...comp.frames.map(t => t.length), 1);
+  const frameDelay   = comp.frameDelays[0]?.[comp.activeFrame] ?? 100;
+  // Compute distinct color count (for budget badge) — just for current frame
+  const distinctCount = (() => {
+    const seen = new Uint8Array(256);
+    for (const tf of comp.frames) {
+      const f = tf[comp.activeFrame]; if (!f) continue;
+      for (let i = 0; i < f.length; i++) if (f[i]) seen[f[i]] = 1;
+    }
+    return Array.from(seen).slice(1).filter(Boolean).length;
+  })();
+
+  const mergeQueueSnapshot = new Set(mergeQueueRef.current); // for rendering (mergeQueueVer drives re-render)
+  void mergeQueueVer; // suppress unused warning
 
   // ─── Render ───────────────────────────────────────────────────────────────────
   return (
@@ -638,7 +1130,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
 
         <div style={DIVIDER} />
 
-        {/* Brush / dither brush params */}
+        {/* Brush params */}
         {activeToolId === 'brush' && (
           <>
             <Param label={`Radius: ${brushRadius}  ([ ] or Shift+scroll)`}>
@@ -659,6 +1151,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           </>
         )}
 
+        {/* Magic wand tolerance */}
         {activeToolId === 'wand' && (
           <Param label={`Tolerance: ${wandTol.toFixed(3)}  (= - or Shift+scroll)`}>
             <input type="range" min={0} max={0.5} step={0.005} value={wandTol}
@@ -668,6 +1161,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           </Param>
         )}
 
+        {/* Fill tolerance */}
         {activeToolId === 'fill' && (
           <Param label={`Tolerance: ${fillTol.toFixed(3)}  (= - or Shift+scroll)`}>
             <input type="range" min={0} max={0.5} step={0.005} value={fillTol}
@@ -681,25 +1175,23 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           <>
             <div style={DIVIDER} />
             <button style={SEL_BTN} onClick={() => setSelMask(null)}>✕ Desel (Esc)</button>
+            <button style={SEL_BTN} onClick={() => setSelMask(dilateSelMask(selMask, comp.gridCols*MAP_SIZE, comp.gridRows*MAP_SIZE))}>+ Grow (=)</button>
+            <button style={SEL_BTN} onClick={() => setSelMask(erodeSelMask(selMask, comp.gridCols*MAP_SIZE, comp.gridRows*MAP_SIZE))}>− Shrink (-)</button>
             <button style={SEL_BTN} onClick={() => {
-              let mask = selMask;
-              for (let i = 0; i < 1; i++) mask = dilateSelMask(mask, gw, gh);
-              setSelMask(mask);
-            }}>+ Grow (=)</button>
-            <button style={SEL_BTN} onClick={() => {
-              let mask = selMask;
-              for (let i = 0; i < 1; i++) mask = erodeSelMask(mask, gw, gh);
-              setSelMask(mask);
-            }}>− Shrink (-)</button>
-            <button style={SEL_BTN} onClick={() => {
-              // Invert
-              const size = gw * gh;
+              const size = comp.gridCols*MAP_SIZE*comp.gridRows*MAP_SIZE;
               const inv  = new Uint8Array(size);
               let any    = false;
               for (let i = 0; i < size; i++) { inv[i] = selMask[i] ? 0 : 1; if (inv[i]) any = true; }
               setSelMask(any ? inv : null);
             }}>⇄ Invert (Ctrl+I)</button>
+            <button style={SEL_BTN} onClick={doCopySelection}>⎘ Copy (Ctrl+C)</button>
+            <button style={SEL_BTN} onClick={doCutSelection}>✂ Cut (Ctrl+X)</button>
           </>
+        )}
+
+        {/* Paste ghost hint */}
+        {clipPixRef.current && !inPasteMode && (
+          <button style={SEL_BTN} onClick={startPaste}>⎘ Paste (Ctrl+V)</button>
         )}
 
         <div style={DIVIDER} />
@@ -759,16 +1251,36 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           <span style={{ fontSize:11 }}>Tile palette</span>
         </label>
 
-        <button
-          onClick={() => void doRequantize()}
-          disabled={reqRunning}
-          style={{ ...SEL_BTN, marginTop:4, textAlign:'center', color: reqRunning ? '#555' : '#8cf' }}
-        >
-          {reqRunning ? 'Running…' : 'Apply (R)'}
-        </button>
+        {/* Preview mode controls */}
+        {previewComp ? (
+          <div style={{ marginTop:4, display:'flex', gap:3 }}>
+            <button style={{ ...SEL_BTN, flex:1, textAlign:'center', color:'#7f7', borderColor:'#3a6' }}
+              onClick={() => {
+                historyRef.current.snapshot(compRef.current.frames);
+                syncComp(previewComp);
+                setPreviewComp(null);
+                setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+                setReqStatus(null); setStatusMsg('Requantize applied ✓');
+              }}>
+              ✓ Commit
+            </button>
+            <button style={{ ...SEL_BTN, flex:1, textAlign:'center', color:'#f77', borderColor:'#633' }}
+              onClick={() => { setPreviewComp(null); setReqStatus(null); }}>
+              ✕ Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => void doRequantize()}
+            disabled={reqRunning}
+            style={{ ...SEL_BTN, marginTop:4, textAlign:'center', color: reqRunning ? '#555' : '#8cf' }}
+          >
+            {reqRunning ? 'Computing…' : 'Apply (R)'}
+          </button>
+        )}
 
         {reqStatus && (
-          <div style={{ fontSize:10, color: reqStatus.startsWith('Error') ? '#f77' : '#7f7', marginTop:2 }}>
+          <div style={{ fontSize:10, color: reqStatus.startsWith('Error') ? '#f77' : reqStatus.startsWith('🔍') ? '#5cf' : '#7f7', marginTop:2 }}>
             {reqStatus}
           </div>
         )}
@@ -777,14 +1289,158 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
             No source — from current pixels
           </div>
         )}
+
+        <div style={DIVIDER} />
+
+        {/* ── Filter section ──────────────────────────────────────────────── */}
+        <div style={SECTION_LABEL}>Filter (P)</div>
+        <div style={CHIP_ROW}>
+          {FILTER_CYCLE.map(ft => (
+            <ChipBtn key={ft} active={filterType === ft} onClick={() => setFilterType(ft)}>
+              {FILTER_LABEL[ft]}
+            </ChipBtn>
+          ))}
+        </div>
+        {(filterType === 'SMOOTH' || filterType === 'SHARPEN') && (
+          <Param label={`Strength: ${filterStrength.toFixed(1)}`}>
+            <input type="range" min={0.5} max={3} step={0.5} value={filterStrength}
+              onInput={(e) => setFilterStrength(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        {filterType === 'POSTERIZE' && (
+          <Param label={`Levels: ${Math.round(filterStrength)}`}>
+            <input type="range" min={2} max={8} step={1} value={Math.round(filterStrength)}
+              onInput={(e) => setFilterStrength(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        <button style={{ ...SEL_BTN, marginTop:2 }} onClick={() => void applyEditorFilter()}>
+          Apply (P)
+        </button>
+        <div style={{ fontSize:10, color:'#555', marginTop:1 }}>Shift+P: cycle type</div>
+
+        <div style={DIVIDER} />
+
+        {/* ── Color reduce section ────────────────────────────────────────── */}
+        <div style={SECTION_LABEL}>Reduce (K)</div>
+        <div style={CHIP_ROW}>
+          {STRATEGY_CYCLE.map(s => (
+            <ChipBtn key={s} active={reductionStrategy === s} onClick={() => setReductionStrategy(s)}>
+              {STRATEGY_LABEL[s]}
+            </ChipBtn>
+          ))}
+        </div>
+        <button style={{ ...SEL_BTN, marginTop:2 }} onClick={applyReduction}>
+          Reduce 1 color (K)
+        </button>
+        <div style={{ fontSize:10, color:'#555', marginTop:1 }}>Shift+K: cycle strategy · {distinctCount} distinct</div>
+
+        <div style={DIVIDER} />
+
+        {/* ── Merge section ───────────────────────────────────────────────── */}
+        <div style={SECTION_LABEL}>Color Merge</div>
+        <div style={{ fontSize:10, color:'#666', lineHeight:1.3 }}>
+          Ctrl+click canvas or palette to queue; C commits → active color
+        </div>
+        {mergeQueueSnapshot.size > 0 && (
+          <>
+            <div style={{ fontSize:10, color:'#f93', marginTop:2 }}>
+              {mergeQueueSnapshot.size} color{mergeQueueSnapshot.size>1?'s':''} queued
+            </div>
+            <div style={{ display:'flex', flexWrap:'wrap', gap:2, marginTop:2 }}>
+              {Array.from(mergeQueueSnapshot).map(c => {
+                const rgb = MC_PALETTE[c] ?? 0;
+                const r = (rgb>>16)&0xff, g = (rgb>>8)&0xff, b = rgb&0xff;
+                return (
+                  <div key={c} onClick={() => toggleMergeColor(c)}
+                    title={`Byte ${c} — click to remove`}
+                    style={{ width:16, height:16, background:`rgb(${r},${g},${b})`, border:'1px solid #f93', cursor:'pointer', borderRadius:2 }} />
+                );
+              })}
+            </div>
+            <label style={TOGGLE_ROW}>
+              <input type="checkbox" checked={mergeScope === 'all'}
+                onChange={e => setMergeScope((e.target as HTMLInputElement).checked ? 'all' : 'frame')} />
+              <span style={{ fontSize:10 }}>All frames (V to toggle)</span>
+            </label>
+            <div style={{ display:'flex', gap:3, marginTop:2 }}>
+              <button style={{ ...SEL_BTN, flex:1, textAlign:'center', color:'#f93' }}
+                onClick={commitMerge}>C: Commit</button>
+              <button style={{ ...SEL_BTN, flex:1, textAlign:'center' }}
+                onClick={() => { mergeQueueRef.current.clear(); setMergeQueueVer(v=>v+1); }}>Clear</button>
+            </div>
+          </>
+        )}
+
+        <div style={DIVIDER} />
+
+        {/* ── Heatmap / overlays ───────────────────────────────────────────── */}
+        <label style={TOGGLE_ROW}>
+          <input type="checkbox" checked={heatmapOn}
+            onChange={e => setHeatmapOn((e.target as HTMLInputElement).checked)} />
+          <span style={{ fontSize:11 }}>Heatmap (H)</span>
+        </label>
+        <div style={{ fontSize:10, color:'#555' }}>red=rarest · blue=common</div>
+
+        {/* ── Frame controls ───────────────────────────────────────────────── */}
+        {maxFrames > 1 && (
+          <>
+            <div style={DIVIDER} />
+            <div style={SECTION_LABEL}>
+              Frames: {comp.activeFrame + 1} / {maxFrames}  {frameDelay}ms
+            </div>
+            <div style={{ display:'flex', gap:3, flexWrap:'wrap' }}>
+              <button style={SEL_BTN} onClick={() => syncComp({ ...comp, activeFrame: Math.max(0, comp.activeFrame - 1) })}>← Prev</button>
+              <button style={SEL_BTN} onClick={() => syncComp({ ...comp, activeFrame: Math.min(maxFrames-1, comp.activeFrame+1) })}>Next →</button>
+            </div>
+            <div style={{ display:'flex', gap:3, flexWrap:'wrap', marginTop:2 }}>
+              <button style={SEL_BTN} onClick={cloneCurrentFrame} title="Clone current frame">⎘ Clone</button>
+              <button style={SEL_BTN} onClick={addBlankFrame}     title="Add blank frame">+ Blank</button>
+              <button style={{ ...SEL_BTN, color:'#f77' }} onClick={dropCurrentFrame} title="Delete current frame (Del)">✕ Drop</button>
+            </div>
+            <div style={{ fontSize:10, color:'#555', marginTop:1 }}>
+              , / .  adjust delay (±10ms, Shift=±100ms)
+            </div>
+          </>
+        )}
+        {maxFrames === 1 && (
+          <>
+            <div style={DIVIDER} />
+            <div style={{ display:'flex', gap:3 }}>
+              <button style={SEL_BTN} onClick={cloneCurrentFrame} title="Clone to start animation">⎘ Clone frame</button>
+              <button style={SEL_BTN} onClick={addBlankFrame}     title="Add blank frame">+ Blank</button>
+            </div>
+          </>
+        )}
+
       </div>
 
       {/* Canvas */}
       <div style={CANVAS_AREA}>
         <canvas ref={canvasElRef} style={{ display:'block', width:'100%', height:'100%' }} />
+
         {/* Status overlay for key-triggered messages */}
-        {statusMsg && (
+        {statusMsg && !reqStatus && (
           <div style={STATUS_OVERLAY}>{statusMsg}</div>
+        )}
+
+        {/* Requantize status — shown in a distinct color, persists until acted on */}
+        {reqStatus && (
+          <div style={{
+            ...STATUS_OVERLAY,
+            background: reqStatus.startsWith('🔍') ? 'rgba(0,40,70,0.88)' : 'rgba(0,0,0,0.75)',
+            color: reqStatus.startsWith('🔍') ? '#5cf' : reqStatus.startsWith('Error') ? '#f77' : '#ccc',
+          }}>
+            {reqStatus}
+          </div>
+        )}
+
+        {/* Paste mode banner */}
+        {inPasteMode && (
+          <div style={{ ...STATUS_OVERLAY, background:'rgba(40,0,80,0.88)', color:'#caf' }}>
+            📋 PASTE — click to stamp · Enter · Esc to cancel
+          </div>
         )}
       </div>
 
@@ -793,7 +1449,10 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
         comp={comp}
         activeColor={activeColor}
         selMask={selMask}
+        mergeQueue={mergeQueueSnapshot}
+        distinctCount={distinctCount}
         onColorPick={setActiveColor}
+        onCtrlClick={toggleMergeColor}
       />
 
       {/* Status bar */}
@@ -808,24 +1467,16 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
           scale={scale}
           canUndo={undoState.canUndo}
           canRedo={undoState.canRedo}
+          maxFrames={maxFrames}
+          frameDelay={frameDelay}
+          distinctCount={distinctCount}
+          inPreview={!!previewComp}
+          mergeQueueSize={mergeQueueSnapshot.size}
         />
       </div>
     </div>
   );
 }
-
-// Helpers used in render (need access to comp dims for selection buttons)
-// Defined outside so they're stable — use current comp from closures that get fresh values
-function _dilate(mask: Uint8Array, gw: number, gh: number) {
-  return dilateSelMask(mask, gw, gh);
-}
-function _erode(mask: Uint8Array, gw: number, gh: number) {
-  return erodeSelMask(mask, gw, gh);
-}
-// Note: gw/gh are computed inline in the render from compRef values via
-// the selMask buttons' onClick closures which close over comp state.
-const gw = 0; const gh = 0; // silence TS — overridden inline
-void _dilate; void _erode; void gw; void gh;
 
 // ─── Small helper components ──────────────────────────────────────────────────
 
@@ -841,15 +1492,15 @@ function Param({ label, children }: { label: string; children: ComponentChildren
 function ChipBtn({ active, onClick, children }: { active: boolean; onClick: () => void; children: ComponentChildren }) {
   return (
     <button onClick={onClick} style={{
-      flex:        1,
-      background:  active ? '#1b3556' : 'transparent',
-      border:      `1px solid ${active ? '#4a9eff' : '#444'}`,
-      borderRadius: 3,
-      color:       active ? '#8cf' : '#888',
-      cursor:      'pointer',
-      fontSize:     10,
-      padding:     '2px 0',
-      textAlign:   'center',
+      flex:         1,
+      background:   active ? '#1b3556' : 'transparent',
+      border:       `1px solid ${active ? '#4a9eff' : '#444'}`,
+      borderRadius:  3,
+      color:        active ? '#8cf' : '#888',
+      cursor:       'pointer',
+      fontSize:      10,
+      padding:      '2px 0',
+      textAlign:    'center',
     }}>
       {children}
     </button>
@@ -860,7 +1511,7 @@ function ChipBtn({ active, onClick, children }: { active: boolean; onClick: () =
 
 const ROOT_STYLE: h.JSX.CSSProperties = {
   display:             'grid',
-  gridTemplateColumns: '128px 1fr 160px',
+  gridTemplateColumns: '136px 1fr 160px',
   gridTemplateRows:    '1fr auto',
   width:               '100%',
   height:              '100%',

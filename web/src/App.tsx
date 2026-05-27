@@ -28,6 +28,28 @@ async function scaleImageTo(bmp: ImageBitmap, w: number, h: number): Promise<Ima
   return octx.getImageData(0, 0, w, h);
 }
 
+// ─── Auto-grid detection ──────────────────────────────────────────────────────
+
+/**
+ * Given an image's pixel dimensions, pick the best (cols × rows) grid
+ * where cols, rows ≤ maxDim and the grid's aspect ratio is closest to
+ * the image's aspect ratio.  Tiebreak by fewest total tiles.
+ */
+function bestGridSize(w: number, h: number, maxDim = 8): [number, number] {
+  const ratio = w / h;
+  let bestCols = 1, bestRows = 1, bestScore = Infinity;
+  for (let cols = 1; cols <= maxDim; cols++) {
+    for (let rows = 1; rows <= maxDim; rows++) {
+      const gridRatio = cols / rows;
+      const maxR  = Math.max(ratio, gridRatio);
+      const diff  = Math.abs(ratio - gridRatio) / maxR;   // 0 = perfect match
+      const score = diff * 100 + cols * rows * 0.1;        // fewer tiles win ties
+      if (score < bestScore) { bestScore = score; bestCols = cols; bestRows = rows; }
+    }
+  }
+  return [bestCols, bestRows];
+}
+
 // ─── GridInput ────────────────────────────────────────────────────────────────
 // A number input that shows a draft value while typing and only commits
 // on blur or Enter, so the grid doesn't change on every keystroke.
@@ -44,7 +66,7 @@ function GridInput({ value, onChange }: GridInputProps) {
   useEffect(() => setDraft(String(value)), [value]);
 
   function commit() {
-    const n = Math.max(1, Math.min(128, parseInt(draft, 10) || 1));
+    const n = Math.max(1, Math.min(8, parseInt(draft, 10) || 1));
     setDraft(String(n));
     if (n !== value) onChange(n);
   }
@@ -53,7 +75,7 @@ function GridInput({ value, onChange }: GridInputProps) {
     <input
       type="number"
       min={1}
-      max={128}
+      max={8}
       value={draft}
       onInput={e => setDraft((e.target as HTMLInputElement).value)}
       onBlur={commit}
@@ -120,13 +142,23 @@ export function App() {
     try {
       const bmp = await createImageBitmap(file);
       setSourceBitmap(bmp);
-      await reimportImage(bmp, gridCols, gridRows);
+
+      // Auto-detect the best grid layout from the image's aspect ratio,
+      // but only when the grid is unlocked.
+      let cols = gridCols, rows = gridRows;
+      if (!gridLocked) {
+        [cols, rows] = bestGridSize(bmp.width, bmp.height);
+        setGridCols(cols);
+        setGridRows(rows);
+      }
+
+      await reimportImage(bmp, cols, rows);
     } catch (err) {
       alert(`Failed to import image: ${err}`);
     }
     // Reset the input so the same file can be re-selected.
     (e.target as HTMLInputElement).value = '';
-  }, [gridCols, gridRows, reimportImage]);
+  }, [gridCols, gridRows, gridLocked, reimportImage]);
 
   // ─── Import state JSON ──────────────────────────────────────────────────────
   const handleStateImport = useCallback(async (e: Event) => {

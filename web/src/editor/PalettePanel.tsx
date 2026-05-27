@@ -17,15 +17,22 @@ import type { CompositionState } from '../payload-state.js';
 // ─── Props ────────────────────────────────────────────────────────────────────
 
 interface PalettePanelProps {
-  comp:        CompositionState;
-  activeColor: number;
-  selMask:     Uint8Array | null;
-  onColorPick: (mapByte: number) => void;
+  comp:          CompositionState;
+  activeColor:   number;
+  selMask:       Uint8Array | null;
+  mergeQueue:    ReadonlySet<number>;
+  distinctCount: number;
+  onColorPick:   (mapByte: number) => void;
+  onCtrlClick:   (mapByte: number) => void;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
-export function PalettePanel({ comp, activeColor, selMask, onColorPick }: PalettePanelProps) {
+export function PalettePanel({
+  comp, activeColor, selMask,
+  mergeQueue, distinctCount,
+  onColorPick, onCtrlClick,
+}: PalettePanelProps) {
   const [tab, setTab] = useState<'all' | 'sel'>('all');
 
   // Count pixel frequency across the whole composition.
@@ -86,13 +93,16 @@ export function PalettePanel({ comp, activeColor, selMask, onColorPick }: Palett
 
   return (
     <div style={PANEL_STYLE}>
-      {/* Tab bar */}
-      <div style={{ display:'flex', borderBottom:'1px solid #333', marginBottom:4 }}>
+      {/* Tab bar + distinct count badge */}
+      <div style={{ display:'flex', alignItems:'center', borderBottom:'1px solid #333', marginBottom:4 }}>
         {(['all','sel'] as const).map(t => (
           <button key={t} onClick={() => setTab(t)} style={tab === t ? TAB_ACTIVE : TAB_INACTIVE}>
             {t.toUpperCase()}
           </button>
         ))}
+        <span style={{ marginLeft:'auto', fontSize:10, color:'#666', paddingRight:2 }} title="Distinct colors in composition">
+          {distinctCount}c
+        </span>
       </div>
 
       {/* Eraser / transparent swatch — always pinned at top */}
@@ -145,24 +155,30 @@ export function PalettePanel({ comp, activeColor, selMask, onColorPick }: Palett
           const g = (rgb >>  8) & 0xff;
           const b = rgb & 0xff;
           const bgColor = `rgb(${r},${g},${b})`;
-          const barW = Math.round(freq[c] / maxFreq * 100);
-          const isActive = c === activeColor;
+          const barW    = Math.round(freq[c] / maxFreq * 100);
+          const isActive  = c === activeColor;
+          const inMergeQ  = mergeQueue.has(c);
+
+          // Outline priority: active (white) > merge queue (orange) > default (dark)
+          const outlineColor  = isActive ? '#fff' : inMergeQ ? '#f93' : '#222';
+          const outlineWidth  = (isActive || inMergeQ) ? 2 : 1;
+          const outlineOffset = (isActive || inMergeQ) ? -2 : -1;
 
           return (
             <div
               key={c}
-              onClick={() => onColorPick(c)}
-              title={`Map byte ${c} | rgb(${r},${g},${b})`}
+              onClick={e => e.ctrlKey || e.metaKey ? onCtrlClick(c) : onColorPick(c)}
+              title={`Byte ${c} · rgb(${r},${g},${b})${inMergeQ ? ' · in merge queue' : ''}\nCtrl+click to add/remove from merge queue`}
               style={{
-                position:    'relative',
-                width:       28,
-                height:      28,
-                background:  bgColor,
-                cursor:      'pointer',
-                outline:     isActive ? '2px solid #fff' : '1px solid #222',
-                outlineOffset: isActive ? -2 : -1,
-                boxSizing:   'border-box',
-                overflow:    'hidden',
+                position:      'relative',
+                width:          28,
+                height:         28,
+                background:     bgColor,
+                cursor:        'pointer',
+                outline:       `${outlineWidth}px solid ${outlineColor}`,
+                outlineOffset: `${outlineOffset}px`,
+                boxSizing:     'border-box',
+                overflow:      'hidden',
               }}
             >
               {/* Frequency bar (bottom strip) */}
@@ -171,6 +187,14 @@ export function PalettePanel({ comp, activeColor, selMask, onColorPick }: Palett
                   position:'absolute', bottom:0, left:0,
                   width: `${barW}%`, height: 3,
                   background: 'rgba(255,255,255,0.5)',
+                }} />
+              )}
+              {/* Merge queue dot */}
+              {inMergeQ && (
+                <div style={{
+                  position:'absolute', top:1, right:1,
+                  width:5, height:5, borderRadius:'50%',
+                  background:'#f93', border:'1px solid rgba(0,0,0,0.5)',
                 }} />
               )}
             </div>

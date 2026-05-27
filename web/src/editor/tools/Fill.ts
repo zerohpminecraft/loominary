@@ -4,8 +4,8 @@
  * Left-click  floods the connected region with the active colour.
  * Right-click picks the colour under the cursor (eyedropper behaviour).
  *
- * Flood fill is performed in global pixel coordinates so it crosses tile seams.
- * If a selection is active, only selected pixels are filled.
+ * Hovering shows a semi-transparent preview of the fill region in the active
+ * colour.  Shift+scroll (or = / -) adjusts the OKLab flood tolerance.
  */
 
 import type { Tool, ToolContext } from './Tool.js';
@@ -16,6 +16,10 @@ export class FillTool implements Tool {
   readonly id     = 'fill';
   readonly name   = 'Fill';
   readonly cursor = 'crosshair';
+
+  private lastHoverGx  = -1;
+  private lastHoverGy  = -1;
+  private lastHoverTol = -1;
 
   onPointerEvent(gx: number, gy: number, button: number, _buttons: number, ctx: ToolContext): void {
     // Right-click → pick colour
@@ -43,8 +47,7 @@ export class FillTool implements Tool {
 
     const startEntry = oklabLookup[startColor];
     const tolSq      = fillTolerance * fillTolerance;
-
-    const visited = new Uint8Array(gridW * gridH);
+    const visited    = new Uint8Array(gridW * gridH);
     const queue: number[] = [gy * gridW + gx];
     visited[gy * gridW + gx] = 1;
 
@@ -56,7 +59,6 @@ export class FillTool implements Tool {
       const cx  = cur % gridW;
       const curColor = readPixel(comp, cx, cy);
 
-      // Tolerance gate — OKLab distance from the start colour.
       if (startEntry && oklabLookup[curColor]) {
         const e = oklabLookup[curColor]!;
         if (oklabDistSq(startEntry[0], startEntry[1], startEntry[2], e[0], e[1], e[2]) > tolSq) continue;
@@ -77,6 +79,84 @@ export class FillTool implements Tool {
       }
     }
 
+    // After fill: clear the hover preview (canvas will show the new pixels).
+    ctx.canvas.fillPreview = null;
     if (anyWrite) ctx.canvas.markDirty();
+  }
+
+  /** Update the hover preview for the current cursor position. */
+  updateHover(gx: number, gy: number, ctx: ToolContext): void {
+    if (gx === this.lastHoverGx
+        && gy === this.lastHoverGy
+        && ctx.fillTolerance === this.lastHoverTol) return;
+    this.lastHoverGx = gx; this.lastHoverGy = gy; this.lastHoverTol = ctx.fillTolerance;
+
+    const region = this.floodRegion(gx, gy, ctx);
+    ctx.canvas.fillPreview      = region;
+    ctx.canvas.fillPreviewColor = ctx.activeColor;
+    ctx.canvas.markDirty();
+  }
+
+  /** Force the next hover call to recompute even if position hasn't changed. */
+  invalidateHoverCache(): void {
+    this.lastHoverGx = -1; this.lastHoverGy = -1;
+  }
+
+  deactivate(ctx: ToolContext): void {
+    ctx.canvas.fillPreview = null;
+    ctx.canvas.markDirty();
+  }
+
+  /** Flood-fill region (read-only) — returns the region mask, or null if out of bounds. */
+  private floodRegion(gx: number, gy: number, ctx: ToolContext): Uint8Array | null {
+    const { comp, oklabLookup, fillTolerance } = ctx;
+    const gridW = comp.gridCols * MAP_SIZE;
+    const gridH = comp.gridRows * MAP_SIZE;
+
+    if (gx < 0 || gy < 0 || gx >= gridW || gy >= gridH) return null;
+
+    const startColor = readPixel(comp, gx, gy);
+    // If hover color matches fill color, nothing would change — no preview.
+    if (startColor === ctx.activeColor) return null;
+
+    const startEntry = oklabLookup[startColor];
+    const tolSq      = fillTolerance * fillTolerance;
+    const sel        = ctx.getSelMask();
+    const selActive  = sel !== null;
+
+    if (selActive && !sel![gy * gridW + gx]) return null;
+
+    const result  = new Uint8Array(gridW * gridH);
+    const visited = new Uint8Array(gridW * gridH);
+    const queue: number[] = [gy * gridW + gx];
+    visited[gy * gridW + gx] = 1;
+
+    while (queue.length > 0) {
+      const cur = queue.pop()!;
+      const cy = (cur / gridW) | 0;
+      const cx = cur % gridW;
+      const curColor = readPixel(comp, cx, cy);
+
+      if (startEntry && oklabLookup[curColor]) {
+        const e = oklabLookup[curColor]!;
+        if (oklabDistSq(startEntry[0], startEntry[1], startEntry[2], e[0], e[1], e[2]) > tolSq) continue;
+      } else if (curColor !== startColor) {
+        continue;
+      }
+
+      result[cur] = 1;
+
+      for (const [dx, dy] of [[-1,0],[1,0],[0,-1],[0,1]] as [number,number][]) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) continue;
+        const ni = ny * gridW + nx;
+        if (visited[ni]) continue;
+        if (selActive && !sel![ni]) continue;
+        visited[ni] = 1;
+        queue.push(ni);
+      }
+    }
+
+    return result;
   }
 }

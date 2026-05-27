@@ -6,9 +6,10 @@
  */
 
 import { h } from 'preact';
-import { useState, useCallback, useEffect } from 'preact/hooks';
+import { useState, useCallback, useEffect, useRef } from 'preact/hooks';
 import { Editor } from './editor/Editor.js';
 import type { CompositionState } from './payload-state.js';
+import type { QuantizeParams } from './quantize.js';
 import {
   importStateFile,
   downloadState,
@@ -62,7 +63,7 @@ interface GridInputProps {
 function GridInput({ value, onChange }: GridInputProps) {
   const [draft, setDraft] = useState(String(value));
 
-  // Keep draft in sync when value changes externally (e.g. state file load).
+  // Keep draft in sync when value changes externally (e.g. auto-detection).
   useEffect(() => setDraft(String(value)), [value]);
 
   function commit() {
@@ -92,23 +93,21 @@ export function App() {
   const [importing,    setImporting]   = useState(false);
   const [gridCols,     setGridCols]    = useState(1);
   const [gridRows,     setGridRows]    = useState(1);
-  /** Source bitmap kept in memory so grid changes can reimport without re-reading the file. */
+  /** Source bitmap kept in memory so grid changes can reimport at the new size. */
   const [sourceBitmap, setSourceBitmap] = useState<ImageBitmap | null>(null);
-  /** When locked, grid changes only resize; they do NOT reimport the image. */
-  const [gridLocked,   setGridLocked]  = useState(true);
+  /** Live quantize params from Editor — updated whenever the user changes a setting. */
+  const importParamsRef = useRef<QuantizeParams>({
+    legalOnly: true, targetColors: 0, dither: 'NONE',
+  });
 
   // ─── Core reimport ─────────────────────────────────────────────────────────
-  // Called both on initial image import and on grid-size changes when unlocked.
   const reimportImage = useCallback(async (bitmap: ImageBitmap, cols: number, rows: number) => {
     setImporting(true);
     try {
       const { convertTwoPassGrid } = await import('./quantize.js');
       const img   = await scaleImageTo(bitmap, cols * 128, rows * 128);
-      const tiles = convertTwoPassGrid(img, cols, rows, {
-        legalOnly:    true,
-        targetColors: 0,
-        dither:       'FS',
-      });
+      // Use whatever params the Editor currently has; default NONE if not yet set.
+      const tiles = convertTwoPassGrid(img, cols, rows, importParamsRef.current);
       const ps = emptyPayloadState(cols, rows);
       setComp(compositionFromState(ps, tiles.map(t => [t])));
     } catch (err) {
@@ -116,24 +115,25 @@ export function App() {
     } finally {
       setImporting(false);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ─── Grid dimension change ──────────────────────────────────────────────────
-  // When unlocked and a source image exists, reimport at the new size.
-  // When locked (or no source), only resize the existing composition.
+  // If a source image is loaded, reimport it at the new size.
+  // Otherwise just update the dimensions — the Editor's resize effect handles it.
   const handleColsChange = useCallback((cols: number) => {
     setGridCols(cols);
-    if (!gridLocked && sourceBitmap) {
-      reimportImage(sourceBitmap, cols, gridRows);
+    if (sourceBitmap) {
+      void reimportImage(sourceBitmap, cols, gridRows);
     }
-  }, [gridLocked, sourceBitmap, gridRows, reimportImage]);
+  }, [sourceBitmap, gridRows, reimportImage]);
 
   const handleRowsChange = useCallback((rows: number) => {
     setGridRows(rows);
-    if (!gridLocked && sourceBitmap) {
-      reimportImage(sourceBitmap, gridCols, rows);
+    if (sourceBitmap) {
+      void reimportImage(sourceBitmap, gridCols, rows);
     }
-  }, [gridLocked, sourceBitmap, gridCols, reimportImage]);
+  }, [sourceBitmap, gridCols, reimportImage]);
 
   // ─── Import image ───────────────────────────────────────────────────────────
   const handleImageImport = useCallback(async (e: Event) => {
@@ -144,8 +144,6 @@ export function App() {
       setSourceBitmap(bmp);
 
       // Always auto-detect the best grid layout from the image's aspect ratio.
-      // The lock only controls whether *manual* grid-input changes trigger a
-      // reimport — it does not suppress auto-sizing on initial import.
       const [cols, rows] = bestGridSize(bmp.width, bmp.height);
       setGridCols(cols);
       setGridRows(rows);
@@ -156,7 +154,7 @@ export function App() {
     }
     // Reset the input so the same file can be re-selected.
     (e.target as HTMLInputElement).value = '';
-  }, [gridCols, gridRows, gridLocked, reimportImage]);
+  }, [reimportImage]);
 
   // ─── Import state JSON ──────────────────────────────────────────────────────
   const handleStateImport = useCallback(async (e: Event) => {
@@ -198,10 +196,6 @@ export function App() {
   }, [comp]);
 
   // ─── Render ─────────────────────────────────────────────────────────────────
-  const lockTitle = gridLocked
-    ? 'Grid locked — changes only resize. Click to unlock and allow reimport.'
-    : 'Grid unlocked — changing size will reimport the image. Click to lock.';
-
   return (
     <div style={{ display:'flex', flexDirection:'column', width:'100%', height:'100%', background:'#111', color:'#ccc', fontFamily:'system-ui,sans-serif' }}>
 
@@ -215,26 +209,10 @@ export function App() {
         <span style={{ color:'#555' }}>×</span>
         <GridInput value={gridRows} onChange={handleRowsChange} />
 
-        {/* Lock button */}
-        <button
-          onClick={() => setGridLocked(l => !l)}
-          title={lockTitle}
-          style={{
-            ...BTN,
-            padding:     '3px 7px',
-            fontSize:     15,
-            background:   gridLocked ? '#1e3a1e' : '#3a1e1e',
-            borderColor:  gridLocked ? '#3a6b3a' : '#6b3a3a',
-            color:        gridLocked ? '#7c7'    : '#f87',
-          }}
-        >
-          {gridLocked ? '🔒' : '🔓'}
-        </button>
-
         {/* Source image indicator */}
-        {!gridLocked && sourceBitmap && (
-          <span style={{ fontSize:11, color:'#f87', fontStyle:'italic' }}>
-            ⚠ live reimport
+        {sourceBitmap && (
+          <span style={{ fontSize:11, color:'#888', fontStyle:'italic' }}>
+            ↺ re-tiles on resize
           </span>
         )}
 
@@ -266,7 +244,13 @@ export function App() {
       {/* ── Editor / placeholder ── */}
       <div style={{ flex:1, overflow:'hidden' }}>
         {comp ? (
-          <Editor initialComp={comp} gridCols={gridCols} gridRows={gridRows} sourceBitmap={sourceBitmap} />
+          <Editor
+            initialComp={comp}
+            gridCols={gridCols}
+            gridRows={gridRows}
+            sourceBitmap={sourceBitmap}
+            onImportParamsChange={p => { importParamsRef.current = p; }}
+          />
         ) : (
           <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100%', gap:16 }}>
             <p style={{ color:'#555', fontSize:14, margin:0 }}>No composition loaded.</p>

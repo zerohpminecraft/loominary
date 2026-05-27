@@ -151,15 +151,20 @@ function buildHeatmapLut(comp: CompositionState): Uint32Array {
 // ─── Editor props ─────────────────────────────────────────────────────────────
 
 export interface EditorProps {
-  initialComp?:  CompositionState;
-  gridCols?:     number;
-  gridRows?:     number;
-  sourceBitmap?: ImageBitmap | null;
+  initialComp?:           CompositionState;
+  gridCols?:              number;
+  gridRows?:              number;
+  sourceBitmap?:          ImageBitmap | null;
+  /** Called whenever the user changes a quantize param so App can use it for reimport. */
+  onImportParamsChange?:  (p: import('../quantize.js').QuantizeParams) => void;
 }
 
 // ─── Editor ───────────────────────────────────────────────────────────────────
 
-export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, sourceBitmap }: EditorProps) {
+export function Editor({
+  initialComp, gridCols: propCols, gridRows: propRows, sourceBitmap,
+  onImportParamsChange,
+}: EditorProps) {
   const canvasElRef = useRef<HTMLCanvasElement>(null);
   const canvasRef   = useRef<MapCanvas | null>(null);
   const historyRef  = useRef(new EditHistory());
@@ -204,7 +209,19 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
 
   const [activeColor, _setActiveColor] = useState<number>(60);
   const activeColorRef = useRef<number>(60);
-  function setActiveColor(c: number) { activeColorRef.current = c; _setActiveColor(c); }
+  function setActiveColor(c: number) {
+    activeColorRef.current = c;
+    _setActiveColor(c);
+    // Keep fill preview tint in sync when the user picks a new colour.
+    if (canvasRef.current) {
+      canvasRef.current.fillPreviewColor = c;
+      if (canvasRef.current.fillPreview) canvasRef.current.markDirty();
+    }
+  }
+
+  // Keyboard modifier state (updated in keydown/keyup so tools can read it via context)
+  const ctrlHeldRef  = useRef(false);
+  const shiftHeldRef = useRef(false);
 
   const [brushRadius, _setBrushRadius] = useState(0);
   const brushRadiusRef = useRef(0);
@@ -244,7 +261,7 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
   }
 
   // ── Requantize params ───────────────────────────────────────────────────────
-  const [reqAlgo,    setReqAlgo]    = useState<DitherAlgo>(DEFAULT_REQ_PARAMS.dither);
+  const [reqAlgo,    setReqAlgo]    = useState<DitherAlgo>('NONE');
   const [reqMetric,  setReqMetric]  = useState<typeof MatchMetric[keyof typeof MatchMetric]>(DEFAULT_REQ_PARAMS.metric);
   const [reqFsStr,   setReqFsStr]   = useState(DEFAULT_REQ_PARAMS.fsStrength);
   const [reqAtkStr,  setReqAtkStr]  = useState(DEFAULT_REQ_PARAMS.atkStrength);
@@ -271,6 +288,20 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
 
   const sourceBitmapRef = useRef<ImageBitmap | null>(sourceBitmap ?? null);
   useEffect(() => { sourceBitmapRef.current = sourceBitmap ?? null; }, [sourceBitmap]);
+
+  // ── Notify App of current import params so reimport respects user settings ──
+  useEffect(() => {
+    onImportParamsChange?.({
+      legalOnly:     !compRef.current.allShades,
+      targetColors:  0,
+      dither:        reqAlgo,
+      metric:        reqMetric,
+      chromaBoost:   reqChroma,
+      diffuseAmount: reqAlgo === 'ATKINSON' ? reqAtkStr : reqFsStr,
+      bayerScale:    reqBayer,
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reqAlgo, reqMetric, reqChroma, reqFsStr, reqAtkStr, reqBayer]);
 
   // ── Requantize preview ──────────────────────────────────────────────────────
   const [previewComp, _setPreviewComp] = useState<CompositionState | null>(null);
@@ -353,6 +384,8 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
     brushShape:    brushShapeRef.current,
     fillTolerance: fillTolRef.current,
     wandTolerance: wandTolRef.current,
+    ctrlHeld:      ctrlHeldRef.current,
+    shiftHeld:     shiftHeldRef.current,
     setColor:      (b: number) => setActiveColor(b),
     setSelMask,
     getSelMask:    () => selMaskRef.current,
@@ -743,14 +776,16 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
         const frame = c.frames[ti]?.[c.activeFrame];
         setHoverColor(frame ? frame[(gx % MAP_SIZE) + (gy % MAP_SIZE) * MAP_SIZE] : 0);
         setScale(canvas.scale);
-        if (activeToolIdRef.current === 'wand') {
-          magicWand.updateHover(gx, gy, getCtx());
+        const toolId = activeToolIdRef.current;
+        if (toolId === 'wand') {
+          magicWand.updateHover(gx, gy, getCtx(), ctrlHeldRef.current);
+        } else if (toolId === 'fill') {
+          fillTool.updateHover(gx, gy, getCtx());
         }
-        // Paste ghost always follows cursor (canvas brushX/Y already updated by Canvas.ts)
       },
       onWheel: (e) => {
         // Shift+scroll: adjust the active tool's primary parameter.
-        const delta = e.deltaY < 0 ? 1 : -1;
+        const delta  = e.deltaY < 0 ? 1 : -1;
         const toolId = activeToolIdRef.current;
         switch (toolId) {
           case 'brush': {
@@ -761,12 +796,18 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
             const step = e.ctrlKey ? 0.005 : 0.025;
             const sc   = e.ctrlKey ? 200   : 40;
             setWandTol(t => Math.round(Math.max(0, Math.min(0.5, t + delta * step)) * sc) / sc);
+            // Recompute hover preview at current cursor position with updated tolerance.
+            magicWand.invalidateHoverCache();
+            magicWand.updateHover(canvas.brushX, canvas.brushY, getCtx(), ctrlHeldRef.current);
             break;
           }
           case 'fill': {
             const step  = e.ctrlKey ? 0.005 : 0.025;
-            const scale = e.ctrlKey ? 200   : 40;
-            setFillTol(t => Math.round(Math.max(0, Math.min(0.5, t + delta * step)) * scale) / scale);
+            const sc    = e.ctrlKey ? 200   : 40;
+            setFillTol(t => Math.round(Math.max(0, Math.min(0.5, t + delta * step)) * sc) / sc);
+            // Recompute fill preview at current cursor position with updated tolerance.
+            fillTool.invalidateHoverCache();
+            fillTool.updateHover(canvas.brushX, canvas.brushY, getCtx());
             break;
           }
         }
@@ -795,9 +836,35 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
 
   // ── Keyboard shortcuts ──────────────────────────────────────────────────────
   useEffect(() => {
+    // Track modifier key state so tools can read it via ToolContext.
+    // Also re-run the wand hover when Ctrl toggles (changes preview mode).
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Control' || e.key === 'Meta') {
+        ctrlHeldRef.current = false;
+        // If wand is active, switch back to blue (add) preview.
+        if (activeToolIdRef.current === 'wand' && canvasRef.current) {
+          magicWand.invalidateHoverCache();
+          magicWand.updateHover(canvasRef.current.brushX, canvasRef.current.brushY, getCtx(), false);
+        }
+      }
+      if (e.key === 'Shift') shiftHeldRef.current = false;
+    };
+    window.addEventListener('keyup', onKeyUp);
+
     const onKey = (e: KeyboardEvent) => {
       const tag = (document.activeElement as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+
+      // Update modifier refs (used by tools via ToolContext).
+      ctrlHeldRef.current  = e.ctrlKey || e.metaKey;
+      shiftHeldRef.current = e.shiftKey;
+
+      // When Ctrl is pressed while wand is active, switch to orange (subtract) preview.
+      if ((e.key === 'Control' || e.key === 'Meta') && activeToolIdRef.current === 'wand' && canvasRef.current) {
+        magicWand.invalidateHoverCache();
+        magicWand.updateHover(canvasRef.current.brushX, canvasRef.current.brushY, getCtx(), true);
+        return;
+      }
 
       const ctrl  = e.ctrlKey || e.metaKey;
       const shift = e.shiftKey;
@@ -1087,7 +1154,10 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
     };
 
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keyup', onKeyUp);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1100,11 +1170,11 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
 
   // ─── Computed display values ──────────────────────────────────────────────────
   const TOOL_DEFS = [
-    { id:'brush',  label:'Brush',  key:'B', hint:'right-click: pick' },
-    { id:'fill',   label:'Fill',   key:'F', hint:'right-click: pick' },
-    { id:'select', label:'Select', key:'S', hint:'drag: marquee' },
-    { id:'lasso',  label:'Lasso',  key:'L', hint:'dbl-click: close' },
-    { id:'wand',   label:'Wand',   key:'W', hint:'click: add, right: subtract' },
+    { id:'brush',  label:'🖌 Brush',  key:'B', hint:'right-click: pick color' },
+    { id:'fill',   label:'🪣 Fill',   key:'F', hint:'right-click: pick · scroll: tolerance' },
+    { id:'select', label:'▭ Select', key:'S', hint:'drag: marquee · Ctrl: subtract' },
+    { id:'lasso',  label:'⬡ Lasso',  key:'L', hint:'dbl-click: close · Ctrl: subtract' },
+    { id:'wand',   label:'✦ Wand',   key:'W', hint:'click: add · Ctrl: subtract · scroll: tol' },
   ] as const;
 
   const activeTool   = TOOL_MAP.get(activeToolId) ?? brushTool;
@@ -1491,8 +1561,8 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
 
 function Param({ label, children }: { label: string; children: ComponentChildren }) {
   return (
-    <div style={{ display:'flex', flexDirection:'column', gap:3, marginTop:2 }}>
-      <span style={{ fontSize:10, color:'#888', lineHeight:1.2 }}>{label}</span>
+    <div style={{ display:'flex', flexDirection:'column', gap:3, marginTop:3 }}>
+      <span style={{ fontSize:11, color:'#888', lineHeight:1.2 }}>{label}</span>
       {children}
     </div>
   );
@@ -1507,8 +1577,8 @@ function ChipBtn({ active, onClick, children }: { active: boolean; onClick: () =
       borderRadius:  3,
       color:        active ? '#8cf' : '#888',
       cursor:       'pointer',
-      fontSize:      10,
-      padding:      '2px 0',
+      fontSize:      11,
+      padding:      '3px 0',
       textAlign:    'center',
     }}>
       {children}
@@ -1520,7 +1590,7 @@ function ChipBtn({ active, onClick, children }: { active: boolean; onClick: () =
 
 const ROOT_STYLE: h.JSX.CSSProperties = {
   display:             'grid',
-  gridTemplateColumns: '136px 1fr 160px',
+  gridTemplateColumns: '152px 1fr 168px',
   gridTemplateRows:    '1fr auto',
   width:               '100%',
   height:              '100%',
@@ -1528,7 +1598,7 @@ const ROOT_STYLE: h.JSX.CSSProperties = {
   background:          '#1a1a1a',
   color:               '#ddd',
   fontFamily:          'system-ui, sans-serif',
-  fontSize:             13,
+  fontSize:             14,
 };
 
 const LEFT_PANEL: h.JSX.CSSProperties = {
@@ -1536,7 +1606,7 @@ const LEFT_PANEL: h.JSX.CSSProperties = {
   gridRow:       1,
   background:    '#1e1e1e',
   borderRight:   '1px solid #333',
-  padding:        6,
+  padding:        7,
   display:       'flex',
   flexDirection: 'column',
   gap:            3,
@@ -1556,16 +1626,16 @@ const BTN_BASE: h.JSX.CSSProperties = {
   borderRadius:   3,
   color:         '#ccc',
   cursor:        'pointer',
-  padding:       '4px 6px',
+  padding:       '5px 6px',
   textAlign:     'left',
-  fontSize:       12,
+  fontSize:       13,
   lineHeight:     1.3,
 };
 const TOOL_BTN_OFF: h.JSX.CSSProperties = { ...BTN_BASE };
 const TOOL_BTN_ON:  h.JSX.CSSProperties = { ...BTN_BASE, background:'#1b3556', borderColor:'#4a9eff', color:'#fff' };
 
 const SHAPE_BASE: h.JSX.CSSProperties = {
-  flex: 1, background:'transparent', border:'1px solid #444', borderRadius:3, color:'#ccc', cursor:'pointer', fontSize:14,
+  flex: 1, background:'transparent', border:'1px solid #444', borderRadius:3, color:'#ccc', cursor:'pointer', fontSize:15,
 };
 const SHAPE_OFF: h.JSX.CSSProperties = { ...SHAPE_BASE };
 const SHAPE_ON:  h.JSX.CSSProperties = { ...SHAPE_BASE, background:'#1b3556', borderColor:'#4a9eff' };
@@ -1576,26 +1646,26 @@ const SEL_BTN: h.JSX.CSSProperties = {
   borderRadius:  3,
   color:         '#bbb',
   cursor:        'pointer',
-  padding:       '3px 6px',
-  fontSize:       10,
+  padding:       '4px 7px',
+  fontSize:       12,
   textAlign:     'left',
 };
 
 const DIVIDER: h.JSX.CSSProperties = {
   borderTop:  '1px solid #333',
-  margin:     '4px 0',
+  margin:     '5px 0',
   flexShrink:  0,
 };
 
 const SECTION_LABEL: h.JSX.CSSProperties = {
-  fontSize:    11,
+  fontSize:    12,
   color:       '#5af',
   fontWeight:  'bold',
   marginBottom: 2,
 };
 
 const MICRO_LABEL: h.JSX.CSSProperties = {
-  fontSize: 10,
+  fontSize: 11,
   color:    '#666',
   marginTop: 3,
 };
@@ -1620,8 +1690,8 @@ const STATUS_OVERLAY: h.JSX.CSSProperties = {
   transform:   'translateX(-50%)',
   background:  'rgba(0,0,0,0.75)',
   color:       '#fff',
-  fontSize:     12,
-  padding:     '3px 10px',
+  fontSize:     13,
+  padding:     '4px 12px',
   borderRadius: 4,
   pointerEvents: 'none',
   whiteSpace:  'nowrap',

@@ -64,8 +64,10 @@ export class MapCanvas {
   ditherMask: Float32Array | null = null;
   showDitherMask = false;
 
-  // Wand hover preview (same size as selMask)
+  // Wand / lasso / rect hover preview (same size as selMask).
+  // When wandPreviewSubtract=true the preview is orange (deselect) instead of blue (select).
   wandPreview: Uint8Array | null = null;
+  wandPreviewSubtract = false;
 
   // Brush overlay
   brushX = -1;
@@ -78,6 +80,10 @@ export class MapCanvas {
 
   // Paste ghost — clipboard pixels rendered semi-transparently at cursor.
   pasteGhost: { pixels: Uint8Array; mask: Uint8Array; w: number; h: number } | null = null;
+
+  // Fill hover preview — flood region shown with the fill colour.
+  fillPreview:      Uint8Array | null = null;
+  fillPreviewColor  = 0;  // map byte whose palette RGB is used for the overlay tint
 
   // Heatmap LUT — packed 0x00RRGGBB per map-byte; when set, replaces MC_PALETTE.
   heatmapLut: Uint32Array | null = null;
@@ -212,8 +218,11 @@ export class MapCanvas {
     // Dither mask heatmap.
     if (this.showDitherMask && this.ditherMask) this.drawDitherMask(ctx, gridW, gridH);
 
-    // Wand hover preview.
+    // Wand / lasso / rect hover preview.
     if (this.wandPreview) this.drawWandPreview(ctx, gridW, gridH);
+
+    // Fill tool hover preview (coloured with the active fill colour).
+    if (this.fillPreview) this.drawFillPreview(ctx, gridW, gridH);
 
     // Brush ring overlay.
     if (this.brushX >= 0) this.drawBrushOverlay(ctx);
@@ -341,7 +350,30 @@ export class MapCanvas {
     const [gxMin, gyMin] = this.screenToGlobal(0, 0);
     const [gxMax, gyMax] = this.screenToGlobal(this.el.width, this.el.height);
 
-    ctx.fillStyle = 'rgba(0, 136, 255, 0.31)';
+    // Blue tint = add to selection; orange tint = subtract from selection.
+    ctx.fillStyle = this.wandPreviewSubtract
+      ? 'rgba(255, 140, 0, 0.38)'
+      : 'rgba(0, 136, 255, 0.31)';
+    for (let gy = Math.max(0, gyMin); gy <= Math.min(gridH - 1, gyMax); gy++) {
+      for (let gx = Math.max(0, gxMin); gx <= Math.min(gridW - 1, gxMax); gx++) {
+        if (preview[gy * gridW + gx]) {
+          ctx.fillRect(translateX + gx * scale, translateY + gy * scale, scale, scale);
+        }
+      }
+    }
+  }
+
+  private drawFillPreview(ctx: CanvasRenderingContext2D, gridW: number, gridH: number): void {
+    const { scale, translateX, translateY } = this;
+    const preview = this.fillPreview!;
+    const [gxMin, gyMin] = this.screenToGlobal(0, 0);
+    const [gxMax, gyMax] = this.screenToGlobal(this.el.width, this.el.height);
+
+    const rgb = MC_PALETTE[this.fillPreviewColor] ?? 0;
+    const r = (rgb >> 16) & 0xff;
+    const g = (rgb >>  8) & 0xff;
+    const b = rgb & 0xff;
+    ctx.fillStyle = `rgba(${r},${g},${b},0.55)`;
     for (let gy = Math.max(0, gyMin); gy <= Math.min(gridH - 1, gyMax); gy++) {
       for (let gx = Math.max(0, gxMin); gx <= Math.min(gridW - 1, gxMax); gx++) {
         if (preview[gy * gridW + gx]) {

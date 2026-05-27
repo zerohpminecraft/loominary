@@ -25,6 +25,10 @@ export interface ToolContext {
   fillTolerance: number;   // OKLab distance (0–1)
   wandTolerance: number;
 
+  // Modifier key state at the time of the event
+  ctrlHeld:  boolean;
+  shiftHeld: boolean;
+
   // Callbacks to modify Editor state
   setColor:    (mapByte: number) => void;
   setSelMask:  (mask: Uint8Array | null) => void;

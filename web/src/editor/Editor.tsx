@@ -685,6 +685,15 @@ export function Editor({ initialComp, gridCols: propCols, gridRows: propRows, so
   const doRequantizeRef = useRef(doRequantize);
   useEffect(() => { doRequantizeRef.current = doRequantize; }, [doRequantize]);
 
+  // ── Auto-refresh preview when req params change ──────────────────────────────
+  // If a preview is already showing, re-run requantize immediately so the
+  // user can see the effect of dither / metric / chroma changes live.
+  useEffect(() => {
+    if (!previewCompRef.current) return;
+    void doRequantizeRef.current();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reqAlgo, reqMetric, reqChroma, reqFsStr, reqAtkStr, reqBayer, reqTilePal]);
+
   // ── Canvas init ─────────────────────────────────────────────────────────────
   useEffect(() => {
     const el = canvasElRef.current!;

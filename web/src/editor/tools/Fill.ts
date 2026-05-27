@@ -1,8 +1,8 @@
 /**
  * Fill tool (F) — OKLab tolerance flood fill.
  *
- * Left-click fills the connected region (within tolerance) with the active colour.
- * Right-click flood-fills with colour 0 (transparent/erase).
+ * Left-click  floods the connected region with the active colour.
+ * Right-click picks the colour under the cursor (eyedropper behaviour).
  *
  * Flood fill is performed in global pixel coordinates so it crosses tile seams.
  * If a selection is active, only selected pixels are filled.
@@ -18,16 +18,22 @@ export class FillTool implements Tool {
   readonly cursor = 'crosshair';
 
   onPointerEvent(gx: number, gy: number, button: number, _buttons: number, ctx: ToolContext): void {
-    if (button !== 0 && button !== 2) return;
+    // Right-click → pick colour
+    if (button === 2) {
+      ctx.setColor(readPixel(ctx.comp, gx, gy));
+      return;
+    }
+
+    if (button !== 0) return;
 
     const { comp, history, oklabLookup, fillTolerance } = ctx;
-    const fillColor  = button === 0 ? ctx.activeColor : 0;
+    const fillColor  = ctx.activeColor;
     const startColor = readPixel(comp, gx, gy);
     if (startColor === fillColor) return;
 
-    const sel      = ctx.getSelMask();
-    const gridW    = comp.gridCols * MAP_SIZE;
-    const gridH    = comp.gridRows * MAP_SIZE;
+    const sel       = ctx.getSelMask();
+    const gridW     = comp.gridCols * MAP_SIZE;
+    const gridH     = comp.gridRows * MAP_SIZE;
     const selActive = sel !== null;
 
     if (selActive && !sel![gy * gridW + gx]) return;
@@ -46,24 +52,21 @@ export class FillTool implements Tool {
 
     while (queue.length > 0) {
       const cur = queue.pop()!;
-      const cy = (cur / gridW) | 0;
-      const cx = cur % gridW;
+      const cy  = (cur / gridW) | 0;
+      const cx  = cur % gridW;
       const curColor = readPixel(comp, cx, cy);
 
       // Tolerance gate — OKLab distance from the start colour.
       if (startEntry && oklabLookup[curColor]) {
         const e = oklabLookup[curColor]!;
-        if (oklabDistSq(startEntry[0], startEntry[1], startEntry[2], e[0], e[1], e[2]) > tolSq) {
-          continue;
-        }
+        if (oklabDistSq(startEntry[0], startEntry[1], startEntry[2], e[0], e[1], e[2]) > tolSq) continue;
       } else if (curColor !== startColor) {
         continue;
       }
 
       if (writePixel(comp, cx, cy, fillColor, sel)) anyWrite = true;
 
-      const DIRS: [number, number][] = [[-1,0],[1,0],[0,-1],[0,1]];
-      for (const [dx, dy] of DIRS) {
+      for (const [dx, dy] of [[-1,0],[1,0],[0,-1],[0,1]] as [number,number][]) {
         const nx = cx + dx, ny = cy + dy;
         if (nx < 0 || ny < 0 || nx >= gridW || ny >= gridH) continue;
         const ni = ny * gridW + nx;

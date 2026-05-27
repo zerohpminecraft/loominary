@@ -122,6 +122,9 @@ export class LassoTool implements Tool {
     ctx.canvas.markDirty();
   }
 
+  /** True while vertices have been added but the path is not yet closed. */
+  hasPath(): boolean { return this.points.length > 0; }
+
   deactivate(ctx: ToolContext): void {
     this.points = [];
     ctx.canvas.wandPreview = null;

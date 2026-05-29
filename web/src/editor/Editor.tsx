@@ -32,7 +32,7 @@ import {
 import { MC_PALETTE }  from '../palette.js';
 import type { CompositionState } from '../payload-state.js';
 import { emptyPayloadState, compositionFromState } from '../payload-state.js';
-import { FilterType, applyFilter } from '../filters.js';
+import { FilterType } from '../filters.js';
 import { type PreprocessParams, DEFAULT_PREPROCESS, prepareSourceImage, applyPreprocess } from '../preprocess.js';
 import {
   PALETTE_CHOICES, buildPaletteFlag, type PaletteRestriction,
@@ -64,6 +64,63 @@ interface DataStats {
   tiles:      TileDataStat[];
   totalBytes: number;
   maxBanners: number;
+}
+
+// ─── Persistent compress worker pool ─────────────────────────────────────────
+// Workers are created lazily on first use and kept alive for the lifetime of
+// the module so WASM is initialised only once per worker instance.
+
+let _compressPool: Worker[] | null = null;
+
+function getCompressPool(): Worker[] {
+  if (!_compressPool) {
+    const n = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2)));
+    _compressPool = Array.from({ length: n }, () =>
+      new Worker(new URL('../compress-worker.ts', import.meta.url), { type: 'module' }),
+    );
+  }
+  return _compressPool;
+}
+
+// ─── Parallel worker dispatch helpers ────────────────────────────────────────
+
+/**
+ * Dispatch `total` tasks across a pool of workers (create-per-call).
+ * Workers are terminated when all tasks complete or on error.
+ * `dispatchOne(worker, taskIndex)` sends one task to a worker.
+ * Each `onResult` call receives the structured-cloned message from the worker.
+ */
+function runWorkerPool<R>(
+  workerUrl: URL,
+  total: number,
+  dispatchOne: (worker: Worker, taskIndex: number) => void,
+  onResult:   (data: R, taskIndex: number) => void,
+): Promise<void> {
+  if (total === 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const concurrency = Math.min(total, navigator.hardwareConcurrency || 4);
+    const workers: Worker[] = [];
+    let nextJob = 0, finished = 0;
+
+    const terminateAll = () => workers.forEach(w => w.terminate());
+
+    function dispatch(worker: Worker) {
+      if (nextJob >= total) return;
+      dispatchOne(worker, nextJob++);
+    }
+
+    for (let i = 0; i < concurrency; i++) {
+      const w = new Worker(workerUrl, { type: 'module' });
+      w.onmessage = ({ data }: MessageEvent<R & { frameIndex?: number; taskIndex?: number }>) => {
+        onResult(data as R, (data.frameIndex ?? data.taskIndex)!);
+        if (++finished === total) { terminateAll(); resolve(); }
+        else dispatch(w);
+      };
+      w.onerror = (e) => { terminateAll(); reject(new Error((e as ErrorEvent).message ?? 'Worker error')); };
+      workers.push(w);
+      dispatch(w);
+    }
+  });
 }
 
 /**
@@ -633,21 +690,47 @@ export function Editor({
     const c = compRef.current;
     setDataComputing(true);
     try {
-      const { compress } = await import('../compression.js');
-      const tiles: TileDataStat[] = [];
-      for (let ti = 0; ti < c.frames.length; ti++) {
-        const frame      = c.frames[ti]?.[c.activeFrame] ?? new Uint8Array(MAP_SIZE * MAP_SIZE);
-        const compressed = await compress(frame);
-        const bytes      = compressed.length;
-        // CJK banner count: each banner holds 84 bytes; 2-byte length header overhead
-        const banners    = Math.ceil((bytes + 2) / 84);
-        const pct        = bytes / 5290 * 100;
-        tiles.push({ tileCol: ti % c.gridCols, tileRow: Math.floor(ti / c.gridCols), bytes, banners, pct, overflow: bytes > 5290 });
-      }
+      const tileCount   = c.frames.length;
+      const pool        = getCompressPool();
+      const compLengths = new Array<number>(tileCount);
+      let pending       = tileCount;
+      let poolIdx       = 0;
+
+      await new Promise<void>((resolve, reject) => {
+        // Assign one task per worker slot (pool may be smaller than tileCount).
+        const nextTask = { i: 0 };
+
+        function sendNext(worker: Worker) {
+          if (nextTask.i >= tileCount) return;
+          const ti   = nextTask.i++;
+          const frame = c.frames[ti]?.[c.activeFrame] ?? new Uint8Array(MAP_SIZE * MAP_SIZE);
+          const buf   = new ArrayBuffer(frame.byteLength);
+          new Uint8Array(buf).set(frame);
+          // Temporarily override the onmessage for this task.
+          worker.onmessage = ({ data }: MessageEvent<{ taskIndex: number; compressedLength: number }>) => {
+            compLengths[data.taskIndex] = data.compressedLength;
+            if (--pending === 0) resolve();
+            else sendNext(worker);
+          };
+          worker.onerror = (e) => reject(new Error((e as ErrorEvent).message ?? 'Compress worker error'));
+          worker.postMessage({ taskIndex: ti, buffer: buf }, { transfer: [buf] });
+        }
+
+        // Kick off one task per worker (up to tileCount tasks total).
+        for (let i = 0; i < Math.min(pool.length, tileCount); i++) {
+          sendNext(pool[poolIdx++ % pool.length]);
+        }
+      });
+
+      const tiles: TileDataStat[] = compLengths.map((bytes, ti) => {
+        const banners = Math.ceil((bytes + 2) / 84);
+        const pct     = bytes / 5290 * 100;
+        return { tileCol: ti % c.gridCols, tileRow: Math.floor(ti / c.gridCols), bytes, banners, pct, overflow: bytes > 5290 };
+      });
       setDataStats({
         tiles,
-        totalBytes:  tiles.reduce((s, t) => s + t.bytes, 0),
-        maxBanners:  Math.max(...tiles.map(t => t.banners)),
+        totalBytes: tiles.reduce((s, t) => s + t.bytes, 0),
+        maxBanners: Math.max(...tiles.map(t => t.banners)),
       });
     } catch (err) {
       console.warn('[Loominary] computeDataStats error:', err);
@@ -885,31 +968,61 @@ export function Editor({
     const allF = filterScopeRef.current === 'all';
     const maxF = Math.max(...c.frames.map(t => t.length), 1);
     const frameIdxs = allF ? Array.from({ length: maxF }, (_, i) => i) : [c.activeFrame];
-    setStatusMsg(`Applying ${filterTypeRef.current}…`);
+    const total = frameIdxs.length;
+    setStatusMsg(`Applying ${filterTypeRef.current}… (0/${total})`);
     try {
       const { customPalette: filterCp, tilePalette: filterTp } = buildReqPalette();
-      const params: RequantizeParams = {
-        ...DEFAULT_REQ_PARAMS,
-        dither:          'NONE',
-        metric:          reqMetricRef.current,
-        legalOnly:       !c.allShades,
-        customPalette:   filterCp,
-        tilePalette:     filterTp,
-        chromaBoost:     reqChromaRef.current,
-        useCustomDither: false,
-        ditherMask:      null,
+      const reqParams: RequantizeParams = {
+        ...DEFAULT_REQ_PARAMS, dither: 'NONE',
+        metric: reqMetricRef.current, legalOnly: !c.allShades,
+        customPalette: filterCp, tilePalette: filterTp,
+        chromaBoost: reqChromaRef.current, useCustomDither: false, ditherMask: null,
       };
+      const filterParams = { type: filterTypeRef.current, strength: filterStrengthRef.current };
+      const selMask = selMaskRef.current;
+      const tileCount = c.frames.length;
+
       historyRef.current.snapshot(c.frames);
-      let newFrames = c.frames.map(tf => [...tf]);
-      for (const fi of frameIdxs) {
-        const source   = mapBytesToImageData(c.frames, fi, c.gridCols, c.gridRows);
-        const filtered = applyFilter(source, { type: filterTypeRef.current, strength: filterStrengthRef.current });
-        const newTiles = requantizeGrid(filtered, c, selMaskRef.current, params);
-        newFrames = newFrames.map((tf, ti) => tf.map((f, fj) => fj === fi ? newTiles[ti] : f));
-      }
+
+      // Results indexed by position in frameIdxs (not by fi directly).
+      const ordered = new Array<Uint8Array[]>(total);
+      let done = 0;
+
+      await runWorkerPool<{ frameIndex: number; tileBuffers: ArrayBuffer[] }>(
+        new URL('../filter-worker.ts', import.meta.url),
+        total,
+        (worker, jobIdx) => {
+          const fi = frameIdxs[jobIdx];
+          // Transfer a copy of each tile's frame buffer.
+          const tileBuffers: ArrayBuffer[] = Array.from({ length: tileCount }, (_, ti) => {
+            const src  = c.frames[ti]?.[fi] ?? new Uint8Array(128 * 128);
+            const copy = new ArrayBuffer(src.byteLength);
+            new Uint8Array(copy).set(src);
+            return copy;
+          });
+          worker.postMessage(
+            { frameIndex: jobIdx, tileBuffers,
+              gridCols: c.gridCols, gridRows: c.gridRows,
+              filterParams, reqParams,
+              selMask: selMask ? new Uint8Array(selMask) : null },
+            { transfer: tileBuffers },
+          );
+        },
+        (data, jobIdx) => {
+          ordered[jobIdx] = data.tileBuffers.map((b: ArrayBuffer) => new Uint8Array(b));
+          setStatusMsg(`Applying ${filterTypeRef.current}… (${++done}/${total})`);
+        },
+      );
+
+      // Reconstruct frames: slot each worker result back into its frame index.
+      const newFrames = c.frames.map((tf, ti) => {
+        const updated = [...tf];
+        frameIdxs.forEach((fi, jobIdx) => { updated[fi] = ordered[jobIdx][ti]; });
+        return updated;
+      });
       syncComp({ ...c, frames: newFrames });
       setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
-      setStatusMsg(`Filter: ${filterTypeRef.current} applied${allF ? ` (${frameIdxs.length} frames)` : ''}`);
+      setStatusMsg(`Filter: ${filterTypeRef.current} applied${allF ? ` (${total} frames)` : ''}`);
     } catch (err) {
       setStatusMsg(`Filter error: ${err}`);
     }

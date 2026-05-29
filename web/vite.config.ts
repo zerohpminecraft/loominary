@@ -3,6 +3,9 @@ import preact from '@preact/preset-vite';
 
 export default defineConfig({
   plugins: [preact()],
+  worker: {
+    format: 'es',  // ESM workers support dynamic imports (needed by compress-worker)
+  },
   build: {
     target: 'es2022',
     // Inline the zstd WASM as a base64 data URL so the bundle is

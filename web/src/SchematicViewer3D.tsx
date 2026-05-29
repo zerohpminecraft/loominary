@@ -2,7 +2,7 @@
  * SchematicViewer3D — WebGL2 3D preview of carpet platform schematics.
  *
  * Two data sources:
- *   Composition (default) — renders from comp.frames using MC_PALETTE for exact colors.
+ *   Tile preview  — renders the LOOM-encoded carpet nibbles for one exported tile.
  *   .litematic file drop  — parses gzip/NBT, extracts carpet block positions & colors.
  *
  * Rendering: one thin slab (1×0.125×1) per carpet block, instanced.
@@ -11,8 +11,11 @@
 
 import { h }                            from 'preact';
 import { useRef, useEffect, useCallback, useState } from 'preact/hooks';
-import type { CompositionState }         from './payload-state.js';
-import { MAP_BYTE_TO_NIBBLE }            from './carpet.js';
+import type { CodecMode }                from './codec-mode.js';
+import {
+  encodeNibbles, computeHeights, buildLoomHeader,
+  MAX_CARPET_BYTES, MAX_SHADE_BYTES, LOOM_FLAG_SHADE,
+}                                        from './carpet.js';
 
 // ─── Carpet block names (DyeColor order, matches carpet.ts NIBBLE_TO_MAP_BYTE) ──
 
@@ -162,49 +165,67 @@ function createProgram(gl: WebGL2RenderingContext): WebGLProgram {
   return prog;
 }
 
-// ─── Instance data from composition ──────────────────────────────────────────
+// ─── Instance data from a tile's LOOM-encoded payload ────────────────────────
 //
-// Renders the physical carpet schematic: 16-colour carpet blocks coloured by
-// their actual dye colour, with shade bits (mapByte & 3) driving the Y height
-// so the shade-channel staircase is visible.
+// Mirrors exportCarpetSchematic exactly: builds LOOM cargo from the compressed
+// payload, splits into carpet / shade channels, encodes nibbles, renders the
+// physical carpet blocks (flat or staircase).
 //
 // Instance buffer format: [x, y, z, r, g, b] — stride 6 floats (24 bytes).
 
-const TILE_GAP = 8;
+function instancesFromTileData(
+  compressedData: Uint8Array,
+  codec: CodecMode,
+): { data: Float32Array; count: number; cx: number; cz: number; span: number } | null {
+  const useShade = codec === 'CARPET_SHADE' || codec === 'CARPET_BANNERS_SHADE'
+                || codec === 'CARPET_SHADE_BANNERS';
+  const flags  = useShade ? LOOM_FLAG_SHADE : 0;
 
-function instancesFromComp(comp: CompositionState): {
-  data: Float32Array; count: number;
-  cx: number; cz: number; span: number;
-} {
-  const { gridCols, gridRows, frames, activeFrame } = comp;
-  const TILE = 128;
+  // Prepend LOOM header to form cargo (same as exportCarpetSchematic).
+  const header = buildLoomHeader(flags, 0, 0, compressedData.length, compressedData.length);
+  const cargo  = new Uint8Array(header.length + compressedData.length);
+  cargo.set(header, 0);
+  cargo.set(compressedData, header.length);
+
+  const carpetBytes = Math.min(cargo.length, MAX_CARPET_BYTES);
+  const shadeBytes  = useShade && cargo.length > MAX_CARPET_BYTES
+    ? Math.min(cargo.length - carpetBytes, MAX_SHADE_BYTES)
+    : 0;
+
+  const nibbles     = encodeNibbles(cargo, carpetBytes);
+  const nibblesUsed = carpetBytes * 2;
+  const carpetRows  = Math.ceil(carpetBytes * 2 / 128);
   const buf: number[] = [];
 
-  for (let ti = 0; ti < gridCols * gridRows; ti++) {
-    const tc  = ti % gridCols, tr = Math.floor(ti / gridCols);
-    const ox  = tc * (TILE + TILE_GAP);
-    const oz  = tr * (TILE + TILE_GAP);
-    const map = frames[ti]?.[activeFrame] ?? new Uint8Array(TILE * TILE);
-
-    for (let z = 0; z < TILE; z++) {
-      for (let x = 0; x < TILE; x++) {
-        const mapByte = map[z * TILE + x];
-        const nibble  = MAP_BYTE_TO_NIBBLE[mapByte];
-        if (nibble === 255) continue;   // non-carpet byte → no block
-        const col = CARPET_COLORS[`minecraft:${CARPET_NAMES[nibble]}_carpet`]
+  if (shadeBytes > 0) {
+    const heights = computeHeights(cargo.slice(carpetBytes, carpetBytes + shadeBytes), shadeBytes);
+    for (let z = 0; z < 128; z++) {
+      for (let x = 0; x < 128; x++) {
+        const ni = z * 128 + x;
+        if (ni >= nibblesUsed) continue;
+        const col = CARPET_COLORS[`minecraft:${CARPET_NAMES[nibbles[ni]]}_carpet`]
                  ?? [0.5, 0.5, 0.5] as [number, number, number];
-        const y = mapByte & 3;          // shade bits → physical height (0/1/2)
-        buf.push(ox + x, y, oz + z, col[0], col[1], col[2]);
+        buf.push(x, heights[x][z], z, col[0], col[1], col[2]);
+      }
+    }
+  } else {
+    for (let z = 0; z < carpetRows; z++) {
+      for (let x = 0; x < 128; x++) {
+        const ni = z * 128 + x;
+        if (ni >= nibblesUsed) continue;
+        const col = CARPET_COLORS[`minecraft:${CARPET_NAMES[nibbles[ni]]}_carpet`]
+                 ?? [0.5, 0.5, 0.5] as [number, number, number];
+        buf.push(x, 0, z, col[0], col[1], col[2]);
       }
     }
   }
 
-  const totalW = gridCols * (TILE + TILE_GAP) - TILE_GAP;
-  const totalD = gridRows * (TILE + TILE_GAP) - TILE_GAP;
+  if (buf.length === 0) return null;
+  const depth = shadeBytes > 0 ? 128 : carpetRows;
   return {
     data: new Float32Array(buf), count: buf.length / 6,
-    cx: totalW / 2, cz: totalD / 2,
-    span: Math.max(totalW, totalD),
+    cx: 64, cz: depth / 2,
+    span: Math.max(128, depth),
   };
 }
 
@@ -323,10 +344,11 @@ function instancesFromLitematic(root: Map<string, NbtVal>): {
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export interface SchematicViewer3DProps {
-  comp: CompositionState;
+  codec:        CodecMode;
+  tilePreview?: { ti: number; compressedData: Uint8Array; label: string } | null;
 }
 
-export function SchematicViewer3D({ comp }: SchematicViewer3DProps) {
+export function SchematicViewer3D({ codec, tilePreview }: SchematicViewer3DProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [error,     setError]     = useState<string | null>(null);
   const [dropHover, setDropHover] = useState(false);
@@ -466,13 +488,23 @@ export function SchematicViewer3D({ comp }: SchematicViewer3DProps) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Refresh instances when composition changes ────────────────────────────
+  // ── Refresh instances when tile selection or codec changes ───────────────
   useEffect(() => {
     if (!wgl.current.gl) return;
-    const { data, count, cx, cz, span } = instancesFromComp(comp);
-    uploadInstances(data, count, cx, cz, span);
+    if (!tilePreview) {
+      // No tile selected — clear the scene.
+      uploadInstances(new Float32Array(0), 0, 64, 64, 128);
+      setSourceLabel(null);
+      return;
+    }
+    const result = instancesFromTileData(tilePreview.compressedData, codec);
+    if (result) {
+      uploadInstances(result.data, result.count, result.cx, result.cz, result.span);
+    } else {
+      uploadInstances(new Float32Array(0), 0, 64, 64, 128);
+    }
     setSourceLabel(null);
-  }, [comp, uploadInstances]);
+  }, [tilePreview, codec, uploadInstances]);
 
   // ── Mouse / pointer controls ──────────────────────────────────────────────
 
@@ -577,9 +609,22 @@ export function SchematicViewer3D({ comp }: SchematicViewer3DProps) {
       }}>
         {sourceLabel
           ? `📄 ${sourceLabel}`
-          : `Carpet schematic · ${comp.gridCols}×${comp.gridRows} tile${comp.gridCols*comp.gridRows>1?'s':''}`}
-        {' · '}drag a .litematic to preview it
+          : tilePreview
+            ? `Schematic · ${tilePreview.label} · ${codec}`
+            : 'Click 👁 on a tile row to preview its schematic'}
+        {' · '}drag a .litematic to override
       </div>
+
+      {/* Empty state prompt */}
+      {!tilePreview && !sourceLabel && (
+        <div style={{
+          position: 'absolute', inset: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          color: '#333', fontSize: '0.7em', pointerEvents: 'none',
+        }}>
+          Click 👁 on a tile to preview
+        </div>
+      )}
 
       {/* Controls hint */}
       <div style={{

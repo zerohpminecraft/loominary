@@ -259,6 +259,10 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [gifUrl,  setGifUrl]  = useState<string | null>(null);
   const [show3D,  setShow3D]  = useState(false);
+  // Per-tile 3D schematic preview (null = no tile selected)
+  const [preview3DTile, setPreview3DTile] = useState<{
+    ti: number; compressedData: Uint8Array; label: string;
+  } | null>(null);
 
   const maxF       = Math.max(...comp.frames.map(t => t.length), 1);
   const isAnimated = maxF > 1;
@@ -366,7 +370,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     let extra = 0;
     let alloc = computeMuxAllocation(sizes, codec);
 
-    while (alloc.unresolved > 0 && extra < 64) {
+    while (alloc.unresolved > 0 && extra < 9999) {
       extra++;
       alloc = computeMuxAllocation([...sizes, ...Array(extra).fill(0)], codec);
     }
@@ -856,8 +860,16 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
           </div>
 
           {show3D ? (
-            <div style={{ height:320, width:'100%', border:'1px solid #333', borderRadius:3, overflow:'hidden' }}>
-              <SchematicViewer3D comp={comp} />
+            <div style={{ position:'relative', height:320, width:'100%', border:'1px solid #333', borderRadius:3, overflow:'hidden' }}>
+              <SchematicViewer3D codec={codec} tilePreview={preview3DTile} />
+              {preview3DTile && (
+                <button onClick={() => setPreview3DTile(null)} title="Back to tile selection"
+                  style={{ position:'absolute', top:6, left:8, background:'rgba(0,0,0,0.6)',
+                    border:'1px solid #444', borderRadius:3, color:'#aaa', cursor:'pointer',
+                    fontSize:'0.55em', padding:'2px 6px' }}>
+                  ← clear
+                </button>
+              )}
             </div>
           ) : (
             <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:4 }}>
@@ -941,7 +953,29 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
                         <td style={{ textAlign:'right', padding:'3px 6px', color:'#fa8' }}>{bd.bannerCount}</td>
                       )}
                       <td style={{ textAlign:'right', padding:'3px 6px' }}>{pct.toFixed(0)}%</td>
-                      <td style={{ padding:'3px 0 3px 4px' }}>{bd.fits ? '✓' : '✗'}</td>
+                      <td style={{ padding:'3px 0 3px 4px', whiteSpace:'nowrap' }}>
+                        {bd.fits ? '✓' : '✗'}
+                        {codec !== 'BANNER' && (
+                          <button
+                            onClick={() => {
+                              setPreview3DTile(preview3DTile?.ti === s.ti ? null : {
+                                ti: s.ti,
+                                compressedData: s.compressedData,
+                                label: multiTile ? `(${s.tileRow},${s.tileCol})` : 'tile',
+                              });
+                              setShow3D(true);
+                            }}
+                            title="Preview this tile's schematic in 3D"
+                            style={{
+                              marginLeft:4, background:'none',
+                              border:`1px solid ${preview3DTile?.ti === s.ti ? '#4a9eff' : '#333'}`,
+                              borderRadius:2,
+                              color: preview3DTile?.ti === s.ti ? '#8cf' : '#555',
+                              cursor:'pointer', fontSize:'0.85em', padding:'0 2px', lineHeight:1.3,
+                            }}
+                          >👁</button>
+                        )}
+                      </td>
                     </tr>
                   );
                 })}

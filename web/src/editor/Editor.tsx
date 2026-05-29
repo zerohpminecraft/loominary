@@ -1297,25 +1297,74 @@ export function Editor({
       const maxF = Math.max(...frames.map(t => t.length), 1);
       const allF = reqAllFramesRef.current && maxF > 1;
 
-      // Build per-frame results (one requantize pass per animation frame if "all frames").
-      let builtFrames = frames.map(tf => [...tf]); // shallow copy
       const framesToProcess = allF ? Array.from({ length: maxF }, (_, i) => i) : [activeFrame];
-      if (allF) setReqProgress({ done: 0, total: maxF });
+      const total = framesToProcess.length;
+      if (allF) setReqProgress({ done: 0, total });
 
-      for (const fi of framesToProcess) {
-        const src    = await buildSource(fi);
-        // Temporarily present the composition as if activeFrame=fi so requantizeGrid
-        // reads the right tile data for selection masking.
-        const cForFi = fi === activeFrame ? c : { ...c, activeFrame: fi };
-        const tiles  = requantizeGrid(src, cForFi, selMaskRef.current, params);
-        builtFrames  = builtFrames.map((tf, ti) => {
+      // Build all source ImageData objects up-front (parallel — each is independent).
+      setReqStatus('⏳ Preparing sources…');
+      const allSources = await Promise.all(framesToProcess.map(fi => buildSource(fi)));
+
+      // Dispatch each frame to a quantize worker in parallel.
+      const selMask = selMaskRef.current;
+      const ordered = new Array<Uint8Array[]>(total);
+      let done = 0;
+
+      await runWorkerPool<{ frameIndex: number; tileBuffers: ArrayBuffer[] }>(
+        new URL('../quantize-worker.ts', import.meta.url),
+        total,
+        (worker, jobIdx) => {
+          const src = allSources[jobIdx];
+          const fi  = framesToProcess[jobIdx];
+
+          // Transfer image buffer (detaches from allSources[jobIdx] — each source used once).
+          const imageBuffer = src.data.buffer as ArrayBuffer;
+
+          // Clone selection mask for each worker (can't transfer the same buffer twice).
+          const selBuffer = selMask
+            ? (() => { const b = new ArrayBuffer(selMask.byteLength); new Uint8Array(b).set(selMask); return b; })()
+            : null;
+
+          // For tile-palette mode send the current per-tile frame so the worker can
+          // build per-tile colour palettes.  Other modes get null (lighter message).
+          const tileFrameBuffers = params.tilePalette
+            ? frames.map(tf => {
+                const f  = tf[fi] ?? new Uint8Array(128 * 128);
+                const cp = new ArrayBuffer(f.byteLength);
+                new Uint8Array(cp).set(f);
+                return cp;
+              })
+            : null;
+
+          const transfers: ArrayBuffer[] = [
+            imageBuffer,
+            ...(selBuffer ? [selBuffer] : []),
+            ...(tileFrameBuffers ?? []),
+          ];
+          worker.postMessage(
+            { frameIndex: jobIdx, imageBuffer, width: src.width, height: src.height,
+              gridCols, gridRows, reqParams: params, selBuffer, tileFrameBuffers },
+            { transfer: transfers },
+          );
+        },
+        (data, jobIdx) => {
+          ordered[jobIdx] = data.tileBuffers.map((b: ArrayBuffer) => new Uint8Array(b));
+          setReqStatus(`⏳ Frame ${++done}/${total}…`);
+          setReqProgress({ done, total });
+        },
+      );
+      setReqProgress(null);
+
+      // Reconstruct the full frame array from worker results.
+      let builtFrames = frames.map(tf => [...tf]);
+      framesToProcess.forEach((fi, jobIdx) => {
+        const tiles = ordered[jobIdx];
+        builtFrames = builtFrames.map((tf, ti) => {
           const next = [...tf];
           next[fi] = tiles[ti] ?? next[fi];
           return next;
         });
-        if (allF) { setReqStatus(`⏳ Frame ${fi + 1}/${maxF}`); setReqProgress({ done: fi + 1, total: maxF }); }
-      }
-      if (allF) setReqProgress(null);
+      });
 
       const newFrames = builtFrames;
       const preview: CompositionState = { ...c, frames: newFrames };

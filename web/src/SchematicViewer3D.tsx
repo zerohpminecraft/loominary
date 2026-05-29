@@ -198,14 +198,20 @@ function instancesFromTileData(
   const buf: number[] = [];
 
   if (shadeBytes > 0) {
+    // Staircase: place white filler carpets from y=0 up to heights[x][z]-1,
+    // then the data carpet at y=heights[x][z].  Mirrors exportCarpetStaircase.
     const heights = computeHeights(cargo.slice(carpetBytes, carpetBytes + shadeBytes), shadeBytes);
     for (let z = 0; z < 128; z++) {
       for (let x = 0; x < 128; x++) {
         const ni = z * 128 + x;
         if (ni >= nibblesUsed) continue;
-        const col = CARPET_COLORS[`minecraft:${CARPET_NAMES[nibbles[ni]]}_carpet`]
-                 ?? [0.5, 0.5, 0.5] as [number, number, number];
-        buf.push(x, heights[x][z], z, col[0], col[1], col[2]);
+        const h = heights[x][z];
+        for (let y = 0; y <= h; y++) {
+          const nibble = y === h ? nibbles[ni] : 0;  // filler = white carpet (nibble 0)
+          const col = CARPET_COLORS[`minecraft:${CARPET_NAMES[nibble]}_carpet`]
+                   ?? [0.5, 0.5, 0.5] as [number, number, number];
+          buf.push(x, y, z, col[0], col[1], col[2]);
+        }
       }
     }
   } else {

@@ -245,11 +245,12 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
 
   // Mux
   const [muxAlloc,    setMuxAlloc]    = useState<MuxAllocation | null>(null);
-  const [muxApplied,  setMuxApplied]  = useState(false);
   const [muxCodec,    setMuxCodec]    = useState<CodecMode | null>(null);
-  // Blank donor tiles auto-added by "Compute Mux" when existing tiles can't absorb overflow.
-  // Reset to 0 whenever stats are recomputed (composition changed).
   const [extraDonors, setExtraDonors] = useState(0);
+
+  // 3D viewer resizable height
+  const [viewerH,     setViewerH]     = useState(320);
+  const viewerDragRef = useRef<{ y0: number; h0: number } | null>(null);
 
   // Budget warning dialog
   const [budgetWarnLabel,  setBudgetWarnLabel]  = useState<string | null>(null);
@@ -332,10 +333,9 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         setStatsProg({ done: ti + 1, total });
       }
       setTileStats(stats);
-      // Composition changed → mux allocation is stale; clear so user recomputes.
+      // Clear stale mux; auto-mux effect will recompute from fresh stats.
       setMuxAlloc(null);
       setMuxCodec(null);
-      setMuxApplied(false);
       setExtraDonors(0);
     } finally {
       setStatsComputing(false);
@@ -349,37 +349,28 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const { overBudget, budget } = budgetStatus(sizes, codec);
 
   const effectivelyOverBudget =
-    overBudget.length > 0 &&
-    (!muxApplied || !muxAlloc || muxAlloc.unresolved > 0);
+    overBudget.length > 0 && (!muxAlloc || muxAlloc.unresolved > 0);
 
-  // ── Mux computation ───────────────────────────────────────────────────────
-  //
-  // Blank donor tiles are appended automatically when existing tiles can't
-  // absorb all the overflow.  On recompute they're always recalculated from
-  // scratch (old count cleared, new count derived from the algorithm's needs).
-  // Users never see these tiles in the editor — they only appear in the export.
-  //
-  // We add blank donors one at a time rather than using the donorsNeeded()
-  // estimate.  The estimate uses budget−BYTES_PER_BANNER as spare-per-donor,
-  // but the actual donorSpareCalc overhead differs by codec (CARPET uses
-  // LOOM_GUEST_DESC = 10 B per guest, BANNER uses 84 B).  Adding one at a time
-  // guarantees convergence regardless of codec-specific capacity nuances.
-  function handleComputeMux() {
-    if (!tileStats) return;
-
+  // ── Auto-mux: recompute whenever stats or codec changes ───────────────────
+  useEffect(() => {
+    if (!tileStats || statsComputing) return;
+    const currentSizes = tileStats.map(s => s.compressedBytes);
+    const { overBudget: ob } = budgetStatus(currentSizes, codec);
+    if (ob.length === 0) {
+      setMuxAlloc(null); setExtraDonors(0); setMuxCodec(null);
+      return;
+    }
     let extra = 0;
-    let alloc = computeMuxAllocation(sizes, codec);
-
+    let alloc = computeMuxAllocation(currentSizes, codec);
     while (alloc.unresolved > 0 && extra < 9999) {
       extra++;
-      alloc = computeMuxAllocation([...sizes, ...Array(extra).fill(0)], codec);
+      alloc = computeMuxAllocation([...currentSizes, ...Array(extra).fill(0)], codec);
     }
-
     setExtraDonors(extra);
     setMuxAlloc(alloc);
     setMuxCodec(codec);
-    setMuxApplied(false);
-  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tileStats, codec, statsComputing]);
 
   // ── Budget-aware export gate ──────────────────────────────────────────────
   function tryExport(label: string, action: () => Promise<void>) {
@@ -424,7 +415,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   // carpetCompressedB64, which is exactly what applyBannerMux /
   // applyCarpetMux expect for blank donors (the functions fill in routing
   // banners / muxCargoB64 automatically).
-  async function encodeAndMux(nonceVal: number, localExtraDonors: number, localMuxApplied: boolean, localMuxAlloc: MuxAllocation | null) {
+  async function encodeAndMux(nonceVal: number, localExtraDonors: number, localMuxAlloc: MuxAllocation | null) {
     const ps = await encodeComposition(comp, {
       title: title.trim(), author: author.trim(), nonce: nonceVal, whitelist: [], codecMode: codec,
     });
@@ -452,15 +443,12 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
       setExportProg(null);
     }
 
-    if (localMuxApplied && localMuxAlloc) {
-      // Append auto-added blank donor tiles before applying mux so the
-      // allocation indices align with ps.tiles indices.
+    if (localMuxAlloc) {
       for (let i = 0; i < localExtraDonors; i++) {
         const donor = emptyTileData();
         donor.isDonorOnly = true;
         ps.tiles.push(donor);
       }
-
       if (codec === 'BANNER') {
         const { applyBannerMux: mx } = await import('../mux.js');
         const result = mx(ps.tiles, localMuxAlloc, comp.gridCols);
@@ -484,14 +472,14 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     setExporting(true); setStatus('Encoding…');
     try {
       const nonceVal = nonce ? ((Math.random() * 0x100000000) >>> 0) : 0;
-      const ps = await encodeAndMux(nonceVal, extraDonors, muxApplied, muxAlloc);
+      const ps = await encodeAndMux(nonceVal, extraDonors, muxAlloc);
       downloadState(ps);
       setStatus('Exported ✓'); setTimeout(() => setStatus(null), 2500);
     } catch (err) {
       setStatus(`Error: ${err}`); setTimeout(() => setStatus(null), 4000);
     } finally { setExporting(false); setExportProg(null); }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [comp, title, author, codec, nonce, encryptOn, passwords, muxApplied, muxAlloc, extraDonors, canExport]);
+  }, [comp, title, author, codec, nonce, encryptOn, passwords, muxAlloc, extraDonors, canExport]);
 
   // ── Export PNG ────────────────────────────────────────────────────────────
   const handlePngExport = useCallback(async () => {
@@ -574,7 +562,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
 
       // 1 — State JSON (with mux/encryption if active)
       setStatus('Building ZIP… encoding state');
-      const ps = await encodeAndMux(nonceVal, extraDonors, muxApplied, muxAlloc);
+      const ps = await encodeAndMux(nonceVal, extraDonors, muxAlloc);
       files.push({
         name: 'loominary_state.json',
         data: new TextEncoder().encode(JSON.stringify(ps, null, 2)),
@@ -624,7 +612,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     } catch (err) { setStatus(`Error: ${err}`); setTimeout(() => setStatus(null), 4000); }
     finally { setExporting(false); setExportProg(null); }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [comp, title, author, codec, nonce, encryptOn, passwords, muxApplied, muxAlloc, extraDonors, schematicsAvailable, canExport]);
+  }, [comp, title, author, codec, nonce, encryptOn, passwords, muxAlloc, extraDonors, schematicsAvailable, canExport]);
 
   // ─── Render ───────────────────────────────────────────────────────────────
   return (
@@ -775,7 +763,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
           onClick={() => tryExport('State JSON', handleExport)}
           disabled={exporting || !canExport}
           style={{ ...EXPORT_BTN, opacity: canExport ? 1 : 0.5, cursor: canExport && !exporting ? 'pointer' : 'not-allowed' }}>
-          {exporting ? 'Working…' : `⬇ State JSON${encryptOn && passwords.length > 0 ? ' (encrypted)' : ''}${muxApplied ? ' (mux)' : ''}`}
+          {exporting ? 'Working…' : `⬇ State JSON${encryptOn && passwords.length > 0 ? ' (encrypted)' : ''}${muxAlloc ? ' (mux)' : ''}`}
         </button>
 
         <div title={!schematicsAvailable ? 'Carpet platform schematics are only generated for carpet codecs — banner codec places banners automatically via the state JSON, no schematic needed' : 'Exports a 128×128 carpet-block platform schematic for each tile'}>
@@ -860,17 +848,34 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
           </div>
 
           {show3D ? (
-            <div style={{ position:'relative', height:320, width:'100%', border:'1px solid #333', borderRadius:3, overflow:'hidden' }}>
-              <SchematicViewer3D codec={codec} tilePreview={preview3DTile} />
-              {preview3DTile && (
-                <button onClick={() => setPreview3DTile(null)} title="Back to tile selection"
-                  style={{ position:'absolute', top:6, left:8, background:'rgba(0,0,0,0.6)',
-                    border:'1px solid #444', borderRadius:3, color:'#aaa', cursor:'pointer',
-                    fontSize:'0.55em', padding:'2px 6px' }}>
-                  ← clear
-                </button>
-              )}
-            </div>
+            <>
+              <div style={{ position:'relative', height:viewerH, width:'100%', border:'1px solid #333', borderRadius:3, overflow:'hidden' }}>
+                <SchematicViewer3D codec={codec} tilePreview={preview3DTile} />
+                {preview3DTile && (
+                  <button onClick={() => setPreview3DTile(null)} title="Back to tile selection"
+                    style={{ position:'absolute', top:6, left:8, background:'rgba(0,0,0,0.6)',
+                      border:'1px solid #444', borderRadius:3, color:'#aaa', cursor:'pointer',
+                      fontSize:'0.55em', padding:'2px 6px' }}>
+                    ← clear
+                  </button>
+                )}
+              </div>
+              {/* Vertical resize handle */}
+              <div
+                style={{ height:5, cursor:'ns-resize', background:'#1a1a1a',
+                  borderBottom:'1px solid #2a2a2a', flexShrink:0, userSelect:'none' }}
+                onPointerDown={e => {
+                  (e.target as HTMLElement).setPointerCapture(e.pointerId);
+                  viewerDragRef.current = { y0: e.clientY, h0: viewerH };
+                }}
+                onPointerMove={e => {
+                  if (!viewerDragRef.current) return;
+                  setViewerH(Math.max(120, Math.min(720,
+                    viewerDragRef.current.h0 + e.clientY - viewerDragRef.current.y0)));
+                }}
+                onPointerUp={() => { viewerDragRef.current = null; }}
+              />
+            </>
           ) : (
             <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:4 }}>
               {isAnimated && gifUrl
@@ -997,152 +1002,87 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
           )}
 
           {/* ── Mux section ── */}
-          {tileStats && multiTile && (
+          {tileStats && multiTile && muxAlloc && (
             <div style={{ background:'#161616', border:'1px solid #2a2a2a', borderRadius:4, padding:'8px 10px' }}>
               <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:6, flexWrap:'wrap' }}>
                 <div style={{ fontSize:'0.63em', color:'#5af', fontWeight:'bold' }}>Mux</div>
-
-                {overBudget.length > 0 && (
-                  <div style={{ fontSize:'0.58em', color:'#f93' }}>
-                    ⚠ {overBudget.length} tile{overBudget.length>1?'s':''} over budget
-                  </div>
-                )}
-                {overBudget.length === 0 && (
-                  <div style={{ fontSize:'0.58em', color:'#666' }}>All tiles fit — mux available for rebalancing</div>
-                )}
-
-                {/* Staleness badge */}
-                {muxAlloc && muxCodec && muxCodec !== codec && (
-                  <div style={{ fontSize:'0.53em', color:'#fa8', background:'#2a1800', border:'1px solid #663', borderRadius:2, padding:'1px 5px' }}>
-                    ↺ computed for {CODEC_LABEL[muxCodec]} — recompute for {CODEC_LABEL[codec]}
-                  </div>
-                )}
-
-                {/* Extra donors badge */}
-                {muxAlloc && extraDonors > 0 && (
-                  <div style={{ fontSize:'0.53em', color:'#5af', background:'#001633', border:'1px solid #15385a', borderRadius:2, padding:'1px 5px' }}>
-                    + {extraDonors} blank donor tile{extraDonors>1?'s':''} auto-added
-                  </div>
-                )}
-
-                <button onClick={handleComputeMux} style={{ ...SM_BTN, marginLeft:'auto' }}>
-                  {muxAlloc ? '↺ Recompute' : '▶ Compute Mux'}
-                </button>
-              </div>
-
-              <div style={{ fontSize:'0.58em', color:'#666', lineHeight:1.5, marginBottom:6 }}>
-                <b style={{ color:'#888' }}>What mux does:</b> Over-budget tiles become <em>receivers</em> — their overflow
-                bytes are redistributed into <em>donor</em> tiles with spare capacity. If the existing grid has insufficient
-                donor capacity, blank donor tiles are appended automatically. These donor tiles only appear in the exported
-                state JSON and are never shown in the editor.
-              </div>
-
-              {muxAlloc && (
-                <>
-                  <table style={{ width:'100%', borderCollapse:'collapse', fontSize:'0.58em', marginBottom:6 }}>
-                    <thead>
-                      <tr style={{ color:'#666', borderBottom:'1px solid #2a2a2a' }}>
-                        <th style={TH}>Tile</th>
-                        <th style={{ ...TH, textAlign:'center' }}>Role</th>
-                        <th style={{ ...TH, textAlign:'right' }}>Own bytes</th>
-                        <th style={{ ...TH, textAlign:'right' }}>Guest bytes</th>
-                        <th style={TH}>Details</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {muxAlloc.roles.map(r => {
-                        const isBlankDonor = r.ti >= (tileStats?.length ?? 0);
-                        const tileLabel = isBlankDonor
-                          ? `blank ${r.ti - (tileStats?.length ?? 0) + 1}`
-                          : multiTile ? `(${Math.floor(r.ti/comp.gridCols)},${r.ti%comp.gridCols})` : 'tile';
-                        return (
-                          <tr key={r.ti} style={{ borderBottom:'1px solid #1a1a1a',
-                            color: isBlankDonor ? '#5af' : r.role==='receiver' ? '#fa0' : r.role==='donor' ? '#5af' : '#666' }}>
-                            <td style={{ padding:'3px 6px 3px 0' }}>
-                              {tileLabel}
-                              {isBlankDonor && (
-                                <span style={{ marginLeft:4, fontSize:9, color:'#5af',
-                                  background:'#00122a', borderRadius:2, padding:'1px 3px' }}>
-                                  auto
-                                </span>
-                              )}
-                            </td>
-                            <td style={{ textAlign:'center', padding:'3px 6px' }}>
-                              <span style={{
-                                background: r.role==='receiver' ? '#332200' : r.role==='donor' ? '#001633' : '#1a1a1a',
-                                borderRadius:2, padding:'1px 5px', fontSize:'0.53em',
-                              }}>
-                                {r.role}
-                              </span>
-                            </td>
-                            <td style={{ textAlign:'right', padding:'3px 6px' }}>
-                              {r.ownBytes > 0 ? `${(r.ownBytes/1024).toFixed(1)} KB` : '—'}
-                            </td>
-                            <td style={{ textAlign:'right', padding:'3px 6px' }}>
-                              {r.guestBytes > 0 ? `${(r.guestBytes/1024).toFixed(1)} KB` : '—'}
-                            </td>
-                            <td style={{ padding:'3px 0 3px 6px', fontSize:'0.53em', color:'#555' }}>
-                              {r.role === 'receiver' && r.donors.length > 0 && (() => {
-                                const artLen = tileStats?.length ?? 0;
-                                return `→ ${r.donors.map(d => d.donorTi >= artLen ? `blank ${d.donorTi - artLen + 1}` : multiTile ? `(${Math.floor(d.donorTi/comp.gridCols)},${d.donorTi%comp.gridCols})` : 'donor').join(', ')}`;
-                              })()}
-                              {r.role === 'donor' && r.guests.length > 0 && (() => {
-                                const artLen = tileStats?.length ?? 0;
-                                return `← ${r.guests.map(g => g.rxTi >= artLen ? `blank ${g.rxTi - artLen + 1}` : multiTile ? `(${Math.floor(g.rxTi/comp.gridCols)},${g.rxTi%comp.gridCols})` : 'rx').join(', ')}`;
-                              })()}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-
-                  {muxAlloc.unresolved > 0 && (
-                    <div style={{ fontSize:'0.58em', color:'#f55', marginBottom:4 }}>
-                      ⚠ {muxAlloc.unresolved} tile(s) still unresolved — tile payloads may be too large for any donor configuration.
-                      Try switching to a higher-capacity codec or reducing payload size.
-                    </div>
-                  )}
-
-                  {codec !== 'BANNER' && (
-                    <div style={{ fontSize:'0.58em', color:'#888', marginBottom:4 }}>
-                      Carpet mode: mux routing stored in state JSON. The Java mod re-encodes the
-                      LOOM carpet channel at place time using muxCargoB64.
-                    </div>
-                  )}
-
-                  <div style={{ display:'flex', gap:6, alignItems:'center' }}>
-                    <button
-                      onClick={() => setMuxApplied(a => !a)}
-                      style={{ ...SM_BTN,
-                        color: muxApplied ? '#7f7' : '#ccc',
-                        border: `1px solid ${muxApplied ? '#3a6a3a' : '#444'}`,
-                        background: muxApplied ? '#1a2a1a' : '#252525' }}>
-                      {muxApplied ? '✓ Mux applied on export' : 'Apply mux on export'}
-                    </button>
-                    {muxApplied && muxAlloc.unresolved === 0 && (
-                      <span style={{ fontSize:'0.53em', color:'#3a3' }}>✓ Fully resolved</span>
-                    )}
-                    {muxApplied && muxAlloc.unresolved > 0 && (
-                      <span style={{ fontSize:'0.53em', color:'#f93' }}>⚠ Partially resolved</span>
-                    )}
-                  </div>
-                </>
-              )}
-
-              {!muxAlloc && (
-                <div style={{ fontSize:'0.58em', color:'#555' }}>
-                  Click <b>Compute Mux</b> to see which tiles would be receivers and donors.
-                  Blank donor tiles will be added automatically if needed.
+                <div style={{ fontSize:'0.58em', color: muxAlloc.unresolved > 0 ? '#f55' : '#3a3' }}>
+                  {muxAlloc.unresolved > 0
+                    ? `⚠ ${muxAlloc.unresolved} tile(s) unresolved`
+                    : '✓ auto-applied on export'}
                 </div>
-              )}
+                {extraDonors > 0 && (
+                  <div style={{ fontSize:'0.53em', color:'#5af', background:'#001633', border:'1px solid #15385a', borderRadius:2, padding:'1px 5px' }}>
+                    +{extraDonors} blank donor{extraDonors>1?'s':''}
+                  </div>
+                )}
+              </div>
 
-              {overBudget.length > 0 && !muxAlloc && (
-                <div style={{ marginTop:6, fontSize:'0.58em', color:'#666', lineHeight:1.5,
-                  borderTop:'1px solid #2a2a2a', paddingTop:6 }}>
-                  <b style={{ color:'#888' }}>To reduce payload size without mux:</b> thin frames with Stride/Skip ·
-                  reduce colour count (K) · apply Requantize with a restricted palette ·
-                  switch to a higher-capacity codec.
+              <table style={{ width:'100%', borderCollapse:'collapse', fontSize:'0.58em', marginBottom:4 }}>
+                <thead>
+                  <tr style={{ color:'#666', borderBottom:'1px solid #2a2a2a' }}>
+                    <th style={TH}>Tile</th>
+                    <th style={{ ...TH, textAlign:'center' }}>Role</th>
+                    <th style={{ ...TH, textAlign:'right' }}>Own</th>
+                    <th style={{ ...TH, textAlign:'right' }}>Guest</th>
+                    <th style={TH}>Routes to/from</th>
+                    <th style={TH}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {muxAlloc.roles.map(r => {
+                    const artLen      = tileStats?.length ?? 0;
+                    const isBlank     = r.ti >= artLen;
+                    const rowCol      = isBlank ? null : { row: Math.floor(r.ti/comp.gridCols), col: r.ti%comp.gridCols };
+                    const tileLabel   = isBlank ? `blank ${r.ti - artLen + 1}` : multiTile ? `(${rowCol!.row},${rowCol!.col})` : 'tile';
+                    const previewData = isBlank ? null : tileStats?.[r.ti]?.compressedData ?? null;
+                    return (
+                      <tr key={r.ti} style={{ borderBottom:'1px solid #1a1a1a',
+                        color: isBlank ? '#5af' : r.role==='receiver' ? '#fa0' : r.role==='donor' ? '#5af' : '#666' }}>
+                        <td style={{ padding:'3px 6px 3px 0' }}>
+                          {tileLabel}
+                          {isBlank && <span style={{ marginLeft:4, fontSize:9, color:'#5af', background:'#00122a', borderRadius:2, padding:'1px 3px' }}>auto</span>}
+                        </td>
+                        <td style={{ textAlign:'center', padding:'3px 6px' }}>
+                          <span style={{ background: r.role==='receiver'?'#332200':r.role==='donor'?'#001633':'#1a1a1a', borderRadius:2, padding:'1px 5px', fontSize:'0.53em' }}>
+                            {r.role}
+                          </span>
+                        </td>
+                        <td style={{ textAlign:'right', padding:'3px 6px' }}>{r.ownBytes>0?`${(r.ownBytes/1024).toFixed(1)}K`:'—'}</td>
+                        <td style={{ textAlign:'right', padding:'3px 6px' }}>{r.guestBytes>0?`${(r.guestBytes/1024).toFixed(1)}K`:'—'}</td>
+                        <td style={{ padding:'3px 0 3px 6px', fontSize:'0.53em', color:'#555' }}>
+                          {r.role==='receiver' && r.donors.length>0 && `→ ${r.donors.map(d=>d.donorTi>=artLen?`blank ${d.donorTi-artLen+1}`:multiTile?`(${Math.floor(d.donorTi/comp.gridCols)},${d.donorTi%comp.gridCols})`:'donor').join(', ')}`}
+                          {r.role==='donor' && r.guests.length>0 && `← ${r.guests.map(g=>g.rxTi>=artLen?`blank ${g.rxTi-artLen+1}`:multiTile?`(${Math.floor(g.rxTi/comp.gridCols)},${g.rxTi%comp.gridCols})`:'rx').join(', ')}`}
+                        </td>
+                        <td style={{ padding:'3px 0 3px 2px' }}>
+                          {codec !== 'BANNER' && (
+                            <button
+                              onClick={() => {
+                                if (!previewData) return;
+                                setPreview3DTile(preview3DTile?.ti === r.ti ? null : {
+                                  ti: r.ti, compressedData: previewData,
+                                  label: isBlank ? tileLabel : (multiTile ? `(${rowCol!.row},${rowCol!.col})` : 'tile'),
+                                });
+                                setShow3D(true);
+                              }}
+                              disabled={!previewData}
+                              title={previewData ? 'Preview schematic in 3D' : 'No data (blank donor)'}
+                              style={{ background:'none', border:`1px solid ${preview3DTile?.ti===r.ti?'#4a9eff':'#333'}`,
+                                borderRadius:2, color:preview3DTile?.ti===r.ti?'#8cf':previewData?'#555':'#2a2a2a',
+                                cursor:previewData?'pointer':'default', fontSize:'0.85em', padding:'0 2px', lineHeight:1.3 }}>
+                              👁
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              {muxAlloc.unresolved > 0 && (
+                <div style={{ fontSize:'0.58em', color:'#f55', marginTop:4 }}>
+                  ⚠ {muxAlloc.unresolved} tile(s) could not be resolved — switch to a higher-capacity codec or reduce payload size.
                 </div>
               )}
             </div>

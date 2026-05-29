@@ -4,14 +4,22 @@
  * Port of SchematicExporter.java.
  *
  * Two schematic types:
- *   exportBannerSchematic — 16-wide grid of standing banners with CJK custom names
- *   exportCarpetSchematic — carpet blocks + optional shade-height terrain
+ *   exportBannerSchematic    — 16-wide grid of standing banners with CJK custom names
+ *   exportCarpetSchematic    — flat carpet platform encoding the zstd payload as nibbles
+ *   exportCarpetStaircase    — 3D staircase variant for shade-channel codecs
  *
  * The NBT binary format is written by a minimal NbtWriter.
  * `pako.gzip()` wraps the output for the final .litematic file.
  */
 
 import { gzip } from 'pako';
+import {
+  encodeNibbles, computeHeights,
+  buildLoomHeader,
+  LOOM_FLAG_SHADE, LOOM_FLAG_BANNERS,
+  MAX_CARPET_BYTES, MAX_SHADE_BYTES, LOOM_FIXED_HEADER,
+} from './carpet.js';
+import type { CodecMode } from './codec-mode.js';
 
 // ─── MC 1.21.4 data version ──────────────────────────────────────────────────
 
@@ -126,8 +134,8 @@ function writePaletteEntry(w: NbtWriter, bs: BlockState): void {
 }
 
 /**
- * Pack block state indices into a TAG_Long_Array.
- * Uses max(4, ceil(log2(paletteSize))) bits per state, no cross-long spanning.
+ * Pack block state indices, no cross-long spanning (banner schematics).
+ * Uses max(4, ceil(log2(paletteSize))) bits per state.
  */
 function packBlockStates(states: number[], paletteSize: number): Array<[number, number]> {
   const bits     = Math.max(4, Math.ceil(Math.log2(Math.max(paletteSize, 2))));
@@ -145,11 +153,7 @@ function packBlockStates(states: number[], paletteSize: number): Array<[number, 
       const bitPos = j * bits;
       if (bitPos < 32) {
         loWord |= (state << bitPos);
-        if (bitPos + bits > 32) {
-          // State straddles the 32/64-bit boundary — only allowed if no cross-long spanning.
-          // (For 4-bit states in 64-bit longs: bits=4, perLong=16, no straddling)
-          hiWord |= (state >>> (32 - bitPos));
-        }
+        if (bitPos + bits > 32) hiWord |= (state >>> (32 - bitPos));
       } else {
         hiWord |= (state << (bitPos - 32));
       }
@@ -158,6 +162,46 @@ function packBlockStates(states: number[], paletteSize: number): Array<[number, 
   }
   return result;
 }
+
+/**
+ * Pack block indices using Litematica's spanning format (LitematicaBitArray).
+ * Entries are at consecutive bit positions and MAY cross long boundaries.
+ * Used for carpet schematics — matches SchematicExporter.packBlockIndices() in Java.
+ */
+function packBlockIndicesSpanning(indices: number[], bitsPerEntry: number): Array<[number, number]> {
+  const totalBits = indices.length * bitsPerEntry;
+  const numLongs  = Math.ceil(totalBits / 64);
+  // [hi, lo]: bits 32–63 = hi, bits 0–31 = lo (big-endian NBT long)
+  const longs: [number, number][] = Array.from({ length: numLongs }, () => [0, 0]);
+
+  for (let i = 0; i < indices.length; i++) {
+    const bitStart = i * bitsPerEntry;
+    const li       = Math.floor(bitStart / 64);
+    const bitOff   = bitStart % 64;   // bit position within 64-bit long (0 = LSB)
+    const value    = indices[i];
+
+    if (bitOff < 32) {
+      longs[li][1] = (longs[li][1] | (value << bitOff)) >>> 0;
+      if (bitOff + bitsPerEntry > 32)
+        longs[li][0] = (longs[li][0] | (value >>> (32 - bitOff))) >>> 0;
+    } else {
+      longs[li][0] = (longs[li][0] | (value << (bitOff - 32))) >>> 0;
+    }
+
+    const bitsInFirst = 64 - bitOff;
+    if (bitsInFirst < bitsPerEntry && li + 1 < numLongs)
+      longs[li + 1][1] = (longs[li + 1][1] | (value >>> bitsInFirst)) >>> 0;
+  }
+
+  return longs;
+}
+
+// ─── Carpet palette (DyeColor order — matches NIBBLE_TO_MAP_BYTE in carpet.ts) ─
+
+const CARPET_DYE_NAMES = [
+  'white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray',
+  'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black',
+] as const;
 
 // ─── Litematica v6 wrapper ────────────────────────────────────────────────────
 
@@ -279,93 +323,171 @@ export async function exportBannerSchematic(
 
 // ─── Carpet schematic ─────────────────────────────────────────────────────────
 
-/** Carpet color names in DyeColor order (matches NIBBLE_TO_MAP_BYTE index). */
-const CARPET_NAMES = [
-  'white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 'gray',
-  'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black',
-] as const;
-
 /**
- * Shade-channel block types indexed by height 0/1/2.
- * 0=snow (dark), 1=grass (normal), 2=stone (bright).
- * Only relevant when exporting the full carpet+shade schematic.
+ * Build the shared carpet block palette: index 0=air, indices 1–16=carpets
+ * in DyeColor order (white=1 … black=16).  Returns the palette array.
  */
-const SHADE_BLOCKS: BlockState[] = [
-  { name: 'minecraft:snow_block'  },
-  { name: 'minecraft:grass_block' },
-  { name: 'minecraft:stone'       },
-];
-
-import { MAP_BYTE_TO_NIBBLE } from './carpet.js';
+function buildCarpetPalette(): BlockState[] {
+  const palette: BlockState[] = [{ name: 'minecraft:air' }];
+  for (const name of CARPET_DYE_NAMES) palette.push({ name: `minecraft:${name}_carpet` });
+  return palette;
+}
 
 /**
- * Export a carpet schematic for one tile.
+ * Export a flat carpet schematic: a 128 × 1 × carpetRows region of carpet
+ * blocks encoding the carpet channel of the LOOM payload.
  *
- * @param mapColors  16384-byte map colour array.
- * @param name       Schematic name.
- * @param hasShade   Whether shade-channel rows are present.
- * @returns  Gzip-compressed .litematic bytes.
+ * Port of SchematicExporter.exportCarpetTile().
  */
-export async function exportCarpetSchematic(
-  mapColors: Uint8Array,
-  name = 'loominary_carpet',
-  _author = 'Loominary',
-  hasShade = false,
-): Promise<Uint8Array> {
-  const SIZE = 128;
+function buildFlatCarpetSchematic(
+  nibbles: Uint8Array,
+  carpetBytes: number,
+  name: string,
+  author: string,
+): Uint8Array {
+  const carpetRows   = Math.ceil(carpetBytes * 2 / 128);
+  const nibblesUsed  = carpetBytes * 2;
+  const totalBlocks  = 128 * carpetRows;
 
-  // Build carpet block palette: air + 16 carpet colors + (if shade) 3 terrain blocks
-  const paletteMap = new Map<string, number>();
-  const palette: BlockState[] = [];
+  const palette      = buildCarpetPalette();
+  const paletteSize  = palette.length; // 17
+  const bitsPerEntry = Math.max(2, Math.ceil(Math.log2(paletteSize)));  // 5
 
-  function addState(bs: BlockState): number {
-    const key = bs.name + (bs.props ? JSON.stringify(bs.props) : '');
-    if (!paletteMap.has(key)) {
-      paletteMap.set(key, palette.length);
-      palette.push(bs);
-    }
-    return paletteMap.get(key)!;
-  }
-
-  const airIdx = addState({ name: 'minecraft:air' });
-  const carpetIdxs: number[] = CARPET_NAMES.map(c => addState({ name: `minecraft:${c}_carpet` }));
-  // Register shade blocks in palette when shade mode is active.
-  if (hasShade) { for (const b of SHADE_BLOCKS) addState(b); }
-
-  // Build state grid: 128 × ? × 128 (x × y × z)
-  // Row 0 of the map is z=0, col 0 is x=0.
-  // The carpet layer sits at y=0.
-  // For shade: the terrain blocks are at varying heights (y=0 to y=2).
-
-  const sizeX = SIZE, sizeZ = SIZE, sizeY = hasShade ? 3 : 1;
-  const totalBlocks = sizeX * sizeY * sizeZ;
-  const states: number[] = new Array(totalBlocks).fill(airIdx);
-
-  for (let z = 0; z < SIZE; z++) {
-    for (let x = 0; x < SIZE; x++) {
-      const mapByte = mapColors[x + z * SIZE];
-      const nibble  = MAP_BYTE_TO_NIBBLE[mapByte];
-      if (nibble !== 255) {
-        // Carpet pixel: place carpet at y=0
-        const si = (0 * sizeZ + z) * sizeX + x;
-        states[si] = carpetIdxs[nibble];
-      }
-      // Shade layer: would need shade-channel data, skipped in this overload.
+  // Block indices in YZX order: y=0 always (flat), z = row, x = col
+  const blockIndices = new Array<number>(totalBlocks).fill(0);
+  for (let z = 0; z < carpetRows; z++) {
+    for (let x = 0; x < 128; x++) {
+      const nibbleIdx = z * 128 + x;
+      if (nibbleIdx < nibblesUsed)
+        blockIndices[z * 128 + x] = 1 + nibbles[nibbleIdx];  // palette 1-based
     }
   }
 
-  const packed = packBlockStates(states, palette.length);
+  const packed = packBlockIndicesSpanning(blockIndices, bitsPerEntry);
 
   const w = new NbtWriter();
-  writeLitematicaWrapper(w, name, _author, sizeX, sizeY, sizeZ, () => {
-    w.list('BlockStatePalette', TAG.COMPOUND, palette.length, () => {
+  writeLitematicaWrapper(w, name, author, 128, 1, carpetRows, () => {
+    w.list('BlockStatePalette', TAG.COMPOUND, paletteSize, () => {
       for (const bs of palette) writePaletteEntry(w, bs);
     });
     w.longArray('BlockStates', packed);
     w.list('TileEntities', TAG.COMPOUND, 0, () => {});
   });
 
-  return gzip(w.bytes(), { level: 9 });
+  return w.bytes();
+}
+
+/**
+ * Export a staircase carpet schematic: a 128 × regionY × 128 region where
+ * each (x, z) column has carpets stacked from y=0 to y=heights[x][z].
+ * The top carpet carries the data nibble; fillers below are white carpet.
+ *
+ * Port of SchematicExporter.exportCarpetStaircase().
+ */
+function buildStaircaseCarpetSchematic(
+  nibbles: Uint8Array,
+  carpetBytes: number,
+  heights: number[][],
+  name: string,
+  author: string,
+): Uint8Array {
+  let maxHeight = 0;
+  for (let col = 0; col < 128; col++)
+    for (let row = 0; row < 128; row++)
+      if (heights[col][row] > maxHeight) maxHeight = heights[col][row];
+
+  const regionY      = maxHeight + 1;
+  const nibblesUsed  = Math.min(carpetBytes * 2, nibbles.length);
+  const totalVoxels  = regionY * 128 * 128;
+
+  const palette      = buildCarpetPalette();
+  const paletteSize  = palette.length; // 17
+  const bitsPerEntry = Math.max(2, Math.ceil(Math.log2(paletteSize)));  // 5
+
+  // YZX ordering: idx = (y * 128 + z) * 128 + x
+  const blockIndices = new Array<number>(totalVoxels).fill(0);
+  for (let y = 0; y < regionY; y++) {
+    for (let z = 0; z < 128; z++) {
+      for (let x = 0; x < 128; x++) {
+        const nibbleIdx = z * 128 + x;
+        const h         = heights[x][z];
+        if (y <= h) {
+          const nibble = (y === h && nibbleIdx < nibblesUsed) ? nibbles[nibbleIdx] : 0;
+          blockIndices[(y * 128 + z) * 128 + x] = 1 + nibble;
+        }
+      }
+    }
+  }
+
+  const packed = packBlockIndicesSpanning(blockIndices, bitsPerEntry);
+
+  const w = new NbtWriter();
+  writeLitematicaWrapper(w, name, author, 128, regionY, 128, () => {
+    w.list('BlockStatePalette', TAG.COMPOUND, paletteSize, () => {
+      for (const bs of palette) writePaletteEntry(w, bs);
+    });
+    w.longArray('BlockStates', packed);
+    w.list('TileEntities', TAG.COMPOUND, 0, () => {});
+  });
+
+  return w.bytes();
+}
+
+/**
+ * Export a carpet schematic for one tile.
+ *
+ * Takes the zstd-compressed payload (carpetCompressedB64 from TileData),
+ * wraps it in a LOOM header, encodes as carpet nibbles, and generates either
+ * a flat or staircase litematic depending on whether the codec uses the shade
+ * channel.  Mirrors SchematicExporter.exportCarpetTile / exportCarpetStaircase.
+ *
+ * @param carpetCompressedB64  Base64-encoded zstd payload (TileData.carpetCompressedB64)
+ * @param name                 Schematic name (region name + file stem)
+ * @param author               Author string embedded in NBT metadata
+ * @param tileCol              Tile column in the grid (for LOOM header)
+ * @param tileRow              Tile row in the grid (for LOOM header)
+ * @param codec                Active codec mode (drives shade/banner channel split)
+ */
+export async function exportCarpetSchematic(
+  carpetCompressedB64: string,
+  name = 'loominary_carpet',
+  author = 'Loominary',
+  tileCol = 0,
+  tileRow = 0,
+  codec: CodecMode = 'CARPET_BANNERS_SHADE',
+): Promise<Uint8Array> {
+  const useShade   = codec === 'CARPET_SHADE' || codec === 'CARPET_BANNERS_SHADE' || codec === 'CARPET_SHADE_BANNERS';
+  const useBanners = codec === 'CARPET_BANNERS' || codec === 'CARPET_BANNERS_SHADE' || codec === 'CARPET_SHADE_BANNERS';
+
+  // Decode the stored compressed payload
+  const compressed = Uint8Array.from(atob(carpetCompressedB64), c => c.charCodeAt(0));
+
+  // Build LOOM cargo: header + compressed payload
+  const flags      = (useShade ? LOOM_FLAG_SHADE : 0) | (useBanners ? LOOM_FLAG_BANNERS : 0);
+  const loomHeader = buildLoomHeader(flags, tileCol, tileRow, compressed.length, compressed.length);
+  const cargo      = new Uint8Array(loomHeader.length + compressed.length);
+  cargo.set(loomHeader, 0);
+  cargo.set(compressed, loomHeader.length);
+
+  // Split cargo into channels
+  const carpetBytes = Math.min(cargo.length, MAX_CARPET_BYTES);
+  const shadeBytes  = useShade && cargo.length > MAX_CARPET_BYTES
+    ? Math.min(cargo.length - carpetBytes, MAX_SHADE_BYTES)
+    : 0;
+
+  // Encode carpet channel as nibbles (one nibble per pixel in the carpet region)
+  const nibbles = encodeNibbles(cargo, carpetBytes);
+
+  let nbtBytes: Uint8Array;
+  if (shadeBytes > 0) {
+    const shadeData = cargo.slice(carpetBytes, carpetBytes + shadeBytes);
+    const heights   = computeHeights(shadeData, shadeBytes);
+    nbtBytes = buildStaircaseCarpetSchematic(nibbles, carpetBytes, heights, name, author);
+  } else {
+    nbtBytes = buildFlatCarpetSchematic(nibbles, carpetBytes, name, author);
+  }
+
+  return gzip(nbtBytes, { level: 9 });
 }
 
 // ─── Download helper ──────────────────────────────────────────────────────────

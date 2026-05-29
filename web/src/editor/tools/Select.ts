@@ -1,9 +1,9 @@
 /**
  * Rectangle Select tool (S) — drag to define a rectangular selection.
  *
- * Left-drag          creates a new selection.
- * Shift+drag         adds to the existing selection.
- * Ctrl+drag          subtracts from the selection (orange preview).
+ * Left-drag          adds to or creates the selection (Shift = add, default = replace).
+ * Right-drag         subtracts from the selection (orange preview).
+ * Ctrl+left-drag     subtracts from the selection.
  * Click with no drag clears the selection.
  */
 
@@ -20,14 +20,22 @@ export class RectSelectTool implements Tool {
   private endGx    = -1;
   private endGy    = -1;
   private dragging = false;
-  addMode  = false;  // Shift held — exposed so Editor can set before first event
-  subMode  = false;  // Ctrl held  — exposed so Editor can set before first event
+  private addMode  = false;
+  private subMode  = false;
 
   onPointerEvent(gx: number, gy: number, button: number, _buttons: number, ctx: ToolContext): void {
-    if (button === 0) {
-      this.startGx = gx; this.startGy = gy;
-      this.endGx   = gx; this.endGy   = gy;
+    if (button === 0 || button === 2) {
+      this.startGx  = gx; this.startGy = gy;
+      this.endGx    = gx; this.endGy   = gy;
       this.dragging = true;
+      // Right-click always subtracts; left-click reads modifier keys.
+      if (button === 2) {
+        this.subMode = true;
+        this.addMode = false;
+      } else {
+        this.subMode = ctx.ctrlHeld;
+        this.addMode = ctx.shiftHeld;
+      }
       this.updatePreview(ctx);
     } else if (button === -1 && this.dragging) {
       this.endGx = gx; this.endGy = gy;
@@ -52,17 +60,20 @@ export class RectSelectTool implements Tool {
     ctx.canvas.wandPreview        = null;
     ctx.canvas.wandPreviewSubtract = false;
 
-    if (noMove && !this.addMode && !this.subMode) {
-      // Click with no drag → clear selection
-      ctx.setSelMask(null);
-      ctx.canvas.selMask = null;
-      ctx.canvas.markDirty();
+    if (noMove) {
+      if (!this.addMode && !this.subMode) {
+        // Plain left-click with no drag → clear selection
+        ctx.setSelMask(null);
+        ctx.canvas.selMask = null;
+        ctx.canvas.markDirty();
+      }
+      // Right-click or ctrl+click with no drag → no-op
       return;
     }
 
     const size = gridW * gridH;
     const existing = ctx.getSelMask();
-    const newMask = existing ? existing.slice() : new Uint8Array(size);
+    const newMask  = existing ? existing.slice() : new Uint8Array(size);
 
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
@@ -75,7 +86,6 @@ export class RectSelectTool implements Tool {
     ctx.canvas.markDirty();
   }
 
-  /** Show a preview of the pending rectangle; orange when subMode. */
   private updatePreview(ctx: ToolContext): void {
     const gridW = ctx.comp.gridCols * MAP_SIZE;
     const gridH = ctx.comp.gridRows * MAP_SIZE;
@@ -87,7 +97,6 @@ export class RectSelectTool implements Tool {
 
     const preview = new Uint8Array(gridW * gridH);
     if (this.subMode) {
-      // Orange: show only the pixels that would actually be removed
       const existing = ctx.getSelMask();
       for (let y = y0; y <= y1; y++)
         for (let x = x0; x <= x1; x++)

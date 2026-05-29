@@ -1,317 +1,357 @@
 /**
- * App — top-level shell.
+ * App — 3-step wizard shell.
  *
- * Shows a thin toolbar at the top and the Editor below.
- * The editor occupies all remaining height.
+ * Step 1: Import  — image selection + settings  (ImportPage)
+ * Step 2: Edit    — the full Editor              (Editor)
+ * Step 3: Export  — metadata + download          (ExportPage)
+ *
+ * A persistent StepBar at the top shows progress and allows back-navigation.
  */
 
 import { h } from 'preact';
-import { useState, useCallback, useEffect, useRef } from 'preact/hooks';
-import { Editor } from './editor/Editor.js';
+import { useState, useRef, useEffect } from 'preact/hooks';
+
+import { Editor }      from './editor/Editor.js';
+import { ImportPage }  from './pages/ImportPage.js';
+import { ExportPage }  from './pages/ExportPage.js';
 import type { CompositionState } from './payload-state.js';
-import type { QuantizeParams } from './quantize.js';
+import type { RequantizeParams } from './quantize.js';
+import { type PreprocessParams, DEFAULT_PREPROCESS } from './preprocess.js';
 import {
-  importStateFile,
-  downloadState,
-  compositionFromState,
-  emptyPayloadState,
-  saveState,
-} from './payload-state.js';
+  saveSession, loadSession, clearSession,
+  sessionToComposition, savedAgoLabel,
+} from './persistence.js';
+import { decodeGifFrames } from './gif-decode.js';
 
-// ─── Image scaling helper ─────────────────────────────────────────────────────
+// ─── Step type ────────────────────────────────────────────────────────────────
 
-async function scaleImageTo(bmp: ImageBitmap, w: number, h: number): Promise<ImageData> {
-  const osc  = new OffscreenCanvas(w, h);
-  const octx = osc.getContext('2d')!;
-  octx.imageSmoothingEnabled = true;
-  octx.imageSmoothingQuality = 'high';
-  octx.drawImage(bmp, 0, 0, w, h);
-  return octx.getImageData(0, 0, w, h);
+type Step = 'import' | 'edit' | 'export';
+
+// ─── StepBar ─────────────────────────────────────────────────────────────────
+
+interface StepBarProps {
+  step:           Step;
+  canEdit:        boolean;
+  canExport:      boolean;
+  showGridLines:  boolean;
+  uiFontSize:     number;
+  onStepClick:    (s: Step) => void;
+  onGridToggle:   () => void;
+  onFontChange:   (n: number) => void;
 }
 
-// ─── Auto-grid detection ──────────────────────────────────────────────────────
+function StepBar({
+  step, canEdit, canExport,
+  showGridLines, uiFontSize,
+  onStepClick, onGridToggle, onFontChange,
+}: StepBarProps) {
+  const steps: { id: Step; num: string; label: string }[] = [
+    { id: 'import', num: '①', label: 'Import' },
+    { id: 'edit',   num: '②', label: 'Edit'   },
+    { id: 'export', num: '③', label: 'Export' },
+  ];
 
-/**
- * Given an image's pixel dimensions, pick the best (cols × rows) grid
- * where cols, rows ≤ maxDim and the grid's aspect ratio is closest to
- * the image's aspect ratio.  Tiebreak by fewest total tiles.
- */
-function bestGridSize(w: number, h: number, maxDim = 8): [number, number] {
-  const ratio = w / h;
-  let bestCols = 1, bestRows = 1, bestScore = Infinity;
-  for (let cols = 1; cols <= maxDim; cols++) {
-    for (let rows = 1; rows <= maxDim; rows++) {
-      const gridRatio = cols / rows;
-      const maxR  = Math.max(ratio, gridRatio);
-      const diff  = Math.abs(ratio - gridRatio) / maxR;   // 0 = perfect match
-      const score = diff * 100 + cols * rows * 0.1;        // fewer tiles win ties
-      if (score < bestScore) { bestScore = score; bestCols = cols; bestRows = rows; }
-    }
+  function isClickable(s: Step): boolean {
+    if (s === 'import') return true;
+    if (s === 'edit')   return canEdit;
+    if (s === 'export') return canExport;
+    return false;
   }
-  return [bestCols, bestRows];
-}
 
-// ─── GridInput ────────────────────────────────────────────────────────────────
-// A number input that shows a draft value while typing and only commits
-// on blur or Enter, so the grid doesn't change on every keystroke.
+  function isActive(s: Step): boolean { return s === step; }
 
-interface GridInputProps {
-  value:    number;
-  onChange: (v: number) => void;
-}
-
-function GridInput({ value, onChange }: GridInputProps) {
-  const [draft, setDraft] = useState(String(value));
-
-  // Keep draft in sync when value changes externally (e.g. auto-detection).
-  useEffect(() => setDraft(String(value)), [value]);
-
-  function commit() {
-    const n = Math.max(1, Math.min(128, parseInt(draft, 10) || 1));
-    setDraft(String(n));
-    if (n !== value) onChange(n);
+  function stepStyle(s: Step): h.JSX.CSSProperties {
+    const active    = isActive(s);
+    const clickable = isClickable(s);
+    const past      = (s === 'import') || (s === 'edit' && (step === 'edit' || step === 'export'));
+    return {
+      padding:    '2px 8px',
+      borderRadius: 3,
+      cursor:     clickable ? 'pointer' : 'default',
+      fontSize:   13,
+      fontWeight: active ? 'bold' : 'normal',
+      color:      active ? '#fff' : (clickable && past ? '#aaa' : '#555'),
+      textDecoration: active ? 'underline' : 'none',
+      background: active ? '#1b3556' : 'transparent',
+      border:     active ? '1px solid #4a9eff' : '1px solid transparent',
+      userSelect: 'none',
+    };
   }
 
   return (
-    <input
-      type="number"
-      min={1}
-      max={128}
-      value={draft}
-      onInput={e => setDraft((e.target as HTMLInputElement).value)}
-      onBlur={commit}
-      onKeyDown={e => { if (e.key === 'Enter') commit(); }}
-      style={NUM_INPUT_STYLE}
-    />
+    <div style={{
+      display:       'flex',
+      alignItems:    'center',
+      gap:            6,
+      padding:       '3px 10px',
+      background:    '#1a1a1a',
+      borderBottom:  '1px solid #333',
+      fontSize:       13,
+      flexShrink:     0,
+      minHeight:      36,
+    }}>
+      {/* Brand */}
+      <span style={{ fontWeight: 'bold', color: '#5af', marginRight: 6, whiteSpace: 'nowrap' }}>
+        🧵 Loominary
+      </span>
+
+      {/* Steps */}
+      {steps.map((s, i) => (
+        <span key={s.id} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {i > 0 && <span style={{ color: '#444' }}>→</span>}
+          <span
+            style={stepStyle(s.id)}
+            onClick={() => { if (isClickable(s.id)) onStepClick(s.id); }}
+          >
+            {s.num} {s.label}
+          </span>
+        </span>
+      ))}
+
+      {/* Spacer */}
+      <div style={{ flex: 1 }} />
+
+      {/* Grid toggle — edit step only */}
+      {step === 'edit' && (
+        <button
+          onClick={onGridToggle}
+          title={showGridLines ? 'Hide tile grid lines' : 'Show tile grid lines'}
+          style={{
+            background:   showGridLines ? '#1b3556' : '#252525',
+            border:       `1px solid ${showGridLines ? '#4a9eff' : '#444'}`,
+            borderRadius:  3,
+            color:        showGridLines ? '#8cf' : '#666',
+            cursor:       'pointer',
+            padding:      '3px 8px',
+            fontSize:      12,
+          }}
+        >
+          ⊞ Grid
+        </button>
+      )}
+
+      {/* Font size — all steps */}
+      <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: '#aaa' }}>
+        <span>Aa</span>
+        <input
+          type="range" min={10} max={22} value={uiFontSize}
+          onInput={e => onFontChange(+(e.target as HTMLInputElement).value)}
+          style={{ width: 60 }}
+          title={`UI font size: ${uiFontSize}px`}
+        />
+        <span style={{ fontSize: 11, color: '#666', minWidth: 22 }}>{uiFontSize}</span>
+      </label>
+    </div>
   );
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export function App() {
-  const [comp,         setComp]        = useState<CompositionState | null>(null);
-  const [importing,    setImporting]   = useState(false);
-  const [gridCols,     setGridCols]    = useState(1);
-  const [gridRows,     setGridRows]    = useState(1);
-  /** Source bitmap kept in memory so grid changes can reimport at the new size. */
-  const [sourceBitmap, setSourceBitmap] = useState<ImageBitmap | null>(null);
-  const [showGridLines, setShowGridLines] = useState(true);
-  /** Live quantize params from Editor — updated whenever the user changes a setting. */
-  const importParamsRef = useRef<QuantizeParams>({
-    legalOnly: true, targetColors: 0, dither: 'NONE',
-  });
+  const [step,            setStep]            = useState<Step>('import');
+  const [composition,     setComposition]     = useState<CompositionState | null>(null);
+  const [sourceBitmap,    setSourceBitmap]    = useState<ImageBitmap | null>(null);
+  const [importReqParams, setImportReqParams] = useState<RequantizeParams | null>(null);
+  const [importCropMode,  setImportCropMode]  = useState<'scale' | 'center'>('center');
+  const [importPre,       setImportPre]       = useState<PreprocessParams>(DEFAULT_PREPROCESS);
+  // Per-animation-frame source bitmaps decoded from a multi-frame GIF.
+  const [sourceFrames,    setSourceFrames]    = useState<ImageBitmap[] | null>(null);
+  const [showGridLines,   setShowGridLines]   = useState(true);
+  const [uiFontSize,      setUiFontSize]      = useState(19);
 
-  // ─── Core reimport ─────────────────────────────────────────────────────────
-  const reimportImage = useCallback(async (bitmap: ImageBitmap, cols: number, rows: number) => {
-    setImporting(true);
-    try {
-      const { convertTwoPassGrid } = await import('./quantize.js');
-      const img   = await scaleImageTo(bitmap, cols * 128, rows * 128);
-      // Use whatever params the Editor currently has; default NONE if not yet set.
-      const tiles = convertTwoPassGrid(img, cols, rows, importParamsRef.current);
-      const ps = emptyPayloadState(cols, rows);
-      setComp(compositionFromState(ps, tiles.map(t => [t])));
-    } catch (err) {
-      alert(`Failed to import image: ${err}`);
-    } finally {
-      setImporting(false);
-    }
+  // Track the Editor's latest composition for export (without losing edits).
+  const latestCompRef = useRef<CompositionState | null>(null);
+
+  // ── Session persistence ───────────────────────────────────────────────────
+  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // On mount: try to restore a saved session.
+  useEffect(() => {
+    loadSession().then(s => {
+      if (!s) return;
+      try {
+        const comp = sessionToComposition(s);
+        setComposition(comp);
+        setImportCropMode(s.cropMode);
+        setImportPre(s.pre);
+        if (s.reqParams) setImportReqParams(s.reqParams);
+        latestCompRef.current = comp;
+        setStep('edit');
+        setRestoreNotice('Session restored — saved ' + savedAgoLabel(s.savedAt));
+      } catch {
+        // Corrupt session; ignore.
+      }
+    });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ─── Grid dimension change ──────────────────────────────────────────────────
-  // If a source image is loaded, reimport it at the new size.
-  // Otherwise just update the dimensions — the Editor's resize effect handles it.
-  const handleColsChange = useCallback((cols: number) => {
-    setGridCols(cols);
-    if (sourceBitmap) {
-      void reimportImage(sourceBitmap, cols, gridRows);
+  // Debounced auto-save: fires 3 s after the last composition change.
+  function scheduleSave(
+    comp: CompositionState,
+    crop: 'scale' | 'center',
+    pre: PreprocessParams,
+    req: RequantizeParams | null,
+  ) {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      void saveSession(comp, crop, pre, req);
+    }, 3000);
+  }
+
+  // ── Re-link source image (after session restore) ──────────────────────────
+  const relinkInputRef = useRef<HTMLInputElement | null>(null);
+
+  function handleRelinkSource() {
+    if (!relinkInputRef.current) {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = 'image/*';
+      input.style.display = 'none';
+      input.addEventListener('change', async (e) => {
+        const file = (e.target as HTMLInputElement).files?.[0];
+        if (!file) return;
+        try {
+          const bmp = await createImageBitmap(file);
+          setSourceBitmap(bmp);
+        } catch { /* ignore invalid file */ }
+        (e.target as HTMLInputElement).value = '';
+      });
+      document.body.appendChild(input);
+      relinkInputRef.current = input;
     }
-  }, [sourceBitmap, gridRows, reimportImage]);
+    relinkInputRef.current.click();
+  }
 
-  const handleRowsChange = useCallback((rows: number) => {
-    setGridRows(rows);
-    if (sourceBitmap) {
-      void reimportImage(sourceBitmap, gridCols, rows);
+  // ── Import proceed ────────────────────────────────────────────────────────
+  function handleImportProceed(
+    comp:         CompositionState,
+    bitmap:       ImageBitmap,
+    reqParams:    RequantizeParams,
+    cropMode:     'scale' | 'center',
+    pre:          PreprocessParams,
+    gifFrames?:   ImageBitmap[] | null,
+  ) {
+    setComposition(comp);
+    setSourceBitmap(bitmap);
+    setImportReqParams(reqParams);
+    setImportCropMode(cropMode);
+    setImportPre(pre);
+    setSourceFrames(gifFrames ?? null);
+    latestCompRef.current = comp;
+    setStep('edit');
+    setRestoreNotice(null);
+    void saveSession(comp, cropMode, pre, reqParams);
+  }
+
+  // ── Step navigation ────────────────────────────────────────────────────────
+  function handleStepClick(s: Step) {
+    if (s === 'export' && latestCompRef.current) {
+      setComposition(latestCompRef.current);
     }
-  }, [sourceBitmap, gridCols, reimportImage]);
-
-  // ─── Import image ───────────────────────────────────────────────────────────
-  const handleImageImport = useCallback(async (e: Event) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
-    if (!file) return;
-    try {
-      const bmp = await createImageBitmap(file);
-      setSourceBitmap(bmp);
-
-      // Always auto-detect the best grid layout from the image's aspect ratio.
-      const [cols, rows] = bestGridSize(bmp.width, bmp.height);
-      setGridCols(cols);
-      setGridRows(rows);
-
-      await reimportImage(bmp, cols, rows);
-    } catch (err) {
-      alert(`Failed to import image: ${err}`);
+    if (s === 'import') {
+      // User is explicitly going back to start fresh — clear saved session.
+      void clearSession();
+      setRestoreNotice(null);
     }
-    // Reset the input so the same file can be re-selected.
-    (e.target as HTMLInputElement).value = '';
-  }, [reimportImage]);
+    setStep(s);
+  }
 
-  // ─── Import state JSON ──────────────────────────────────────────────────────
-  const handleStateImport = useCallback(async (e: Event) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
-    if (!file) return;
-    try {
-      const ps      = await importStateFile(file);
-      const n       = ps.columns * ps.rows;
-      const pixelData: Uint8Array[][] = Array.from({ length: n }, () => [new Uint8Array(128 * 128)]);
-      setGridCols(ps.columns);
-      setGridRows(ps.rows);
-      setSourceBitmap(null); // state files don't have a source image
-      setComp(compositionFromState(ps, pixelData));
-    } catch (err) {
-      alert(`Failed to load state: ${err}`);
-    }
-    (e.target as HTMLInputElement).value = '';
-  }, []);
+  // ── Back from export ──────────────────────────────────────────────────────
+  function handleBackFromExport() {
+    setStep('edit');
+  }
 
-  // ─── New blank ─────────────────────────────────────────────────────────────
-  const handleNew = useCallback(() => {
-    const n  = gridCols * gridRows;
-    const ps = emptyPayloadState(gridCols, gridRows);
-    const pd: Uint8Array[][] = Array.from({ length: n }, () => [new Uint8Array(128 * 128)]);
-    setSourceBitmap(null);
-    setComp(compositionFromState(ps, pd));
-  }, [gridCols, gridRows]);
+  // ── Composition the export page sees ──────────────────────────────────────
+  // When navigating to export, use latestCompRef so it reflects any edits.
+  const exportComp = latestCompRef.current ?? composition;
 
-  // ─── Export state JSON ──────────────────────────────────────────────────────
-  const handleExport = useCallback(() => {
-    if (!comp) return;
-    const ps = emptyPayloadState(comp.gridCols, comp.gridRows);
-    ps.title          = comp.title ?? null;
-    ps.authorOverride = comp.author ?? null;
-    ps.allShades      = comp.allShades;
-    ps.codecMode      = comp.codecMode;
-    downloadState(ps);
-    saveState(ps);
-  }, [comp]);
-
-  // ─── Render ─────────────────────────────────────────────────────────────────
+  // ─── Render ────────────────────────────────────────────────────────────────
   return (
-    <div style={{ display:'flex', flexDirection:'column', width:'100%', height:'100%', background:'#111', color:'#ccc', fontFamily:'system-ui,sans-serif' }}>
+    <div style={{
+      display:       'flex',
+      flexDirection: 'column',
+      width:         '100%',
+      height:        '100%',
+      background:    '#111',
+      color:         '#ccc',
+      fontFamily:    'system-ui, sans-serif',
+      overflow:      'hidden',
+    }}>
+      {/* Step bar */}
+      <StepBar
+        step={step}
+        canEdit={composition !== null}
+        canExport={composition !== null}
+        showGridLines={showGridLines}
+        uiFontSize={uiFontSize}
+        onStepClick={handleStepClick}
+        onGridToggle={() => setShowGridLines(v => !v)}
+        onFontChange={setUiFontSize}
+      />
 
-      {/* ── Toolbar ── */}
-      <div style={TOOLBAR_STYLE}>
-        <span style={{ fontWeight:'bold', color:'#5af', marginRight:8 }}>🧵 Loominary</span>
+      {/* Restore notice */}
+      {restoreNotice && (
+        <div style={{
+          background: '#1a2a1a', borderBottom: '1px solid #3a6a3a',
+          color: '#8f8', fontSize: 12, padding: '4px 12px',
+          display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0,
+        }}>
+          <span>↺ {restoreNotice}</span>
+          {!sourceBitmap && (
+            <button onClick={handleRelinkSource} style={{
+              background: 'none', border: '1px solid #3a6a3a', borderRadius: 3,
+              color: '#6a9a6a', cursor: 'pointer', fontSize: 11, padding: '1px 7px',
+            }} title="Re-link the original source file to re-enable requantize from source">
+              Re-link source…
+            </button>
+          )}
+          <button onClick={() => setRestoreNotice(null)} style={{
+            marginLeft: 'auto', background: 'none', border: 'none',
+            color: '#5a8a5a', cursor: 'pointer', fontSize: 13,
+          }}>✕</button>
+        </div>
+      )}
 
-        {/* Grid size */}
-        <label style={LABEL}>Grid:</label>
-        <GridInput value={gridCols} onChange={handleColsChange} />
-        <span style={{ color:'#555' }}>×</span>
-        <GridInput value={gridRows} onChange={handleRowsChange} />
-
-        {/* Source image indicator */}
-        {sourceBitmap && (
-          <span style={{ fontSize:11, color:'#888', fontStyle:'italic' }}>
-            ↺ re-tiles on resize
-          </span>
+      {/* Page content */}
+      <div style={{ flex: 1, overflow: 'hidden' }}>
+        {step === 'import' && (
+          <ImportPage onProceed={handleImportProceed} uiFontSize={uiFontSize} />
         )}
 
-        {/* Grid line toggle */}
-        <button
-          onClick={() => setShowGridLines(v => !v)}
-          title={showGridLines ? 'Hide tile grid lines' : 'Show tile grid lines'}
-          style={{
-            ...BTN,
-            background:  showGridLines ? '#1b3556' : '#252525',
-            borderColor: showGridLines ? '#4a9eff' : '#444',
-            color:       showGridLines ? '#8cf'    : '#666',
-          }}
-        >
-          ⊞ Grid
-        </button>
-
-        <div style={{ width:1, height:16, background:'#333', margin:'0 4px' }} />
-
-        <button onClick={handleNew} style={BTN}>New</button>
-
-        <label style={{ ...BTN, cursor:'pointer' }}>
-          {importing ? 'Loading…' : 'Import Image'}
-          <input type="file" accept="image/*" onChange={handleImageImport} style={{ display:'none' }} />
-        </label>
-
-        <label style={{ ...BTN, cursor:'pointer' }}>
-          Load State
-          <input type="file" accept=".json" onChange={handleStateImport} style={{ display:'none' }} />
-        </label>
-
-        {comp && <button onClick={handleExport} style={BTN}>Export State</button>}
-
-        <div style={{ flex:1 }} />
-
-        {comp && (
-          <span style={{ fontSize:11, color:'#555' }}>
-            {gridCols}×{gridRows} tile{gridCols * gridRows !== 1 ? 's' : ''}
-          </span>
-        )}
-      </div>
-
-      {/* ── Editor / placeholder ── */}
-      <div style={{ flex:1, overflow:'hidden' }}>
-        {comp ? (
+        {step === 'edit' && composition && (
           <Editor
-            initialComp={comp}
-            gridCols={gridCols}
-            gridRows={gridRows}
+            initialComp={composition}
             sourceBitmap={sourceBitmap}
+            importCropMode={importCropMode}
+            importPre={importPre}
             showGridLines={showGridLines}
-            onImportParamsChange={p => { importParamsRef.current = p; }}
+            uiFontSize={uiFontSize}
+            initialReqParams={importReqParams ?? undefined}
+            sourceFrames={sourceFrames}
+            onCompChange={c => {
+              latestCompRef.current = c;
+              scheduleSave(c, importCropMode, importPre, importReqParams);
+            }}
+            onRelinkSource={handleRelinkSource}
           />
-        ) : (
-          <div style={{ display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', height:'100%', gap:16 }}>
-            <p style={{ color:'#555', fontSize:14, margin:0 }}>No composition loaded.</p>
-            <p style={{ color:'#444', fontSize:12, margin:0 }}>
-              Choose a grid size, then click <b>New</b> or <b>Import Image</b>.
-            </p>
+        )}
+
+        {step === 'export' && exportComp && (
+          <ExportPage
+            comp={exportComp}
+            onBack={handleBackFromExport}
+            uiFontSize={uiFontSize}
+          />
+        )}
+
+        {/* Fallback if edit step but no comp (shouldn't happen normally) */}
+        {step === 'edit' && !composition && (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#555' }}>
+            No composition loaded — go back to Import.
           </div>
         )}
       </div>
     </div>
   );
 }
-
-// ─── Styles ───────────────────────────────────────────────────────────────────
-
-const TOOLBAR_STYLE: h.JSX.CSSProperties = {
-  display:    'flex',
-  alignItems: 'center',
-  gap:         6,
-  padding:    '4px 8px',
-  background: '#1a1a1a',
-  borderBottom: '1px solid #333',
-  fontSize:    13,
-  flexShrink:  0,
-};
-
-const LABEL: h.JSX.CSSProperties = { color:'#aaa', fontSize:12 };
-
-const BTN: h.JSX.CSSProperties = {
-  background:   '#252525',
-  border:       '1px solid #444',
-  borderRadius:  3,
-  color:         '#ccc',
-  cursor:        'pointer',
-  padding:       '3px 8px',
-  fontSize:       12,
-};
-
-const NUM_INPUT_STYLE: h.JSX.CSSProperties = {
-  width:        44,
-  background:   '#252525',
-  border:       '1px solid #444',
-  borderRadius:  3,
-  color:         '#ccc',
-  fontSize:       12,
-  padding:       '2px 4px',
-  textAlign:     'center',
-};

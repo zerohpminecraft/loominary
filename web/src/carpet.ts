@@ -34,12 +34,20 @@ export const MAX_CARPET_PAYLOAD = MAX_CARPET_BYTES - LOOM_FIXED_HEADER; // 8176
 // These values are from the MC 1.21.4 MapColor assignments for carpet blocks.
 // If the game dumps a different table, call updateCarpetTables() below.
 
-/** nibble (0–15) → map byte for that carpet at shade NORMAL (shade 1). */
+/**
+ * nibble (0–15) → map byte for that carpet at shade NORMAL (shade 1).
+ *
+ * Values are derived from the MC 1.21.4 DyeColor → MapColor assignments.
+ * Every entry ends in ...01 binary (shade 1 = NORMAL height placement).
+ *
+ * ⚠  These should be verified by running /loominary dumppalette in-game
+ *    and calling updateCarpetTables() if the game reports different values.
+ */
 export const NIBBLE_TO_MAP_BYTE = new Uint8Array([
   //  WHITE  ORANGE  MAGENTA  L.BLUE  YELLOW    LIME    PINK    GRAY
-       13,    48,      40,     88,      72,      52,     144,    28,
+       33,    61,      65,     69,      73,      77,      81,    85,
   // L.GRAY    CYAN  PURPLE    BLUE   BROWN   GREEN     RED   BLACK
-       29,      92,   96,     104,     56,      32,      60,   116,
+       89,     93,    97,     101,     105,     109,     113,   117,
 ]);
 // (Values correspond to Minecraft map color IDs × 4 + shade 1.
 //  These are validated against the MC 1.21.4 source; re-check after updates.)

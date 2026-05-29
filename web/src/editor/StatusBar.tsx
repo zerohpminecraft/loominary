@@ -144,7 +144,7 @@ const BAR_STYLE: h.JSX.CSSProperties = {
   display:    'flex',
   alignItems: 'center',
   padding:    '0 8px',
-  fontSize:   11,
+  fontSize:   '0.79em',
   color:      '#aaa',
   userSelect: 'none',
   flexShrink:  0,

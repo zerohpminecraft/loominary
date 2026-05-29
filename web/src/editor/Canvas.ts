@@ -91,6 +91,22 @@ export class MapCanvas {
   // Heatmap LUT — packed 0x00RRGGBB per map-byte; when set, replaces MC_PALETTE.
   heatmapLut: Uint32Array | null = null;
 
+  // Compression detail map — per-pixel edge-density (0=cheap, 255=expensive).
+  // When active, replaces the normal pixel colours with a blue→red heat gradient
+  // (same colour scheme as the frequency heatmap).
+  compressionMap:     Uint8Array | null = null;
+  showCompressionMap: boolean           = false;
+  private _cmImgData: ImageData | null  = null;   // cached at grid resolution
+
+  // Tile index (row*cols+col) to highlight with a white overlay (from stats panel).
+  hoveredTileTi: number | null = null;
+
+  // Palette-swatch hover — all pixels of this map byte flash with a white overlay.
+  hoveredPaletteColor: number | null = null;
+  private _hmColor: number              = -1;
+  private _hmComp:  CompositionState | null = null;
+  private _hmMask:  Uint8Array | null   = null;
+
   private raf: number | null = null;
   private opts: CanvasOptions;
 
@@ -119,6 +135,16 @@ export class MapCanvas {
 
   /** Mark pixel data dirty so the ImageData is rebuilt on the next frame. */
   markDirty(): void { this.imgDirty = true; }
+
+  /**
+   * Set the compression detail map.  Passing null hides it and restores normal
+   * pixel rendering.  The ImageData is built lazily on the next render frame.
+   */
+  setCompressionMap(map: Uint8Array | null): void {
+    this.compressionMap     = map;
+    this.showCompressionMap = map !== null;
+    this._cmImgData         = null;   // force rebuild on next frame
+  }
 
   /** Convert screen coordinates to global pixel coordinates. */
   screenToGlobal(sx: number, sy: number): [gx: number, gy: number] {
@@ -174,28 +200,25 @@ export class MapCanvas {
     const gridW = comp.gridCols * MAP_SIZE;
     const gridH = comp.gridRows * MAP_SIZE;
 
-    // Rebuild pixel ImageData if dirty.
-    if (this.imgDirty) {
-      this.rebuildImageData(comp);
-      this.imgDirty = false;
+    // Choose which ImageData to display: compression detail map or normal pixels.
+    const useCompMap = this.showCompressionMap && this.compressionMap !== null;
+    if (useCompMap) {
+      if (!this._cmImgData) this._cmImgData = this.buildCompressionImageData(gridW, gridH);
+    } else {
+      if (this.imgDirty) { this.rebuildImageData(comp); this.imgDirty = false; }
     }
+    const displayData = useCompMap ? this._cmImgData : this.imgData;
 
-    // Draw the pixel grid.
-    if (this.imgData) {
-      // Recreate offscreen canvas only when dimensions change.
+    if (displayData) {
       if (!this.offscreen
-          || this.offscreen.width  !== this.imgData.width
-          || this.offscreen.height !== this.imgData.height) {
-        this.offscreen = new OffscreenCanvas(this.imgData.width, this.imgData.height);
+          || this.offscreen.width  !== displayData.width
+          || this.offscreen.height !== displayData.height) {
+        this.offscreen = new OffscreenCanvas(displayData.width, displayData.height);
       }
       const octx = this.offscreen.getContext('2d')!;
-      octx.putImageData(this.imgData, 0, 0);
-
+      octx.putImageData(displayData, 0, 0);
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(this.offscreen,
-        0, 0, gridW, gridH,
-        translateX, translateY, gridW * scale, gridH * scale,
-      );
+      ctx.drawImage(this.offscreen, 0, 0, gridW, gridH, translateX, translateY, gridW * scale, gridH * scale);
     }
 
     // Tile grid lines (visible when scale >= 2 and showGridLines is true).
@@ -220,6 +243,14 @@ export class MapCanvas {
 
     // Dither mask heatmap.
     if (this.showDitherMask && this.ditherMask) this.drawDitherMask(ctx, gridW, gridH);
+
+    // Hovered-tile highlight (from stats panel hover).
+    if (this.hoveredTileTi !== null) this.drawTileHighlight(ctx, comp);
+
+    // Palette-swatch hover: flash all pixels of the hovered color.
+    if (this.hoveredPaletteColor !== null && !useCompMap) {
+      this.drawHoveredColorFlash(ctx, gridW, gridH, now, comp);
+    }
 
     // Wand / lasso / rect hover preview.
     if (this.wandPreview) this.drawWandPreview(ctx, gridW, gridH);
@@ -328,6 +359,106 @@ export class MapCanvas {
           drawAnt(sx + scale, sy, sx + scale + 1, sy + scale, gy);
       }
     }
+  }
+
+  /**
+   * Build an ImageData for the compression cost map.
+   * Cost 0 (uniform/cheap) → blue; cost 255 (noisy/expensive) → red.
+   * Same hue range (0°–240°) as the frequency heatmap so the two views look consistent.
+   */
+  private buildCompressionImageData(gridW: number, gridH: number): ImageData {
+    const id  = new ImageData(gridW, gridH);
+    const d   = id.data;
+    const map = this.compressionMap!;
+    // Pre-compute 256-entry LUT: 0=blue(cheap), 255=red(expensive)
+    const lut = new Uint32Array(256);
+    for (let v = 0; v < 256; v++) {
+      const t  = (255 - v) / 255;        // invert: 0=expensive, 1=cheap
+      const h  = (240 * t) / 360;        // 0=red, 0.667=blue
+      const s  = 0.9, l = 0.45;
+      const cv = (1 - Math.abs(2*l - 1)) * s;
+      const x  = cv * (1 - Math.abs((h * 6) % 2 - 1));
+      const m  = l - cv / 2;
+      let r = 0, g = 0, b = 0;
+      const h6 = h * 6;
+      if      (h6 < 1) { r=cv; g=x;  b=0;  }
+      else if (h6 < 2) { r=x;  g=cv; b=0;  }
+      else if (h6 < 3) { r=0;  g=cv; b=x;  }
+      else if (h6 < 4) { r=0;  g=x;  b=cv; }
+      else if (h6 < 5) { r=x;  g=0;  b=cv; }
+      else             { r=cv; g=0;  b=x;  }
+      lut[v] = ((Math.round((r+m)*255) << 16) | (Math.round((g+m)*255) << 8) | Math.round((b+m)*255)) >>> 0;
+    }
+    for (let i = 0; i < gridW * gridH; i++) {
+      const rgb = lut[map[i]];
+      d[i*4    ] = (rgb >> 16) & 0xff;
+      d[i*4 + 1] = (rgb >>  8) & 0xff;
+      d[i*4 + 2] =  rgb        & 0xff;
+      d[i*4 + 3] = 255;
+    }
+    return id;
+  }
+
+  private drawHoveredColorFlash(
+    ctx: CanvasRenderingContext2D, gridW: number, gridH: number,
+    now: number, comp: CompositionState,
+  ): void {
+    const color = this.hoveredPaletteColor!;
+
+    // Rebuild mask when color or comp changes.
+    if (this._hmColor !== color || this._hmComp !== comp) {
+      this._hmColor = color;
+      this._hmComp  = comp;
+      const mask = new Uint8Array(gridW * gridH);
+      for (let tileRow = 0; tileRow < comp.gridRows; tileRow++) {
+        for (let tileCol = 0; tileCol < comp.gridCols; tileCol++) {
+          const ti    = tileRow * comp.gridCols + tileCol;
+          const frame = comp.frames[ti]?.[comp.activeFrame];
+          if (!frame) continue;
+          for (let ly = 0; ly < MAP_SIZE; ly++) {
+            const gy = tileRow * MAP_SIZE + ly;
+            for (let lx = 0; lx < MAP_SIZE; lx++) {
+              if (frame[lx + ly * MAP_SIZE] === color)
+                mask[gy * gridW + tileCol * MAP_SIZE + lx] = 1;
+            }
+          }
+        }
+      }
+      this._hmMask = mask;
+    }
+
+    const mask = this._hmMask;
+    if (!mask) return;
+
+    // Smooth 1 Hz pulse: alpha oscillates 0.2 → 0.6
+    const pulse = (Math.sin(now * 0.006283) + 1) / 2; // 0–1, period ≈1 s
+    const alpha = (0.2 + pulse * 0.4).toFixed(2);
+    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+
+    const { scale, translateX, translateY } = this;
+    const [gxMin, gyMin] = this.screenToGlobal(0, 0);
+    const [gxMax, gyMax] = this.screenToGlobal(this.el.width, this.el.height);
+    for (let gy = Math.max(0, gyMin); gy <= Math.min(gridH - 1, gyMax); gy++) {
+      for (let gx = Math.max(0, gxMin); gx <= Math.min(gridW - 1, gxMax); gx++) {
+        if (mask[gy * gridW + gx])
+          ctx.fillRect(translateX + gx * scale, translateY + gy * scale, scale, scale);
+      }
+    }
+  }
+
+  private drawTileHighlight(ctx: CanvasRenderingContext2D, comp: CompositionState): void {
+    if (this.hoveredTileTi === null) return;
+    const { scale, translateX, translateY } = this;
+    const tileCol = this.hoveredTileTi % comp.gridCols;
+    const tileRow = Math.floor(this.hoveredTileTi / comp.gridCols);
+    const tx = translateX + tileCol * MAP_SIZE * scale;
+    const ty = translateY + tileRow * MAP_SIZE * scale;
+    const ts = MAP_SIZE * scale;
+    ctx.fillStyle   = 'rgba(255,255,255,0.18)';
+    ctx.fillRect(tx, ty, ts, ts);
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth   = 2;
+    ctx.strokeRect(tx + 1, ty + 1, ts - 2, ts - 2);
   }
 
   private drawDitherMask(ctx: CanvasRenderingContext2D, gridW: number, gridH: number): void {
@@ -461,20 +592,23 @@ export class MapCanvas {
       return;
     }
 
-    const [gx, gy] = this.screenToGlobal(e.offsetX, e.offsetY);
+    const dpr = window.devicePixelRatio || 1;
+    const [gx, gy] = this.screenToGlobal(e.offsetX * dpr, e.offsetY * dpr);
     this.opts.onPixelEvent(gx, gy, e.button, e.buttons, e);
   };
 
   private onPointerMove = (e: PointerEvent) => {
+    const dpr = window.devicePixelRatio || 1;
     if (this.panActive) {
-      this.translateX += e.clientX - this.panLastX;
-      this.translateY += e.clientY - this.panLastY;
+      // clientX/Y deltas are in CSS pixels; translateX/Y are in canvas device pixels.
+      this.translateX += (e.clientX - this.panLastX) * dpr;
+      this.translateY += (e.clientY - this.panLastY) * dpr;
       this.panLastX = e.clientX;
       this.panLastY = e.clientY;
       return;
     }
 
-    const [gx, gy] = this.screenToGlobal(e.offsetX, e.offsetY);
+    const [gx, gy] = this.screenToGlobal(e.offsetX * dpr, e.offsetY * dpr);
     if (e.buttons > 0) {
       this.opts.onPixelEvent(gx, gy, -1, e.buttons, e); // -1 = drag
     } else {
@@ -503,8 +637,9 @@ export class MapCanvas {
     this.scale = Math.max(1, Math.min(16, this.scale + delta));
     if (this.scale === oldScale) return;
 
-    // Keep mouse position stable during zoom.
-    const mx = e.offsetX, my = e.offsetY;
+    // Keep mouse position stable during zoom (offsetX/Y are CSS px → scale to device px).
+    const dpr = window.devicePixelRatio || 1;
+    const mx = e.offsetX * dpr, my = e.offsetY * dpr;
     this.translateX = mx - (mx - this.translateX) * this.scale / oldScale;
     this.translateY = my - (my - this.translateY) * this.scale / oldScale;
   };

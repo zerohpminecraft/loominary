@@ -1,63 +1,107 @@
 /**
- * Lasso tool (L) — freehand polygon selection.
+ * Lasso tool (L) — freehand and polygon selection.
  *
- * Left-click adds vertices to a polygon.  Double-click closes the polygon and
- * rasterizes it to the selection mask via browser-native Path2D.isPointInPath().
- * Right-click cancels the current path.
- *
- * Hold Ctrl while clicking to start a subtract-lasso (orange preview):
- * closing the polygon removes the area from the current selection.
+ * Left-drag       freehand add; committed on mouse up.
+ * Right-drag      freehand subtract; committed on mouse up.
+ * Left-click      enter polygon vertex mode; double-click closes.
+ * Right-click     cancel the active path (no drag detected).
+ * Ctrl+left-drag  same as right-drag (subtract).
  */
 
 import type { Tool, ToolContext } from './Tool.js';
 import { MAP_SIZE } from './Tool.js';
+
+type LassoMode = 'idle' | 'freehand' | 'polygon';
 
 export class LassoTool implements Tool {
   readonly id     = 'lasso';
   readonly name   = 'Lasso';
   readonly cursor = 'crosshair';
 
-  private points: Array<[number, number]> = [];
-  private lastClickTime = 0;
-  private subtract      = false; // set on first vertex, locked for the rest of the path
+  private mode:          LassoMode = 'idle';
+  private points:        Array<[number, number]> = [];
+  private subtract       = false;
+  private hasDragged     = false;
+  private lastClickTime  = 0;
+  private rightButton    = false;  // freehand started with right-click
 
   onPointerEvent(gx: number, gy: number, button: number, _buttons: number, ctx: ToolContext): void {
-    const sub = ctx.ctrlHeld;
     if (button === 2) {
-      // Right-click → cancel
-      this.points   = [];
-      this.subtract = false;
-      ctx.canvas.wandPreview        = null;
-      ctx.canvas.wandPreviewSubtract = false;
-      ctx.canvas.markDirty();
+      if (this.mode === 'idle') {
+        // Right-click from idle: start a subtract freehand drag.
+        this.subtract      = true;
+        this.rightButton   = true;
+        this.points        = [[gx, gy]];
+        this.hasDragged    = false;
+        this.mode          = 'freehand';
+        this.lastClickTime = Date.now();
+      } else {
+        // Right-click while a path is active → cancel it.
+        this.reset(ctx);
+      }
       return;
     }
 
-    if (button !== 0) return;
+    if (button === 0) {
+      if (this.mode === 'idle') {
+        this.subtract      = ctx.ctrlHeld;
+        this.rightButton   = false;
+        this.points        = [[gx, gy]];
+        this.hasDragged    = false;
+        this.mode          = 'freehand';
+        this.lastClickTime = Date.now();
+        return;
+      }
 
-    const now = Date.now();
-    const dblClick = now - this.lastClickTime < 350 && this.points.length >= 2;
-    this.lastClickTime = now;
+      if (this.mode === 'polygon') {
+        const now = Date.now();
+        const dbl = now - this.lastClickTime < 350 && this.points.length >= 2;
+        this.lastClickTime = now;
 
-    if (dblClick) {
-      // Close polygon and rasterize
-      this.commit(ctx);
-      this.points   = [];
-      this.subtract = false;
-      ctx.canvas.wandPreview        = null;
-      ctx.canvas.wandPreviewSubtract = false;
-      ctx.canvas.markDirty();
-      return;
+        if (dbl) {
+          this.commit(ctx);
+          this.reset(ctx);
+        } else {
+          this.points.push([gx, gy]);
+          this.updatePreview(ctx);
+        }
+        return;
+      }
+
+      // mode === 'freehand': a second pointerdown can't normally occur mid-drag,
+      // but handle it defensively.
     }
 
-    // First vertex: lock in the mode (add or subtract).
-    if (this.points.length === 0) this.subtract = sub;
-
-    this.points.push([gx, gy]);
-    this.updatePreview(ctx);
+    if (button === -1 && this.mode === 'freehand') {
+      const last = this.points[this.points.length - 1];
+      if (!last || gx !== last[0] || gy !== last[1]) {
+        this.hasDragged = true;
+        this.points.push([gx, gy]);
+        this.updatePreview(ctx);
+      }
+    }
   }
 
-  /** Rasterize the Path2D polygon into the selection mask. */
+  onPointerUp(ctx: ToolContext): void {
+    if (this.mode !== 'freehand') return;
+
+    if (this.hasDragged && this.points.length >= 3) {
+      // Freehand drag complete — commit the region.
+      this.commit(ctx);
+      this.reset(ctx);
+    } else if (this.rightButton) {
+      // Right-click with no meaningful drag → cancel (don't enter polygon mode).
+      this.reset(ctx);
+    } else {
+      // Left-click with no drag → enter polygon vertex mode.
+      this.mode = 'polygon';
+      ctx.canvas.wandPreview        = null;
+      ctx.canvas.wandPreviewSubtract = false;
+      ctx.canvas.markDirty();
+    }
+  }
+
+  /** Rasterize the polygon into the selection mask. */
   private commit(ctx: ToolContext): void {
     if (this.points.length < 3) return;
 
@@ -130,7 +174,6 @@ export class LassoTool implements Tool {
       for (let x = x0; x <= x1; x++) {
         if (octx.isPointInPath(path, x + 0.5, y + 0.5)) {
           if (this.subtract) {
-            // Only highlight pixels that are actually selected (and would be removed)
             if (existing?.[y * gridW + x]) preview[y * gridW + x] = 1;
           } else {
             preview[y * gridW + x] = 1;
@@ -144,14 +187,21 @@ export class LassoTool implements Tool {
     ctx.canvas.markDirty();
   }
 
-  /** True while vertices have been added but the path is not yet closed. */
-  hasPath(): boolean { return this.points.length > 0; }
-
-  deactivate(ctx: ToolContext): void {
-    this.points   = [];
-    this.subtract = false;
+  private reset(ctx: ToolContext): void {
+    this.mode        = 'idle';
+    this.points      = [];
+    this.subtract    = false;
+    this.hasDragged  = false;
+    this.rightButton = false;
     ctx.canvas.wandPreview        = null;
     ctx.canvas.wandPreviewSubtract = false;
     ctx.canvas.markDirty();
+  }
+
+  /** True while a path is in progress (used by Editor Escape handler). */
+  hasPath(): boolean { return this.mode !== 'idle'; }
+
+  deactivate(ctx: ToolContext): void {
+    this.reset(ctx);
   }
 }

@@ -21,19 +21,22 @@ import {
   buildOklabLookup,
   requantizeGrid,
   mapBytesToImageData,
-  scaleImage,
   DitherAlgo,
   MatchMetric,
   DEFAULT_REQ_PARAMS,
   type RequantizeParams,
   countDistinct,
-  reduceColorsInPlace,
+  findReductionTarget,
   type Strategy,
 } from '../quantize.js';
 import { MC_PALETTE }  from '../palette.js';
 import type { CompositionState } from '../payload-state.js';
 import { emptyPayloadState, compositionFromState } from '../payload-state.js';
 import { FilterType, applyFilter } from '../filters.js';
+import { type PreprocessParams, DEFAULT_PREPROCESS, prepareSourceImage, applyPreprocess } from '../preprocess.js';
+import {
+  PALETTE_CHOICES, buildPaletteFlag, type PaletteRestriction,
+} from '../palette-filters.js';
 
 import { BrushTool }      from './tools/Brush.js';
 import { FillTool }       from './tools/Fill.js';
@@ -45,6 +48,97 @@ import {
   dilateSelMask, erodeSelMask,
   readPixel, writePixel, MAP_SIZE,
 } from './tools/Tool.js';
+
+// ─── Data / compression types ─────────────────────────────────────────────────
+
+interface TileDataStat {
+  tileCol:  number;
+  tileRow:  number;
+  bytes:    number;    // compressed pixel data size (actual zstd output)
+  banners:  number;    // CJK banners needed (ceil((bytes+2)/84))
+  pct:      number;    // 0–100, percent of BANNER capacity (5290 B)
+  overflow: boolean;   // exceeds BANNER mode capacity
+}
+
+interface DataStats {
+  tiles:      TileDataStat[];
+  totalBytes: number;
+  maxBanners: number;
+}
+
+/**
+ * Build a per-pixel compression-cost map.
+ *
+ * Steps:
+ *   1. Per-pixel 4-neighbor edge count (0–4): pixels where all neighbors match
+ *      are free to compress; pixels with many differing neighbors are expensive.
+ *   2. Separable box-blur (radius 8, i.e. a 17×17 window) to turn the raw edge
+ *      map into a smooth regional density estimate.
+ *   3. Gamma-correct (sqrt) and scale to 0–255 so subtle variations are visible.
+ *
+ * Result: 0 = very uniform region (cheap) → 255 = dense/noisy region (expensive).
+ */
+function buildDetailMap(comp: CompositionState): Uint8Array {
+  const { gridCols, gridRows, frames, activeFrame } = comp;
+  const gridW = gridCols * MAP_SIZE;
+  const gridH = gridRows * MAP_SIZE;
+
+  // ── Step 1: raw 4-neighbor edge count ──────────────────────────────────────
+  const edges = new Float32Array(gridW * gridH);
+  for (let tileRow = 0; tileRow < gridRows; tileRow++) {
+    for (let tileCol = 0; tileCol < gridCols; tileCol++) {
+      const ti    = tileRow * gridCols + tileCol;
+      const frame = frames[ti]?.[activeFrame];
+      if (!frame) continue;
+      for (let ly = 0; ly < MAP_SIZE; ly++) {
+        const gy = tileRow * MAP_SIZE + ly;
+        for (let lx = 0; lx < MAP_SIZE; lx++) {
+          const gx   = tileCol * MAP_SIZE + lx;
+          const here = frame[lx + ly * MAP_SIZE];
+          let   diff = 0;
+          if (lx > 0            && frame[(lx-1) +  ly    * MAP_SIZE] !== here) diff++;
+          if (lx < MAP_SIZE - 1 && frame[(lx+1) +  ly    * MAP_SIZE] !== here) diff++;
+          if (ly > 0            && frame[ lx    + (ly-1) * MAP_SIZE] !== here) diff++;
+          if (ly < MAP_SIZE - 1 && frame[ lx    + (ly+1) * MAP_SIZE] !== here) diff++;
+          edges[gy * gridW + gx] = diff;
+        }
+      }
+    }
+  }
+
+  // ── Step 2: separable box blur (radius 8) ──────────────────────────────────
+  const R    = 8;
+  const tmpH = new Float32Array(gridW * gridH);
+
+  // Horizontal pass
+  for (let y = 0; y < gridH; y++) {
+    let sum = 0;
+    for (let dx = 0; dx <= R && dx < gridW; dx++) sum += edges[y * gridW + dx];
+    for (let x = 0; x < gridW; x++) {
+      if (x + R < gridW)   sum += edges[y * gridW + x + R];
+      if (x - R - 1 >= 0) sum -= edges[y * gridW + x - R - 1];
+      const winW = Math.min(x + R, gridW - 1) - Math.max(x - R, 0) + 1;
+      tmpH[y * gridW + x] = sum / winW;
+    }
+  }
+
+  // Vertical pass
+  const out = new Uint8Array(gridW * gridH);
+  for (let x = 0; x < gridW; x++) {
+    let sum = 0;
+    for (let dy = 0; dy <= R && dy < gridH; dy++) sum += tmpH[dy * gridW + x];
+    for (let y = 0; y < gridH; y++) {
+      if (y + R < gridH)   sum += tmpH[(y + R) * gridW + x];
+      if (y - R - 1 >= 0) sum -= tmpH[(y - R - 1) * gridW + x];
+      const winH = Math.min(y + R, gridH - 1) - Math.max(y - R, 0) + 1;
+      const avg  = sum / winH;  // 0–4 range
+      // Gamma-correct (sqrt) then cap at avg=2.5 → 255 for typical map art range
+      out[y * gridW + x] = Math.min(255, Math.round(Math.sqrt(avg / 2.5) * 255));
+    }
+  }
+
+  return out;
+}
 
 // ─── Tool registry ────────────────────────────────────────────────────────────
 
@@ -66,27 +160,6 @@ function makeEmptyComp(cols = 1, rows = 1): CompositionState {
   return compositionFromState(ps, pixelData);
 }
 
-function resizeComposition(comp: CompositionState, newCols: number, newRows: number): CompositionState {
-  const frameCount     = Math.max(...comp.frames.map(t => t.length), 1);
-  const newFrames:      Uint8Array[][] = [];
-  const newFrameDelays: number[][]     = [];
-
-  for (let row = 0; row < newRows; row++) {
-    for (let col = 0; col < newCols; col++) {
-      const oldTi = row * comp.gridCols + col;
-      if (col < comp.gridCols && row < comp.gridRows && comp.frames[oldTi]) {
-        newFrames.push(comp.frames[oldTi]);
-        newFrameDelays.push(comp.frameDelays[oldTi] ?? new Array(comp.frames[oldTi].length).fill(100));
-      } else {
-        newFrames.push(Array.from({ length: frameCount }, () => new Uint8Array(128 * 128)));
-        newFrameDelays.push(new Array(frameCount).fill(100));
-      }
-    }
-  }
-
-  return { ...comp, gridCols: newCols, gridRows: newRows, frames: newFrames, frameDelays: newFrameDelays };
-}
-
 const OKLAB = buildOklabLookup();
 
 // ─── Metric / algo / filter / strategy cycle helpers ─────────────────────────
@@ -97,10 +170,14 @@ const METRIC_LABEL: Record<string, string> = {
   OKLAB: 'OKLab', CHROMA_FIRST: 'Chr+', LUMA_FIRST: 'Lum+', HUE_ONLY: 'Hue', RGB: 'RGB',
 };
 
-const DITHER_CYCLE: DitherAlgo[] = ['NONE', 'FS', 'ATKINSON', 'BAYER'];
+const DITHER_CYCLE: DitherAlgo[] = ['NONE', 'FS', 'ATKINSON', 'SIERRA', 'SIERRA2', 'SIERRA_LITE', 'SHIAU_FAN', 'JJN', 'STUCKI', 'BAYER'];
 const DITHER_LABEL: Record<string, string> = {
-  NONE: 'None', FS: 'FS', ATKINSON: 'Atk', BAYER: 'Bayer',
+  NONE: 'None', FS: 'FS', ATKINSON: 'Atk',
+  SIERRA: 'Sierra', SIERRA2: 'Sierra2', SIERRA_LITE: 'SierraL',
+  SHIAU_FAN: 'Shiau', JJN: 'JJN', STUCKI: 'Stucki',
+  BAYER: 'Bayer',
 };
+const ED_ALGOS = new Set<DitherAlgo>(['FS', 'ATKINSON', 'SIERRA', 'SIERRA2', 'SIERRA_LITE', 'SHIAU_FAN', 'JJN', 'STUCKI']);
 
 const FILTER_CYCLE: FilterType[] = ['SMOOTH', 'MEDIAN', 'SHARPEN', 'POSTERIZE'];
 const FILTER_LABEL: Record<string, string> = {
@@ -151,33 +228,62 @@ function buildHeatmapLut(comp: CompositionState): Uint32Array {
 // ─── Editor props ─────────────────────────────────────────────────────────────
 
 export interface EditorProps {
-  initialComp?:           CompositionState;
-  gridCols?:              number;
-  gridRows?:              number;
-  sourceBitmap?:          ImageBitmap | null;
-  showGridLines?:         boolean;
-  /** Called whenever the user changes a quantize param so App can use it for reimport. */
-  onImportParamsChange?:  (p: import('../quantize.js').QuantizeParams) => void;
+  initialComp?:        CompositionState;
+  sourceBitmap?:       ImageBitmap | null;
+  /** Crop mode used at import — applied when re-quantizing from the source bitmap. */
+  importCropMode?:     'scale' | 'center';
+  /** Preprocessing params used at import — applied when re-quantizing from the source bitmap. */
+  importPre?:          PreprocessParams;
+  /**
+   * Per-animation-frame source bitmaps (from multi-frame GIF import).
+   * sourceFrames[i] is the original bitmap for animation frame i.
+   * When present, requantize from source uses sourceFrames[activeFrame]
+   * instead of the single sourceBitmap.
+   */
+  sourceFrames?:       ImageBitmap[] | null;
+  showGridLines?:      boolean;
+  /** Base font size in px — slider controlled by App toolbar. */
+  uiFontSize?:         number;
+  /** If provided, initialises the requantize params on mount. */
+  initialReqParams?:   RequantizeParams;
+  /** Called after every composition mutation so the parent can track the latest state. */
+  onCompChange?:       (comp: CompositionState) => void;
+  /** Called when the user wants to re-link a source image (e.g. after session restore). */
+  onRelinkSource?:     () => void;
 }
 
 // ─── Editor ───────────────────────────────────────────────────────────────────
 
 export function Editor({
-  initialComp, gridCols: propCols, gridRows: propRows, sourceBitmap,
-  showGridLines = true,
-  onImportParamsChange,
+  initialComp, sourceBitmap,
+  importCropMode = 'scale',
+  importPre      = DEFAULT_PREPROCESS,
+  sourceFrames   = null,
+  showGridLines  = true,
+  uiFontSize     = 14,
+  initialReqParams,
+  onCompChange,
+  onRelinkSource,
 }: EditorProps) {
   const canvasElRef = useRef<HTMLCanvasElement>(null);
   const canvasRef   = useRef<MapCanvas | null>(null);
   const historyRef  = useRef(new EditHistory());
 
+  // ── Sidebar widths ─────────────────────────────────────────────────────────
+  const [leftW,  setLeftW]  = useState(304);
+  const [rightW, setRightW] = useState(336);
+
   // ── Composition ────────────────────────────────────────────────────────────
   const [comp, setComp] = useState<CompositionState>(() => initialComp ?? makeEmptyComp());
   const compRef = useRef(comp);
+  const onCompChangeRef = useRef(onCompChange);
+  useEffect(() => { onCompChangeRef.current = onCompChange; }, [onCompChange]);
+
   const syncComp = useCallback((next: CompositionState) => {
     compRef.current = next;
     setComp(next);
     canvasRef.current?.setComposition(next);
+    onCompChangeRef.current?.(next);
   }, []);
 
   useEffect(() => {
@@ -185,21 +291,6 @@ export function Editor({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialComp]);
 
-  useEffect(() => {
-    if (propCols === undefined || propRows === undefined) return;
-    const c = compRef.current;
-    if (c.gridCols === propCols && c.gridRows === propRows) return;
-    const resized = resizeComposition(c, propCols, propRows);
-    syncComp(resized);
-    setSelMask(null);
-    if (canvasRef.current) {
-      canvasRef.current.resize();
-      canvasRef.current.fitToView(resized);
-    }
-    historyRef.current.clear();
-    setUndoState({ canUndo: false, canRedo: false });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [propCols, propRows]);
 
   // ── Tool state ──────────────────────────────────────────────────────────────
   const [activeToolId, _setActiveToolId] = useState('brush');
@@ -263,47 +354,113 @@ export function Editor({
   }
 
   // ── Requantize params ───────────────────────────────────────────────────────
-  const [reqAlgo,    setReqAlgo]    = useState<DitherAlgo>('NONE');
-  const [reqMetric,  setReqMetric]  = useState<typeof MatchMetric[keyof typeof MatchMetric]>(DEFAULT_REQ_PARAMS.metric);
-  const [reqFsStr,   setReqFsStr]   = useState(DEFAULT_REQ_PARAMS.fsStrength);
-  const [reqAtkStr,  setReqAtkStr]  = useState(DEFAULT_REQ_PARAMS.atkStrength);
-  const [reqBayer,   setReqBayer]   = useState(DEFAULT_REQ_PARAMS.bayerScale);
-  const [reqChroma,  setReqChroma]  = useState(DEFAULT_REQ_PARAMS.chromaBoost);
-  const [reqTilePal, setReqTilePal] = useState(DEFAULT_REQ_PARAMS.tilePalette);
-  const [reqRunning, setReqRunning] = useState(false);
-  const [reqStatus,  setReqStatus]  = useState<string | null>(null);
+  const [reqAlgo,          setReqAlgo]          = useState<DitherAlgo>('NONE');
+  const [reqMetric,        setReqMetric]        = useState<typeof MatchMetric[keyof typeof MatchMetric]>(DEFAULT_REQ_PARAMS.metric);
+  const [reqFsStr,         setReqFsStr]         = useState(DEFAULT_REQ_PARAMS.fsStrength);
+  const [reqAtkStr,        setReqAtkStr]        = useState(DEFAULT_REQ_PARAMS.atkStrength);
+  const [reqSierraStr,     setReqSierraStr]     = useState(DEFAULT_REQ_PARAMS.sierraStrength);
+  const [reqSierra2Str,    setReqSierra2Str]    = useState(DEFAULT_REQ_PARAMS.sierra2Strength);
+  const [reqSierraLiteStr, setReqSierraLiteStr] = useState(DEFAULT_REQ_PARAMS.sierraLiteStrength);
+  const [reqShiauFanStr,   setReqShiauFanStr]   = useState(DEFAULT_REQ_PARAMS.shiauFanStrength);
+  const [reqJjnStr,        setReqJjnStr]        = useState(DEFAULT_REQ_PARAMS.jjnStrength);
+  const [reqStuckiStr,     setReqStuckiStr]     = useState(DEFAULT_REQ_PARAMS.stuckiStrength);
+  const [reqSerpentine,    setReqSerpentine]    = useState(DEFAULT_REQ_PARAMS.serpentine);
+  const [reqBayer,         setReqBayer]         = useState(DEFAULT_REQ_PARAMS.bayerScale);
+  const [reqBayerSize,     setReqBayerSize]     = useState<2|4|8|16>(DEFAULT_REQ_PARAMS.bayerSize);
+  const [reqChroma,        setReqChroma]        = useState(DEFAULT_REQ_PARAMS.chromaBoost);
+  // 'auto' = use comp.allShades  |  'tile' = restrict to existing tile colours
+  // any PaletteRestriction = use that specific palette
+  const [reqPaletteMode,   setReqPaletteMode]   = useState<PaletteRestriction | 'auto' | 'tile'>('auto');
+  const [reqGreyThresh,    setReqGreyThresh]     = useState(40);
+  const [reqRunning,       setReqRunning]       = useState(false);
+  const [reqStatus,        setReqStatus]        = useState<string | null>(null);
+  const [reqProgress,    _setReqProgress]       = useState<{ done: number; total: number } | null>(null);
+  const reqProgressRef     = useRef<{ done: number; total: number } | null>(null);
+  function setReqProgress(v: typeof reqProgressRef.current) { reqProgressRef.current = v; _setReqProgress(v); }
+  const [reqAllFrames,     setReqAllFrames]     = useState(false);
+  const reqAllFramesRef  = useRef(false);
+  useEffect(() => { reqAllFramesRef.current = reqAllFrames; }, [reqAllFrames]);
+  const [reqUseSource,   _setReqUseSource]   = useState<'source' | 'pixels'>('source');
+  const reqUseSourceRef  = useRef<'source' | 'pixels'>('source');
+  function setReqUseSource(v: 'source' | 'pixels') { reqUseSourceRef.current = v; _setReqUseSource(v); }
+  const [reqQueuePalette, _setReqQueuePalette] = useState(false);
+  const reqQueuePaletteRef = useRef(false);
+  function setReqQueuePalette(v: boolean) { reqQueuePaletteRef.current = v; _setReqQueuePalette(v); }
 
-  const reqAlgoRef    = useRef(reqAlgo);
-  const reqMetricRef  = useRef(reqMetric);
-  const reqFsStrRef   = useRef(reqFsStr);
-  const reqAtkStrRef  = useRef(reqAtkStr);
-  const reqBayerRef   = useRef(reqBayer);
-  const reqChromaRef  = useRef(reqChroma);
-  const reqTilePalRef = useRef(reqTilePal);
-  useEffect(() => { reqAlgoRef.current    = reqAlgo;    }, [reqAlgo]);
-  useEffect(() => { reqMetricRef.current  = reqMetric;  }, [reqMetric]);
-  useEffect(() => { reqFsStrRef.current   = reqFsStr;   }, [reqFsStr]);
-  useEffect(() => { reqAtkStrRef.current  = reqAtkStr;  }, [reqAtkStr]);
-  useEffect(() => { reqBayerRef.current   = reqBayer;   }, [reqBayer]);
-  useEffect(() => { reqChromaRef.current  = reqChroma;  }, [reqChroma]);
-  useEffect(() => { reqTilePalRef.current = reqTilePal; }, [reqTilePal]);
-
-  const sourceBitmapRef = useRef<ImageBitmap | null>(sourceBitmap ?? null);
-  useEffect(() => { sourceBitmapRef.current = sourceBitmap ?? null; }, [sourceBitmap]);
-
-  // ── Notify App of current import params so reimport respects user settings ──
+  // ── Image adjustments (applied to source before quantization) ───────────────
+  // Initialised from the import-time preprocessing so values carry over.
+  const [reqBrightness, _setReqBrightness] = useState(importPre.brightness);
+  const [reqContrast,   _setReqContrast]   = useState(importPre.contrast);
+  const [reqSaturation, _setReqSaturation] = useState(importPre.saturation);
+  const reqBrightnessRef = useRef(importPre.brightness);
+  const reqContrastRef   = useRef(importPre.contrast);
+  const reqSaturationRef = useRef(importPre.saturation);
+  function setReqBrightness(v: number) { reqBrightnessRef.current = v; _setReqBrightness(v); }
+  function setReqContrast  (v: number) { reqContrastRef.current   = v; _setReqContrast(v);   }
+  function setReqSaturation(v: number) { reqSaturationRef.current = v; _setReqSaturation(v); }
+  // Re-initialise when a new image is loaded.
   useEffect(() => {
-    onImportParamsChange?.({
-      legalOnly:     !compRef.current.allShades,
-      targetColors:  0,
-      dither:        reqAlgo,
-      metric:        reqMetric,
-      chromaBoost:   reqChroma,
-      diffuseAmount: reqAlgo === 'ATKINSON' ? reqAtkStr : reqFsStr,
-      bayerScale:    reqBayer,
-    });
+    setReqBrightness(importPre.brightness);
+    setReqContrast(importPre.contrast);
+    setReqSaturation(importPre.saturation);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reqAlgo, reqMetric, reqChroma, reqFsStr, reqAtkStr, reqBayer]);
+  }, [importPre]);
+
+  const reqAlgoRef          = useRef(reqAlgo);
+  const reqMetricRef        = useRef(reqMetric);
+  const reqFsStrRef         = useRef(reqFsStr);
+  const reqAtkStrRef        = useRef(reqAtkStr);
+  const reqSierraStrRef     = useRef(reqSierraStr);
+  const reqSierra2StrRef    = useRef(reqSierra2Str);
+  const reqSierraLiteStrRef = useRef(reqSierraLiteStr);
+  const reqShiauFanStrRef   = useRef(reqShiauFanStr);
+  const reqJjnStrRef        = useRef(reqJjnStr);
+  const reqStuckiStrRef     = useRef(reqStuckiStr);
+  const reqSerpentineRef    = useRef(reqSerpentine);
+  const reqBayerRef         = useRef(reqBayer);
+  const reqBayerSizeRef     = useRef(reqBayerSize);
+  const reqChromaRef        = useRef(reqChroma);
+  const reqPaletteModeRef   = useRef<PaletteRestriction | 'auto' | 'tile'>('auto');
+  const reqGreyThreshRef    = useRef(40);
+  useEffect(() => { reqAlgoRef.current          = reqAlgo;          }, [reqAlgo]);
+  useEffect(() => { reqMetricRef.current        = reqMetric;        }, [reqMetric]);
+  useEffect(() => { reqFsStrRef.current         = reqFsStr;         }, [reqFsStr]);
+  useEffect(() => { reqAtkStrRef.current        = reqAtkStr;        }, [reqAtkStr]);
+  useEffect(() => { reqSierraStrRef.current     = reqSierraStr;     }, [reqSierraStr]);
+  useEffect(() => { reqSierra2StrRef.current    = reqSierra2Str;    }, [reqSierra2Str]);
+  useEffect(() => { reqSierraLiteStrRef.current = reqSierraLiteStr; }, [reqSierraLiteStr]);
+  useEffect(() => { reqShiauFanStrRef.current   = reqShiauFanStr;   }, [reqShiauFanStr]);
+  useEffect(() => { reqJjnStrRef.current        = reqJjnStr;        }, [reqJjnStr]);
+  useEffect(() => { reqStuckiStrRef.current     = reqStuckiStr;     }, [reqStuckiStr]);
+  useEffect(() => { reqSerpentineRef.current    = reqSerpentine;    }, [reqSerpentine]);
+  useEffect(() => { reqBayerRef.current         = reqBayer;         }, [reqBayer]);
+  useEffect(() => { reqBayerSizeRef.current     = reqBayerSize;     }, [reqBayerSize]);
+  useEffect(() => { reqChromaRef.current        = reqChroma;        }, [reqChroma]);
+  useEffect(() => { reqPaletteModeRef.current   = reqPaletteMode;   }, [reqPaletteMode]);
+  useEffect(() => { reqGreyThreshRef.current    = reqGreyThresh;    }, [reqGreyThresh]);
+
+  // ── Initialise from importReqParams if provided (on mount only) ────────────
+  useEffect(() => {
+    if (!initialReqParams) return;
+    setReqAlgo(initialReqParams.dither);
+    setReqMetric(initialReqParams.metric);
+    setReqFsStr(initialReqParams.fsStrength);
+    setReqAtkStr(initialReqParams.atkStrength);
+    setReqBayer(initialReqParams.bayerScale);
+    setReqChroma(initialReqParams.chromaBoost);
+    setReqPaletteMode(initialReqParams.tilePalette ? 'tile' : 'auto');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const sourceBitmapRef   = useRef<ImageBitmap | null>(sourceBitmap ?? null);
+  const importCropModeRef = useRef(importCropMode);
+  const importPreRef      = useRef(importPre);
+  const sourceFramesRef   = useRef<ImageBitmap[] | null>(sourceFrames ?? null);
+  useEffect(() => { sourceBitmapRef.current   = sourceBitmap ?? null;   }, [sourceBitmap]);
+  useEffect(() => { importCropModeRef.current = importCropMode;         }, [importCropMode]);
+  useEffect(() => { importPreRef.current      = importPre;              }, [importPre]);
+  useEffect(() => { sourceFramesRef.current   = sourceFrames ?? null;   }, [sourceFrames]);
+
 
   // ── Requantize preview ──────────────────────────────────────────────────────
   const [previewComp, _setPreviewComp] = useState<CompositionState | null>(null);
@@ -344,14 +501,38 @@ export function Editor({
   const filterStrengthRef = useRef(1.0);
   function setFilterStrength(s: number) { filterStrengthRef.current = s; _setFilterStrength(s); }
 
+  const [filterScope, _setFilterScope] = useState<'frame' | 'all'>('frame');
+  const filterScopeRef = useRef<'frame' | 'all'>('frame');
+  function setFilterScope(s: 'frame' | 'all') { filterScopeRef.current = s; _setFilterScope(s); }
+
   // ── Reduction strategy ──────────────────────────────────────────────────────
   const [reductionStrategy, _setReductionStrategy] = useState<Strategy>('RAREST');
   const reductionStrategyRef = useRef<Strategy>('RAREST');
   function setReductionStrategy(s: Strategy) { reductionStrategyRef.current = s; _setReductionStrategy(s); }
 
+  const [reduceScope, _setReduceScope] = useState<'frame' | 'all'>('frame');
+  const reduceScopeRef = useRef<'frame' | 'all'>('frame');
+  function setReduceScope(s: 'frame' | 'all') { reduceScopeRef.current = s; _setReduceScope(s); }
+
+  // ── Animation playback ──────────────────────────────────────────────────────
+  const [playing,  _setPlaying]  = useState(false);
+  const playingRef = useRef(false);
+  function setPlaying(v: boolean) { playingRef.current = v; _setPlaying(v); }
+  const playTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // ── Heatmap ─────────────────────────────────────────────────────────────────
   const [heatmapOn, setHeatmapOn] = useState(false);
   const heatmapOnRef = useRef(false);
+
+  // ── Compression data view ───────────────────────────────────────────────────
+  const [detailMapOn,     setDetailMapOn]     = useState(false);
+  const detailMapOnRef  = useRef(false);
+  const [dataStats,       setDataStats]       = useState<DataStats | null>(null);
+  const [dataComputing,   setDataComputing]   = useState(false);
+  const [hoveredStatTile, setHoveredStatTile] = useState<number | null>(null);
+  const [statsOpen,       _setStatsOpen]      = useState(true);
+  const statsOpenRef = useRef(true);
+  function setStatsOpen(v: boolean) { statsOpenRef.current = v; _setStatsOpen(v); }
 
   // ── Grid lines visibility (driven by App toolbar) ───────────────────────────
   useEffect(() => {
@@ -381,6 +562,100 @@ export function Editor({
     c.markDirty();
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [heatmapOn, comp.frames, comp.activeFrame]);
+
+  // ── Playback engine ─────────────────────────────────────────────────────────
+  // Uses recursive setTimeout so each frame's own delay governs the next tick.
+  // Frame advances bypass syncComp to avoid triggering auto-save every tick.
+  useEffect(() => {
+    if (!playing) {
+      if (playTimerRef.current) { clearTimeout(playTimerRef.current); playTimerRef.current = null; }
+      return;
+    }
+    function tick() {
+      const c = compRef.current;
+      const maxF = Math.max(...c.frames.map(t => t.length), 1);
+      if (maxF <= 1) { setPlaying(false); return; }
+      const delay = c.frameDelays[0]?.[c.activeFrame] ?? 100;
+      playTimerRef.current = setTimeout(() => {
+        if (!playingRef.current) return;
+        const nextF = (compRef.current.activeFrame + 1) % Math.max(...compRef.current.frames.map(t => t.length), 1);
+        const next = { ...compRef.current, activeFrame: nextF };
+        compRef.current = next;
+        setComp(next);
+        canvasRef.current?.setComposition(next);
+        tick();
+      }, delay);
+    }
+    tick();
+    return () => { if (playTimerRef.current) { clearTimeout(playTimerRef.current); playTimerRef.current = null; } };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing]);
+
+  // ── Compression detail map ─────────────────────────────────────────────────
+  useEffect(() => {
+    detailMapOnRef.current = detailMapOn;
+    const c = canvasRef.current;
+    if (!c) return;
+    if (detailMapOn) {
+      c.setCompressionMap(buildDetailMap(compRef.current));
+    } else {
+      c.setCompressionMap(null);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detailMapOn, comp]);
+
+  // Auto-recompute stats when the composition changes, but only while the stats
+  // panel is "open" (user has run Compute at least once).
+  // Use a ref for the "panel open" flag to avoid stale-closure issues, and
+  // watch `comp` (not comp.frames) because frames are mutated in place so the
+  // array reference never changes.
+  useEffect(() => {
+    if (canvasRef.current) canvasRef.current.hoveredTileTi = hoveredStatTile;
+  }, [hoveredStatTile]);
+
+  const computeDataStatsRef  = useRef<() => Promise<void>>(async () => {});
+  const autoRecomputeTimer   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Trigger initial computation on mount (panel defaults open).
+  useEffect(() => { void computeDataStatsRef.current(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Debounced auto-recompute when comp changes, only while panel is open.
+  useEffect(() => {
+    if (!statsOpenRef.current) return;
+    if (autoRecomputeTimer.current) clearTimeout(autoRecomputeTimer.current);
+    autoRecomputeTimer.current = setTimeout(() => {
+      void computeDataStatsRef.current();
+    }, 1500);
+    return () => { if (autoRecomputeTimer.current) clearTimeout(autoRecomputeTimer.current); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [comp]);
+
+  const computeDataStats = useCallback(async () => {
+    if (dataComputing) return;
+    const c = compRef.current;
+    setDataComputing(true);
+    try {
+      const { compress } = await import('../compression.js');
+      const tiles: TileDataStat[] = [];
+      for (let ti = 0; ti < c.frames.length; ti++) {
+        const frame      = c.frames[ti]?.[c.activeFrame] ?? new Uint8Array(MAP_SIZE * MAP_SIZE);
+        const compressed = await compress(frame);
+        const bytes      = compressed.length;
+        // CJK banner count: each banner holds 84 bytes; 2-byte length header overhead
+        const banners    = Math.ceil((bytes + 2) / 84);
+        const pct        = bytes / 5290 * 100;
+        tiles.push({ tileCol: ti % c.gridCols, tileRow: Math.floor(ti / c.gridCols), bytes, banners, pct, overflow: bytes > 5290 });
+      }
+      setDataStats({
+        tiles,
+        totalBytes:  tiles.reduce((s, t) => s + t.bytes, 0),
+        maxBanners:  Math.max(...tiles.map(t => t.banners)),
+      });
+    } catch (err) {
+      console.warn('[Loominary] computeDataStats error:', err);
+    } finally {
+      setDataComputing(false);
+    }
+  }, [dataComputing]);
+  useEffect(() => { computeDataStatsRef.current = computeDataStats; }, [computeDataStats]);
 
   // ── ToolContext ─────────────────────────────────────────────────────────────
   const getCtx = useRef((): ToolContext => ({
@@ -548,53 +823,93 @@ export function Editor({
 
   // ── Reduce ──────────────────────────────────────────────────────────────────
   function applyReduction(): void {
-    const c = compRef.current;
-    historyRef.current.snapshot(c.frames);
-    let totalRemoved = 0;
-    for (const tf of c.frames) {
-      const frame = tf[c.activeFrame]; if (!frame) continue;
-      const d = countDistinct(frame); if (d <= 1) continue;
-      const [removed] = reduceColorsInPlace(frame.slice() as Uint8Array, d - 1, OKLAB, reductionStrategyRef.current);
-      // reduceColorsInPlace mutates in-place, so use the original
-      reduceColorsInPlace(frame, d - 1, OKLAB, reductionStrategyRef.current);
-      totalRemoved += removed;
+    const c    = compRef.current;
+    const sel  = selMaskRef.current;
+    const gw   = c.gridCols * MAP_SIZE;
+    const allF = reduceScopeRef.current === 'all';
+    const maxF = Math.max(...c.frames.map(t => t.length), 1);
+    const frameIdxs = allF ? Array.from({ length: maxF }, (_, i) => i) : [c.activeFrame];
+
+    // Build frequency table across the scoped frames.
+    const freq = new Int32Array(256);
+    for (let ti = 0; ti < c.frames.length; ti++) {
+      const tileCol = ti % c.gridCols;
+      const tileRow = Math.floor(ti / c.gridCols);
+      for (const fi of frameIdxs) {
+        const frame = c.frames[ti]?.[fi];
+        if (!frame) continue;
+        for (let i = 0; i < frame.length; i++) {
+          if (!frame[i]) continue;
+          if (sel) {
+            const lx = i % MAP_SIZE, ly = (i / MAP_SIZE) | 0;
+            if (!sel[(tileRow * MAP_SIZE + ly) * gw + tileCol * MAP_SIZE + lx]) continue;
+          }
+          freq[frame[i]]++;
+        }
+      }
     }
+
+    const [victim, survivor] = findReductionTarget(freq, OKLAB, reductionStrategyRef.current);
+    if (victim === -1) { setStatusMsg('Already at minimum (1 color or less)'); return; }
+
+    historyRef.current.snapshot(c.frames);
+
+    let pixelsChanged = 0;
+    for (let ti = 0; ti < c.frames.length; ti++) {
+      const tileCol = ti % c.gridCols;
+      const tileRow = Math.floor(ti / c.gridCols);
+      for (const fi of frameIdxs) {
+        const frame = c.frames[ti]?.[fi];
+        if (!frame) continue;
+        for (let i = 0; i < frame.length; i++) {
+          if (frame[i] !== victim) continue;
+          if (sel) {
+            const lx = i % MAP_SIZE, ly = (i / MAP_SIZE) | 0;
+            if (!sel[(tileRow * MAP_SIZE + ly) * gw + tileCol * MAP_SIZE + lx]) continue;
+          }
+          frame[i] = survivor;
+          pixelsChanged++;
+        }
+      }
+    }
+
     syncComp({ ...c });
     setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
-    setStatusMsg(totalRemoved > 0
-      ? `Reduced ${totalRemoved} color${totalRemoved>1?'s':''} (${reductionStrategyRef.current})`
-      : 'Already at minimum (1 color or less)');
+    setStatusMsg(`Reduced color ${victim} → ${survivor} (${pixelsChanged} px, ${reductionStrategyRef.current}${allF ? ' · all frames' : ''})`);
   }
 
   // ── Filter ──────────────────────────────────────────────────────────────────
   async function applyEditorFilter(): Promise<void> {
     if (reqRunning) return;
-    const c = compRef.current;
+    const c    = compRef.current;
+    const allF = filterScopeRef.current === 'all';
+    const maxF = Math.max(...c.frames.map(t => t.length), 1);
+    const frameIdxs = allF ? Array.from({ length: maxF }, (_, i) => i) : [c.activeFrame];
     setStatusMsg(`Applying ${filterTypeRef.current}…`);
     try {
-      // Build ImageData from current frame
-      const source   = mapBytesToImageData(c.frames, c.activeFrame, c.gridCols, c.gridRows);
-      const filtered = applyFilter(source, { type: filterTypeRef.current, strength: filterStrengthRef.current });
-
-      // Re-quantize with NONE dither + current palette/metric settings
+      const { customPalette: filterCp, tilePalette: filterTp } = buildReqPalette();
       const params: RequantizeParams = {
         ...DEFAULT_REQ_PARAMS,
         dither:          'NONE',
         metric:          reqMetricRef.current,
         legalOnly:       !c.allShades,
-        tilePalette:     reqTilePalRef.current,
+        customPalette:   filterCp,
+        tilePalette:     filterTp,
         chromaBoost:     reqChromaRef.current,
         useCustomDither: false,
         ditherMask:      null,
       };
-      const newTiles = requantizeGrid(filtered, c, selMaskRef.current, params);
       historyRef.current.snapshot(c.frames);
-      const newFrames = c.frames.map((tf, ti) =>
-        tf.map((f, fi) => fi === c.activeFrame ? newTiles[ti] : f),
-      );
+      let newFrames = c.frames.map(tf => [...tf]);
+      for (const fi of frameIdxs) {
+        const source   = mapBytesToImageData(c.frames, fi, c.gridCols, c.gridRows);
+        const filtered = applyFilter(source, { type: filterTypeRef.current, strength: filterStrengthRef.current });
+        const newTiles = requantizeGrid(filtered, c, selMaskRef.current, params);
+        newFrames = newFrames.map((tf, ti) => tf.map((f, fj) => fj === fi ? newTiles[ti] : f));
+      }
       syncComp({ ...c, frames: newFrames });
       setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
-      setStatusMsg(`Filter: ${filterTypeRef.current} applied`);
+      setStatusMsg(`Filter: ${filterTypeRef.current} applied${allF ? ` (${frameIdxs.length} frames)` : ''}`);
     } catch (err) {
       setStatusMsg(`Filter error: ${err}`);
     }
@@ -673,7 +988,139 @@ export function Editor({
     setStatusMsg(`Frame ${fi+1} delay: ${delay} ms`);
   }
 
+  function setFrameDelay(ms: number): void {
+    const c = compRef.current;
+    const fi = c.activeFrame;
+    const clamped = Math.max(10, Math.min(10000, ms));
+    const newDelays = c.frameDelays.map(dd => {
+      const next = [...dd];
+      next[fi] = clamped;
+      return next;
+    });
+    syncComp({ ...c, frameDelays: newDelays });
+  }
+
+  function applyDelayToAll(ms: number): void {
+    const c = compRef.current;
+    const clamped = Math.max(10, Math.min(10000, ms));
+    const newDelays = c.frameDelays.map(dd => dd.map(() => clamped));
+    syncComp({ ...c, frameDelays: newDelays });
+    setStatusMsg(`All frame delays set to ${clamped} ms`);
+  }
+
+  function applyStride(n: number): void {
+    if (n < 2) return;
+    const c    = compRef.current;
+    const maxF = Math.max(...c.frames.map(t => t.length), 1);
+    if (maxF <= 1) { setStatusMsg('Only 1 frame — nothing to stride'); return; }
+    historyRef.current.snapshot(c.frames);
+
+    const newFrames = c.frames.map(tf => {
+      if (tf.length <= 1) return tf;
+      const kept: Uint8Array[] = [];
+      const keptCount = Math.ceil(tf.length / n);
+      for (let j = 0; j < keptCount; j++) kept.push(tf[j * n]);
+      return kept;
+    });
+
+    const newDelays = c.frameDelays.map(dd => {
+      if (dd.length <= 1) return dd;
+      const kept: number[] = [];
+      const keptCount = Math.ceil(dd.length / n);
+      for (let j = 0; j < keptCount; j++) {
+        const src = j * n;
+        let acc = 0;
+        for (let k = src; k < Math.min(src + n, dd.length); k++) acc += dd[k];
+        kept.push(acc);
+      }
+      return kept;
+    });
+
+    const newCount  = Math.ceil(maxF / n);
+    const newActive = Math.min(c.activeFrame, newCount - 1);
+    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: newActive });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setStatusMsg(`Stride ${n}: ${maxF} → ${newCount} frames`);
+  }
+
+  function applySkip(n: number): void {
+    if (n < 2) return;
+    const c    = compRef.current;
+    const maxF = Math.max(...c.frames.map(t => t.length), 1);
+    if (maxF <= 1) { setStatusMsg('Only 1 frame — nothing to skip'); return; }
+    historyRef.current.snapshot(c.frames);
+
+    const newFrames = c.frames.map(tf => {
+      if (tf.length <= 1) return tf;
+      const kept: Uint8Array[] = [];
+      for (let j = 0; j < tf.length; j++) if ((j + 1) % n !== 0) kept.push(tf[j]);
+      if (kept.length === 0) kept.push(tf[0]);
+      return kept;
+    });
+
+    const newDelays = c.frameDelays.map(dd => {
+      if (dd.length <= 1) return dd;
+      const kept: number[] = [];
+      let pending = 0;
+      for (let j = 0; j < dd.length; j++) {
+        if ((j + 1) % n === 0) {
+          pending += dd[j];
+        } else {
+          kept.push((dd[j] ?? 100) + pending);
+          pending = 0;
+        }
+      }
+      if (pending > 0 && kept.length > 0) kept[kept.length - 1] += pending;
+      if (kept.length === 0) kept.push(dd[0] ?? 100);
+      return kept;
+    });
+
+    const newCount  = Math.max(...newFrames.map(tf => tf.length), 1);
+    const newActive = Math.min(c.activeFrame, newCount - 1);
+    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: newActive });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+    setStatusMsg(`Skip ${n}: ${maxF} → ${newCount} frames`);
+  }
+
+  function moveFrame(dir: -1 | 1): void {
+    const c = compRef.current;
+    const fi  = c.activeFrame;
+    const maxF = Math.max(...c.frames.map(t => t.length), 1);
+    const fi2 = fi + dir;
+    if (fi2 < 0 || fi2 >= maxF) return;
+    historyRef.current.snapshot(c.frames);
+    const newFrames = c.frames.map(tf => {
+      const next = [...tf];
+      [next[fi], next[fi2]] = [next[fi2], next[fi]];
+      return next;
+    });
+    const newDelays = c.frameDelays.map(dd => {
+      const next = [...dd];
+      [next[fi], next[fi2]] = [next[fi2], next[fi]];
+      return next;
+    });
+    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: fi2 });
+    setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+  }
+
   // ── Requantize ──────────────────────────────────────────────────────────────
+  // Derive { customPalette, tilePalette } from the current palette-mode setting.
+  // Queue-palette override (reqQueuePalette) takes precedence.
+  function buildReqPalette(): { customPalette: Uint8Array | undefined; tilePalette: boolean } {
+    if (reqQueuePaletteRef.current && mergeQueueRef.current.size > 0) {
+      const cp = new Uint8Array(256);
+      for (const col of mergeQueueRef.current) cp[col] = 1;
+      return { customPalette: cp, tilePalette: false };
+    }
+    const mode = reqPaletteModeRef.current;
+    if (mode === 'tile') return { customPalette: undefined, tilePalette: true };
+    if (mode === 'auto') return { customPalette: undefined, tilePalette: false };
+    return {
+      customPalette: buildPaletteFlag(mode, { greyThreshold: reqGreyThreshRef.current }),
+      tilePalette: false,
+    };
+  }
+
   const doRequantize = useCallback(async () => {
     if (reqRunning) return;
     // Clear any existing preview
@@ -685,47 +1132,105 @@ export function Editor({
     const { gridCols, gridRows, frames, activeFrame, allShades } = c;
 
     try {
-      let source: ImageData;
-      if (sourceBitmapRef.current) {
-        source = await scaleImage(sourceBitmapRef.current, gridCols * MAP_SIZE, gridRows * MAP_SIZE);
-      } else {
-        source = mapBytesToImageData(frames, activeFrame, gridCols, gridRows);
-      }
-
-      const params: RequantizeParams = {
-        legalOnly:       !allShades,
-        dither:          reqAlgoRef.current,
-        metric:          reqMetricRef.current,
-        fsStrength:      reqFsStrRef.current,
-        atkStrength:     reqAtkStrRef.current,
-        bayerScale:      reqBayerRef.current,
-        chromaBoost:     reqChromaRef.current,
-        tilePalette:     reqTilePalRef.current,
-        useCustomDither: false,
-        ditherMask:      null,
+      const useSourceImg = reqUseSourceRef.current === 'source'
+        && (!!sourceBitmapRef.current || !!sourceFramesRef.current);
+      const reqPre: PreprocessParams = {
+        brightness: reqBrightnessRef.current,
+        contrast:   reqContrastRef.current,
+        saturation: reqSaturationRef.current,
       };
 
-      const newTiles  = requantizeGrid(source, c, selMaskRef.current, params);
-      const newFrames = frames.map((tileFrames, ti) =>
-        tileFrames.map((f, fi) => fi === activeFrame ? newTiles[ti] : f),
-      );
+      // Helper: build source ImageData for a given animation frame index.
+      async function buildSource(fi: number): Promise<ImageData> {
+        if (useSourceImg) {
+          // Prefer per-frame source bitmap (from GIF import), fall back to single bitmap.
+          const bmp = sourceFramesRef.current?.[fi] ?? sourceBitmapRef.current;
+          if (bmp) {
+            return prepareSourceImage(bmp, gridCols * MAP_SIZE, gridRows * MAP_SIZE,
+              importCropModeRef.current, reqPre);
+          }
+        }
+        const raw = mapBytesToImageData(frames, fi, gridCols, gridRows);
+        return applyPreprocess(raw, reqPre);
+      }
 
-      // Show as preview — user must press Enter/Y to commit.
+      let source: ImageData;
+      source = await buildSource(activeFrame);
+
+      const { customPalette, tilePalette: tp } = buildReqPalette();
+
+      const params: RequantizeParams = {
+        legalOnly:          !allShades,
+        customPalette,
+        dither:             reqAlgoRef.current,
+        metric:             reqMetricRef.current,
+        fsStrength:         reqFsStrRef.current,
+        atkStrength:        reqAtkStrRef.current,
+        sierraStrength:     reqSierraStrRef.current,
+        sierra2Strength:    reqSierra2StrRef.current,
+        sierraLiteStrength: reqSierraLiteStrRef.current,
+        shiauFanStrength:   reqShiauFanStrRef.current,
+        jjnStrength:        reqJjnStrRef.current,
+        stuckiStrength:     reqStuckiStrRef.current,
+        serpentine:         reqSerpentineRef.current,
+        bayerScale:         reqBayerRef.current,
+        bayerSize:          reqBayerSizeRef.current,
+        chromaBoost:        reqChromaRef.current,
+        tilePalette:        tp,
+        useCustomDither:    false,
+        ditherMask:         null,
+      };
+
+      const maxF = Math.max(...frames.map(t => t.length), 1);
+      const allF = reqAllFramesRef.current && maxF > 1;
+
+      // Build per-frame results (one requantize pass per animation frame if "all frames").
+      let builtFrames = frames.map(tf => [...tf]); // shallow copy
+      const framesToProcess = allF ? Array.from({ length: maxF }, (_, i) => i) : [activeFrame];
+      if (allF) setReqProgress({ done: 0, total: maxF });
+
+      for (const fi of framesToProcess) {
+        const src    = await buildSource(fi);
+        // Temporarily present the composition as if activeFrame=fi so requantizeGrid
+        // reads the right tile data for selection masking.
+        const cForFi = fi === activeFrame ? c : { ...c, activeFrame: fi };
+        const tiles  = requantizeGrid(src, cForFi, selMaskRef.current, params);
+        builtFrames  = builtFrames.map((tf, ti) => {
+          const next = [...tf];
+          next[fi] = tiles[ti] ?? next[fi];
+          return next;
+        });
+        if (allF) { setReqStatus(`⏳ Frame ${fi + 1}/${maxF}`); setReqProgress({ done: fi + 1, total: maxF }); }
+      }
+      if (allF) setReqProgress(null);
+
+      const newFrames = builtFrames;
       const preview: CompositionState = { ...c, frames: newFrames };
       setPreviewComp(preview);
-      setReqStatus(sourceBitmapRef.current
-        ? '🔍 Preview — Enter/Y: commit  ·  Esc: cancel'
-        : '🔍 Preview (from pixels) — Enter/Y: commit  ·  Esc: cancel');
+      const srcNote = useSourceImg ? '' : ' (pixels)';
+      const framesNote = allF ? ` · all ${maxF} frames` : '';
+      void framesNote; // used below
+      const modeLabel = reqPaletteModeRef.current === 'auto' ? '' :
+        reqPaletteModeRef.current === 'tile' ? ' · tile palette' :
+        reqPaletteModeRef.current === 'greyscale' ? ' · greyscale' :
+        ' · ' + reqPaletteModeRef.current;
+      const palNote = (reqQueuePaletteRef.current && mergeQueueRef.current.size > 0)
+        ? ` · ${mergeQueueRef.current.size}c queue`
+        : modeLabel;
+      const allFramesNote = allF ? ` · all ${maxF} frames` : '';
+      setReqStatus(`🔍 Preview${srcNote}${palNote}${allFramesNote} — Enter/Y: commit  ·  Esc: cancel`);
     } catch (err) {
       setReqStatus(`Error: ${err}`);
       setTimeout(() => setReqStatus(null), 3500);
     } finally {
       setReqRunning(false);
+      setReqProgress(null);
     }
   }, [reqRunning]);
 
   const doRequantizeRef = useRef(doRequantize);
   useEffect(() => { doRequantizeRef.current = doRequantize; }, [doRequantize]);
+
 
   // ── Auto-refresh preview when req params change ──────────────────────────────
   // If a preview is already showing, re-run requantize immediately so the
@@ -734,7 +1239,12 @@ export function Editor({
     if (!previewCompRef.current) return;
     void doRequantizeRef.current();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reqAlgo, reqMetric, reqChroma, reqFsStr, reqAtkStr, reqBayer, reqTilePal]);
+  }, [reqAlgo, reqMetric, reqChroma, reqFsStr, reqAtkStr,
+      reqSierraStr, reqSierra2Str, reqSierraLiteStr, reqShiauFanStr, reqJjnStr, reqStuckiStr,
+      reqSerpentine, reqBayer, reqBayerSize,
+      reqPaletteMode, reqGreyThresh,
+      reqUseSource, reqQueuePalette, mergeQueueVer,
+      reqBrightness, reqContrast, reqSaturation]);
 
   // ── Canvas init ─────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -861,11 +1371,18 @@ export function Editor({
     window.addEventListener('keyup', onKeyUp);
 
     const onKey = (e: KeyboardEvent) => {
-      const tag = (document.activeElement as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const tag       = (document.activeElement as HTMLElement)?.tagName ?? '';
+      const inputType = ((document.activeElement as HTMLInputElement)?.type ?? '').toLowerCase();
+      const ctrl      = e.ctrlKey || e.metaKey;
+      // Only suppress single-key shortcuts when the user is actively typing text.
+      // Range sliders, checkboxes, radio buttons, selects, and buttons should NOT
+      // block shortcuts — only text/number/password/email/url/search inputs do.
+      const isTextEntry = tag === 'TEXTAREA'
+        || (tag === 'INPUT' && ['text','number','email','password','search','url'].includes(inputType));
+      if (isTextEntry && !ctrl) return;
 
       // Update modifier refs (used by tools via ToolContext).
-      ctrlHeldRef.current  = e.ctrlKey || e.metaKey;
+      ctrlHeldRef.current  = ctrl;
       shiftHeldRef.current = e.shiftKey;
 
       // When Ctrl is pressed while wand is active, switch to orange (subtract) preview.
@@ -875,11 +1392,10 @@ export function Editor({
         return;
       }
 
-      const ctrl  = e.ctrlKey || e.metaKey;
       const shift = e.shiftKey;
 
       // ── Ctrl combos ──────────────────────────────────────────────────────
-      if (ctrl && e.key === 'z') {
+      if (ctrl && !shift && e.key === 'z') {
         e.preventDefault();
         const h = historyRef.current;
         const res = h.undo(compRef.current.frames);
@@ -890,7 +1406,7 @@ export function Editor({
         }
         return;
       }
-      if (ctrl && (e.key === 'y' || (shift && e.key === 'z'))) {
+      if (ctrl && shift && (e.key === 'z' || e.key === 'Z')) {
         e.preventDefault();
         const h = historyRef.current;
         const res = h.redo(compRef.current.frames);
@@ -935,6 +1451,12 @@ export function Editor({
       const maxFrames = Math.max(...c.frames.map(t => t.length), 1);
 
       switch (e.key) {
+
+        // ─ Play/pause animation (Space) ──────────────────────────────────
+        case ' ':
+          e.preventDefault();
+          setPlaying(p => !p);
+          break;
 
         // ─ Escape ────────────────────────────────────────────────────────
         case 'Escape':
@@ -1059,12 +1581,30 @@ export function Editor({
           break;
         }
 
-        // ─ Frame delay (,/.) — only when multi-frame ──────────────────────
+        // ─ Frame navigation (<  >) and delay adjustment (,  .) ───────────
         case ',':
-          if (maxFrames > 1) { e.preventDefault(); adjustFrameDelay(shift ? -100 : -10); }
+          e.preventDefault();
+          if (shift && maxFrames > 1) {
+            // Shift+, = < = previous frame
+            syncComp({ ...c, activeFrame: (c.activeFrame - 1 + maxFrames) % maxFrames });
+          } else if (!shift && maxFrames > 1) {
+            adjustFrameDelay(-10);
+          }
           break;
         case '.':
-          if (maxFrames > 1) { e.preventDefault(); adjustFrameDelay(shift ? 100 : 10); }
+          e.preventDefault();
+          if (shift && maxFrames > 1) {
+            // Shift+. = > = next frame
+            syncComp({ ...c, activeFrame: (c.activeFrame + 1) % maxFrames });
+          } else if (!shift && maxFrames > 1) {
+            adjustFrameDelay(10);
+          }
+          break;
+        case '<':   // explicit in case browser reports shifted key
+          if (maxFrames > 1) { e.preventDefault(); syncComp({ ...c, activeFrame: (c.activeFrame - 1 + maxFrames) % maxFrames }); }
+          break;
+        case '>':
+          if (maxFrames > 1) { e.preventDefault(); syncComp({ ...c, activeFrame: (c.activeFrame + 1) % maxFrames }); }
           break;
 
         // ─ Requantize ─────────────────────────────────────────────────────
@@ -1111,6 +1651,17 @@ export function Editor({
             setStatusMsg(next ? 'Heatmap: red=rarest, blue=most common' : 'Heatmap off');
             return next;
           });
+          break;
+
+        // ─ Toggle detail / compression map (Z) ───────────────────────────
+        case 'z': case 'Z':
+          if (!ctrl) {
+            setDetailMapOn(on => {
+              const next = !on;
+              setStatusMsg(next ? 'Detail map on — bright = expensive to compress' : 'Detail map off');
+              return next;
+            });
+          }
           break;
 
         // ─ Toggle dither mask overlay (M) ─────────────────────────────────
@@ -1182,21 +1733,26 @@ export function Editor({
     { id:'brush',  label:'🖌 Brush',  key:'B', hint:'right-click: pick color' },
     { id:'fill',   label:'🪣 Fill',   key:'F', hint:'right-click: pick · scroll: tolerance' },
     { id:'select', label:'▭ Select', key:'S', hint:'drag: marquee · Ctrl: subtract' },
-    { id:'lasso',  label:'⬡ Lasso',  key:'L', hint:'dbl-click: close · Ctrl: subtract' },
+    { id:'lasso',  label:'⬡ Lasso',  key:'L', hint:'drag: freehand · click: add vertex · dbl-click: close polygon · Ctrl: subtract' },
     { id:'wand',   label:'✦ Wand',   key:'W', hint:'click: add · Ctrl: subtract · scroll: tol' },
   ] as const;
 
   const activeTool   = TOOL_MAP.get(activeToolId) ?? brushTool;
   const maxFrames    = Math.max(...comp.frames.map(t => t.length), 1);
   const frameDelay   = comp.frameDelays[0]?.[comp.activeFrame] ?? 100;
-  // Compute distinct color count (for budget badge) — just for current frame
+  // Distinct color count across all tiles for the active frame.
+  // The IIFE runs on every render; the Uint8Array scan is O(tiles × 16384) so
+  // we guard with useMemo to skip repeats when only non-pixel state changes.
   const distinctCount = (() => {
     const seen = new Uint8Array(256);
+    const af = comp.activeFrame;
     for (const tf of comp.frames) {
-      const f = tf[comp.activeFrame]; if (!f) continue;
+      const f = tf[af]; if (!f) continue;
       for (let i = 0; i < f.length; i++) if (f[i]) seen[f[i]] = 1;
     }
-    return Array.from(seen).slice(1).filter(Boolean).length;
+    let n = 0;
+    for (let c = 1; c < 256; c++) if (seen[c]) n++;
+    return n;
   })();
 
   const mergeQueueSnapshot = new Set(mergeQueueRef.current); // for rendering (mergeQueueVer drives re-render)
@@ -1204,15 +1760,17 @@ export function Editor({
 
   // ─── Render ───────────────────────────────────────────────────────────────────
   return (
-    <div style={ROOT_STYLE}>
+    <div style={{ ...ROOT_STYLE, fontSize: uiFontSize }}>
+      {/* ── Main row ── */}
+      <div style={{ display:'flex', flex:1, overflow:'hidden' }}>
       {/* Left sidebar */}
-      <div style={LEFT_PANEL}>
+      <div style={{ ...LEFT_PANEL, width: leftW, minWidth: 80, maxWidth: 500 }}>
 
         {/* Tool list */}
         {TOOL_DEFS.map(({ id, label, key, hint }) => (
           <button key={id} onClick={() => doSwitchTool(id)} title={`${label} (${key}) — ${hint}`}
             style={id === activeToolId ? TOOL_BTN_ON : TOOL_BTN_OFF}>
-            <span style={{ fontSize:10, color: id === activeToolId ? '#8cf' : '#555' }}>{key} — {label}</span>
+            <span style={{ fontSize:'0.71em', color: id === activeToolId ? '#8cf' : '#555' }}>{key} — {label}</span>
           </button>
         ))}
 
@@ -1245,7 +1803,7 @@ export function Editor({
             <input type="range" min={0} max={0.5} step={0.005} value={wandTol}
               onInput={(e) => setWandTol(+(e.target as HTMLInputElement).value)}
               style={{ width:'100%' }} />
-            <span style={{ fontSize:10, color:'#555' }}>click: add · right-click: subtract</span>
+            <span style={{ fontSize:'0.71em', color:'#555' }}>click: add · right-click: subtract</span>
           </Param>
         )}
 
@@ -1288,7 +1846,7 @@ export function Editor({
         <div style={SECTION_LABEL}>Requantize (R)</div>
 
         <div style={MICRO_LABEL}>Dither  (D to cycle)</div>
-        <div style={CHIP_ROW}>
+        <div style={{ ...CHIP_ROW, flexWrap: 'wrap' }}>
           {DITHER_CYCLE.map(a => (
             <ChipBtn key={a} active={reqAlgo === a} onClick={() => setReqAlgo(a)}>
               {DITHER_LABEL[a]}
@@ -1296,26 +1854,90 @@ export function Editor({
           ))}
         </div>
 
+        {/* Per-algo strength — shown for every error-diffusion algo */}
         {reqAlgo === 'FS' && (
-          <Param label={`FS Error: ${reqFsStr.toFixed(1)}`}>
+          <Param label={`FS strength: ${reqFsStr.toFixed(1)}`}>
             <input type="range" min={0.1} max={1} step={0.1} value={reqFsStr}
               onInput={(e) => setReqFsStr(+(e.target as HTMLInputElement).value)}
               style={{ width:'100%' }} />
           </Param>
         )}
         {reqAlgo === 'ATKINSON' && (
-          <Param label={`Atk Error: ${reqAtkStr.toFixed(1)}`}>
+          <Param label={`Atk strength: ${reqAtkStr.toFixed(1)}`}>
             <input type="range" min={0.1} max={1} step={0.1} value={reqAtkStr}
               onInput={(e) => setReqAtkStr(+(e.target as HTMLInputElement).value)}
               style={{ width:'100%' }} />
           </Param>
         )}
-        {reqAlgo === 'BAYER' && (
-          <Param label={`Bayer Scale: ${reqBayer.toFixed(2)}`}>
-            <input type="range" min={0.02} max={0.20} step={0.02} value={reqBayer}
-              onInput={(e) => setReqBayer(+(e.target as HTMLInputElement).value)}
+        {reqAlgo === 'SIERRA' && (
+          <Param label={`Sierra strength: ${reqSierraStr.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqSierraStr}
+              onInput={(e) => setReqSierraStr(+(e.target as HTMLInputElement).value)}
               style={{ width:'100%' }} />
           </Param>
+        )}
+        {reqAlgo === 'SIERRA2' && (
+          <Param label={`Sierra2 strength: ${reqSierra2Str.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqSierra2Str}
+              onInput={(e) => setReqSierra2Str(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        {reqAlgo === 'SIERRA_LITE' && (
+          <Param label={`SierraL strength: ${reqSierraLiteStr.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqSierraLiteStr}
+              onInput={(e) => setReqSierraLiteStr(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        {reqAlgo === 'SHIAU_FAN' && (
+          <Param label={`Shiau-Fan strength: ${reqShiauFanStr.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqShiauFanStr}
+              onInput={(e) => setReqShiauFanStr(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        {reqAlgo === 'JJN' && (
+          <Param label={`JJN strength: ${reqJjnStr.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqJjnStr}
+              onInput={(e) => setReqJjnStr(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+        {reqAlgo === 'STUCKI' && (
+          <Param label={`Stucki strength: ${reqStuckiStr.toFixed(1)}`}>
+            <input type="range" min={0.1} max={1} step={0.1} value={reqStuckiStr}
+              onInput={(e) => setReqStuckiStr(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </Param>
+        )}
+
+        {/* Serpentine scanning — all ED algos */}
+        {ED_ALGOS.has(reqAlgo) && (
+          <label style={TOGGLE_ROW}>
+            <input type="checkbox" checked={reqSerpentine}
+              onChange={e => setReqSerpentine((e.target as HTMLInputElement).checked)} />
+            <span style={{ fontSize:'0.79em' }}>Serpentine scan</span>
+          </label>
+        )}
+
+        {/* Bayer options */}
+        {reqAlgo === 'BAYER' && (
+          <>
+            <Param label={`Bayer scale: ${reqBayer.toFixed(2)}`}>
+              <input type="range" min={0.02} max={0.20} step={0.02} value={reqBayer}
+                onInput={(e) => setReqBayer(+(e.target as HTMLInputElement).value)}
+                style={{ width:'100%' }} />
+            </Param>
+            <div style={{ fontSize:'0.79em', color:'#888', marginTop:2 }}>Matrix size</div>
+            <div style={CHIP_ROW}>
+              {([2,4,8,16] as const).map(sz => (
+                <ChipBtn key={sz} active={reqBayerSize === sz} onClick={() => setReqBayerSize(sz)}>
+                  {sz}×{sz}
+                </ChipBtn>
+              ))}
+            </div>
+          </>
         )}
 
         <div style={MICRO_LABEL}>Metric  (Q to cycle)</div>
@@ -1333,11 +1955,88 @@ export function Editor({
             style={{ width:'100%' }} />
         </Param>
 
-        <label style={TOGGLE_ROW}>
-          <input type="checkbox" checked={reqTilePal}
-            onChange={(e) => setReqTilePal((e.target as HTMLInputElement).checked)} />
-          <span style={{ fontSize:11 }}>Tile palette</span>
-        </label>
+        <div style={MICRO_LABEL}>Palette</div>
+        <select
+          value={reqPaletteMode}
+          onChange={e => setReqPaletteMode((e.target as HTMLSelectElement).value as typeof reqPaletteMode)}
+          style={{
+            width: '100%', background: '#252525', border: '1px solid #444',
+            borderRadius: 3, color: '#ccc', fontSize: '0.82em', padding: '3px 5px',
+            marginBottom: 2, cursor: 'pointer',
+          }}
+        >
+          <option value="auto">Auto (respects All Shades)</option>
+          <option value="tile">Tile colors</option>
+          {PALETTE_CHOICES.map(c => (
+            <option key={c.id} value={c.id}>{c.label}</option>
+          ))}
+        </select>
+
+        {reqPaletteMode === 'greyscale' && (
+          <Param label={`Chroma threshold: ${reqGreyThresh}`}>
+            <input type="range" min={5} max={120} step={5} value={reqGreyThresh}
+              onInput={e => setReqGreyThresh(+(e.target as HTMLInputElement).value)}
+              style={{ width: '100%' }} />
+          </Param>
+        )}
+
+        {/* Source image vs current pixels */}
+        {sourceBitmap && (
+          <>
+            <div style={MICRO_LABEL}>Source</div>
+            <div style={CHIP_ROW}>
+              <ChipBtn active={reqUseSource === 'source'} onClick={() => setReqUseSource('source')}>
+                ↺ Source image
+              </ChipBtn>
+              <ChipBtn active={reqUseSource === 'pixels'} onClick={() => setReqUseSource('pixels')}>
+                ✎ Current pixels
+              </ChipBtn>
+            </div>
+          </>
+        )}
+
+        {/* Image adjustments */}
+        <div style={MICRO_LABEL}>Image Adjustments</div>
+        {([ ['Brightness', reqBrightness, setReqBrightness],
+            ['Contrast',   reqContrast,   setReqContrast],
+            ['Saturation', reqSaturation, setReqSaturation],
+          ] as [string, number, (v: number) => void][]).map(([label, val, set]) => (
+          <div key={label} style={{ marginBottom: 3 }}>
+            <div style={{ display:'flex', justifyContent:'space-between', fontSize:'0.71em', color:'#888' }}>
+              <span>{label}</span>
+              <span style={{ color: val === 1 ? '#555' : '#aaa' }}>{val.toFixed(2)}</span>
+            </div>
+            <input type="range" min={0} max={2} step={0.05} value={val}
+              onInput={e => set(+(e.target as HTMLInputElement).value)}
+              style={{ width:'100%' }} />
+          </div>
+        ))}
+        {(reqBrightness !== 1 || reqContrast !== 1 || reqSaturation !== 1) && (
+          <button style={{ ...SEL_BTN, fontSize:'0.71em', marginBottom:3 }}
+            onClick={() => { setReqBrightness(1); setReqContrast(1); setReqSaturation(1); }}>
+            Reset adjustments
+          </button>
+        )}
+
+        {/* Apply to all animation frames */}
+        {maxFrames > 1 && (
+          <label style={TOGGLE_ROW}>
+            <input type="checkbox" checked={reqAllFrames}
+              onChange={e => setReqAllFrames((e.target as HTMLInputElement).checked)} />
+            <span style={{ fontSize:'0.79em' }}>All {maxFrames} frames</span>
+          </label>
+        )}
+
+        {/* Override with queued colors (takes precedence over palette selector) */}
+        {mergeQueueSnapshot.size > 0 && (
+          <label style={TOGGLE_ROW}>
+            <input type="checkbox" checked={reqQueuePalette}
+              onChange={e => setReqQueuePalette((e.target as HTMLInputElement).checked)} />
+            <span style={{ fontSize:'0.79em' }}>
+              Override: {mergeQueueSnapshot.size} queued color{mergeQueueSnapshot.size > 1 ? 's' : ''}
+            </span>
+          </label>
+        )}
 
         {/* Preview mode controls */}
         {previewComp ? (
@@ -1367,14 +2066,35 @@ export function Editor({
           </button>
         )}
 
+        {reqProgress && (
+          <div style={{ marginTop:3 }}>
+            <div style={{ height:3, background:'#252525', borderRadius:2, overflow:'hidden' }}>
+              <div style={{
+                height:'100%',
+                width:`${Math.round(reqProgress.done / reqProgress.total * 100)}%`,
+                background:'#4a9eff', borderRadius:2, transition:'width 0.1s ease',
+              }} />
+            </div>
+          </div>
+        )}
         {reqStatus && (
-          <div style={{ fontSize:10, color: reqStatus.startsWith('Error') ? '#f77' : reqStatus.startsWith('🔍') ? '#5cf' : '#7f7', marginTop:2 }}>
+          <div style={{ fontSize:'0.71em', color: reqStatus.startsWith('Error') ? '#f77' : reqStatus.startsWith('🔍') ? '#5cf' : '#7f7', marginTop:2 }}>
             {reqStatus}
           </div>
         )}
         {!sourceBitmap && (
-          <div style={{ fontSize:10, color:'#555', marginTop:2, fontStyle:'italic' }}>
-            No source — from current pixels
+          <div style={{ marginTop:2, display:'flex', alignItems:'center', gap:5, flexWrap:'wrap' }}>
+            <span style={{ fontSize:'0.71em', color:'#555', fontStyle:'italic' }}>
+              No source image
+            </span>
+            {onRelinkSource && (
+              <button onClick={onRelinkSource} style={{
+                background:'transparent', border:'1px solid #444', borderRadius:3,
+                color:'#888', cursor:'pointer', fontSize:'0.68em', padding:'1px 5px',
+              }} title="Re-link the original source file so requantize from source works">
+                Re-link file…
+              </button>
+            )}
           </div>
         )}
 
@@ -1403,10 +2123,15 @@ export function Editor({
               style={{ width:'100%' }} />
           </Param>
         )}
+        <label style={TOGGLE_ROW}>
+          <input type="checkbox" checked={filterScope === 'all'}
+            onChange={e => setFilterScope((e.target as HTMLInputElement).checked ? 'all' : 'frame')} />
+          <span style={{ fontSize:'0.71em' }}>All frames</span>
+        </label>
         <button style={{ ...SEL_BTN, marginTop:2 }} onClick={() => void applyEditorFilter()}>
           Apply (P)
         </button>
-        <div style={{ fontSize:10, color:'#555', marginTop:1 }}>Shift+P: cycle type</div>
+        <div style={{ fontSize:'0.71em', color:'#555', marginTop:1 }}>Shift+P: cycle type</div>
 
         <div style={DIVIDER} />
 
@@ -1419,21 +2144,26 @@ export function Editor({
             </ChipBtn>
           ))}
         </div>
+        <label style={TOGGLE_ROW}>
+          <input type="checkbox" checked={reduceScope === 'all'}
+            onChange={e => setReduceScope((e.target as HTMLInputElement).checked ? 'all' : 'frame')} />
+          <span style={{ fontSize:'0.71em' }}>All frames</span>
+        </label>
         <button style={{ ...SEL_BTN, marginTop:2 }} onClick={applyReduction}>
           Reduce 1 color (K)
         </button>
-        <div style={{ fontSize:10, color:'#555', marginTop:1 }}>Shift+K: cycle strategy · {distinctCount} distinct</div>
+        <div style={{ fontSize:'0.71em', color:'#555', marginTop:1 }}>Shift+K: cycle strategy · {distinctCount} distinct</div>
 
         <div style={DIVIDER} />
 
         {/* ── Merge section ───────────────────────────────────────────────── */}
         <div style={SECTION_LABEL}>Color Merge</div>
-        <div style={{ fontSize:10, color:'#666', lineHeight:1.3 }}>
+        <div style={{ fontSize:'0.71em', color:'#666', lineHeight:1.3 }}>
           Ctrl+click canvas or palette to queue; C commits → active color
         </div>
         {mergeQueueSnapshot.size > 0 && (
           <>
-            <div style={{ fontSize:10, color:'#f93', marginTop:2 }}>
+            <div style={{ fontSize:'0.71em', color:'#f93', marginTop:2 }}>
               {mergeQueueSnapshot.size} color{mergeQueueSnapshot.size>1?'s':''} queued
             </div>
             <div style={{ display:'flex', flexWrap:'wrap', gap:2, marginTop:2 }}>
@@ -1450,7 +2180,7 @@ export function Editor({
             <label style={TOGGLE_ROW}>
               <input type="checkbox" checked={mergeScope === 'all'}
                 onChange={e => setMergeScope((e.target as HTMLInputElement).checked ? 'all' : 'frame')} />
-              <span style={{ fontSize:10 }}>All frames (V to toggle)</span>
+              <span style={{ fontSize:'0.71em' }}>All frames (V to toggle)</span>
             </label>
             <div style={{ display:'flex', gap:3, marginTop:2 }}>
               <button style={{ ...SEL_BTN, flex:1, textAlign:'center', color:'#f93' }}
@@ -1467,9 +2197,17 @@ export function Editor({
         <label style={TOGGLE_ROW}>
           <input type="checkbox" checked={heatmapOn}
             onChange={e => setHeatmapOn((e.target as HTMLInputElement).checked)} />
-          <span style={{ fontSize:11 }}>Heatmap (H)</span>
+          <span style={{ fontSize:'0.79em' }}>Heatmap (H)</span>
         </label>
-        <div style={{ fontSize:10, color:'#555' }}>red=rarest · blue=common</div>
+        <div style={{ fontSize:'0.71em', color:'#555' }}>red=rarest · blue=common</div>
+
+        {/* Detail map overlay */}
+        <label style={{ ...TOGGLE_ROW, marginTop:6 }}>
+          <input type="checkbox" checked={detailMapOn}
+            onChange={e => setDetailMapOn((e.target as HTMLInputElement).checked)} />
+          <span style={{ fontSize:'0.79em' }}>Detail map (Z)</span>
+        </label>
+        <div style={{ fontSize:'0.68em', color:'#555' }}>transparent=cheap · bright red=expensive</div>
 
         {/* ── Frame controls ───────────────────────────────────────────────── */}
         {maxFrames > 1 && (
@@ -1487,7 +2225,7 @@ export function Editor({
               <button style={SEL_BTN} onClick={addBlankFrame}     title="Add blank frame">+ Blank</button>
               <button style={{ ...SEL_BTN, color:'#f77' }} onClick={dropCurrentFrame} title="Delete current frame (Del)">✕ Drop</button>
             </div>
-            <div style={{ fontSize:10, color:'#555', marginTop:1 }}>
+            <div style={{ fontSize:'0.71em', color:'#555', marginTop:1 }}>
               , / .  adjust delay (±10ms, Shift=±100ms)
             </div>
           </>
@@ -1503,6 +2241,8 @@ export function Editor({
         )}
 
       </div>
+
+      <ResizeHandle onDrag={dx => setLeftW(w => Math.max(80, Math.min(500, w + dx)))} />
 
       {/* Canvas */}
       <div style={CANVAS_AREA}>
@@ -1532,6 +2272,91 @@ export function Editor({
         )}
       </div>
 
+      {/* ── Stats sidebar ── */}
+      {statsOpen ? (
+        <div style={{
+          width: 160, flexShrink: 0,
+          background: '#181818', borderLeft: '1px solid #2a2a2a',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          fontSize: uiFontSize,
+        }}>
+          {/* Header */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '3px 6px 3px 8px', borderBottom: '1px solid #2a2a2a', flexShrink: 0,
+          }}>
+            <span style={{ fontSize: '0.71em', color: '#666', fontWeight: 'bold' }}>
+              Stats{dataComputing ? ' ⏳' : ''}
+            </span>
+            <button onClick={() => setStatsOpen(false)} style={{
+              background: 'none', border: 'none', color: '#444', cursor: 'pointer',
+              fontSize: '0.79em', lineHeight: 1, padding: '0 2px',
+            }} title="Collapse stats">×</button>
+          </div>
+
+          {/* Content */}
+          <div style={{ flex: 1, overflowY: 'auto', padding: '4px 6px' }}>
+            {dataStats ? (() => {
+              const { tiles, totalBytes, maxBanners } = dataStats;
+              return (
+                <>
+                  {tiles.map(t => {
+                    const ti       = t.tileRow * comp.gridCols + t.tileCol;
+                    const label    = comp.gridCols * comp.gridRows > 1 ? `(${t.tileRow},${t.tileCol})` : 'Tile';
+                    const barPct   = Math.min(100, t.pct);
+                    const barColor = t.overflow ? '#f55' : t.pct > 85 ? '#f93' : '#4af';
+                    const isHov    = hoveredStatTile === ti;
+                    return (
+                      <div key={`${t.tileRow}_${t.tileCol}`}
+                        style={{ marginBottom: 5, borderRadius: 2, background: isHov ? '#222' : 'transparent', padding: '1px 2px', cursor: 'default' }}
+                        onMouseEnter={() => setHoveredStatTile(ti)}
+                        onMouseLeave={() => setHoveredStatTile(null)}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.71em',
+                          color: t.overflow ? '#f77' : isHov ? '#ccc' : '#888', marginBottom: 2 }}>
+                          <span>{label}</span>
+                          <span style={{ color: t.overflow ? '#f77' : '#555' }}>
+                            {t.overflow ? '⚠ ' : ''}{(t.bytes / 1024).toFixed(1)}K
+                          </span>
+                        </div>
+                        <div style={{ height: 3, background: '#2a2a2a', borderRadius: 2, overflow: 'hidden' }}>
+                          <div style={{ height: '100%', width: `${barPct}%`, background: barColor, borderRadius: 2 }} />
+                        </div>
+                        <div style={{ fontSize: '0.63em', color: '#444', marginTop: 1 }}>
+                          {t.banners} ban · {t.pct.toFixed(0)}%
+                        </div>
+                      </div>
+                    );
+                  })}
+                  <div style={{ fontSize: '0.68em', color: '#555', borderTop: '1px solid #2a2a2a', paddingTop: 4, marginTop: 2 }}>
+                    {(totalBytes / 1024).toFixed(1)} KB total · max {maxBanners} ban
+                  </div>
+                  <div style={{ fontSize: '0.58em', color: '#333', marginTop: 2, lineHeight: 1.4 }}>
+                    cap 5,290 B / 63 ban
+                  </div>
+                </>
+              );
+            })() : (
+              <div style={{ fontSize: '0.68em', color: '#333', marginTop: 6 }}>
+                {dataComputing ? 'Computing…' : 'Loading…'}
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div
+          onClick={() => { setStatsOpen(true); void computeDataStats(); }}
+          title="Show stats"
+          style={{
+            width: 16, flexShrink: 0, background: '#181818',
+            borderLeft: '1px solid #2a2a2a', cursor: 'pointer',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+          <span style={{ fontSize: '0.58em', color: '#333', writingMode: 'vertical-rl' }}>Stats</span>
+        </div>
+      )}
+
+      <ResizeHandle onDrag={dx => setRightW(w => Math.max(80, Math.min(500, w - dx)))} />
+
       {/* Palette */}
       <PalettePanel
         comp={comp}
@@ -1541,28 +2366,356 @@ export function Editor({
         distinctCount={distinctCount}
         onColorPick={setActiveColor}
         onCtrlClick={toggleMergeColor}
+        onColorHover={(color) => {
+          if (canvasRef.current) canvasRef.current.hoveredPaletteColor = color;
+        }}
+        onShiftClick={(mapByte) => {
+          const sel = selMaskRef.current;
+          if (!sel || mapByte === 0) return;
+          const c  = compRef.current;
+          const gw = c.gridCols * MAP_SIZE;
+          const newMask = sel.slice();
+          let changed   = false;
+          for (let ti = 0; ti < c.frames.length; ti++) {
+            const tileCol = ti % c.gridCols;
+            const tileRow = Math.floor(ti / c.gridCols);
+            const frame   = c.frames[ti]?.[c.activeFrame];
+            if (!frame) continue;
+            for (let ly = 0; ly < MAP_SIZE; ly++) {
+              for (let lx = 0; lx < MAP_SIZE; lx++) {
+                if ((frame[lx + ly * MAP_SIZE] & 0xFF) === mapByte) {
+                  const idx = (tileRow * MAP_SIZE + ly) * gw + (tileCol * MAP_SIZE + lx);
+                  if (newMask[idx]) { newMask[idx] = 0; changed = true; }
+                }
+              }
+            }
+          }
+          if (changed) setSelMask(newMask);
+        }}
+        panelWidth={rightW}
+      />
+
+      </div>{/* end main row */}
+
+      {/* ── Frame timeline ── */}
+      <FrameTimeline
+        comp={comp}
+        maxFrames={maxFrames}
+        playing={playing}
+        onPlayPause={() => setPlaying(!playingRef.current)}
+        onPrevFrame={() => {
+          if (playingRef.current) setPlaying(false);
+          const c = compRef.current;
+          const maxF = Math.max(...c.frames.map(t => t.length), 1);
+          syncComp({ ...c, activeFrame: (c.activeFrame - 1 + maxF) % maxF });
+        }}
+        onNextFrame={() => {
+          if (playingRef.current) setPlaying(false);
+          const c = compRef.current;
+          const maxF = Math.max(...c.frames.map(t => t.length), 1);
+          syncComp({ ...c, activeFrame: (c.activeFrame + 1) % maxF });
+        }}
+        onFrameClick={fi => {
+          if (playingRef.current) setPlaying(false);
+          syncComp({ ...compRef.current, activeFrame: fi });
+        }}
+        onDelayChange={setFrameDelay}
+        onApplyToAll={applyDelayToAll}
+        onClone={() => { if (playing) setPlaying(false); cloneCurrentFrame(); }}
+        onBlank ={() => { if (playing) setPlaying(false); addBlankFrame(); }}
+        onDrop  ={() => { if (playing) setPlaying(false); dropCurrentFrame(); }}
+        onMove   ={moveFrame}
+        onStride ={applyStride}
+        onSkip   ={applySkip}
       />
 
       {/* Status bar */}
-      <div style={{ gridColumn:'1 / -1' }}>
-        <StatusBar
-          comp={comp}
-          cursorGx={cursorGx}
-          cursorGy={cursorGy}
-          hoverColor={hoverColor}
-          activeColor={activeColor}
-          activeTool={activeTool.name}
-          scale={scale}
-          canUndo={undoState.canUndo}
-          canRedo={undoState.canRedo}
-          maxFrames={maxFrames}
-          frameDelay={frameDelay}
-          distinctCount={distinctCount}
-          inPreview={!!previewComp}
-          mergeQueueSize={mergeQueueSnapshot.size}
-        />
-      </div>
+      <StatusBar
+        comp={comp}
+        cursorGx={cursorGx}
+        cursorGy={cursorGy}
+        hoverColor={hoverColor}
+        activeColor={activeColor}
+        activeTool={activeTool.name}
+        scale={scale}
+        canUndo={undoState.canUndo}
+        canRedo={undoState.canRedo}
+        maxFrames={maxFrames}
+        frameDelay={frameDelay}
+        distinctCount={distinctCount}
+        inPreview={!!previewComp}
+        mergeQueueSize={mergeQueueSnapshot.size}
+      />
     </div>
+  );
+}
+
+// ─── FrameTimeline ────────────────────────────────────────────────────────────
+
+interface FrameTimelineProps {
+  comp:           CompositionState;
+  maxFrames:      number;
+  playing:        boolean;
+  onPlayPause:    () => void;
+  onPrevFrame:    () => void;   // uses compRef internally — never stale
+  onNextFrame:    () => void;
+  onFrameClick:   (fi: number) => void;
+  onDelayChange:  (ms: number) => void;
+  onApplyToAll:   (ms: number) => void;
+  onClone:        () => void;
+  onBlank:        () => void;
+  onDrop:         () => void;
+  onMove:         (dir: -1 | 1) => void;
+  onStride:       (n: number) => void;
+  onSkip:         (n: number) => void;
+}
+
+function FrameTimeline({
+  comp, maxFrames, playing,
+  onPlayPause, onPrevFrame, onNextFrame, onFrameClick,
+  onDelayChange, onApplyToAll,
+  onClone, onBlank, onDrop, onMove, onStride, onSkip,
+}: FrameTimelineProps) {
+  const fi    = comp.activeFrame;
+  const delay = comp.frameDelays[0]?.[fi] ?? 100;
+  const [thinN, setThinN] = useState(2);
+
+  // ── Thumbnail dimensions ────────────────────────────────────────────────────
+  const THUMB_H = 44;
+  const THUMB_W = Math.max(28, Math.min(88, Math.round(THUMB_H * comp.gridCols / comp.gridRows)));
+
+  // ── Thumbnail generation ─────────────────────────────────────────────────────
+  // Draw directly to per-frame <canvas> elements — no blob encoding, no URLs.
+  const thumbCanvasRefs = useRef<Array<HTMLCanvasElement | null>>([]);
+  const thumbGenIdRef   = useRef(0);
+  const latestCompRef2  = useRef(comp);
+  latestCompRef2.current = comp;
+
+  useEffect(() => {
+    // Skip regeneration while playing — thumbnails update 500 ms after playback stops.
+    if (playing) return;
+    const genId = ++thumbGenIdRef.current;
+    const timer = setTimeout(() => {
+      // Run as an async generator so we can yield between frames and avoid
+      // blocking the main thread (mapBytesToImageData + GPU uploads per frame
+      // can total seconds for large animated GIFs).
+      async function generate() {
+        const c   = latestCompRef2.current;
+        const nF  = Math.max(...c.frames.map(t => t.length), 1);
+        const tw  = Math.max(28, Math.min(88, Math.round(THUMB_H * c.gridCols / c.gridRows)));
+        // Shared full-size OffscreenCanvas reused for each frame.
+        const src  = new OffscreenCanvas(c.gridCols * 128, c.gridRows * 128);
+        const sctx = src.getContext('2d')!;
+        for (let f = 0; f < nF; f++) {
+          if (thumbGenIdRef.current !== genId) return;
+          const thumbEl = thumbCanvasRefs.current[f];
+          if (!thumbEl) continue;
+          const imgData = mapBytesToImageData(c.frames, f, c.gridCols, c.gridRows);
+          sctx.putImageData(imgData, 0, 0);
+          thumbEl.width  = tw;
+          thumbEl.height = THUMB_H;
+          const dctx = thumbEl.getContext('2d')!;
+          dctx.imageSmoothingEnabled = false;
+          dctx.drawImage(src, 0, 0, tw, THUMB_H);
+          // Yield every 4 frames so the browser can dispatch pending events
+          // and the GPU can flush uploads before we queue more.
+          if ((f & 3) === 3) await new Promise<void>(r => setTimeout(r, 0));
+        }
+      }
+      void generate();
+    }, 500);
+    return () => { clearTimeout(timer); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [comp, playing]);
+
+  // ── Auto-scroll active chip into view ────────────────────────────────────────
+  const stripRef    = useRef<HTMLDivElement>(null);
+  const chipW       = THUMB_W + 2; // chip + gap
+
+  useEffect(() => {
+    const strip = stripRef.current;
+    if (!strip) return;
+    const target = fi * chipW - strip.clientWidth / 2 + chipW / 2;
+    strip.scrollLeft = Math.max(0, target);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fi]);
+
+  // ── Scrub-drag ───────────────────────────────────────────────────────────────
+  const isDraggingRef = useRef(false);
+
+  function getFrameAtPointer(clientX: number): number {
+    const strip = stripRef.current;
+    if (!strip) return -1;
+    const rect = strip.getBoundingClientRect();
+    const x    = clientX - rect.left + strip.scrollLeft;
+    return Math.max(0, Math.min(maxFrames - 1, Math.floor(x / chipW)));
+  }
+
+  function handleStripPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    e.preventDefault(); // keep keyboard focus where it was (prevents browser Ctrl+I / Page-Info)
+    isDraggingRef.current = true;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    const f = getFrameAtPointer(e.clientX);
+    if (f >= 0) onFrameClick(f);
+  }
+
+  function handleStripPointerMove(e: PointerEvent) {
+    if (!isDraggingRef.current) return;
+    const f = getFrameAtPointer(e.clientX);
+    if (f >= 0 && f !== fi) onFrameClick(f);
+  }
+
+  function handleStripPointerUp() {
+    isDraggingRef.current = false;
+  }
+
+  // ── Render ───────────────────────────────────────────────────────────────────
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      background: '#161616', borderTop: '1px solid #2a2a2a',
+      padding: '3px 8px', flexShrink: 0, flexWrap: 'wrap', minHeight: THUMB_H + 10,
+    }}>
+      {/* Playback controls */}
+      <div style={{ display:'flex', gap:2, flexShrink:0 }}>
+        <TBtn title="Previous frame  (< or Ctrl+[)" onClick={onPrevFrame} disabled={maxFrames <= 1}>⏮</TBtn>
+        <TBtn title={playing ? 'Pause (Space)' : 'Play (Space)'} onClick={onPlayPause} disabled={maxFrames <= 1}
+          style={{ color: playing ? '#fc6' : undefined }}>{playing ? '⏸' : '▶'}</TBtn>
+        <TBtn title="Next frame  (> or Ctrl+])" onClick={onNextFrame} disabled={maxFrames <= 1}>⏭</TBtn>
+      </div>
+
+      {/* Frame counter */}
+      <span style={{ fontSize: 11, color: '#888', flexShrink: 0, minWidth: 56, textAlign: 'center' }}>
+        {maxFrames > 1 ? `${fi + 1} / ${maxFrames}` : '1 frame'}
+      </span>
+
+      {/* Delay input */}
+      {maxFrames > 1 && (
+        <div style={{ display:'flex', alignItems:'center', gap:3, flexShrink:0 }}>
+          <span style={{ fontSize:10, color:'#666' }}>ms</span>
+          <input
+            type="number" min={10} max={10000} step={10} value={delay}
+            onChange={e => onDelayChange(+(e.target as HTMLInputElement).value)}
+            style={{
+              width: 58, background:'#252525', border:'1px solid #444',
+              borderRadius:3, color:'#ccc', fontSize:11, padding:'2px 4px', textAlign:'center',
+            }}
+            title="Frame delay in milliseconds"
+          />
+          <TBtn title="Apply this delay to all frames" onClick={() => onApplyToAll(delay)} style={{ fontSize:9 }}>all</TBtn>
+        </div>
+      )}
+
+      {/* Scrollable frame strip — click or drag to scrub */}
+      <div
+        ref={stripRef}
+        onPointerDown={handleStripPointerDown}
+        onPointerMove={handleStripPointerMove}
+        onPointerUp={handleStripPointerUp}
+        onPointerCancel={handleStripPointerUp}
+        style={{
+          display:'flex', gap:2, overflowX:'auto', flex:1, alignItems:'center',
+          scrollbarWidth:'thin', minWidth:0, cursor:'pointer', userSelect:'none',
+        }}
+      >
+        {Array.from({ length: maxFrames }, (_, i) => {
+          const isActive = i === fi;
+          return (
+            <div key={i}
+              title={`Frame ${i + 1}  (${comp.frameDelays[0]?.[i] ?? 100} ms)`}
+              style={{
+                width: THUMB_W, height: THUMB_H, flexShrink: 0,
+                border: `1px solid ${isActive ? '#4a9eff' : '#2a2a2a'}`,
+                borderRadius: 3, overflow: 'hidden', position: 'relative',
+                background: '#111',
+                boxShadow: isActive ? '0 0 0 1px #4a9eff' : 'none',
+              }}
+            >
+              {/* Canvas element drawn to imperatively by the thumbnail effect */}
+              <canvas
+                ref={el => { thumbCanvasRefs.current[i] = el; }}
+                style={{ display:'block', width:'100%', height:'100%', imageRendering:'pixelated' }}
+              />
+              {/* Frame-number badge */}
+              <div style={{
+                position:'absolute', bottom:1, right:2, fontSize:8, lineHeight:1,
+                color: isActive ? '#8cf' : '#555',
+                textShadow:'0 0 3px #000,0 0 3px #000',
+                pointerEvents:'none',
+              }}>
+                {i + 1}
+              </div>
+              {/* Active underline */}
+              {isActive && (
+                <div style={{
+                  position:'absolute', bottom:0, left:0, right:0, height:2,
+                  background:'#4a9eff', pointerEvents:'none',
+                }} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Frame operations */}
+      <div style={{ display:'flex', gap:2, flexShrink:0 }}>
+        {maxFrames > 1 && <>
+          <TBtn title="Move frame left"  onClick={() => onMove(-1)} disabled={fi === 0}>◀</TBtn>
+          <TBtn title="Move frame right" onClick={() => onMove(1)}  disabled={fi === maxFrames - 1}>▶</TBtn>
+        </>}
+        <TBtn title="Clone current frame (add copy after)"  onClick={onClone}>⎘</TBtn>
+        <TBtn title="Add blank frame after current"         onClick={onBlank}>+</TBtn>
+        {maxFrames > 1 && (
+          <TBtn title="Delete current frame" onClick={onDrop} style={{ color:'#f77' }}>✕</TBtn>
+        )}
+      </div>
+
+      {/* Stride / Skip — frame thinning */}
+      {maxFrames > 1 && (
+        <div style={{ display:'flex', alignItems:'center', gap:3, flexShrink:0, borderLeft:'1px solid #2a2a2a', paddingLeft:6 }}>
+          <span style={{ fontSize:10, color:'#555' }}>n=</span>
+          <input
+            type="number" min={2} max={maxFrames} step={1} value={thinN}
+            onChange={e => setThinN(Math.max(2, Math.min(maxFrames, +(e.target as HTMLInputElement).value | 0)))}
+            style={{
+              width:42, background:'#252525', border:'1px solid #444',
+              borderRadius:3, color:'#ccc', fontSize:11, padding:'2px 4px', textAlign:'center',
+            }}
+            title="Thinning factor n for Stride / Skip"
+          />
+          <TBtn
+            title={`Stride ${thinN}: keep every ${thinN}th frame (0, ${thinN}, ${2*thinN}…), accumulate delays`}
+            onClick={() => onStride(thinN)}
+          >
+            Stride
+          </TBtn>
+          <TBtn
+            title={`Skip ${thinN}: drop every ${thinN}th frame (${thinN-1}, ${2*thinN-1}…), merge delays`}
+            onClick={() => onSkip(thinN)}
+          >
+            Skip
+          </TBtn>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Compact icon button used in the FrameTimeline. */
+function TBtn({ onClick, title, disabled, style, children }: {
+  onClick: () => void; title?: string; disabled?: boolean;
+  style?: h.JSX.CSSProperties; children: preact.ComponentChildren;
+}) {
+  return (
+    <button onClick={onClick} title={title} disabled={disabled} style={{
+      background:'#252525', border:'1px solid #333', borderRadius:3,
+      color: disabled ? '#444' : '#888', cursor: disabled ? 'default' : 'pointer',
+      fontSize:12, padding:'2px 5px', lineHeight:1.4,
+      ...style,
+    }}>
+      {children}
+    </button>
   );
 }
 
@@ -1571,7 +2724,7 @@ export function Editor({
 function Param({ label, children }: { label: string; children: ComponentChildren }) {
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:3, marginTop:3 }}>
-      <span style={{ fontSize:11, color:'#888', lineHeight:1.2 }}>{label}</span>
+      <span style={{ fontSize:'0.79em', color:'#888', lineHeight:1.2 }}>{label}</span>
       {children}
     </div>
   );
@@ -1586,7 +2739,7 @@ function ChipBtn({ active, onClick, children }: { active: boolean; onClick: () =
       borderRadius:  3,
       color:        active ? '#8cf' : '#888',
       cursor:       'pointer',
-      fontSize:      11,
+      fontSize:     '0.79em',
       padding:      '3px 0',
       textAlign:    'center',
     }}>
@@ -1595,24 +2748,62 @@ function ChipBtn({ active, onClick, children }: { active: boolean; onClick: () =
   );
 }
 
+/** Draggable vertical divider between panels. */
+function ResizeHandle({ onDrag }: { onDrag: (dx: number) => void }) {
+  const onDragRef = useRef(onDrag);
+  onDragRef.current = onDrag;
+
+  const handleMouseDown = useCallback((e: MouseEvent) => {
+    e.preventDefault();
+    let lastX = e.clientX;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - lastX;
+      lastX    = ev.clientX;
+      onDragRef.current(dx);
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup',   onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
+  }, []);
+
+  return (
+    <div
+      onMouseDown={handleMouseDown}
+      style={{
+        width:       5,
+        height:      '100%',
+        cursor:      'ew-resize',
+        background:  '#252525',
+        flexShrink:   0,
+        borderLeft:  '1px solid #333',
+        borderRight: '1px solid #333',
+        transition:  'background 0.1s',
+        userSelect:  'none',
+      }}
+      onMouseEnter={e => { (e.target as HTMLElement).style.background = '#4a9eff55'; }}
+      onMouseLeave={e => { (e.target as HTMLElement).style.background = '#252525'; }}
+    />
+  );
+}
+
 // ─── Styles ───────────────────────────────────────────────────────────────────
 
 const ROOT_STYLE: h.JSX.CSSProperties = {
-  display:             'grid',
-  gridTemplateColumns: '152px 1fr 168px',
-  gridTemplateRows:    '1fr auto',
-  width:               '100%',
-  height:              '100%',
-  overflow:            'hidden',
-  background:          '#1a1a1a',
-  color:               '#ddd',
-  fontFamily:          'system-ui, sans-serif',
-  fontSize:             14,
+  display:       'flex',
+  flexDirection: 'column',
+  width:         '100%',
+  height:        '100%',
+  overflow:      'hidden',
+  background:    '#1a1a1a',
+  color:         '#ddd',
+  fontFamily:    'system-ui, sans-serif',
+  // fontSize applied inline with uiFontSize prop
 };
 
 const LEFT_PANEL: h.JSX.CSSProperties = {
-  gridColumn:    1,
-  gridRow:       1,
   background:    '#1e1e1e',
   borderRight:   '1px solid #333',
   padding:        7,
@@ -1620,13 +2811,13 @@ const LEFT_PANEL: h.JSX.CSSProperties = {
   flexDirection: 'column',
   gap:            3,
   overflowY:     'auto',
+  flexShrink:     0,
 };
 
 const CANVAS_AREA: h.JSX.CSSProperties = {
-  gridColumn: 2,
-  gridRow:    1,
-  overflow:   'hidden',
-  position:   'relative',
+  flex:     1,
+  overflow: 'hidden',
+  position: 'relative',
 };
 
 const BTN_BASE: h.JSX.CSSProperties = {
@@ -1637,14 +2828,14 @@ const BTN_BASE: h.JSX.CSSProperties = {
   cursor:        'pointer',
   padding:       '5px 6px',
   textAlign:     'left',
-  fontSize:       13,
+  fontSize:      '0.93em',
   lineHeight:     1.3,
 };
 const TOOL_BTN_OFF: h.JSX.CSSProperties = { ...BTN_BASE };
 const TOOL_BTN_ON:  h.JSX.CSSProperties = { ...BTN_BASE, background:'#1b3556', borderColor:'#4a9eff', color:'#fff' };
 
 const SHAPE_BASE: h.JSX.CSSProperties = {
-  flex: 1, background:'transparent', border:'1px solid #444', borderRadius:3, color:'#ccc', cursor:'pointer', fontSize:15,
+  flex: 1, background:'transparent', border:'1px solid #444', borderRadius:3, color:'#ccc', cursor:'pointer', fontSize:'1.07em',
 };
 const SHAPE_OFF: h.JSX.CSSProperties = { ...SHAPE_BASE };
 const SHAPE_ON:  h.JSX.CSSProperties = { ...SHAPE_BASE, background:'#1b3556', borderColor:'#4a9eff' };
@@ -1656,7 +2847,7 @@ const SEL_BTN: h.JSX.CSSProperties = {
   color:         '#bbb',
   cursor:        'pointer',
   padding:       '4px 7px',
-  fontSize:       12,
+  fontSize:      '0.86em',
   textAlign:     'left',
 };
 
@@ -1667,14 +2858,14 @@ const DIVIDER: h.JSX.CSSProperties = {
 };
 
 const SECTION_LABEL: h.JSX.CSSProperties = {
-  fontSize:    12,
+  fontSize:    '0.86em',
   color:       '#5af',
   fontWeight:  'bold',
   marginBottom: 2,
 };
 
 const MICRO_LABEL: h.JSX.CSSProperties = {
-  fontSize: 11,
+  fontSize: '0.79em',
   color:    '#666',
   marginTop: 3,
 };
@@ -1699,7 +2890,7 @@ const STATUS_OVERLAY: h.JSX.CSSProperties = {
   transform:   'translateX(-50%)',
   background:  'rgba(0,0,0,0.75)',
   color:       '#fff',
-  fontSize:     13,
+  fontSize:    '0.93em',
   padding:     '4px 12px',
   borderRadius: 4,
   pointerEvents: 'none',

@@ -20,21 +20,121 @@ const ERROR_FLOOR_SQ = 0.015 * 0.015;
 /** Squared OKLab chroma below which a colour is considered achromatic (for HUE_ONLY). */
 const ACHROMATIC_SQ = 0.04 * 0.04;
 
-const BAYER_MATRIX: readonly number[][] = [
-  [ 0,  8,  2, 10],
-  [12,  4, 14,  6],
-  [ 3, 11,  1,  9],
-  [15,  7, 13,  5],
-] as const;
 const DEFAULT_BAYER_SCALE = 0.08;
+
+// ─── Error-diffusion kernels ──────────────────────────────────────────────────
+// Each entry: { dx, dy, weight } where (dx, dy) is the neighbour offset from the
+// current pixel and weight is the fraction of error to distribute.
+
+type EDEntry = { dx: number; dy: number; weight: number };
+
+const FS_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight:  7/16 },
+  { dx: -1, dy: 1, weight:  3/16 },
+  { dx:  0, dy: 1, weight:  5/16 },
+  { dx:  1, dy: 1, weight:  1/16 },
+];
+
+// Atkinson: intentionally distributes only 6/8 = 3/4 of the error (reduces clipping)
+const ATK_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight: 1/8 },
+  { dx:  2, dy: 0, weight: 1/8 },
+  { dx: -1, dy: 1, weight: 1/8 },
+  { dx:  0, dy: 1, weight: 1/8 },
+  { dx:  1, dy: 1, weight: 1/8 },
+  { dx:  0, dy: 2, weight: 1/8 },
+];
+
+// Sierra full (3 rows, sum=1)
+const SIERRA_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight:  5/32 }, { dx:  2, dy: 0, weight:  3/32 },
+  { dx: -2, dy: 1, weight:  2/32 }, { dx: -1, dy: 1, weight:  4/32 },
+  { dx:  0, dy: 1, weight:  5/32 }, { dx:  1, dy: 1, weight:  4/32 },
+  { dx:  2, dy: 1, weight:  2/32 },
+  { dx: -1, dy: 2, weight:  2/32 }, { dx:  0, dy: 2, weight:  3/32 },
+  { dx:  1, dy: 2, weight:  2/32 },
+];
+
+// Sierra Two-Row (2 rows, sum=1)
+const SIERRA2_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight:  4/16 }, { dx:  2, dy: 0, weight:  3/16 },
+  { dx: -2, dy: 1, weight:  1/16 }, { dx: -1, dy: 1, weight:  2/16 },
+  { dx:  0, dy: 1, weight:  3/16 }, { dx:  1, dy: 1, weight:  2/16 },
+  { dx:  2, dy: 1, weight:  1/16 },
+];
+
+// Sierra Lite (1 row, sum=1)
+const SIERRA_LITE_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight:  2/4 },
+  { dx: -1, dy: 1, weight:  1/4 }, { dx:  0, dy: 1, weight:  1/4 },
+];
+
+// Shiau-Fan (1994, sum=1)
+const SHIAU_FAN_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight:  4/8 },
+  { dx: -2, dy: 1, weight:  1/8 }, { dx: -1, dy: 1, weight:  1/8 },
+  { dx:  0, dy: 1, weight:  2/8 },
+];
+
+// Jarvis-Judice-Ninke (3 rows, sum=1)
+const JJN_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight:  7/48 }, { dx:  2, dy: 0, weight:  5/48 },
+  { dx: -2, dy: 1, weight:  3/48 }, { dx: -1, dy: 1, weight:  5/48 },
+  { dx:  0, dy: 1, weight:  7/48 }, { dx:  1, dy: 1, weight:  5/48 },
+  { dx:  2, dy: 1, weight:  3/48 },
+  { dx: -2, dy: 2, weight:  1/48 }, { dx: -1, dy: 2, weight:  3/48 },
+  { dx:  0, dy: 2, weight:  5/48 }, { dx:  1, dy: 2, weight:  3/48 },
+  { dx:  2, dy: 2, weight:  1/48 },
+];
+
+// Stucki (3 rows, sum=1)
+const STUCKI_KERNEL: readonly EDEntry[] = [
+  { dx:  1, dy: 0, weight:  8/42 }, { dx:  2, dy: 0, weight:  4/42 },
+  { dx: -2, dy: 1, weight:  2/42 }, { dx: -1, dy: 1, weight:  4/42 },
+  { dx:  0, dy: 1, weight:  8/42 }, { dx:  1, dy: 1, weight:  4/42 },
+  { dx:  2, dy: 1, weight:  2/42 },
+  { dx: -2, dy: 2, weight:  1/42 }, { dx: -1, dy: 2, weight:  2/42 },
+  { dx:  0, dy: 2, weight:  4/42 }, { dx:  1, dy: 2, weight:  2/42 },
+  { dx:  2, dy: 2, weight:  1/42 },
+];
+
+// ─── Bayer threshold matrices (generated recursively) ─────────────────────────
+
+function genBayer(size: number): Float32Array {
+  const m = new Float32Array(size * size);
+  if (size === 1) { m[0] = 0; return m; }
+  const h   = size >> 1;
+  const sub = genBayer(h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < h; x++) {
+      const v = sub[y * h + x] * 4;
+      m[y * size + x]             = v;
+      m[y * size + x + h]         = v + 2;
+      m[(y + h) * size + x]       = v + 3;
+      m[(y + h) * size + x + h]   = v + 1;
+    }
+  }
+  return m;
+}
+
+const BAYER_2  = genBayer(2);
+const BAYER_4  = genBayer(4);
+const BAYER_8  = genBayer(8);
+const BAYER_16 = genBayer(16);
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
 export const DitherAlgo = {
-  NONE:     'NONE',
-  FS:       'FS',       // Floyd-Steinberg
-  ATKINSON: 'ATKINSON',
-  BAYER:    'BAYER',
+  NONE:        'NONE',
+  FS:          'FS',          // Floyd-Steinberg
+  ATKINSON:    'ATKINSON',
+  SIERRA:      'SIERRA',      // Sierra Full (3-row)
+  SIERRA2:     'SIERRA2',     // Sierra Two-Row
+  SIERRA_LITE: 'SIERRA_LITE', // Sierra Lite (1-row)
+  SHIAU_FAN:   'SHIAU_FAN',   // Shiau-Fan 1994
+  JJN:         'JJN',         // Jarvis-Judice-Ninke
+  STUCKI:      'STUCKI',
+  BAYER:       'BAYER',       // Ordered/threshold
 } as const;
 export type DitherAlgo = typeof DitherAlgo[keyof typeof DitherAlgo];
 
@@ -234,11 +334,23 @@ export interface QuantizeParams {
 /** Full parameter set for the editor requantize (R key). */
 export interface RequantizeParams {
   legalOnly:        boolean;
+  customPalette?:   PaletteFlag;   // if set, overrides legalOnly palette selection
   dither:           DitherAlgo;
   metric:           MatchMetric;
-  fsStrength:       number;        // FS error diffusion scale 0.1–1.0
-  atkStrength:      number;        // Atkinson error diffusion scale 0.1–1.0
-  bayerScale:       number;        // Bayer threshold amplitude 0.02–0.20
+  // Error-diffusion strengths (0.1–1.0; each scales the amount of error propagated)
+  fsStrength:       number;
+  atkStrength:      number;
+  sierraStrength:   number;
+  sierra2Strength:  number;
+  sierraLiteStrength: number;
+  shiauFanStrength: number;
+  jjnStrength:      number;
+  stuckiStrength:   number;
+  /** Alternate scan direction per row for all ED algos — reduces worm/directional artifacts. */
+  serpentine:       boolean;
+  // Bayer ordered dithering
+  bayerScale:       number;        // threshold amplitude 0.02–0.20
+  bayerSize:        2 | 4 | 8 | 16;
   chromaBoost:      number;        // OKLab a,b multiplier 0.25–4.0 (1.0 = off)
   tilePalette:      boolean;       // restrict palette to colors already in the tile
   useCustomDither:  boolean;       // use ditherMask for per-pixel FS strength
@@ -246,16 +358,24 @@ export interface RequantizeParams {
 }
 
 export const DEFAULT_REQ_PARAMS: RequantizeParams = {
-  legalOnly:       true,
-  dither:          'FS',
-  metric:          'OKLAB',
-  fsStrength:      1.0,
-  atkStrength:     1.0,
-  bayerScale:      DEFAULT_BAYER_SCALE,
-  chromaBoost:     1.0,
-  tilePalette:     false,
-  useCustomDither: false,
-  ditherMask:      null,
+  legalOnly:         true,
+  dither:            'FS',
+  metric:            'OKLAB',
+  fsStrength:        1.0,
+  atkStrength:       1.0,
+  sierraStrength:    1.0,
+  sierra2Strength:   1.0,
+  sierraLiteStrength: 1.0,
+  shiauFanStrength:  1.0,
+  jjnStrength:       1.0,
+  stuckiStrength:    1.0,
+  serpentine:        false,
+  bayerScale:        DEFAULT_BAYER_SCALE,
+  bayerSize:         4,
+  chromaBoost:       1.0,
+  tilePalette:       false,
+  useCustomDither:   false,
+  ditherMask:        null,
 };
 
 // ─── Two-pass grid quantization (import path) ─────────────────────────────────
@@ -401,23 +521,23 @@ export function requantizeGrid(
   const totalW = cols * MAP_SIZE;
   const totalH = rows * MAP_SIZE;
   const oklab  = buildOklabLookup();
-  const palette: PaletteFlag = p.legalOnly ? IS_LEGAL.slice() : IS_VALID.slice();
+  const palette: PaletteFlag = p.customPalette?.slice() ?? (p.legalOnly ? IS_LEGAL.slice() : IS_VALID.slice());
 
   const src = p.chromaBoost !== 1 ? boostChromaImageData(source, p.chromaBoost) : source;
 
   // Build extra lookup tables needed for some metrics.
-  const rgbLookup = p.metric === 'RGB'      ? buildLinearRgbLookup() : null;
+  const rgbLookup = p.metric === 'RGB' ? buildLinearRgbLookup() : null;
 
-  // Decide whether to use the fast seamless grid path or per-tile.
-  // Seamless grid FS only works for OKLAB + no tilePalette + no custom dither mask.
-  const useGridPass = p.dither === 'FS'
-    && p.metric === 'OKLAB'
-    && !p.tilePalette
-    && !p.useCustomDither;
-
-  // ── Seamless grid FS path ───────────────────────────────────────────────
-  if (useGridPass) {
-    // First pass: build the global palette.
+  // ── Global path (default) ───────────────────────────────────────────────
+  // Run the first pass + dithering on the ENTIRE grid as one image, then split
+  // into tiles.  This ensures:
+  //   (a) all tiles use the same palette (no per-tile brightness divergence)
+  //   (b) FS/Atkinson error diffuses across tile boundaries seamlessly
+  //
+  // The per-tile path is only used when `tilePalette` is explicitly requested,
+  // which by design restricts each tile to its own existing palette.
+  if (!p.tilePalette) {
+    // First pass: one NN sweep over the full grid to build a representative palette.
     const firstPass = new Uint8Array(totalW * totalH);
     for (let y = 0; y < totalH; y++) {
       for (let x = 0; x < totalW; x++) {
@@ -425,26 +545,56 @@ export function requantizeGrid(
         const d = src.data;
         if (d[i + 3] < 128) { firstPass[y * totalW + x] = 0; continue; }
         const [L, a, b] = rgbToOklab(d[i], d[i + 1], d[i + 2]);
-        firstPass[y * totalW + x] = findClosestInPalette(L, a, b, palette, oklab);
+        firstPass[y * totalW + x] = findClosestInPaletteWithMetric(L, a, b, palette, oklab, p.metric, rgbLookup, null);
       }
     }
     const activePalette = buildPaletteFromTile(firstPass);
+    const palHues = p.metric === 'HUE_ONLY' ? buildPaletteHues(activePalette, oklab) : null;
 
-    // Dither strength: custom mask if provided, else Otsu-adaptive.
-    let strength: Float32Array;
-    if (p.useCustomDither && p.ditherMask) {
-      strength = p.ditherMask;
-    } else {
-      strength = computeDitherStrength(src, totalW, totalH, oklab);
+    const uniformStrength = new Float32Array(totalW * totalH).fill(1);
+
+    let full: Uint8Array;
+    switch (p.dither) {
+      case 'FS': {
+        const strength = (p.useCustomDither && p.ditherMask)
+          ? p.ditherMask
+          : computeDitherStrength(src, totalW, totalH, oklab);
+        full = renderErrorDiffusion(src, activePalette, oklab, strength,     totalW, totalH, FS_KERNEL,         p.serpentine, p.fsStrength,         p.metric, rgbLookup, palHues);
+        break;
+      }
+      case 'ATKINSON':
+        full = renderErrorDiffusion(src, activePalette, oklab, uniformStrength, totalW, totalH, ATK_KERNEL,        p.serpentine, p.atkStrength,        p.metric, rgbLookup, palHues);
+        break;
+      case 'SIERRA':
+        full = renderErrorDiffusion(src, activePalette, oklab, uniformStrength, totalW, totalH, SIERRA_KERNEL,     p.serpentine, p.sierraStrength,     p.metric, rgbLookup, palHues);
+        break;
+      case 'SIERRA2':
+        full = renderErrorDiffusion(src, activePalette, oklab, uniformStrength, totalW, totalH, SIERRA2_KERNEL,    p.serpentine, p.sierra2Strength,    p.metric, rgbLookup, palHues);
+        break;
+      case 'SIERRA_LITE':
+        full = renderErrorDiffusion(src, activePalette, oklab, uniformStrength, totalW, totalH, SIERRA_LITE_KERNEL, p.serpentine, p.sierraLiteStrength, p.metric, rgbLookup, palHues);
+        break;
+      case 'SHIAU_FAN':
+        full = renderErrorDiffusion(src, activePalette, oklab, uniformStrength, totalW, totalH, SHIAU_FAN_KERNEL,   p.serpentine, p.shiauFanStrength,   p.metric, rgbLookup, palHues);
+        break;
+      case 'JJN':
+        full = renderErrorDiffusion(src, activePalette, oklab, uniformStrength, totalW, totalH, JJN_KERNEL,        p.serpentine, p.jjnStrength,        p.metric, rgbLookup, palHues);
+        break;
+      case 'STUCKI':
+        full = renderErrorDiffusion(src, activePalette, oklab, uniformStrength, totalW, totalH, STUCKI_KERNEL,     p.serpentine, p.stuckiStrength,     p.metric, rgbLookup, palHues);
+        break;
+      case 'BAYER':
+        full = renderBayer(src, activePalette, oklab, totalW, totalH, p.bayerScale, p.bayerSize, p.metric, rgbLookup, palHues);
+        break;
+      default:
+        full = renderNearest(src, activePalette, oklab, totalW, totalH, p.metric, rgbLookup, palHues);
     }
 
-    const full    = renderDithered(src, activePalette, oklab, strength, totalW, totalH, p.fsStrength, 'OKLAB');
     const newTiles = splitIntoTiles(full, totalW, cols, rows);
-
     return applySelectionMask(newTiles, comp.frames, comp.activeFrame, selMask, cols, rows);
   }
 
-  // ── Per-tile path (all other algo/metric combinations) ─────────────────
+  // ── Per-tile path (tilePalette=true only) ──────────────────────────────
   const result: Uint8Array[] = [];
 
   for (let tileRow = 0; tileRow < rows; tileRow++) {
@@ -488,24 +638,39 @@ export function requantizeGrid(
       const palHues = p.metric === 'HUE_ONLY' ? buildPaletteHues(tilePalette, oklab) : null;
 
       // Render.
+      const tileUniform = new Float32Array(MAP_BYTES).fill(1);
       let rendered: Uint8Array;
       switch (p.dither) {
         case 'FS': {
-          let sm: Float32Array;
-          if (p.useCustomDither && p.ditherMask) {
-            // Extract tile-local slice of the global dither mask.
-            sm = extractTileMask(p.ditherMask, tileCol, tileRow, cols);
-          } else {
-            sm = new Float32Array(MAP_BYTES).fill(1);
-          }
-          rendered = renderDithered(tileImg, tilePalette, oklab, sm, MAP_SIZE, MAP_SIZE, p.fsStrength, p.metric, rgbLookup, palHues);
+          const sm = (p.useCustomDither && p.ditherMask)
+            ? extractTileMask(p.ditherMask, tileCol, tileRow, cols)
+            : tileUniform;
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, sm, MAP_SIZE, MAP_SIZE, FS_KERNEL,          p.serpentine, p.fsStrength,          p.metric, rgbLookup, palHues);
           break;
         }
         case 'ATKINSON':
-          rendered = renderAtkinson(tileImg, tilePalette, oklab, MAP_SIZE, MAP_SIZE, p.atkStrength, p.metric, rgbLookup, palHues);
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, tileUniform, MAP_SIZE, MAP_SIZE, ATK_KERNEL,         p.serpentine, p.atkStrength,         p.metric, rgbLookup, palHues);
+          break;
+        case 'SIERRA':
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, tileUniform, MAP_SIZE, MAP_SIZE, SIERRA_KERNEL,      p.serpentine, p.sierraStrength,      p.metric, rgbLookup, palHues);
+          break;
+        case 'SIERRA2':
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, tileUniform, MAP_SIZE, MAP_SIZE, SIERRA2_KERNEL,     p.serpentine, p.sierra2Strength,     p.metric, rgbLookup, palHues);
+          break;
+        case 'SIERRA_LITE':
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, tileUniform, MAP_SIZE, MAP_SIZE, SIERRA_LITE_KERNEL, p.serpentine, p.sierraLiteStrength,  p.metric, rgbLookup, palHues);
+          break;
+        case 'SHIAU_FAN':
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, tileUniform, MAP_SIZE, MAP_SIZE, SHIAU_FAN_KERNEL,   p.serpentine, p.shiauFanStrength,    p.metric, rgbLookup, palHues);
+          break;
+        case 'JJN':
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, tileUniform, MAP_SIZE, MAP_SIZE, JJN_KERNEL,         p.serpentine, p.jjnStrength,         p.metric, rgbLookup, palHues);
+          break;
+        case 'STUCKI':
+          rendered = renderErrorDiffusion(tileImg, tilePalette, oklab, tileUniform, MAP_SIZE, MAP_SIZE, STUCKI_KERNEL,      p.serpentine, p.stuckiStrength,      p.metric, rgbLookup, palHues);
           break;
         case 'BAYER':
-          rendered = renderBayer4x4(tileImg, tilePalette, oklab, MAP_SIZE, MAP_SIZE, p.bayerScale, p.metric, rgbLookup, palHues);
+          rendered = renderBayer(tileImg, tilePalette, oklab, MAP_SIZE, MAP_SIZE, p.bayerScale, p.bayerSize, p.metric, rgbLookup, palHues);
           break;
         default:
           rendered = renderNearest(tileImg, tilePalette, oklab, MAP_SIZE, MAP_SIZE, p.metric, rgbLookup, palHues);
@@ -644,130 +809,97 @@ function renderNearest(
   return out;
 }
 
-function renderDithered(
+/**
+ * Generic error-diffusion renderer.
+ *
+ * Supports any kernel layout up to 3 rows deep.  Uses a rotating circular
+ * buffer of (maxDy+1) row error arrays so memory scales with kernel depth,
+ * not image height.
+ *
+ * When `serpentine` is true, odd rows are scanned right-to-left with the
+ * kernel dx values mirrored — this reduces the directional bias and worm
+ * artefacts that single-direction FS produces.
+ */
+function renderErrorDiffusion(
   img: ImageData, palette: PaletteFlag, oklab: OklabLookup,
-  ditherStrength: Float32Array,
-  width: number, height: number,
-  diffuseAmount: number,
-  metric: MatchMetric = 'OKLAB',
-  rgbLookup: LinearRgbLookup | null = null,
-  palHues:   Float32Array | null = null,
+  strength: Float32Array, width: number, height: number,
+  kernel: readonly EDEntry[], serpentine: boolean, diffuseAmount: number,
+  metric: MatchMetric, rgbLookup: LinearRgbLookup | null, palHues: Float32Array | null,
 ): Uint8Array {
   const out = new Uint8Array(width * height);
   const d   = img.data;
-  let errCur = new Float32Array(width * 3);
-  let errNxt = new Float32Array(width * 3);
+
+  const maxDy  = kernel.reduce((m, k) => Math.max(m, k.dy), 0);
+  const nBufs  = maxDy + 1;
+  // Circular buffer of row error accumulators.
+  const bufs   = Array.from({ length: nBufs }, () => new Float32Array(width * 3));
 
   for (let y = 0; y < height; y++) {
-    const tmp = errCur; errCur = errNxt; errNxt = tmp;
-    errNxt.fill(0);
+    const cur         = bufs[y % nBufs];          // accumulated error for this row
+    const leftToRight = !serpentine || (y % 2 === 0);
 
-    for (let x = 0; x < width; x++) {
-      const si = (y * width + x) * 4;
-      if (d[si + 3] < 128) { out[y * width + x] = 0; continue; }
+    for (let xi = 0; xi < width; xi++) {
+      const x  = leftToRight ? xi : width - 1 - xi;
+      const pi = y * width + x;
+      const si = pi * 4;
+      if (d[si + 3] < 128) { out[pi] = 0; continue; }
 
       const [sL, sa, sb] = rgbToOklab(d[si], d[si + 1], d[si + 2]);
       const ei = x * 3;
-      const L  = sL + errCur[ei    ];
-      const a  = sa + errCur[ei + 1];
-      const b  = sb + errCur[ei + 2];
+      const L  = sL + cur[ei];
+      const a  = sa + cur[ei + 1];
+      const b  = sb + cur[ei + 2];
 
       const chosen = findClosestInPaletteWithMetric(L, a, b, palette, oklab, metric, rgbLookup, palHues);
-      out[y * width + x] = chosen;
+      out[pi] = chosen;
 
-      const cl = oklab[chosen]!;
-      const eL = L - cl[0], ea = a - cl[1], eb = b - cl[2];
-      const errMagSq = eL * eL + ea * ea + eb * eb;
-      const s = (errMagSq > ERROR_FLOOR_SQ)
-        ? ditherStrength[y * width + x] * diffuseAmount
-        : 0;
+      const cl       = oklab[chosen]!;
+      const eL       = L - cl[0], ea = a - cl[1], eb = b - cl[2];
+      const errMagSq = eL*eL + ea*ea + eb*eb;
+      const s        = (errMagSq > ERROR_FLOOR_SQ) ? strength[pi] * diffuseAmount : 0;
 
       if (s > 0) {
-        const seL = eL * s, sea = ea * s, seb = eb * s;
-        if (x + 1 < width) {
-          const ri = (x + 1) * 3;
-          errCur[ri] += seL * (7/16); errCur[ri+1] += sea * (7/16); errCur[ri+2] += seb * (7/16);
-        }
-        if (x - 1 >= 0) {
-          const li = (x - 1) * 3;
-          errNxt[li] += seL * (3/16); errNxt[li+1] += sea * (3/16); errNxt[li+2] += seb * (3/16);
-        }
-        errNxt[ei] += seL * (5/16); errNxt[ei+1] += sea * (5/16); errNxt[ei+2] += seb * (5/16);
-        if (x + 1 < width) {
-          const ri = (x + 1) * 3;
-          errNxt[ri] += seL * (1/16); errNxt[ri+1] += sea * (1/16); errNxt[ri+2] += seb * (1/16);
+        for (const { dx, dy, weight } of kernel) {
+          const adx = leftToRight ? dx : -dx;
+          // Causality: skip entries that would go backward in the scan direction.
+          if (dy === 0 && (leftToRight ? adx <= 0 : adx >= 0)) continue;
+          const nx = x + adx;
+          if (nx < 0 || nx >= width) continue;
+          const ny = y + dy;
+          if (ny >= height) continue;
+          const ni  = nx * 3;
+          const w   = weight * s;
+          const buf = bufs[(y + dy) % nBufs];
+          buf[ni]     += eL * w;
+          buf[ni + 1] += ea * w;
+          buf[ni + 2] += eb * w;
         }
       }
     }
+    // Clear the current row's slot so it's ready for accumulation nBufs rows later.
+    cur.fill(0);
   }
   return out;
 }
 
-function renderAtkinson(
+function renderBayer(
   img: ImageData, palette: PaletteFlag, oklab: OklabLookup,
   width: number, height: number,
-  diffuseAmount: number,
-  metric: MatchMetric = 'OKLAB',
-  rgbLookup: LinearRgbLookup | null = null,
-  palHues:   Float32Array | null = null,
+  bayerScale: number, bayerSize: 2 | 4 | 8 | 16,
+  metric: MatchMetric, rgbLookup: LinearRgbLookup | null, palHues: Float32Array | null,
 ): Uint8Array {
-  const out = new Uint8Array(width * height);
-  const d   = img.data;
-  let errCur  = new Float32Array(width * 3);
-  let errNxt  = new Float32Array(width * 3);
-  let errNxt2 = new Float32Array(width * 3);
-
-  for (let y = 0; y < height; y++) {
-    const tmp = errCur; errCur = errNxt; errNxt = errNxt2; errNxt2 = tmp;
-    errNxt2.fill(0);
-
-    for (let x = 0; x < width; x++) {
-      const si = (y * width + x) * 4;
-      if (d[si + 3] < 128) { out[y * width + x] = 0; continue; }
-
-      const [sL, sa, sb] = rgbToOklab(d[si], d[si + 1], d[si + 2]);
-      const ei = x * 3;
-      const L  = sL + errCur[ei];
-      const a  = sa + errCur[ei + 1];
-      const b  = sb + errCur[ei + 2];
-
-      const chosen = findClosestInPaletteWithMetric(L, a, b, palette, oklab, metric, rgbLookup, palHues);
-      out[y * width + x] = chosen;
-
-      const cl  = oklab[chosen]!;
-      const sc  = diffuseAmount / 8;
-      const seL = (L - cl[0]) * sc;
-      const sea = (a - cl[1]) * sc;
-      const seb = (b - cl[2]) * sc;
-
-      if (x + 1 < width) { const ri=(x+1)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
-      if (x + 2 < width) { const ri=(x+2)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
-      if (x - 1 >= 0)    { const li=(x-1)*3; errNxt[li]+=seL; errNxt[li+1]+=sea; errNxt[li+2]+=seb; }
-      errNxt[ei]+=seL;  errNxt[ei+1]+=sea;  errNxt[ei+2]+=seb;
-      if (x + 1 < width) { const ri=(x+1)*3; errNxt[ri]+=seL; errNxt[ri+1]+=sea; errNxt[ri+2]+=seb; }
-      errNxt2[ei]+=seL; errNxt2[ei+1]+=sea; errNxt2[ei+2]+=seb;
-    }
-  }
-  return out;
-}
-
-function renderBayer4x4(
-  img: ImageData, palette: PaletteFlag, oklab: OklabLookup,
-  width: number, height: number,
-  bayerScale: number,
-  metric: MatchMetric = 'OKLAB',
-  rgbLookup: LinearRgbLookup | null = null,
-  palHues:   Float32Array | null = null,
-): Uint8Array {
-  const out = new Uint8Array(width * height);
-  const d   = img.data;
+  const out  = new Uint8Array(width * height);
+  const d    = img.data;
+  const mat  = bayerSize === 2 ? BAYER_2 : bayerSize === 8 ? BAYER_8 : bayerSize === 16 ? BAYER_16 : BAYER_4;
+  const norm = bayerSize * bayerSize;
+  const mask = bayerSize - 1;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const si = (y * width + x) * 4;
       if (d[si + 3] < 128) { out[y * width + x] = 0; continue; }
       const [L, a, b] = rgbToOklab(d[si], d[si + 1], d[si + 2]);
-      const t      = (BAYER_MATRIX[y & 3][x & 3] + 0.5) / 16.0 - 0.5;
-      const offset = t * bayerScale;
+      const t         = (mat[(y & mask) * bayerSize + (x & mask)] + 0.5) / norm - 0.5;
+      const offset    = t * bayerScale;
       out[y * width + x] = findClosestInPaletteWithMetric(
         L + offset, a + offset, b + offset, palette, oklab, metric, rgbLookup, palHues);
     }
@@ -931,6 +1063,29 @@ function findClosestPairForMerge(
   const victim   = freq[bestA] <= freq[bestB] ? bestA : bestB;
   const survivor = freq[bestA] <= freq[bestB] ? bestB : bestA;
   return [victim, survivor];
+}
+
+/**
+ * Given a pre-built frequency table, return [victim, survivor] for one
+ * color-reduction step using the specified strategy.
+ * Returns [-1, -1] if no valid pair exists (too few colors).
+ */
+export function findReductionTarget(
+  freq:     Int32Array,
+  oklab:    OklabLookup,
+  strategy: Strategy,
+): [victim: number, survivor: number] {
+  if (strategy === 'RAREST') {
+    let rarestColor = -1, rarestFreq = Infinity;
+    for (let c = 1; c < 256; c++) {
+      if (freq[c] > 0 && freq[c] < rarestFreq) { rarestFreq = freq[c]; rarestColor = c; }
+    }
+    if (rarestColor === -1) return [-1, -1];
+    const neighbor = findNearestNeighbor(rarestColor, freq, oklab);
+    return neighbor === rarestColor ? [-1, -1] : [rarestColor, neighbor];
+  } else {
+    return findClosestPairForMerge(freq, oklab, strategy);
+  }
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────────

@@ -2,8 +2,8 @@
  * Magic Wand tool (W) — OKLab tolerance flood-select.
  *
  * Hover shows a preview of what would be selected (blue) or deselected (orange).
- * Left-click  — add flood to selection; Ctrl+left-click → subtract.
- * Right-click — subtract flood from selection.
+ * Left-click/drag  — add flood regions to selection; Ctrl → subtract.
+ * Right-click/drag — subtract flood regions from selection.
  *
  * Shift+scroll (or = / -) adjusts tolerance; the hover preview updates live.
  */
@@ -21,39 +21,52 @@ export class MagicWandTool implements Tool {
   private lastHoverGy       = -1;
   private lastHoverSubtract = false;
 
+  // Drag state — tracks whether we're mid-drag and which mode
+  private dragActive   = false;
+  private dragSubtract = false;
+  private lastDragGx   = -1;
+  private lastDragGy   = -1;
+
   onPointerEvent(gx: number, gy: number, button: number, _buttons: number, ctx: ToolContext): void {
-    const doSubtract = button === 2 || (button === 0 && ctx.ctrlHeld);
     if (button === 0 || button === 2) {
-      const region = this.flood(gx, gy, ctx);
-      if (!region) return;
-
-      const gridW    = ctx.comp.gridCols * MAP_SIZE;
-      const gridH    = ctx.comp.gridRows * MAP_SIZE;
-      const existing = ctx.getSelMask();
-      const newMask  = existing ? existing.slice() : new Uint8Array(gridW * gridH);
-
-      for (let i = 0; i < region.length; i++) {
-        newMask[i] = doSubtract ? (newMask[i] & ~region[i]) : (newMask[i] | region[i]);
-      }
-
-      ctx.setSelMask(newMask);
-      ctx.canvas.selMask            = newMask;
-      ctx.canvas.wandPreview        = null;
-      ctx.canvas.wandPreviewSubtract = false;
-      ctx.canvas.markDirty();
+      const doSubtract = button === 2 || (button === 0 && ctx.ctrlHeld);
+      this.dragActive   = true;
+      this.dragSubtract = doSubtract;
+      this.lastDragGx   = gx;
+      this.lastDragGy   = gy;
+      this.applyFlood(gx, gy, doSubtract, ctx);
+      return;
     }
+
+    if (button === -1 && this.dragActive) {
+      if (gx === this.lastDragGx && gy === this.lastDragGy) return;
+      this.lastDragGx = gx;
+      this.lastDragGy = gy;
+      this.applyFlood(gx, gy, this.dragSubtract, ctx);
+    }
+  }
+
+  onPointerUp(ctx: ToolContext): void {
+    this.dragActive = false;
+    // Invalidate hover cache so the preview reappears on the next move.
+    this.invalidateHoverCache();
+    ctx.canvas.wandPreview        = null;
+    ctx.canvas.wandPreviewSubtract = false;
+    ctx.canvas.markDirty();
   }
 
   activate(ctx: ToolContext): void {
     ctx.canvas.wandPreview        = null;
     ctx.canvas.wandPreviewSubtract = false;
     this.lastHoverGx = -1; this.lastHoverGy = -1; this.lastHoverSubtract = false;
+    this.dragActive  = false;
   }
 
   deactivate(ctx: ToolContext): void {
     ctx.canvas.wandPreview        = null;
     ctx.canvas.wandPreviewSubtract = false;
     ctx.canvas.markDirty();
+    this.dragActive = false;
   }
 
   /**
@@ -73,7 +86,6 @@ export class MagicWandTool implements Tool {
     }
 
     if (subtract) {
-      // Orange: show only the pixels that would actually be removed
       const existing = ctx.getSelMask();
       if (existing) {
         const intersect = new Uint8Array(flood.length);
@@ -93,6 +105,26 @@ export class MagicWandTool implements Tool {
   /** Force the next hover call to recompute even if position hasn't changed. */
   invalidateHoverCache(): void {
     this.lastHoverGx = -1; this.lastHoverGy = -1;
+  }
+
+  private applyFlood(gx: number, gy: number, doSubtract: boolean, ctx: ToolContext): void {
+    const region = this.flood(gx, gy, ctx);
+    if (!region) return;
+
+    const gridW    = ctx.comp.gridCols * MAP_SIZE;
+    const gridH    = ctx.comp.gridRows * MAP_SIZE;
+    const existing = ctx.getSelMask();
+    const newMask  = existing ? existing.slice() : new Uint8Array(gridW * gridH);
+
+    for (let i = 0; i < region.length; i++) {
+      newMask[i] = doSubtract ? (newMask[i] & ~region[i]) : (newMask[i] | region[i]);
+    }
+
+    ctx.setSelMask(newMask);
+    ctx.canvas.selMask            = newMask;
+    ctx.canvas.wandPreview        = null;
+    ctx.canvas.wandPreviewSubtract = false;
+    ctx.canvas.markDirty();
   }
 
   private flood(gx: number, gy: number, ctx: ToolContext): Uint8Array | null {

@@ -10,6 +10,6 @@ export default defineConfig({
     assetsInlineLimit: 1024 * 1024, // 1 MB
   },
   optimizeDeps: {
-    exclude: ['zstd-codec'],
+    include: ['zstd-codec'],
   },
 });

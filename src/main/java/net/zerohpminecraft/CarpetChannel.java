@@ -228,8 +228,8 @@ public class CarpetChannel {
 
     // ── Carpet-channel lookup tables ──────────────────────────────────────
 
-    static final DyeColor[] NIBBLE_TO_COLOR  = DyeColor.values();
-    static final byte[]     NIBBLE_TO_MAP_BYTE = new byte[16];
+    static final DyeColor[] NIBBLE_TO_COLOR   = DyeColor.values();
+    public static final byte[] NIBBLE_TO_MAP_BYTE = new byte[16];
     /** Map color byte → nibble (0–15), or −1. Accepts shade 0, 1, or 2. */
     static final int[]      MAP_BYTE_TO_NIBBLE = new int[256];
 

@@ -167,6 +167,10 @@ export function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const activeSessionIdRef  = useRef<string | null>(null);
   const sourceImageRef      = useRef<SourceImage | null>(null);
+  // True once sourceImageRef has been persisted to session_images for the
+  // current session.  Cleared whenever sourceImageRef changes so the next
+  // auto-save writes it.
+  const sourceImageSavedRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Restore source image from a stored session ────────────────────────────
@@ -205,7 +209,7 @@ export function App() {
       sessionStorage.removeItem('loominary_fresh');
       return;
     }
-    loadMostRecentSession().then(s => {
+    loadMostRecentSession().then(async s => {
       if (!s) return;
       try {
         const comp = sessionToComposition(s);
@@ -218,7 +222,8 @@ export function App() {
         setActiveSessionId(s.id);
         setStep('edit');
         setRestoreNotice('Session restored — saved ' + savedAgoLabel(s.savedAt));
-        void restoreSourceImage(s.sourceImageBuffer ?? null, s.sourceImageMime ?? null);
+        await restoreSourceImage(s.sourceImageBuffer ?? null, s.sourceImageMime ?? null);
+        sourceImageSavedRef.current = true; // image already in IDB
       } catch { /* corrupt session */ }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -234,7 +239,11 @@ export function App() {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       const id = activeSessionIdRef.current;
-      if (id) void updateSession(id, comp, crop, pre, req);
+      if (!id) return;
+      const img = sourceImageSavedRef.current ? null : sourceImageRef.current;
+      void updateSession(id, comp, crop, pre, req, img).then(() => {
+        if (img) sourceImageSavedRef.current = true;
+      });
     }, 3000);
   }
 
@@ -255,7 +264,8 @@ export function App() {
           setSourceBitmap(bmp);
           // Store the newly linked file so future auto-saves include it.
           const buffer = await file.arrayBuffer();
-          sourceImageRef.current = { buffer, mime: file.type || 'image/png' };
+          sourceImageRef.current    = { buffer, mime: file.type || 'image/png' };
+          sourceImageSavedRef.current = false;
         } catch { /* ignore invalid file */ }
         (e.target as HTMLInputElement).value = '';
       });
@@ -279,7 +289,8 @@ export function App() {
     // auto-save fired between now and when saveNewSession resolves.  Without
     // this, the Editor's initialComp effect fires onCompChange on mount and
     // the 3-second timer writes the new composition into the OLD session.
-    activeSessionIdRef.current = null;
+    activeSessionIdRef.current  = null;
+    sourceImageSavedRef.current = false;
     setActiveSessionId(null);
 
     setComposition(comp);
@@ -302,16 +313,18 @@ export function App() {
           img = { buffer, mime: sourceFile.type || 'image/png' };
         } catch { /* ignore */ }
       }
-      sourceImageRef.current = img;
+      sourceImageRef.current      = img;
       const id = await saveNewSession(comp, cropMode, pre, reqParams, img);
-      activeSessionIdRef.current = id;
+      activeSessionIdRef.current  = id;
+      sourceImageSavedRef.current = img !== null;
       setActiveSessionId(id);
     });
   }
 
   // ── Proceed from state JSON import (no source bitmap) ────────────────────
   function handleProceedFromState(comp: CompositionState) {
-    activeSessionIdRef.current = null;
+    activeSessionIdRef.current  = null;
+    sourceImageSavedRef.current = true; // no source image; nothing to save
     setActiveSessionId(null);
 
     setComposition(comp);
@@ -351,7 +364,8 @@ export function App() {
       setStep('edit');
       setRestoreNotice('Session restored — saved ' + savedAgoLabel(s.savedAt));
       sessionStorage.removeItem('loominary_fresh');
-      void restoreSourceImage(s.sourceImageBuffer ?? null, s.sourceImageMime ?? null);
+      await restoreSourceImage(s.sourceImageBuffer ?? null, s.sourceImageMime ?? null);
+      sourceImageSavedRef.current = true; // image already in IDB
     } catch { /* corrupt session */ }
   }
 

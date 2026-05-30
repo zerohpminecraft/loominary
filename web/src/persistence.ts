@@ -305,20 +305,24 @@ export async function saveNewSession(
 
 /**
  * Update an existing session in-place (auto-save).
- * Never touches the session_images store — source image doesn't change
- * between saves, and we avoid re-writing large buffers every 3 seconds.
+ * Writes sourceImage to session_images when provided (e.g. after a re-link,
+ * or when saveNewSession couldn't write it yet).  Pass null to leave the
+ * stored image unchanged.
  */
 export async function updateSession(
-  id:        string,
-  comp:      CompositionState,
-  cropMode:  'scale' | 'center',
-  pre:       PreprocessParams,
-  reqParams: RequantizeParams | null,
+  id:          string,
+  comp:        CompositionState,
+  cropMode:    'scale' | 'center',
+  pre:         PreprocessParams,
+  reqParams:   RequantizeParams | null,
+  sourceImage: SourceImage | null = null,
 ): Promise<void> {
   try {
     const db  = await openDb();
     const row = buildRow(id, comp, cropMode, pre, reqParams);
-    await putSession(db, row, null); // null = don't touch session_images
+    const img = sourceImage && sourceImage.buffer.byteLength <= MAX_SOURCE_IMAGE_BYTES
+      ? sourceImage : null;
+    await putSession(db, row, img);
   } catch { /* ignore */ }
 }
 

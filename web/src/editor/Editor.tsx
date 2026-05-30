@@ -17,6 +17,7 @@ import { MapCanvas }    from './Canvas.js';
 import { EditHistory }  from './history.js';
 import { PalettePanel } from './PalettePanel.js';
 import { StatusBar }    from './StatusBar.js';
+import { OriginalPreviewPanel } from '../OriginalPreview.js';
 import {
   buildOklabLookup,
   requantizeGrid,
@@ -329,6 +330,9 @@ export function Editor({
   // ── Sidebar widths ─────────────────────────────────────────────────────────
   const [leftW,  setLeftW]  = useState(304);
   const [rightW, setRightW] = useState(336);
+
+  // ── Original image sidebar ────────────────────────────────────────────────
+  const [origOpen, setOrigOpen] = useState(true);
 
   // ── Composition ────────────────────────────────────────────────────────────
   const [comp, setComp] = useState<CompositionState>(() => initialComp ?? makeEmptyComp());
@@ -1325,9 +1329,11 @@ export function Editor({
             ? (() => { const b = new ArrayBuffer(selMask.byteLength); new Uint8Array(b).set(selMask); return b; })()
             : null;
 
-          // For tile-palette mode send the current per-tile frame so the worker can
-          // build per-tile colour palettes.  Other modes get null (lighter message).
-          const tileFrameBuffers = params.tilePalette
+          // Send current-frame tile data when tilePalette mode is active OR a
+          // selection mask is present.  requantizeGrid's applySelectionMask needs
+          // the original pixel data to preserve non-selected pixels; without it,
+          // those pixels are blended against zeros (transparent byte 0).
+          const tileFrameBuffers = (params.tilePalette || !!selMask)
             ? frames.map(tf => {
                 const f  = tf[fi] ?? new Uint8Array(128 * 128);
                 const cp = new ArrayBuffer(f.byteLength);
@@ -1349,8 +1355,14 @@ export function Editor({
         },
         (data, jobIdx) => {
           ordered[jobIdx] = data.tileBuffers.map((b: ArrayBuffer) => new Uint8Array(b));
-          setReqStatus(`⏳ Frame ${++done}/${total}…`);
-          setReqProgress({ done, total });
+          ++done;
+          // Update every ~1% of total (min 1, max 50) so progress moves visibly
+          // for small counts without flooding the render loop on large ones.
+          const stride = Math.max(1, Math.min(50, Math.ceil(total / 100)));
+          if (done === total || done % stride === 0) {
+            setReqStatus(`⏳ Frame ${done}/${total}…`);
+            setReqProgress({ done, total });
+          }
         },
       );
       setReqProgress(null);
@@ -1925,6 +1937,7 @@ export function Editor({
     <div style={{ ...ROOT_STYLE, fontSize: uiFontSize }}>
       {/* ── Main row ── */}
       <div style={{ display:'flex', flex:1, overflow:'hidden' }}>
+
       {/* Left sidebar */}
       <div style={{ ...LEFT_PANEL, width: leftW, minWidth: 80, maxWidth: 500 }}>
 
@@ -2406,6 +2419,15 @@ export function Editor({
 
       <ResizeHandle onDrag={dx => setLeftW(w => Math.max(80, Math.min(500, w + dx)))} />
 
+      {/* Original image preview panel */}
+      <OriginalPreviewPanel
+        bitmap={sourceFrames?.[comp.activeFrame] ?? sourceBitmap ?? null}
+        open={origOpen}
+        onClose={() => setOrigOpen(false)}
+        onOpen={() => setOrigOpen(true)}
+        onRelink={onRelinkSource}
+      />
+
       {/* Canvas */}
       <div style={CANVAS_AREA}>
         <canvas ref={canvasElRef} style={{ display:'block', width:'100%', height:'100%' }} />
@@ -2459,7 +2481,7 @@ export function Editor({
           {/* Content */}
           <div style={{ flex: 1, overflowY: 'auto', padding: '4px 6px' }}>
             {dataStats ? (() => {
-              const { tiles, totalBytes, maxBanners } = dataStats;
+              const { tiles, totalBytes } = dataStats;
               return (
                 <>
                   {tiles.map(t => {
@@ -2477,23 +2499,23 @@ export function Editor({
                           color: t.overflow ? '#f77' : isHov ? '#ccc' : '#888', marginBottom: 2 }}>
                           <span>{label}</span>
                           <span style={{ color: t.overflow ? '#f77' : '#555' }}>
-                            {t.overflow ? '⚠ ' : ''}{(t.bytes / 1024).toFixed(1)}K
+                            {t.overflow ? '⚠ ' : ''}{t.bytes.toLocaleString()} B
                           </span>
                         </div>
                         <div style={{ height: 3, background: '#2a2a2a', borderRadius: 2, overflow: 'hidden' }}>
                           <div style={{ height: '100%', width: `${barPct}%`, background: barColor, borderRadius: 2 }} />
                         </div>
                         <div style={{ fontSize: '0.63em', color: '#444', marginTop: 1 }}>
-                          {t.banners} ban · {t.pct.toFixed(0)}%
+                          {t.pct.toFixed(0)}% of cap
                         </div>
                       </div>
                     );
                   })}
                   <div style={{ fontSize: '0.68em', color: '#555', borderTop: '1px solid #2a2a2a', paddingTop: 4, marginTop: 2 }}>
-                    {(totalBytes / 1024).toFixed(1)} KB total · max {maxBanners} ban
+                    {totalBytes.toLocaleString()} B total
                   </div>
                   <div style={{ fontSize: '0.58em', color: '#333', marginTop: 2, lineHeight: 1.4 }}>
-                    cap 5,290 B / 63 ban
+                    cap 5,290 B/tile
                   </div>
                 </>
               );
@@ -2645,30 +2667,59 @@ function FrameTimeline({
   // ── Thumbnail dimensions ────────────────────────────────────────────────────
   const THUMB_H = 44;
   const THUMB_W = Math.max(28, Math.min(88, Math.round(THUMB_H * comp.gridCols / comp.gridRows)));
+  const chipW   = THUMB_W + 2; // chip width + gap
+
+  // ── Virtual scroll ─────────────────────────────────────────────────────────
+  // Only the chips currently visible in the strip (plus a buffer on each side)
+  // are rendered as DOM nodes.  For a 5000-frame animation this avoids creating
+  // thousands of canvas elements that would freeze the browser.
+  const VBUF = 15; // extra chips to render beyond each visible edge
+  const [vsFirst, setVsFirst] = useState(0);
+  const [vsCount, setVsCount] = useState(60);
+  const stripRef = useRef<HTMLDivElement>(null);
+
+  const updateVisible = useCallback(() => {
+    const strip = stripRef.current;
+    if (!strip) return;
+    const first = Math.max(0, Math.floor(strip.scrollLeft / chipW) - VBUF);
+    const last  = Math.min(maxFrames - 1,
+      Math.ceil((strip.scrollLeft + strip.clientWidth) / chipW) + VBUF);
+    setVsFirst(first);
+    setVsCount(Math.max(0, last - first + 1));
+  }, [chipW, maxFrames]);
+
+  // Recalculate on mount, resize, and maxFrames changes.
+  useEffect(() => {
+    updateVisible();
+    const strip = stripRef.current;
+    if (!strip) return;
+    const ro = new ResizeObserver(updateVisible);
+    ro.observe(strip);
+    return () => ro.disconnect();
+  }, [updateVisible]);
 
   // ── Thumbnail generation ─────────────────────────────────────────────────────
-  // Draw directly to per-frame <canvas> elements — no blob encoding, no URLs.
+  // Only generates thumbnails for the currently visible chips (canvas elements
+  // outside the virtual window are unmounted, so their refs are null and the
+  // generator skips them automatically).
   const thumbCanvasRefs = useRef<Array<HTMLCanvasElement | null>>([]);
   const thumbGenIdRef   = useRef(0);
   const latestCompRef2  = useRef(comp);
   latestCompRef2.current = comp;
 
   useEffect(() => {
-    // Skip regeneration while playing — thumbnails update 500 ms after playback stops.
     if (playing) return;
     const genId = ++thumbGenIdRef.current;
     const timer = setTimeout(() => {
-      // Run as an async generator so we can yield between frames and avoid
-      // blocking the main thread (mapBytesToImageData + GPU uploads per frame
-      // can total seconds for large animated GIFs).
       async function generate() {
-        const c   = latestCompRef2.current;
-        const nF  = Math.max(...c.frames.map(t => t.length), 1);
-        const tw  = Math.max(28, Math.min(88, Math.round(THUMB_H * c.gridCols / c.gridRows)));
-        // Shared full-size OffscreenCanvas reused for each frame.
+        const c  = latestCompRef2.current;
+        const tw = Math.max(28, Math.min(88, Math.round(THUMB_H * c.gridCols / c.gridRows)));
         const src  = new OffscreenCanvas(c.gridCols * 128, c.gridRows * 128);
         const sctx = src.getContext('2d')!;
-        for (let f = 0; f < nF; f++) {
+        // Iterate only the visible window — skip everything with no canvas ref.
+        const start = Math.max(0, vsFirst - VBUF);
+        const end   = Math.min(Math.max(...c.frames.map(t => t.length), 1) - 1, vsFirst + vsCount + VBUF);
+        for (let f = start; f <= end; f++) {
           if (thumbGenIdRef.current !== genId) return;
           const thumbEl = thumbCanvasRefs.current[f];
           if (!thumbEl) continue;
@@ -2679,8 +2730,6 @@ function FrameTimeline({
           const dctx = thumbEl.getContext('2d')!;
           dctx.imageSmoothingEnabled = false;
           dctx.drawImage(src, 0, 0, tw, THUMB_H);
-          // Yield every 4 frames so the browser can dispatch pending events
-          // and the GPU can flush uploads before we queue more.
           if ((f & 3) === 3) await new Promise<void>(r => setTimeout(r, 0));
         }
       }
@@ -2688,12 +2737,9 @@ function FrameTimeline({
     }, 500);
     return () => { clearTimeout(timer); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [comp, playing]);
+  }, [comp, playing, vsFirst, vsCount]);
 
   // ── Auto-scroll active chip into view ────────────────────────────────────────
-  const stripRef    = useRef<HTMLDivElement>(null);
-  const chipW       = THUMB_W + 2; // chip + gap
-
   useEffect(() => {
     const strip = stripRef.current;
     if (!strip) return;
@@ -2715,7 +2761,7 @@ function FrameTimeline({
 
   function handleStripPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
-    e.preventDefault(); // keep keyboard focus where it was (prevents browser Ctrl+I / Page-Info)
+    e.preventDefault();
     isDraggingRef.current = true;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     const f = getFrameAtPointer(e.clientX);
@@ -2728,9 +2774,7 @@ function FrameTimeline({
     if (f >= 0 && f !== fi) onFrameClick(f);
   }
 
-  function handleStripPointerUp() {
-    isDraggingRef.current = false;
-  }
+  function handleStripPointerUp() { isDraggingRef.current = false; }
 
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
@@ -2769,55 +2813,60 @@ function FrameTimeline({
         </div>
       )}
 
-      {/* Scrollable frame strip — click or drag to scrub */}
+      {/* Scrollable frame strip — virtualised so only visible chips are in the DOM */}
       <div
         ref={stripRef}
+        onScroll={updateVisible}
         onPointerDown={handleStripPointerDown}
         onPointerMove={handleStripPointerMove}
         onPointerUp={handleStripPointerUp}
         onPointerCancel={handleStripPointerUp}
         style={{
-          display:'flex', gap:2, overflowX:'auto', flex:1, alignItems:'center',
-          scrollbarWidth:'thin', minWidth:0, cursor:'pointer', userSelect:'none',
+          position: 'relative', overflowX: 'auto', flex: 1,
+          height: THUMB_H + 6, scrollbarWidth: 'thin',
+          minWidth: 0, cursor: 'pointer', userSelect: 'none',
         }}
       >
-        {Array.from({ length: maxFrames }, (_, i) => {
-          const isActive = i === fi;
-          return (
-            <div key={i}
-              title={`Frame ${i + 1}  (${comp.frameDelays[0]?.[i] ?? 100} ms)`}
-              style={{
-                width: THUMB_W, height: THUMB_H, flexShrink: 0,
-                border: `1px solid ${isActive ? '#4a9eff' : '#2a2a2a'}`,
-                borderRadius: 3, overflow: 'hidden', position: 'relative',
-                background: '#111',
-                boxShadow: isActive ? '0 0 0 1px #4a9eff' : 'none',
-              }}
-            >
-              {/* Canvas element drawn to imperatively by the thumbnail effect */}
-              <canvas
-                ref={el => { thumbCanvasRefs.current[i] = el; }}
-                style={{ display:'block', width:'100%', height:'100%', imageRendering:'pixelated' }}
-              />
-              {/* Frame-number badge */}
-              <div style={{
-                position:'absolute', bottom:1, right:2, fontSize:8, lineHeight:1,
-                color: isActive ? '#8cf' : '#555',
-                textShadow:'0 0 3px #000,0 0 3px #000',
-                pointerEvents:'none',
-              }}>
-                {i + 1}
-              </div>
-              {/* Active underline */}
-              {isActive && (
+        {/* Full-width spacer gives the scrollbar the correct range */}
+        <div style={{ width: maxFrames * chipW, height: '100%', position: 'relative' }}>
+          {Array.from({ length: vsCount }, (_, i) => {
+            const idx      = vsFirst + i;
+            if (idx >= maxFrames) return null;
+            const isActive = idx === fi;
+            return (
+              <div key={idx}
+                title={`Frame ${idx + 1}  (${comp.frameDelays[0]?.[idx] ?? 100} ms)`}
+                style={{
+                  position: 'absolute', left: idx * chipW, top: 1,
+                  width: THUMB_W, height: THUMB_H, flexShrink: 0,
+                  border: `1px solid ${isActive ? '#4a9eff' : '#2a2a2a'}`,
+                  borderRadius: 3, overflow: 'hidden', position: 'absolute',
+                  background: '#111',
+                  boxShadow: isActive ? '0 0 0 1px #4a9eff' : 'none',
+                } as h.JSX.CSSProperties}
+              >
+                <canvas
+                  ref={el => { thumbCanvasRefs.current[idx] = el; }}
+                  style={{ display:'block', width:'100%', height:'100%', imageRendering:'pixelated' }}
+                />
                 <div style={{
-                  position:'absolute', bottom:0, left:0, right:0, height:2,
-                  background:'#4a9eff', pointerEvents:'none',
-                }} />
-              )}
-            </div>
-          );
-        })}
+                  position:'absolute', bottom:1, right:2, fontSize:8, lineHeight:1,
+                  color: isActive ? '#8cf' : '#555',
+                  textShadow:'0 0 3px #000,0 0 3px #000',
+                  pointerEvents:'none',
+                }}>
+                  {idx + 1}
+                </div>
+                {isActive && (
+                  <div style={{
+                    position:'absolute', bottom:0, left:0, right:0, height:2,
+                    background:'#4a9eff', pointerEvents:'none',
+                  }} />
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* Frame operations */}

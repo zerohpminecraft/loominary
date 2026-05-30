@@ -38,6 +38,12 @@ import {
   paletteMeansAllShades,
   type PaletteRestriction,
 } from '../palette-filters.js';
+import {
+  loadSessionMetas, deleteSession, clearAllSessions,
+  savedAgoLabel,
+  type SessionMeta,
+} from '../persistence.js';
+import { OriginalPreviewPanel } from '../OriginalPreview.js';
 
 // ─── Match quality ────────────────────────────────────────────────────────────
 
@@ -154,10 +160,77 @@ async function computePreview(
   return { tiles, quality: computeMatchQuality(img, paletteFlag, cols, rows) };
 }
 
+// ─── State JSON import ────────────────────────────────────────────────────────
+
+function b64ToBytes(s: string): Uint8Array {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Reconstruct per-tile pixel data from a PayloadState.
+ * Works for all codec modes: carpet (carpetCompressedB64), banner (CJK chunks),
+ * and muxed variants.  Art tiles are the first gridCols×gridRows entries;
+ * donor-only tiles are skipped.
+ */
+async function decodeStateToComposition(
+  ps: import('../payload-state.js').PayloadState,
+  onProgress?: (done: number, total: number) => void,
+): Promise<CompositionState> {
+  const { decompress }     = await import('../compression.js');
+  const { fromBytes: parseMf, extractFrames } = await import('../manifest.js');
+  const { assembleChunks } = await import('../cjk-codec.js');
+
+  const artCount = ps.columns * ps.rows;
+  const pixelData: Uint8Array[][] = [];
+  const BLANK = () => [new Uint8Array(128 * 128)];
+
+  for (let ti = 0; ti < artCount; ti++) {
+    const tile = ps.tiles[ti];
+    if (!tile) { pixelData.push(BLANK()); onProgress?.(ti + 1, artCount); continue; }
+
+    let compressed: Uint8Array | null = null;
+
+    if (tile.carpetCompressedB64) {
+      // Carpet / LOOM modes: full payload stored as base64 zstd.
+      compressed = b64ToBytes(tile.carpetCompressedB64);
+    } else if (tile.chunks.length > 0) {
+      // Banner mode: CJK-encoded chunks contain the compressed payload.
+      const cjk = tile.chunks.filter(c => c.length > 2 && c.charCodeAt(2) >= 0x4E00);
+      if (cjk.length > 0) {
+        try { compressed = assembleChunks(cjk); } catch { /* fall through to blank */ }
+      }
+    } else if (tile.muxCargoB64) {
+      // Muxed donor with cargo but no carpet field — try the cargo segment.
+      compressed = b64ToBytes(tile.muxCargoB64);
+    }
+
+    if (!compressed) { pixelData.push(BLANK()); onProgress?.(ti + 1, artCount); continue; }
+
+    try {
+      const raw    = await decompress(compressed);
+      const mf     = parseMf(raw);
+      const frames = extractFrames(raw, mf);
+      pixelData.push(frames.length > 0 ? frames : BLANK());
+    } catch {
+      pixelData.push(BLANK());
+    }
+
+    onProgress?.(ti + 1, artCount);
+  }
+
+  return compositionFromState(ps, pixelData);
+}
+
 // ─── Props ────────────────────────────────────────────────────────────────────
 
 export interface ImportPageProps {
-  onProceed: (comp: CompositionState, bitmap: ImageBitmap, reqParams: RequantizeParams, cropMode: 'scale' | 'center', pre: PreprocessParams, sourceFrames?: ImageBitmap[] | null) => void;
+  onProceed: (comp: CompositionState, bitmap: ImageBitmap, reqParams: RequantizeParams, cropMode: 'scale' | 'center', pre: PreprocessParams, sourceFrames?: ImageBitmap[] | null, sourceFile?: File | null) => void;
+  /** Called when the user imports a state JSON directly — no source bitmap available. */
+  onProceedFromState?: (comp: CompositionState) => void;
+  onLoadSession?: (id: string) => void;
   uiFontSize?: number;
 }
 
@@ -179,10 +252,21 @@ function Chip({ active, onClick, children }: {
   );
 }
 
-function SectionHeader({ children }: { children: preact.ComponentChildren }) {
+function Step({ n, title, hint }: { n: number; title: string; hint: string }) {
   return (
-    <div style={{ fontSize: '0.58em', color: '#5af', fontWeight: 'bold', marginTop: 12, marginBottom: 4 }}>
-      {children}
+    <div style={{ marginTop: n === 1 ? 4 : 18, marginBottom: 7 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          width: 20, height: 20, borderRadius: '50%',
+          background: '#0d2040', border: '1px solid #1a4880',
+          color: '#5af', fontSize: '0.52em', fontWeight: 'bold', flexShrink: 0,
+        }}>{n}</span>
+        <span style={{ color: '#8cf', fontSize: '0.63em', fontWeight: 'bold' }}>{title}</span>
+      </div>
+      <div style={{ fontSize: '0.51em', color: '#4d6070', lineHeight: 1.55, marginTop: 4, paddingLeft: 28 }}>
+        {hint}
+      </div>
     </div>
   );
 }
@@ -270,7 +354,25 @@ const METRIC_LABEL: Record<string, string> = {
 
 // ─── ImportPage ───────────────────────────────────────────────────────────────
 
-export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
+export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFontSize = 19 }: ImportPageProps) {
+  // ── Session history ────────────────────────────────────────────────────────
+  const [sessionMetas, setSessionMetas] = useState<SessionMeta[]>([]);
+  const [historyOpen,  setHistoryOpen]  = useState(true);
+
+  useEffect(() => {
+    loadSessionMetas().then(setSessionMetas);
+  }, []);
+
+  function handleDeleteSession(id: string) {
+    void deleteSession(id).then(() =>
+      loadSessionMetas().then(setSessionMetas)
+    );
+  }
+
+  function handleClearHistory() {
+    void clearAllSessions().then(() => setSessionMetas([]));
+  }
+
   // ── Image state ────────────────────────────────────────────────────────────
   const [sourceBitmap, setSourceBitmap] = useState<ImageBitmap | null>(null);
   const [filename,     setFilename]     = useState<string | null>(null);
@@ -317,6 +419,40 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
   const [computing,       setComputing]       = useState(false);
   const [proceedProgress, setProceedProgress] = useState(0);
   const [proceedTotal,    setProceedTotal]    = useState(0);
+
+  // ── State JSON import ──────────────────────────────────────────────────────
+  const [stateImporting, setStateImporting] = useState(false);
+  const [stateImportMsg, setStateImportMsg] = useState<string | null>(null);
+  const stateFileRef = useRef<HTMLInputElement | null>(null);
+
+  const handleStateFileInput = useCallback(async (e: Event) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    (e.target as HTMLInputElement).value = '';
+    if (!file) return;
+    setStateImporting(true);
+    setStateImportMsg(`Reading ${file.name}…`);
+    try {
+      const text = await file.text();
+      const ps   = JSON.parse(text) as import('../payload-state.js').PayloadState;
+      if (!ps.columns || !ps.rows || !Array.isArray(ps.tiles)) {
+        throw new Error('Not a valid loominary_state.json file');
+      }
+      const total = ps.columns * ps.rows;
+      setStateImportMsg(`Decoding 0 / ${total} tiles…`);
+      const comp = await decodeStateToComposition(ps, (done, t) =>
+        setStateImportMsg(`Decoding ${done} / ${t} tiles…`)
+      );
+      setStateImportMsg(null);
+      setStateImporting(false);
+      onProceedFromState?.(comp);
+    } catch (err) {
+      setStateImportMsg(`Error: ${err instanceof Error ? err.message : err}`);
+      setStateImporting(false);
+    }
+  }, [onProceedFromState]);
+
+  // ── Original image sidebar ────────────────────────────────────────────────
+  const [origOpen, setOrigOpen] = useState(true);
 
   // ── Canvas refs ────────────────────────────────────────────────────────────
   const canvasRef           = useRef<HTMLCanvasElement>(null);
@@ -562,6 +698,7 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
 
       const ps     = emptyPayloadState(eCols, eRows);
       ps.allShades = paletteMeansAllShades(palRestriction);
+      ps.sourceFilename = filename;
 
       if (gifFrames) {
         const total = gifFrames.length;
@@ -600,10 +737,10 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
         const frameDelays = Array.from({ length: eCols * eRows }, () => [...delays]);
         const comp        = { ...compositionFromState(ps, framesByTile), frameDelays };
         const sourceBitmaps = gifFrames.map(f => f.bitmap);
-        onProceed(comp, sourceBitmaps[0], reqP, cropMode, pre, sourceBitmaps);
+        onProceed(comp, sourceBitmaps[0], reqP, cropMode, pre, sourceBitmaps, latestFileRef.current);
       } else {
         const { tiles } = await computePreview(bmp, eCols, eRows, cropMode, pre, palRestriction, reqP, greyThreshold);
-        onProceed(compositionFromState(ps, tiles.map(t => [t])), bmp, reqP, cropMode, pre, null);
+        onProceed(compositionFromState(ps, tiles.map(t => [t])), bmp, reqP, cropMode, pre, null, latestFileRef.current);
       }
     } catch (err) {
       setPreviewStatus(`Error: ${err}`);
@@ -639,8 +776,49 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
         display: 'flex', flexDirection: 'column',
       }}>
 
-        {/* ① Image */}
-        <SectionHeader>① Image</SectionHeader>
+        {/* ── Session history ── */}
+        <div style={{ marginBottom: 10, border: '1px solid #333', borderRadius: 4 }}>
+          <button
+            onClick={() => setHistoryOpen(o => !o)}
+            style={{
+              width: '100%', textAlign: 'left', background: '#1e1e1e',
+              border: 'none', borderBottom: historyOpen ? '1px solid #333' : 'none',
+              color: '#aaa', cursor: 'pointer', fontSize: '0.58em',
+              padding: '5px 8px', display: 'flex', alignItems: 'center', gap: 5,
+            }}
+          >
+            <span style={{ color: '#5af' }}>{historyOpen ? '▾' : '▸'}</span>
+            <span style={{ flex: 1, fontWeight: 'bold' }}>
+              Recent sessions{sessionMetas.length > 0 ? ` (${sessionMetas.length})` : ''}
+            </span>
+            {historyOpen && sessionMetas.length > 0 && (
+              <span
+                onClick={e => { e.stopPropagation(); handleClearHistory(); }}
+                title="Remove all history"
+                style={{ color: '#666', fontSize: '0.9em', padding: '0 2px', lineHeight: 1 }}
+              >Clear all</span>
+            )}
+          </button>
+          {historyOpen && (
+            <div style={{ maxHeight: 260, overflowY: 'auto' }}>
+              {sessionMetas.length === 0 ? (
+                <div style={{ padding: '8px 10px', fontSize: '0.53em', color: '#555', lineHeight: 1.5 }}>
+                  No saved sessions yet. Proceed to the editor to save your first session.
+                </div>
+              ) : sessionMetas.map(s => (
+                <SessionHistoryItem
+                  key={s.id}
+                  meta={s}
+                  onLoad={() => onLoadSession?.(s.id)}
+                  onDelete={() => handleDeleteSession(s.id)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+
+        <Step n={1} title="Image"
+          hint="Load your source image — PNG, JPEG, WebP, or animated GIF. Drop a file below or browse to choose one. The Minecraft preview on the right updates live as you adjust settings." />
         <div
           onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}
           style={{
@@ -663,6 +841,30 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
             {imgDims && <span style={{ color: '#555' }}> ({imgDims[0]}×{imgDims[1]})</span>}
           </div>
         )}
+
+        {/* ── State JSON import ── */}
+        <div style={{ margin: '8px 0 4px', borderTop: '1px solid #2a2a2a', paddingTop: 8 }}>
+          <label style={{
+            ...BTN_STYLE, textAlign: 'center', cursor: stateImporting ? 'wait' : 'pointer',
+            display: 'block', marginBottom: 4, opacity: stateImporting ? 0.5 : 1,
+          }}>
+            {stateImporting ? stateImportMsg : 'Import state JSON…'}
+            <input
+              ref={el => { if (el) stateFileRef.current = el; }}
+              type="file" accept=".json,application/json"
+              onChange={handleStateFileInput}
+              disabled={stateImporting}
+              style={{ display: 'none' }}
+            />
+          </label>
+          {stateImportMsg && !stateImporting && (
+            <div style={{ fontSize: '0.53em', color: '#f77', marginBottom: 4 }}>{stateImportMsg}</div>
+          )}
+          <div style={{ fontSize: '0.51em', color: '#444', lineHeight: 1.4 }}>
+            Reload pixel data from a previously exported <span style={{ fontFamily: 'monospace' }}>loominary_state.json</span> to continue editing.
+          </div>
+        </div>
+
         {isGif && (
           <div style={{
             fontSize: '0.53em', color: '#888', lineHeight: 1.4,
@@ -675,8 +877,8 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
           </div>
         )}
 
-        {/* ② Grid & Crop */}
-        <SectionHeader>② Grid &amp; Crop</SectionHeader>
+        <Step n={2} title="Grid &amp; Crop"
+          hint="One map tile covers 128×128 pixels in-game. A 2×3 grid produces 6 tiles displayed side-by-side. Loominary suggests a grid from your image's aspect ratio — type to override. Scale stretches to fill every tile; Center crop trims the edges." />
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
           <label style={{ color: '#aaa' }}>Cols</label>
           <input type="number" min={1} max={128} value={effectiveCols} style={NUM_INPUT_STYLE}
@@ -720,8 +922,8 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
           ))}
         </div>
 
-        {/* ③ Image Adjustments */}
-        <SectionHeader>③ Image Adjustments</SectionHeader>
+        <Step n={3} title="Adjustments"
+          hint="Pre-processing applied before colour matching. Boosting saturation often improves results — the Minecraft palette has a limited colour range, so vivid sources map better." />
         {(
           [
             { key: 'brightness', label: 'Brightness' },
@@ -742,8 +944,8 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
           </div>
         ))}
 
-        {/* ④ Palette */}
-        <SectionHeader>④ Palette</SectionHeader>
+        <Step n={4} title="Palette"
+          hint="Restricts which Minecraft map colours are available. Legal = normally-placeable blocks (~186 colours). All Shades adds mod-exclusive shades for a larger palette. Carpet-only is required by carpet-channel codecs on the export screen." />
         {PALETTE_CHOICES.map(choice => (
           <label key={choice.id} style={{ display: 'flex', gap: 6, marginBottom: 5, cursor: 'pointer', alignItems: 'flex-start' }}>
             <input type="radio" name="palette" value={choice.id}
@@ -795,8 +997,8 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
           </div>
         )}
 
-        {/* ⑤ Quantization */}
-        <SectionHeader>⑤ Quantization</SectionHeader>
+        <Step n={5} title="Quantization"
+          hint="Controls how pixels are colour-matched to the palette. Dithering spreads matching error across neighbouring pixels to reduce banding — Floyd–Steinberg (FS) is a solid starting point. Chroma boost pre-amplifies saturation before matching." />
         <div style={{ fontSize: '0.53em', color: '#666', marginBottom: 3 }}>Dither</div>
         <div style={{ display: 'flex', gap: 2, marginBottom: 6, flexWrap: 'wrap' }}>
           {DITHER_CYCLE.map(a => (
@@ -831,11 +1033,12 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
         )}
 
         <div style={{ fontSize: '0.53em', color: '#666', marginBottom: 3 }}>Metric</div>
-        <div style={{ display: 'flex', gap: 2, marginBottom: 6, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', gap: 2, marginBottom: 4, flexWrap: 'wrap' }}>
           {METRIC_CYCLE.map(m => (
             <Chip key={m} active={metric === m} onClick={() => setMetric(m)}>{METRIC_LABEL[m]}</Chip>
           ))}
         </div>
+        <MetricHelp metric={metric} />
         <SliderParam label={`Chroma boost: ${chromaBoost.toFixed(2)}×`} min={0.25} max={4.0} step={0.05}
           value={chromaBoost} onChange={setChromaBoost} />
         <label style={{ display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer', marginTop: 4 }}>
@@ -847,6 +1050,8 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
         {/* Carpet table override + Proceed */}
         <div style={{ flex: 1 }} />
         <CarpetDumpInput />
+        <Step n={6} title="Proceed to Editor"
+          hint="When the preview looks good, continue to the editor for per-tile fine-tuning and additional adjustments before export." />
         <button
           onClick={() => void handleProceed()}
           disabled={!sourceBitmap || computing}
@@ -882,6 +1087,14 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
           </div>
         )}
       </div>
+
+      {/* ── Original image preview panel ── */}
+      <OriginalPreviewPanel
+        bitmap={sourceBitmap}
+        open={origOpen}
+        onClose={() => setOrigOpen(false)}
+        onOpen={() => setOrigOpen(true)}
+      />
 
       {/* ── Right preview panel ── */}
       <div style={{ flex: 1, position: 'relative', overflow: 'hidden', background: '#111' }}>
@@ -936,6 +1149,76 @@ export function ImportPage({ onProceed, uiFontSize = 19 }: ImportPageProps) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── MetricHelp ──────────────────────────────────────────────────────────────
+
+const METRIC_INFO: Array<{ key: MatchMetricType; label: string; desc: string; when: string }> = [
+  {
+    key:   'OKLAB',
+    label: 'OKLab',
+    desc:  'Balanced perceptual distance — equal weight on lightness and colour.',
+    when:  'Good default for most images.',
+  },
+  {
+    key:   'CHROMA_FIRST',
+    label: 'Chr+',
+    desc:  '4× weight on hue/saturation vs lightness.',
+    when:  'Saturated or vivid images where colour accuracy matters more than brightness.',
+  },
+  {
+    key:   'LUMA_FIRST',
+    label: 'Lum+',
+    desc:  '4× weight on lightness vs hue.',
+    when:  'Images where shading/contrast matters most — faces, landscapes, greyscale.',
+  },
+  {
+    key:   'HUE_ONLY',
+    label: 'Hue',
+    desc:  'Matches only the colour-wheel angle; ignores brightness and saturation. Near-grey pixels fall back to OKLab.',
+    when:  'Flat cartoon or pixel art where hue fidelity matters and brightness can vary.',
+  },
+  {
+    key:   'RGB',
+    label: 'RGB',
+    desc:  'Euclidean distance in linear sRGB — how most colour pickers measure difference.',
+    when:  'Images that look better when colour-matched in RGB rather than perceptual space.',
+  },
+];
+
+function MetricHelp({ metric }: { metric: MatchMetricType }) {
+  return (
+    <div style={{
+      marginBottom: 6,
+      border: '1px solid #2a2a2a',
+      borderRadius: 3,
+      background: '#161616',
+      fontSize: '0.53em',
+      lineHeight: 1.45,
+      // No overflow:hidden — it creates a BFC on flex items and collapses height in Firefox.
+    }}>
+      {METRIC_INFO.map((m, i) => {
+        const active = m.key === metric;
+        return (
+          <div key={m.key} style={{
+            padding: '4px 7px',
+            background: active ? '#0d1f0d' : 'transparent',
+            borderTop: i > 0 ? '1px solid #2a2a2a' : 'none',
+          }}>
+            <span style={{
+              color: active ? '#7f7' : '#7a9aaa',
+              fontWeight: active ? 'bold' : 'normal',
+              marginRight: 5,
+            }}>{m.label}</span>
+            <span style={{ color: active ? '#9ab' : '#556070' }}>{m.desc}</span>
+            {active && (
+              <span style={{ color: '#5a9a5a', marginLeft: 4 }}>→ {m.when}</span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1032,6 +1315,75 @@ function CarpetDumpInput() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ─── SessionHistoryItem ───────────────────────────────────────────────────────
+
+function SessionHistoryItem({ meta, onLoad, onDelete }: {
+  meta:     SessionMeta;
+  onLoad:   () => void;
+  onDelete: () => void;
+}) {
+  const thumbRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = thumbRef.current;
+    if (!canvas || !meta.thumbnailData) return;
+    const imgData = mapBytesToImageData([[meta.thumbnailData]], 0, 1, 1);
+    canvas.width  = imgData.width;
+    canvas.height = imgData.height;
+    canvas.getContext('2d')!.putImageData(imgData, 0, 0);
+  }, [meta.thumbnailData]);
+
+  const label = meta.title || meta.sourceFilename || 'untitled';
+  const grid  = `${meta.gridCols}×${meta.gridRows}`;
+  const frames = meta.totalFrames > meta.totalTiles
+    ? ` · ${meta.totalFrames / meta.totalTiles}f` : '';
+
+  return (
+    <div
+      onClick={onLoad}
+      title="Restore this session"
+      style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '5px 8px', cursor: 'pointer', borderBottom: '1px solid #222',
+      }}
+      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = '#1e2a1e'; }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = ''; }}
+    >
+      {/* Thumbnail */}
+      <div style={{
+        width: 40, height: 40, flexShrink: 0,
+        background: '#111', border: '1px solid #2a2a2a', borderRadius: 2,
+        display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden',
+      }}>
+        {meta.thumbnailData
+          ? <canvas ref={thumbRef} style={{ maxWidth: '100%', maxHeight: '100%', imageRendering: 'pixelated' }} />
+          : <span style={{ fontSize: '0.5em', color: '#333' }}>?</span>}
+      </div>
+
+      {/* Info */}
+      <div style={{ flex: 1, overflow: 'hidden' }}>
+        <div style={{
+          fontSize: '0.58em', color: '#ccc', overflow: 'hidden',
+          textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }}>{label}</div>
+        <div style={{ fontSize: '0.52em', color: '#555', marginTop: 1 }}>
+          {grid}{frames} · {savedAgoLabel(meta.savedAt)}
+        </div>
+      </div>
+
+      {/* Delete */}
+      <button
+        onClick={e => { e.stopPropagation(); onDelete(); }}
+        title="Remove from history"
+        style={{
+          background: 'none', border: 'none', color: '#444', cursor: 'pointer',
+          fontSize: '0.75em', padding: '2px 4px', lineHeight: 1, flexShrink: 0,
+        }}
+      >✕</button>
     </div>
   );
 }

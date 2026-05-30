@@ -65,7 +65,7 @@ export function PalettePanel({
   onColorPick, onCtrlClick, onShiftClick, onColorHover,
   panelWidth = 168,
 }: PalettePanelProps) {
-  const [tab,               setTab]              = useState<'all' | 'frame' | 'sel'>('frame');
+  const [tab,               setTab]              = useState<'all' | 'frame' | 'sel' | 'total'>('frame');
   const [sortMode,          setSortMode]         = useState<SortMode>('byte');
   const [allTabFilter,      setAllTabFilter]     = useState<PaletteRestriction | 'none'>('none');
   const [allTabGreyThresh,  setAllTabGreyThresh] = useState(40);
@@ -137,6 +137,21 @@ export function PalettePanel({
 
   const maxFreq = useMemo(() => Math.max(1, ...Array.from(freq)), [freq]);
 
+  // Pixel totals summed across ALL frames (for the TOTAL tab).
+  const { totalFreq, totalAllCount } = useMemo(() => {
+    const f = new Int32Array(256);
+    let total = 0;
+    for (const tf of comp.frames) {
+      for (const frame of tf) {
+        if (!frame) continue;
+        for (let i = 0; i < frame.length; i++) { f[frame[i]]++; total++; }
+      }
+    }
+    return { totalFreq: f, totalAllCount: total };
+  }, [comp.frames]);
+
+  const maxTotalFreq = useMemo(() => Math.max(1, ...Array.from(totalFreq)), [totalFreq]);
+
   // Colours present in the current frame.
   const frameColors = useMemo(() => {
     const p = new Uint8Array(256);
@@ -183,11 +198,13 @@ export function PalettePanel({
       return Array.from({ length: 256 }, (_, i) => i).filter(i => validArr[i]);
     } else if (tab === 'frame') {
       return Array.from({ length: 256 }, (_, i) => i).filter(i => validArr[i] && frameColors[i]);
+    } else if (tab === 'total') {
+      return Array.from({ length: 256 }, (_, i) => i).filter(i => validArr[i] && totalFreq[i] > 0);
     } else {
       const basis = inSel ?? frameColors;
       return Array.from({ length: 256 }, (_, i) => i).filter(i => validArr[i] && basis[i]);
     }
-  }, [tab, comp.allShades, frameColors, inSel, allTabFilter, allTabGreyThresh]);
+  }, [tab, comp.allShades, frameColors, inSel, allTabFilter, allTabGreyThresh, totalFreq]);
 
   // Per-color OKLab sort keys (rebuilt only when sort mode changes, not on every frame).
   const sortKeys = useMemo<Float32Array>(() => {
@@ -205,9 +222,10 @@ export function PalettePanel({
   }, [sortMode]);
 
   const sortedColors = useMemo(() => {
-    if (sortMode === 'frequency') return [...colors].sort((a, b) => (freq[b] || 0) - (freq[a] || 0));
+    const activeFreq = tab === 'total' ? totalFreq : freq;
+    if (sortMode === 'frequency') return [...colors].sort((a, b) => (activeFreq[b] || 0) - (activeFreq[a] || 0));
     return [...colors].sort((a, b) => sortKeys[a] - sortKeys[b]);
-  }, [colors, sortMode, sortKeys, freq]);
+  }, [colors, sortMode, sortKeys, freq, totalFreq, tab]);
 
   return (
     <div style={{ ...PANEL_STYLE, width: panelWidth, minWidth: Math.min(panelWidth, 80) }}>
@@ -216,8 +234,9 @@ export function PalettePanel({
         const selCount = inSel ? Array.from(inSel).slice(1).filter(Boolean).length : null;
         return (
           <div style={{ display:'flex', alignItems:'center', borderBottom:'1px solid #333', marginBottom:4 }}>
-            {(['all','frame','sel'] as const).map(t => (
-              <button key={t} onClick={() => setTab(t)} style={tab === t ? TAB_ACTIVE : TAB_INACTIVE}>
+            {(['all','frame','sel','total'] as const).map(t => (
+              <button key={t} onClick={() => setTab(t)} style={tab === t ? TAB_ACTIVE : TAB_INACTIVE}
+                title={t === 'total' ? 'Pixel totals summed across all frames' : undefined}>
                 {t === 'sel' && selCount !== null ? `SEL(${selCount})` : t.toUpperCase()}
               </button>
             ))}
@@ -338,14 +357,20 @@ export function PalettePanel({
 
       {/* Swatch grid */}
       <div style={SWATCH_GRID} onMouseLeave={() => onColorHover?.(null)}>
-        {sortedColors.map(c => {
+        {(() => {
+          const isTotal   = tab === 'total';
+          const dispFreq  = isTotal ? totalFreq  : freq;
+          const dispTotal = isTotal ? totalAllCount : totalCount;
+          const dispMax   = isTotal ? maxTotalFreq  : maxFreq;
+          const dispNote  = isTotal ? ' across all frames' : selMask ? ' in selection' : '';
+          return sortedColors.map(c => {
           const rgb = MC_PALETTE[c];
           const r = (rgb >> 16) & 0xff;
           const g = (rgb >>  8) & 0xff;
           const b = rgb & 0xff;
           const bgColor = `rgb(${r},${g},${b})`;
-          const count    = freq[c];
-          const barW     = Math.round(count / maxFreq * 100);
+          const count    = dispFreq[c];
+          const barW     = Math.round(count / dispMax * 100);
           const isActive  = c === activeColor;
           const inMergeQ  = mergeQueue.has(c);
 
@@ -353,9 +378,8 @@ export function PalettePanel({
           const outlineWidth  = (isActive || inMergeQ) ? 2 : 1;
           const outlineOffset = (isActive || inMergeQ) ? -2 : -1;
 
-          // Tooltip: show count + percentage
-          const pct       = totalCount > 0 ? (count / totalCount * 100).toFixed(1) : '0.0';
-          const countLine = count > 0 ? `\n${count.toLocaleString()} px (${pct}%)${selMask ? ' in selection' : ''}` : '';
+          const pct       = dispTotal > 0 ? (count / dispTotal * 100).toFixed(1) : '0.0';
+          const countLine = count > 0 ? `\n${count.toLocaleString()} px (${pct}%)${dispNote}` : '';
           const tooltip   = `Byte ${c} · rgb(${r},${g},${b})${countLine}`
             + (inMergeQ ? '\nIn merge queue' : '')
             + `\nCtrl+click: toggle merge queue`
@@ -451,21 +475,26 @@ export function PalettePanel({
               )}
             </div>
           );
-        })}
+          });
+        })()}
       </div>
 
       {/* Active colour info */}
-      <div style={{ marginTop:8, fontSize:'0.79em', color:'#aaa', textAlign:'center' }}>
-        {activeColor === 0 ? 'Transparent (byte 0)' : `Byte ${activeColor}`}
-        {freq[activeColor] > 0 && (() => {
-          const cnt = freq[activeColor];
-          const pct = totalCount > 0 ? ` (${(cnt / totalCount * 100).toFixed(1)}%)` : '';
-          return ` · ${cnt.toLocaleString()} px${pct}`;
-        })()}
-        {selMask && freq[activeColor] > 0 && (
-          <span style={{ color:'#666' }}> in sel</span>
-        )}
-      </div>
+      {(() => {
+        const isTotal   = tab === 'total';
+        const dispFreq  = isTotal ? totalFreq  : freq;
+        const dispTotal = isTotal ? totalAllCount : totalCount;
+        const cnt = dispFreq[activeColor];
+        const pct = dispTotal > 0 && cnt > 0 ? ` (${(cnt / dispTotal * 100).toFixed(1)}%)` : '';
+        const suffix = isTotal ? ' all frames' : selMask && cnt > 0 ? ' in sel' : '';
+        return (
+          <div style={{ marginTop:8, fontSize:'0.79em', color:'#aaa', textAlign:'center' }}>
+            {activeColor === 0 ? 'Transparent (byte 0)' : `Byte ${activeColor}`}
+            {cnt > 0 && <span> · {cnt.toLocaleString()} px{pct}</span>}
+            {suffix && <span style={{ color:'#666' }}>{suffix}</span>}
+          </div>
+        );
+      })()}
     </div>
   );
 }

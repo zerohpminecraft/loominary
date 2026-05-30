@@ -5,7 +5,7 @@
  * Right: animated GIF preview (or static frame) · per-tile data stats.
  */
 
-import { h } from 'preact';
+import { h, Fragment } from 'preact';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { SchematicViewer3D } from '../SchematicViewer3D.js';
 
@@ -24,7 +24,7 @@ import {
 import { compress }                      from '../compression.js';
 import {
   toBytesV2, toBytesAnimated, crc32,
-  FLAG_ALL_SHADES, FLAG_ANIMATED,
+  FLAG_ALL_SHADES, FLAG_ANIMATED, FLAG_MUX, FLAG_DELTA_FRAMES, FLAG_SPARSE_FRAMES,
 } from '../manifest.js';
 
 // ─── Codec display order ──────────────────────────────────────────────────────
@@ -47,12 +47,26 @@ const OVERFLOW_MAX = 5_290;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+interface TileManifest {
+  version:     number;
+  headerBytes: number;
+  flags:       number;
+  colorCrc32:  number;
+  username:    string | null;
+  title:       string | null;
+  nonce:       number;
+  frameCount:  number;
+  loopCount:   number;
+  frameDelays: number[];
+}
+
 interface TileStat {
   ti:             number;
   tileCol:        number;
   tileRow:        number;
   compressedBytes:number;
   compressedData: Uint8Array;
+  manifest:       TileManifest;
 }
 
 interface ChannelBreakdown {
@@ -175,7 +189,7 @@ Files in this archive
 ---------------------
   loominary_state.json         Copy to: <game dir>/config/loominary_state.json
   loominary_carpet*.litematic  Carpet platform schematic(s) — carpet codecs only
-  preview.png                  Rendered preview of the map art
+  preview.png / preview.gif    Rendered preview of the map art
   README.txt                   This file
 
 How to install in-game (carpet codecs)
@@ -222,15 +236,29 @@ export interface ExportPageProps {
 
 // ─── ExportPage ───────────────────────────────────────────────────────────────
 
+const AUTHOR_LS_KEY = 'loominary_author';
+
+function slugifyFilename(filename: string): string {
+  return filename
+    .replace(/\.[^.]+$/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
-  const [title,     setTitle]     = useState(comp.title ?? '');
-  const [author,    setAuthor]    = useState(comp.author ?? '');
+  const defaultTitle = comp.title
+    ?? (comp.sourceFilename ? slugifyFilename(comp.sourceFilename) : '');
+  const defaultAuthor = comp.author
+    ?? localStorage.getItem(AUTHOR_LS_KEY)
+    ?? '';
+
+  const [title,     setTitle]     = useState(defaultTitle);
+  const [author,    setAuthor]    = useState(defaultAuthor);
   const [codec,     setCodec]     = useState<CodecMode>(comp.codecMode ?? DEFAULT_CODEC);
   const [nonce,     setNonce]     = useState(false);
   const [status,    setStatus]    = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
-  const [pngScale,  setPngScale]  = useState<1|2|4|8>(4);
-  const [gifLoop,   setGifLoop]   = useState<0|1>(0);
 
   // Encryption
   const [encryptOn, setEncryptOn] = useState(false);
@@ -252,6 +280,16 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const [viewerH,     setViewerH]     = useState(320);
   const viewerDragRef = useRef<{ y0: number; h0: number } | null>(null);
 
+  // Persist author to localStorage whenever it's updated.
+  useEffect(() => {
+    const trimmed = author.trim();
+    if (trimmed) localStorage.setItem(AUTHOR_LS_KEY, trimmed);
+  }, [author]);
+
+  // Refs for export metadata so computeStats can read them without closure-dep issues
+  const exportMetaRef = useRef({ title, author, nonce });
+  useEffect(() => { exportMetaRef.current = { title, author, nonce }; }, [title, author, nonce]);
+
   // Budget warning dialog
   const [budgetWarnLabel,  setBudgetWarnLabel]  = useState<string | null>(null);
   const pendingExportRef = useRef<(() => Promise<void>) | null>(null);
@@ -260,6 +298,8 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [gifUrl,  setGifUrl]  = useState<string | null>(null);
   const [show3D,  setShow3D]  = useState(false);
+  const [expandedTiles, setExpandedTiles] = useState<Set<number>>(() => new Set());
+
   // Per-tile 3D schematic preview (null = no tile selected)
   const [preview3DTile, setPreview3DTile] = useState<{
     ti: number; compressedData: Uint8Array; label: string;
@@ -308,6 +348,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     setStatsComputing(true);
     const total = comp.gridCols * comp.gridRows;
     setStatsProg({ done: 0, total });
+    const { title: t, author: a, nonce: n } = exportMetaRef.current;
     try {
       const stats: TileStat[] = [];
       for (let ti = 0; ti < total; ti++) {
@@ -321,19 +362,34 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         if (frames.length > 1) flags |= FLAG_ANIMATED;
         const mBytes = frames.length > 1
           ? toBytesAnimated(flags, comp.gridCols, comp.gridRows, tileCol, tileRow,
-              crc32(frame0), null, null, 0, frames.length, 0, delays)
+              crc32(frame0), a || null, t || null, n ? 1 : 0, frames.length, 0, delays)
           : toBytesV2(flags, comp.gridCols, comp.gridRows, tileCol, tileRow,
-              crc32(frame0), null, null, 0);
+              crc32(frame0), a || null, t || null, n ? 1 : 0);
         const combined = new Uint8Array(mBytes.length + frames.length * 128 * 128);
         combined.set(mBytes, 0);
         for (let f = 0; f < frames.length; f++)
           combined.set(frames[f] ?? new Uint8Array(128*128), mBytes.length + f * 128*128);
         const compressed = await compress(combined);
-        stats.push({ ti, tileCol, tileRow, compressedBytes: compressed.length, compressedData: compressed });
+        stats.push({
+          ti, tileCol, tileRow,
+          compressedBytes: compressed.length,
+          compressedData:  compressed,
+          manifest: {
+            version:     mBytes[0],
+            headerBytes: mBytes.length,
+            flags,
+            colorCrc32:  crc32(frame0),
+            username:    a || null,
+            title:       t || null,
+            nonce:       n ? 1 : 0,
+            frameCount:  frames.length,
+            loopCount:   0,
+            frameDelays: delays,
+          },
+        });
         setStatsProg({ done: ti + 1, total });
       }
       setTileStats(stats);
-      // Clear stale mux; auto-mux effect will recompute from fresh stats.
       setMuxAlloc(null);
       setMuxCodec(null);
       setExtraDonors(0);
@@ -341,20 +397,60 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
       setStatsComputing(false);
       setStatsProg(null);
     }
-  }, [comp]);
+  }, [comp]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keep a stable ref so debounced triggers always call the latest version.
+  const computeStatsRef = useRef(computeStats);
+  useEffect(() => { computeStatsRef.current = computeStats; }, [computeStats]);
+
   useEffect(() => { void computeStats(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Debounced rebuild when export metadata changes (title/author/nonce affect manifest).
+  const metaTriggerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (metaTriggerTimer.current) clearTimeout(metaTriggerTimer.current);
+    metaTriggerTimer.current = setTimeout(() => void computeStatsRef.current(), 600);
+    return () => { if (metaTriggerTimer.current) clearTimeout(metaTriggerTimer.current); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [title, author, nonce]);
+
+  // When tileStats refreshes (title/author/nonce) or encryption settings change,
+  // rebuild the active 3D preview tile with the correct (possibly encrypted) bytes.
+  // Donor tiles are cleared — their cargo requires a full mux re-run.
+  useEffect(() => {
+    if (!preview3DTile || !tileStats) return;
+    const artCount = comp.gridCols * comp.gridRows;
+    if (preview3DTile.ti >= artCount) { setPreview3DTile(null); return; }
+    const fresh = tileStats.find(s => s.ti === preview3DTile.ti);
+    if (!fresh) return;
+
+    let cancelled = false;
+    void (async () => {
+      let data: Uint8Array = fresh.compressedData;
+      if (encryptOn && passwords.length > 0) {
+        const { encrypt } = await import('../encryption.js');
+        data = await encrypt(data, passwords, author.trim() || null, title.trim() || null);
+      }
+      if (!cancelled) setPreview3DTile(p => p ? { ...p, compressedData: data } : null);
+    })();
+    return () => { cancelled = true; };
+  }, [tileStats, encryptOn, passwords]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Derived budget info ───────────────────────────────────────────────────
+  // Encryption adds a fixed overhead per tile: 4+1+12+256+1 header bytes + 76 bytes per
+  // password slot + 16 bytes GCM tag = 290 + 76*N bytes.
+  const encryptOverhead = encryptOn && passwords.length > 0 ? 290 + 76 * passwords.length : 0;
   const sizes      = tileStats?.map(s => s.compressedBytes) ?? [];
-  const { overBudget, budget } = budgetStatus(sizes, codec);
+  const effectiveSizes = sizes.map(s => s + encryptOverhead);
+  const { overBudget, budget } = budgetStatus(effectiveSizes, codec);
 
   const effectivelyOverBudget =
     overBudget.length > 0 && (!muxAlloc || muxAlloc.unresolved > 0);
 
-  // ── Auto-mux: recompute whenever stats or codec changes ───────────────────
+  // ── Auto-mux: recompute whenever stats, codec, or encryption changes ──────
   useEffect(() => {
     if (!tileStats || statsComputing) return;
-    const currentSizes = tileStats.map(s => s.compressedBytes);
+    const currentSizes = tileStats.map(s => s.compressedBytes + encryptOverhead);
     const { overBudget: ob } = budgetStatus(currentSizes, codec);
     if (ob.length === 0) {
       setMuxAlloc(null); setExtraDonors(0); setMuxCodec(null);
@@ -370,7 +466,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     setMuxAlloc(alloc);
     setMuxCodec(codec);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tileStats, codec, statsComputing]);
+  }, [tileStats, codec, statsComputing, encryptOverhead]);
 
   // ── Budget-aware export gate ──────────────────────────────────────────────
   function tryExport(label: string, action: () => Promise<void>) {
@@ -415,12 +511,12 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   // carpetCompressedB64, which is exactly what applyBannerMux /
   // applyCarpetMux expect for blank donors (the functions fill in routing
   // banners / muxCargoB64 automatically).
-  async function encodeAndMux(nonceVal: number, localExtraDonors: number, localMuxAlloc: MuxAllocation | null) {
+  async function encodeAndMux(nonceVal: number, localExtraDonors: number, localMuxAlloc: MuxAllocation | null, skipEncrypt = false) {
     const ps = await encodeComposition(comp, {
       title: title.trim(), author: author.trim(), nonce: nonceVal, whitelist: [], codecMode: codec,
     });
 
-    if (encryptOn && passwords.length > 0) {
+    if (!skipEncrypt && encryptOn && passwords.length > 0) {
       const { encrypt } = await import('../encryption.js');
       const encTotal = ps.tiles.length;
       setExportProg({ label: 'Encrypting', done: 0, total: encTotal });
@@ -466,91 +562,6 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     return ps;
   }
 
-  // ── Export State JSON ─────────────────────────────────────────────────────
-  const handleExport = useCallback(async () => {
-    if (!canExport) return;
-    setExporting(true); setStatus('Encoding…');
-    try {
-      const nonceVal = nonce ? ((Math.random() * 0x100000000) >>> 0) : 0;
-      const ps = await encodeAndMux(nonceVal, extraDonors, muxAlloc);
-      downloadState(ps);
-      setStatus('Exported ✓'); setTimeout(() => setStatus(null), 2500);
-    } catch (err) {
-      setStatus(`Error: ${err}`); setTimeout(() => setStatus(null), 4000);
-    } finally { setExporting(false); setExportProg(null); }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [comp, title, author, codec, nonce, encryptOn, passwords, muxAlloc, extraDonors, canExport]);
-
-  // ── Export PNG ────────────────────────────────────────────────────────────
-  const handlePngExport = useCallback(async () => {
-    if (!canExport) return;
-    setExporting(true); setStatus('Rendering PNG…');
-    try {
-      const imgData = mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
-      const sw = imgData.width * pngScale, sh = imgData.height * pngScale;
-      const src = new OffscreenCanvas(imgData.width, imgData.height);
-      src.getContext('2d')!.putImageData(imgData, 0, 0);
-      const dst = new OffscreenCanvas(sw, sh);
-      const dctx = dst.getContext('2d')!; dctx.imageSmoothingEnabled = false;
-      dctx.drawImage(src, 0, 0, sw, sh);
-      const blob = await dst.convertToBlob({ type: 'image/png' });
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement('a'); a.href = url;
-      a.download = (title.trim() || 'loominary') + (pngScale > 1 ? `_${pngScale}x` : '') + '.png';
-      a.click(); setTimeout(() => URL.revokeObjectURL(url), 5000);
-      setStatus('PNG exported ✓'); setTimeout(() => setStatus(null), 2500);
-    } catch (err) { setStatus(`Error: ${err}`); setTimeout(() => setStatus(null), 4000); }
-    finally { setExporting(false); }
-  }, [comp, pngScale, title, canExport]);
-
-  // ── Export GIF ────────────────────────────────────────────────────────────
-  const handleGifExport = useCallback(async () => {
-    if (!canExport) return;
-    setExporting(true); setStatus('Encoding GIF…');
-    try {
-      const { encodeAnimatedGif } = await import('../gif-encode.js');
-      const bytes = encodeAnimatedGif(comp, gifLoop);
-      const blob  = new Blob([bytes.buffer as ArrayBuffer], { type: 'image/gif' });
-      const url   = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url;
-      a.download = (title.trim() || 'loominary') + '.gif';
-      a.click(); setTimeout(() => URL.revokeObjectURL(url), 5000);
-      setStatus('GIF exported ✓'); setTimeout(() => setStatus(null), 2500);
-    } catch (err) { setStatus(`Error: ${err}`); setTimeout(() => setStatus(null), 4000); }
-    finally { setExporting(false); }
-  }, [comp, gifLoop, title, canExport]);
-
-  // ── Export Carpet Schematic ───────────────────────────────────────────────
-  // Carpet schematics encode the physical 128×128 carpet-block platform that
-  // must be placed in-game before the mod writes the LOOM channel data.
-  // Only relevant for carpet codecs — banner data is carried by the state JSON.
-  const handleSchematicExport = useCallback(async () => {
-    if (!canExport || !schematicsAvailable) return;
-    setExporting(true); setStatus('Building carpet schematic…');
-    try {
-      const { exportCarpetSchematic, downloadLitematic } = await import('../schematic.js');
-      const { encodeComposition } = await import('../encode.js');
-      const ps        = await encodeComposition(comp, {
-        title: title.trim(), author: author.trim(), nonce: 0, whitelist: [], codecMode: codec,
-      });
-      const tileCount = comp.gridCols * comp.gridRows;
-      for (let ti = 0; ti < tileCount; ti++) {
-        const tileCol  = ti % comp.gridCols, tileRow = Math.floor(ti / comp.gridCols);
-        const tile     = ps.tiles[ti];
-        if (!tile?.carpetCompressedB64) { setStatus(`Tile (${tileRow},${tileCol}) has no carpet data`); continue; }
-        const suffix   = tileCount > 1 ? `_r${tileRow}_c${tileCol}` : '';
-        const name     = `loominary_carpet${suffix}`;
-        downloadLitematic(
-          await exportCarpetSchematic(tile.carpetCompressedB64, name, author.trim() || 'Loominary', tileCol, tileRow, codec),
-          `${name}.litematic`,
-        );
-      }
-      setStatus(`Carpet schematic${tileCount > 1 ? 's' : ''} exported ✓`); setTimeout(() => setStatus(null), 2500);
-    } catch (err) { setStatus(`Error: ${err}`); setTimeout(() => setStatus(null), 4000); }
-    finally { setExporting(false); }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [comp, title, author, codec, canExport, schematicsAvailable]);
-
   // ── Export all as ZIP ─────────────────────────────────────────────────────
   const handleZipExport = useCallback(async () => {
     if (!canExport) return;
@@ -568,34 +579,51 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         data: new TextEncoder().encode(JSON.stringify(ps, null, 2)),
       });
 
-      // 2 — Per-tile carpet platform schematics (carpet codecs only).
-      //     Encodes the LOOM zstd payload as carpet nibbles — mirrors the Java
-      //     /loominary export command exactly.  Not relevant for banner-only codec.
+      // 2 — Per-tile carpet platform schematics (carpet codecs only), including
+      //     any blank donor tiles added by mux.  Art tiles use muxCargoB64 when
+      //     muxed (receivers carry their own segment), falling back to
+      //     carpetCompressedB64.  Donor tiles always use muxCargoB64.
       if (schematicsAvailable) {
         const { exportCarpetSchematic } = await import('../schematic.js');
-        const tileCount = comp.gridCols * comp.gridRows;
-        for (let ti = 0; ti < tileCount; ti++) {
-          const tileCol  = ti % comp.gridCols, tileRow = Math.floor(ti / comp.gridCols);
-          const tile     = ps.tiles[ti];
-          if (!tile?.carpetCompressedB64) continue;
-          const suffix   = tileCount > 1 ? `_r${tileRow}_c${tileCol}` : '';
-          const name     = `loominary_carpet${suffix}`;
-          setStatus(`Building ZIP… carpet schematic ${ti + 1}/${tileCount}`);
-          const schData  = await exportCarpetSchematic(tile.carpetCompressedB64, name, author.trim() || 'Loominary', tileCol, tileRow, codec);
-          files.push({ name: `${name}.litematic`, data: schData });
+        const artCount  = comp.gridCols * comp.gridRows;
+        const multiTile = artCount > 1 || extraDonors > 0;
+        const schTotal  = artCount + extraDonors;
+        for (let ti = 0; ti < artCount; ti++) {
+          const tileCol = ti % comp.gridCols, tileRow = Math.floor(ti / comp.gridCols);
+          const tile    = ps.tiles[ti];
+          const b64     = tile?.muxCargoB64 ?? tile?.carpetCompressedB64;
+          if (!b64) continue;
+          const suffix  = multiTile ? `_r${tileRow}_c${tileCol}` : '';
+          const name    = `loominary_carpet${suffix}`;
+          setStatus(`Building ZIP… schematic ${ti + 1}/${schTotal}`);
+          files.push({ name: `${name}.litematic`, data: await exportCarpetSchematic(b64, name, author.trim() || 'Loominary', tileCol, tileRow, codec) });
+        }
+        for (let i = 0; i < extraDonors; i++) {
+          const tile = ps.tiles[artCount + i];
+          const b64  = tile?.muxCargoB64;
+          if (!b64) continue;
+          const name = `loominary_carpet_donor${extraDonors > 1 ? i + 1 : ''}`;
+          setStatus(`Building ZIP… donor schematic ${i + 1}/${extraDonors}`);
+          files.push({ name: `${name}.litematic`, data: await exportCarpetSchematic(b64, name, author.trim() || 'Loominary', 0, 0, codec) });
         }
       }
 
-      // 3 — 4× PNG preview
-      setStatus('Building ZIP… rendering preview');
-      const imgData = mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
-      const oscS = new OffscreenCanvas(imgData.width, imgData.height);
-      oscS.getContext('2d')!.putImageData(imgData, 0, 0);
-      const osc  = new OffscreenCanvas(imgData.width * 4, imgData.height * 4);
-      const octx = osc.getContext('2d')!;
-      octx.imageSmoothingEnabled = false;
-      octx.drawImage(oscS, 0, 0, osc.width, osc.height);
-      files.push({ name: 'preview.png', data: new Uint8Array(await (await osc.convertToBlob({ type: 'image/png' })).arrayBuffer()) });
+      // 3 — Preview: animated GIF for multi-frame compositions, 4× PNG otherwise
+      if (isAnimated) {
+        setStatus('Building ZIP… encoding GIF preview');
+        const { encodeAnimatedGif } = await import('../gif-encode.js');
+        files.push({ name: 'preview.gif', data: encodeAnimatedGif(comp, 0) });
+      } else {
+        setStatus('Building ZIP… rendering preview');
+        const imgData = mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
+        const oscS = new OffscreenCanvas(imgData.width, imgData.height);
+        oscS.getContext('2d')!.putImageData(imgData, 0, 0);
+        const osc  = new OffscreenCanvas(imgData.width * 4, imgData.height * 4);
+        const octx = osc.getContext('2d')!;
+        octx.imageSmoothingEnabled = false;
+        octx.drawImage(oscS, 0, 0, osc.width, osc.height);
+        files.push({ name: 'preview.png', data: new Uint8Array(await (await osc.convertToBlob({ type: 'image/png' })).arrayBuffer()) });
+      }
 
       // 4 — README
       files.push({ name: 'README.txt', data: new TextEncoder().encode(README) });
@@ -658,90 +686,89 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         borderRight:'1px solid #333', padding:'14px 12px',
         display:'flex', flexDirection:'column', gap:10, overflowY:'auto',
       }}>
-        <div style={{ fontSize:'0.79em', color:'#5af', fontWeight:'bold', marginBottom:2 }}>Export</div>
-
-        {/* ── Codec ── */}
-        <Section label="Codec">
-          {CODEC_ORDER.map(c => (
-            <label key={c} style={{ display:'flex', alignItems:'flex-start', gap:6, marginBottom:5, cursor:'pointer' }}>
-              <input type="radio" name="codec" value={c} checked={codec===c}
-                onChange={() => setCodec(c)}
-                style={{ marginTop:3, flexShrink:0 }} />
-              <div>
-                <div style={{ color:'#ccc', fontSize:'0.63em' }}>
-                  {CODEC_LABEL[c]}
-                  {c === DEFAULT_CODEC && <span style={{ color:'#666', marginLeft:5 }}>(default)</span>}
-                </div>
-                <div style={{ color:'#555', fontSize:'0.58em' }}>{CODEC_HINT[c]}</div>
-                {tileStats && (() => {
-                  const ob = budgetStatus(sizes, c).overBudget.length, tot = tileStats.length;
-                  return <div style={{ fontSize:'0.53em', color: ob > 0 ? '#f93' : '#3a3', marginTop:1 }}>
-                    {ob > 0 ? `⚠ ${ob}/${tot} tile${ob>1?'s':''} over budget` : `✓ all ${tot} fit`}
-                  </div>;
-                })()}
-              </div>
-            </label>
-          ))}
-          {NEEDS_CARPET.has(codec) && (
-            <div style={{ fontSize:'0.58em', color:'#555', marginTop:2, borderTop:'1px solid #2a2a2a', paddingTop:5 }}>
-              Requires a carpet platform in-game.
-            </div>
-          )}
-        </Section>
-
-        {/* ── Metadata ── */}
-        <Section label="Metadata (required)">
-          <FieldRow label="Title" error={titleMissing ? 'Required' : undefined}>
-            <input type="text" placeholder="Map title…" maxLength={64} value={title}
-              onInput={e => setTitle((e.target as HTMLInputElement).value)}
-              style={{ ...INPUT, border: `1px solid ${titleMissing ? '#f55' : '#444'}` }} />
-          </FieldRow>
-          <FieldRow label="Author" error={authorMissing ? 'Required' : undefined}>
-            <input type="text" placeholder="Your username…" maxLength={16} value={author}
-              onInput={e => setAuthor((e.target as HTMLInputElement).value)}
-              style={{ ...INPUT, border: `1px solid ${authorMissing ? '#f55' : '#444'}` }} />
-          </FieldRow>
-          <label style={{ display:'flex', alignItems:'flex-start', gap:6, cursor:'pointer' }}
-            title="Embeds a random 32-bit nonce so compressed bytes are unique per export.">
-            <input type="checkbox" checked={nonce} onChange={e => setNonce((e.target as HTMLInputElement).checked)}
-              style={{ marginTop:2 }} />
+        {/* ── Step 1: Codec ── */}
+        <Step n={1} title="Codec"
+          hint="How image data is stored in-game. Carpet codecs (default) encode as a 128×128 carpet schematic. More capacity, crisper images, but require the platform to be placed in-game first. The banner codec works on any server but holds less data per tile. The stats panel on the right shows whether your image fits each codec's budget." />
+        {CODEC_ORDER.map(c => (
+          <label key={c} style={{ display:'flex', alignItems:'flex-start', gap:6, marginBottom:5, cursor:'pointer' }}>
+            <input type="radio" name="codec" value={c} checked={codec===c}
+              onChange={() => setCodec(c)}
+              style={{ marginTop:3, flexShrink:0 }} />
             <div>
-              <div style={{ fontSize:'0.63em' }}>Resalt (nonce)</div>
-              <div style={{ fontSize:'0.58em', color:'#555' }}>Randomises compressed bytes without changing the image.</div>
+              <div style={{ color:'#ccc', fontSize:'0.63em' }}>
+                {CODEC_LABEL[c]}
+                {c === DEFAULT_CODEC && <span style={{ color:'#666', marginLeft:5 }}>(default)</span>}
+              </div>
+              <div style={{ color:'#555', fontSize:'0.58em' }}>{CODEC_HINT[c]}</div>
+              {tileStats && (() => {
+                const ob = budgetStatus(effectiveSizes, c).overBudget.length, tot = tileStats.length;
+                return <div style={{ fontSize:'0.53em', color: ob > 0 ? '#f93' : '#3a3', marginTop:1 }}>
+                  {ob > 0 ? `⚠ ${ob}/${tot} tile${ob>1?'s':''} over budget` : `✓ all ${tot} fit`}
+                </div>;
+              })()}
             </div>
           </label>
-        </Section>
+        ))}
+        {NEEDS_CARPET.has(codec) && (
+          <div style={{ fontSize:'0.58em', color:'#555', marginTop:2, borderTop:'1px solid #2a2a2a', paddingTop:5 }}>
+            Requires a carpet platform in-game.
+          </div>
+        )}
 
-        {/* ── Encryption ── */}
-        <Section label="Encryption">
-          <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontSize:'0.63em' }}>
-            <input type="checkbox" checked={encryptOn} onChange={e => setEncryptOn((e.target as HTMLInputElement).checked)} />
-            Encrypt output
-          </label>
-          {encryptOn && (
-            <>
-              <div style={{ fontSize:'0.58em', color:'#555', lineHeight:1.4, marginTop:2 }}>
-                AES-256-GCM · PBKDF2-SHA256 (100 000 iterations per password).
+        {/* ── Step 2: Identify ── */}
+        <Step n={2} title="Identify"
+          hint="Metadata embedded in the encoded data. Title and author are required — they appear in the mod's in-game catalogue. Resalt embeds a random nonce so each export has unique compressed bytes, which is useful when re-submitting the same image." />
+        <FieldRow label="Title" error={titleMissing ? 'Required' : undefined}>
+          <input type="text" placeholder="Map title…" maxLength={64} value={title}
+            onInput={e => setTitle((e.target as HTMLInputElement).value)}
+            style={{ ...INPUT, border: `1px solid ${titleMissing ? '#f55' : '#444'}` }} />
+        </FieldRow>
+        <FieldRow label="Author" error={authorMissing ? 'Required' : undefined}>
+          <input type="text" placeholder="Your username…" maxLength={16} value={author}
+            onInput={e => setAuthor((e.target as HTMLInputElement).value)}
+            style={{ ...INPUT, border: `1px solid ${authorMissing ? '#f55' : '#444'}` }} />
+        </FieldRow>
+        <label style={{ display:'flex', alignItems:'flex-start', gap:6, cursor:'pointer' }}
+          title="Embeds a random 32-bit nonce so compressed bytes are unique per export.">
+          <input type="checkbox" checked={nonce} onChange={e => setNonce((e.target as HTMLInputElement).checked)}
+            style={{ marginTop:2 }} />
+          <div>
+            <div style={{ fontSize:'0.63em' }}>Resalt (nonce)</div>
+            <div style={{ fontSize:'0.58em', color:'#555' }}>Randomises compressed bytes without changing the image.</div>
+          </div>
+        </label>
+
+        {/* ── Step 3: Encrypt (optional) ── */}
+        <Step n={3} title="Encrypt"
+          hint="Optional — AES-256-GCM payload encryption with PBKDF2 key derivation. Any one password in the list can decode the map art. Adds ≈290 B + 76 B per password of overhead per tile; the budget stats on the right account for this automatically." />
+        <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontSize:'0.63em' }}>
+          <input type="checkbox" checked={encryptOn} onChange={e => setEncryptOn((e.target as HTMLInputElement).checked)} />
+          Encrypt output
+        </label>
+        {encryptOn && (
+          <>
+            <div style={{ display:'flex', gap:4, marginTop:6 }}>
+              <input type="text" placeholder="Add password…" value={pwInput}
+                onInput={e => setPwInput((e.target as HTMLInputElement).value)}
+                onKeyDown={e => { if (e.key === 'Enter') addPassword(); }}
+                style={{ ...INPUT, flex:1 }} />
+              <button onClick={addPassword} style={SM_BTN}>Add</button>
+            </div>
+            {passwords.length === 0 && <div style={{ fontSize:'0.58em', color:'#f93', marginTop:2 }}>⚠ No passwords added.</div>}
+            {passwords.map((pw, i) => (
+              <div key={i} style={{ display:'flex', alignItems:'center', gap:4, fontSize:'0.58em', color:'#888', marginTop:2 }}>
+                <span style={{ flex:1 }}>{'•'.repeat(Math.min(pw.length, 12))}</span>
+                <button onClick={() => setPasswords(p => p.filter((_, j) => j !== i))} style={{ ...SM_BTN, color:'#f77' }}>✕</button>
               </div>
-              <div style={{ display:'flex', gap:4, marginTop:4 }}>
-                <input type="text" placeholder="Add password…" value={pwInput}
-                  onInput={e => setPwInput((e.target as HTMLInputElement).value)}
-                  onKeyDown={e => { if (e.key === 'Enter') addPassword(); }}
-                  style={{ ...INPUT, flex:1 }} />
-                <button onClick={addPassword} style={SM_BTN}>Add</button>
-              </div>
-              {passwords.length === 0 && <div style={{ fontSize:'0.58em', color:'#f93', marginTop:2 }}>⚠ No passwords added.</div>}
-              {passwords.map((pw, i) => (
-                <div key={i} style={{ display:'flex', alignItems:'center', gap:4, fontSize:'0.58em', color:'#888', marginTop:2 }}>
-                  <span style={{ flex:1 }}>{'•'.repeat(Math.min(pw.length, 12))}</span>
-                  <button onClick={() => setPasswords(p => p.filter((_, j) => j !== i))} style={{ ...SM_BTN, color:'#f77' }}>✕</button>
-                </div>
-              ))}
-            </>
-          )}
-        </Section>
+            ))}
+          </>
+        )}
 
         <div style={{ flex:1 }} />
+
+        {/* ── Step 4: Export ── */}
+        <Step n={4} title="Export"
+          hint="Copy the State JSON to &lt;game dir&gt;/config/ — the mod loads it automatically. Carpet schematics (.litematic) mark where to place the carpet platform in-game. The ZIP bundles everything with a README." />
 
         {status && (
           <div style={{ fontSize:'0.63em', color: status.startsWith('Error') ? '#f77' : status.includes('✓') ? '#7f7' : '#aaa' }}>
@@ -758,65 +785,12 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         )}
         {!canExport && <div style={{ fontSize:'0.58em', color:'#f55' }}>Fill in Title and Author before exporting.</div>}
 
-        {/* ── Export buttons ── */}
-        <button
-          onClick={() => tryExport('State JSON', handleExport)}
-          disabled={exporting || !canExport}
-          style={{ ...EXPORT_BTN, opacity: canExport ? 1 : 0.5, cursor: canExport && !exporting ? 'pointer' : 'not-allowed' }}>
-          {exporting ? 'Working…' : `⬇ State JSON${encryptOn && passwords.length > 0 ? ' (encrypted)' : ''}${muxAlloc ? ' (mux)' : ''}`}
-        </button>
-
-        <div title={!schematicsAvailable ? 'Carpet platform schematics are only generated for carpet codecs — banner codec places banners automatically via the state JSON, no schematic needed' : 'Exports a 128×128 carpet-block platform schematic for each tile'}>
-          <button
-            onClick={() => tryExport('Schematic', handleSchematicExport)}
-            disabled={exporting || !canExport || !schematicsAvailable}
-            style={{
-              ...EXPORT_BTN, width:'100%',
-              opacity: (canExport && schematicsAvailable) ? 1 : 0.35,
-              cursor: (canExport && schematicsAvailable && !exporting) ? 'pointer' : 'not-allowed',
-            }}>
-            ⬇ Carpet Platform Schematic{comp.gridCols * comp.gridRows > 1 ? 's' : ''}
-            {!schematicsAvailable && <span style={{ fontSize:'0.53em', marginLeft:5, color:'#777' }}>(carpet codecs only)</span>}
-          </button>
-        </div>
-
         <button
           onClick={() => tryExport('Export ZIP', handleZipExport)}
           disabled={exporting || !canExport}
-          style={{ ...EXPORT_BTN, opacity: canExport ? 1 : 0.5, cursor: canExport && !exporting ? 'pointer' : 'not-allowed' }}
-          title="ZIP: state JSON + schematics (if Banner) + PNG preview + README">
-          ⬇ Export all as ZIP
+          style={{ ...EXPORT_BTN, opacity: canExport ? 1 : 0.5, cursor: canExport && !exporting ? 'pointer' : 'not-allowed' }}>
+          {exporting ? 'Working…' : `⬇ Export ZIP${encryptOn && passwords.length > 0 ? ' (encrypted)' : ''}${muxAlloc ? ' (mux)' : ''}`}
         </button>
-
-        {isAnimated ? (
-          <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
-            <button onClick={() => void handleGifExport()} disabled={exporting || !canExport}
-              style={{ ...EXPORT_BTN, opacity: canExport ? 1 : 0.5, cursor: canExport && !exporting ? 'pointer' : 'not-allowed' }}>
-              {exporting ? 'Encoding…' : `⬇ GIF (${maxF} frames)`}
-            </button>
-            <label style={{ display:'flex', alignItems:'center', gap:5, fontSize:'0.58em', color:'#888', cursor:'pointer' }}>
-              <input type="checkbox" checked={gifLoop===1} onChange={e => setGifLoop((e.target as HTMLInputElement).checked ? 1 : 0)} />
-              Play once (no loop)
-            </label>
-          </div>
-        ) : (
-          <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-            <button onClick={() => void handlePngExport()} disabled={exporting || !canExport}
-              style={{ ...EXPORT_BTN, flex:1, opacity: canExport ? 1 : 0.5, cursor: canExport && !exporting ? 'pointer' : 'not-allowed' }}>
-              ⬇ PNG
-            </button>
-            <div style={{ display:'flex', gap:2 }}>
-              {([1,2,4,8] as const).map(s => (
-                <button key={s} onClick={() => setPngScale(s)} style={{
-                  background: pngScale===s ? '#1b3556' : '#252525',
-                  border: `1px solid ${pngScale===s ? '#4a9eff' : '#444'}`,
-                  borderRadius:3, color: pngScale===s ? '#8cf' : '#888',
-                  cursor:'pointer', fontSize:'0.58em', padding:'3px 5px',
-                }}>{s}×</button>
-              ))}
-            </div>
-          </div>
-        )}
 
         <button onClick={onBack} style={{ ...BTN, color:'#888', textAlign:'center' }}>← Back to Editor</button>
       </div>
@@ -923,72 +897,97 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
               </thead>
               <tbody>
                 {tileStats.map(s => {
-                  const bd  = breakdown(s.compressedBytes, codec);
-                  const pct = s.compressedBytes / budget * 100;
-                  const mxRole = muxAlloc?.roles.find(r => r.ti === s.ti);
+                  const effBytes  = s.compressedBytes + encryptOverhead;
+                  const bd        = breakdown(effBytes, codec);
+                  const pct       = effBytes / budget * 100;
+                  const mxRole    = muxAlloc?.roles.find(r => r.ti === s.ti);
+                  const expanded  = expandedTiles.has(s.ti);
+                  const tileLabel = multiTile ? `(${s.tileRow},${s.tileCol})` : 'tile';
                   return (
-                    <tr key={s.ti} style={{ borderBottom:'1px solid #1e1e1e', color: !bd.fits ? '#f93' : '#aaa' }}>
-                      <td style={{ padding:'3px 6px 3px 0' }}>
-                        {multiTile ? `(${s.tileRow},${s.tileCol})` : 'tile'}
-                        {mxRole && mxRole.role !== 'normal' && (
-                          <span style={{ marginLeft:4, fontSize:9,
-                            color: mxRole.role==='receiver' ? '#fa0' : '#5af',
-                            background:'#222', borderRadius:2, padding:'1px 3px' }}>
-                            {mxRole.role}
-                          </span>
-                        )}
-                      </td>
-                      <td style={{ textAlign:'right', padding:'3px 6px' }}>{(s.compressedBytes/1024).toFixed(1)} KB</td>
-                      {codec !== 'BANNER' && (
-                        <td style={{ textAlign:'right', padding:'3px 6px', color:'#5af' }}>
-                          {(bd.carpetBytes/1024).toFixed(1)} KB
+                    <Fragment key={s.ti}>
+                      <tr
+                        onClick={() => setExpandedTiles(prev => {
+                          const n = new Set(prev);
+                          n.has(s.ti) ? n.delete(s.ti) : n.add(s.ti);
+                          return n;
+                        })}
+                        style={{ borderBottom: expanded ? 'none' : '1px solid #1e1e1e',
+                          color: !bd.fits ? '#f93' : '#aaa', cursor:'pointer' }}>
+                        <td style={{ padding:'3px 6px 3px 0', userSelect:'none' }}>
+                          <span style={{ fontSize:'0.75em', marginRight:4, opacity:0.5 }}>{expanded ? '▾' : '▸'}</span>
+                          {tileLabel}
+                          {mxRole && mxRole.role !== 'normal' && (
+                            <span style={{ marginLeft:4, fontSize:9,
+                              color: mxRole.role==='receiver' ? '#fa0' : '#5af',
+                              background:'#222', borderRadius:2, padding:'1px 3px' }}>
+                              {mxRole.role}
+                            </span>
+                          )}
                         </td>
-                      )}
-                      {(codec==='CARPET_SHADE'||codec==='CARPET_BANNERS_SHADE'||codec==='CARPET_SHADE_BANNERS') && (
-                        <td style={{ textAlign:'right', padding:'3px 6px', color:'#a8f' }}>
-                          {bd.shadeBytes > 0 ? `${bd.shadeBytes} B` : '—'}
+                        <td style={{ textAlign:'right', padding:'3px 6px' }}>
+                          {(effBytes/1024).toFixed(1)} KB
+                          {encryptOverhead > 0 && <span style={{ color:'#666', fontSize:'0.85em' }}> 🔒</span>}
                         </td>
-                      )}
-                      {(codec==='CARPET_BANNERS'||codec==='CARPET_BANNERS_SHADE'||codec==='CARPET_SHADE_BANNERS') && (
-                        <td style={{ textAlign:'right', padding:'3px 6px', color:'#fa8' }}>
-                          {bd.overflowBanners > 0 ? bd.overflowBanners : '—'}
-                        </td>
-                      )}
-                      {codec==='BANNER' && (
-                        <td style={{ textAlign:'right', padding:'3px 6px', color:'#fa8' }}>{bd.bannerCount}</td>
-                      )}
-                      <td style={{ textAlign:'right', padding:'3px 6px' }}>{pct.toFixed(0)}%</td>
-                      <td style={{ padding:'3px 0 3px 4px', whiteSpace:'nowrap' }}>
-                        {bd.fits ? '✓' : '✗'}
                         {codec !== 'BANNER' && (
-                          <button
-                            onClick={() => {
-                              setPreview3DTile(preview3DTile?.ti === s.ti ? null : {
-                                ti: s.ti,
-                                compressedData: s.compressedData,
-                                label: multiTile ? `(${s.tileRow},${s.tileCol})` : 'tile',
-                              });
-                              setShow3D(true);
-                            }}
-                            title="Preview this tile's schematic in 3D"
-                            style={{
-                              marginLeft:4, background:'none',
-                              border:`1px solid ${preview3DTile?.ti === s.ti ? '#4a9eff' : '#333'}`,
-                              borderRadius:2,
-                              color: preview3DTile?.ti === s.ti ? '#8cf' : '#555',
-                              cursor:'pointer', fontSize:'0.85em', padding:'0 2px', lineHeight:1.3,
-                            }}
-                          >👁</button>
+                          <td style={{ textAlign:'right', padding:'3px 6px', color:'#5af' }}>
+                            {(bd.carpetBytes/1024).toFixed(1)} KB
+                          </td>
                         )}
-                      </td>
-                    </tr>
+                        {(codec==='CARPET_SHADE'||codec==='CARPET_BANNERS_SHADE'||codec==='CARPET_SHADE_BANNERS') && (
+                          <td style={{ textAlign:'right', padding:'3px 6px', color:'#a8f' }}>
+                            {bd.shadeBytes > 0 ? `${bd.shadeBytes} B` : '—'}
+                          </td>
+                        )}
+                        {(codec==='CARPET_BANNERS'||codec==='CARPET_BANNERS_SHADE'||codec==='CARPET_SHADE_BANNERS') && (
+                          <td style={{ textAlign:'right', padding:'3px 6px', color:'#fa8' }}>
+                            {bd.overflowBanners > 0 ? bd.overflowBanners : '—'}
+                          </td>
+                        )}
+                        {codec==='BANNER' && (
+                          <td style={{ textAlign:'right', padding:'3px 6px', color:'#fa8' }}>{bd.bannerCount}</td>
+                        )}
+                        <td style={{ textAlign:'right', padding:'3px 6px' }}>{pct.toFixed(0)}%</td>
+                        <td style={{ padding:'3px 0 3px 4px', whiteSpace:'nowrap' }}>
+                          {bd.fits ? '✓' : '✗'}
+                          {codec !== 'BANNER' && (
+                            <button
+                              onClick={e => {
+                                e.stopPropagation();
+                                setPreview3DTile(preview3DTile?.ti === s.ti ? null : {
+                                  ti: s.ti,
+                                  compressedData: s.compressedData,
+                                  label: tileLabel,
+                                });
+                                setShow3D(true);
+                              }}
+                              title="Preview this tile's schematic in 3D"
+                              style={{
+                                marginLeft:4, background:'none',
+                                border:`1px solid ${preview3DTile?.ti === s.ti ? '#4a9eff' : '#333'}`,
+                                borderRadius:2,
+                                color: preview3DTile?.ti === s.ti ? '#8cf' : '#555',
+                                cursor:'pointer', fontSize:'0.85em', padding:'0 2px', lineHeight:1.3,
+                              }}
+                            >👁</button>
+                          )}
+                        </td>
+                      </tr>
+                      {expanded && (
+                        <tr style={{ borderBottom:'1px solid #1e1e1e' }}>
+                          <td colSpan={10} style={{ padding:'0 0 6px 18px', background:'#131313' }}>
+                            <ManifestDetail m={s.manifest} />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
                   );
                 })}
               </tbody>
               <tfoot>
                 <tr style={{ color:'#555', borderTop:'1px solid #2a2a2a' }}>
                   <td colSpan={2} style={{ padding:'4px 6px 0 0', fontSize:'0.58em' }}>
-                    Total: {(sizes.reduce((a,b)=>a+b,0)/1024).toFixed(1)} KB
+                    Total: {(effectiveSizes.reduce((a,b)=>a+b,0)/1024).toFixed(1)} KB
+                    {encryptOverhead > 0 && ` (incl. ${(encryptOverhead/1024).toFixed(1)} KB enc. overhead/tile)`}
                   </td>
                   <td colSpan={10} style={{ textAlign:'right', fontSize:'0.58em', padding:'4px 0 0',
                     color: overBudget.length > 0 ? '#f93' : '#3a3' }}>
@@ -1002,7 +1001,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
           )}
 
           {/* ── Mux section ── */}
-          {tileStats && multiTile && muxAlloc && (
+          {tileStats && muxAlloc && (
             <div style={{ background:'#161616', border:'1px solid #2a2a2a', borderRadius:4, padding:'8px 10px' }}>
               <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:6, flexWrap:'wrap' }}>
                 <div style={{ fontSize:'0.63em', color:'#5af', fontWeight:'bold' }}>Mux</div>
@@ -1035,7 +1034,8 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
                     const isBlank     = r.ti >= artLen;
                     const rowCol      = isBlank ? null : { row: Math.floor(r.ti/comp.gridCols), col: r.ti%comp.gridCols };
                     const tileLabel   = isBlank ? `blank ${r.ti - artLen + 1}` : multiTile ? `(${rowCol!.row},${rowCol!.col})` : 'tile';
-                    const previewData = isBlank ? null : tileStats?.[r.ti]?.compressedData ?? null;
+                    const artData = isBlank ? null : tileStats?.[r.ti]?.compressedData ?? null;
+                    const isActive = preview3DTile?.ti === r.ti;
                     return (
                       <tr key={r.ti} style={{ borderBottom:'1px solid #1a1a1a',
                         color: isBlank ? '#5af' : r.role==='receiver' ? '#fa0' : r.role==='donor' ? '#5af' : '#666' }}>
@@ -1058,18 +1058,30 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
                           {codec !== 'BANNER' && (
                             <button
                               onClick={() => {
-                                if (!previewData) return;
-                                setPreview3DTile(preview3DTile?.ti === r.ti ? null : {
-                                  ti: r.ti, compressedData: previewData,
-                                  label: isBlank ? tileLabel : (multiTile ? `(${rowCol!.row},${rowCol!.col})` : 'tile'),
-                                });
                                 setShow3D(true);
+                                if (isActive) { setPreview3DTile(null); return; }
+                                if (artData) {
+                                  // Art tile: show its own payload immediately
+                                  setPreview3DTile({ ti: r.ti, compressedData: artData, label: tileLabel });
+                                } else {
+                                  // Blank donor: run encode+mux (with encryption if active) to get the routed cargo
+                                  setStatus('Computing donor schematic…');
+                                  void encodeAndMux(0, extraDonors, muxAlloc).then(ps => {
+                                    const tile = ps.tiles[r.ti];
+                                    const b64  = tile?.muxCargoB64 ?? tile?.carpetCompressedB64;
+                                    if (b64) {
+                                      setPreview3DTile({ ti: r.ti, compressedData: fromB64(b64), label: tileLabel });
+                                      setStatus(null);
+                                    } else {
+                                      setStatus('No cargo for this donor');
+                                    }
+                                  }).catch(e => setStatus(`Preview error: ${e}`));
+                                }
                               }}
-                              disabled={!previewData}
-                              title={previewData ? 'Preview schematic in 3D' : 'No data (blank donor)'}
-                              style={{ background:'none', border:`1px solid ${preview3DTile?.ti===r.ti?'#4a9eff':'#333'}`,
-                                borderRadius:2, color:preview3DTile?.ti===r.ti?'#8cf':previewData?'#555':'#2a2a2a',
-                                cursor:previewData?'pointer':'default', fontSize:'0.85em', padding:'0 2px', lineHeight:1.3 }}>
+                              title="Preview schematic in 3D"
+                              style={{ background:'none', border:`1px solid ${isActive?'#4a9eff':'#333'}`,
+                                borderRadius:2, color:isActive?'#8cf':'#555',
+                                cursor:'pointer', fontSize:'0.85em', padding:'0 2px', lineHeight:1.3 }}>
                               👁
                             </button>
                           )}
@@ -1112,11 +1124,21 @@ function Bar({ value, total, color = '#4a9eff' }: { value: number; total: number
 
 // ─── Small helpers ────────────────────────────────────────────────────────────
 
-function Section({ label, children }: { label: string; children: preact.ComponentChildren }) {
+function Step({ n, title, hint }: { n: number; title: string; hint: string }) {
   return (
-    <div>
-      <div style={{ fontSize:'0.58em', color:'#666', marginBottom:5 }}>{label}</div>
-      {children}
+    <div style={{ marginTop: n === 1 ? 4 : 18, marginBottom: 7 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{
+          display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+          width: 20, height: 20, borderRadius: '50%',
+          background: '#0d2040', border: '1px solid #1a4880',
+          color: '#5af', fontSize: '0.52em', fontWeight: 'bold', flexShrink: 0,
+        }}>{n}</span>
+        <span style={{ color: '#8cf', fontSize: '0.63em', fontWeight: 'bold' }}>{title}</span>
+      </div>
+      <div style={{ fontSize: '0.51em', color: '#4d6070', lineHeight: 1.55, marginTop: 4, paddingLeft: 28 }}>
+        {hint}
+      </div>
     </div>
   );
 }
@@ -1130,6 +1152,58 @@ function FieldRow({ label, error, children }: { label: string; error?: string; c
       </div>
       {children}
     </label>
+  );
+}
+
+// ─── Manifest detail panel ────────────────────────────────────────────────────
+
+function hex8(n: number)  { return '0x' + n.toString(16).padStart(2, '0').toUpperCase(); }
+function hex32(n: number) { return '0x' + (n >>> 0).toString(16).padStart(8, '0').toUpperCase(); }
+
+function flagNames(flags: number): string {
+  const parts: string[] = [];
+  if (flags & FLAG_ALL_SHADES)    parts.push('ALL_SHADES');
+  if (flags & FLAG_ANIMATED)      parts.push('ANIMATED');
+  if (flags & FLAG_MUX)           parts.push('MUX');
+  if (flags & FLAG_DELTA_FRAMES)  parts.push('DELTA_FRAMES');
+  if (flags & FLAG_SPARSE_FRAMES) parts.push('SPARSE_FRAMES');
+  return parts.length ? parts.join(' | ') : '—';
+}
+
+function ManifestDetail({ m }: { m: TileManifest }) {
+  const KV_STYLE: h.JSX.CSSProperties = {
+    fontFamily: 'monospace', fontSize: '0.90em', lineHeight: 1.9,
+    display: 'grid', gridTemplateColumns: 'max-content 1fr',
+    columnGap: 12, rowGap: 0,
+  };
+  const K: h.JSX.CSSProperties = { color: '#4a6070', userSelect: 'none' };
+  const V: h.JSX.CSSProperties = { color: '#8ab' };
+  const rows: [string, string][] = [
+    ['version',    String(m.version)],
+    ['headerSize', `${m.headerBytes} B`],
+    ['flags',      `${hex8(m.flags)}  (${flagNames(m.flags)})`],
+    ['colorCrc32', hex32(m.colorCrc32)],
+    ['author',     m.username ? `"${m.username}"` : 'null'],
+    ['title',      m.title    ? `"${m.title}"`    : 'null'],
+    ['nonce',      hex32(m.nonce)],
+  ];
+  if (m.frameCount > 1) {
+    rows.push(['frameCount',  String(m.frameCount)]);
+    rows.push(['loopCount',   String(m.loopCount)]);
+    const uniq = [...new Set(m.frameDelays)];
+    rows.push(['frameDelays', uniq.length === 1
+      ? `${uniq[0]} ms (all frames)`
+      : `[${m.frameDelays.join(', ')}] ms`]);
+  }
+  return (
+    <div style={{ ...KV_STYLE, padding: '6px 0 2px' }}>
+      {rows.map(([k, v]) => (
+        <Fragment key={k}>
+          <span style={K}>{k}</span>
+          <span style={V}>{v}</span>
+        </Fragment>
+      ))}
+    </div>
   );
 }
 

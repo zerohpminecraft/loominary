@@ -18,10 +18,10 @@ import type { CompositionState } from './payload-state.js';
 import type { RequantizeParams } from './quantize.js';
 import { type PreprocessParams, DEFAULT_PREPROCESS } from './preprocess.js';
 import {
-  saveSession, loadSession, clearSession,
+  saveNewSession, updateSession, loadMostRecentSession, loadSessionById,
   sessionToComposition, savedAgoLabel,
+  type SourceImage,
 } from './persistence.js';
-import { decodeGifFrames } from './gif-decode.js';
 
 // ─── Step type ────────────────────────────────────────────────────────────────
 
@@ -163,12 +163,49 @@ export function App() {
   const latestCompRef = useRef<CompositionState | null>(null);
 
   // ── Session persistence ───────────────────────────────────────────────────
-  const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
+  const [restoreNotice,   setRestoreNotice]   = useState<string | null>(null);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const activeSessionIdRef  = useRef<string | null>(null);
+  const sourceImageRef      = useRef<SourceImage | null>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // On mount: try to restore a saved session.
+  // ── Restore source image from a stored session ────────────────────────────
+  // Reconstructs sourceBitmap (and sourceFrames for animated GIFs) from the
+  // stored file bytes so the user doesn't need to re-link after a reload.
+  async function restoreSourceImage(
+    buffer: ArrayBuffer | null,
+    mime:   string | null,
+  ) {
+    // Always clear both immediately — previous session's bitmap/frames must
+    // never bleed into the session being restored.
+    setSourceBitmap(null);
+    setSourceFrames(null);
+    sourceImageRef.current = null;
+
+    if (!buffer || !mime) return;
+    try {
+      const blob = new Blob([buffer], { type: mime });
+      const bmp  = await createImageBitmap(blob);
+      setSourceBitmap(bmp);
+      sourceImageRef.current = { buffer, mime };
+      if (mime === 'image/gif') {
+        const file = new File([blob], 'source.gif', { type: mime });
+        const { decodeGifFrames } = await import('./gif-decode.js');
+        const frames = await decodeGifFrames(file);
+        if (frames.length > 1) setSourceFrames(frames.map(f => f.bitmap));
+      }
+      // Non-GIF: sourceFrames stays null (cleared above) — correct.
+    } catch { /* corrupt bytes — ignore */ }
+  }
+
+  // On mount: auto-restore the most recent session unless the user explicitly
+  // navigated back to Import last time (flagged via sessionStorage).
   useEffect(() => {
-    loadSession().then(s => {
+    if (sessionStorage.getItem('loominary_fresh') === '1') {
+      sessionStorage.removeItem('loominary_fresh');
+      return;
+    }
+    loadMostRecentSession().then(s => {
       if (!s) return;
       try {
         const comp = sessionToComposition(s);
@@ -176,12 +213,13 @@ export function App() {
         setImportCropMode(s.cropMode);
         setImportPre(s.pre);
         if (s.reqParams) setImportReqParams(s.reqParams);
-        latestCompRef.current = comp;
+        latestCompRef.current      = comp;
+        activeSessionIdRef.current = s.id;
+        setActiveSessionId(s.id);
         setStep('edit');
         setRestoreNotice('Session restored — saved ' + savedAgoLabel(s.savedAt));
-      } catch {
-        // Corrupt session; ignore.
-      }
+        void restoreSourceImage(s.sourceImageBuffer ?? null, s.sourceImageMime ?? null);
+      } catch { /* corrupt session */ }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -190,12 +228,13 @@ export function App() {
   function scheduleSave(
     comp: CompositionState,
     crop: 'scale' | 'center',
-    pre: PreprocessParams,
-    req: RequantizeParams | null,
+    pre:  PreprocessParams,
+    req:  RequantizeParams | null,
   ) {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
-      void saveSession(comp, crop, pre, req);
+      const id = activeSessionIdRef.current;
+      if (id) void updateSession(id, comp, crop, pre, req);
     }, 3000);
   }
 
@@ -214,6 +253,9 @@ export function App() {
         try {
           const bmp = await createImageBitmap(file);
           setSourceBitmap(bmp);
+          // Store the newly linked file so future auto-saves include it.
+          const buffer = await file.arrayBuffer();
+          sourceImageRef.current = { buffer, mime: file.type || 'image/png' };
         } catch { /* ignore invalid file */ }
         (e.target as HTMLInputElement).value = '';
       });
@@ -231,7 +273,15 @@ export function App() {
     cropMode:     'scale' | 'center',
     pre:          PreprocessParams,
     gifFrames?:   ImageBitmap[] | null,
+    sourceFile?:  File | null,
   ) {
+    // Null out the active session ID immediately so scheduleSave skips any
+    // auto-save fired between now and when saveNewSession resolves.  Without
+    // this, the Editor's initialComp effect fires onCompChange on mount and
+    // the 3-second timer writes the new composition into the OLD session.
+    activeSessionIdRef.current = null;
+    setActiveSessionId(null);
+
     setComposition(comp);
     setSourceBitmap(bitmap);
     setImportReqParams(reqParams);
@@ -241,7 +291,68 @@ export function App() {
     latestCompRef.current = comp;
     setStep('edit');
     setRestoreNotice(null);
-    void saveSession(comp, cropMode, pre, reqParams);
+    sessionStorage.removeItem('loominary_fresh');
+    // Read the source file bytes for persistence (async, but saveNewSession
+    // awaits it internally so the session is written with the image).
+    void (async () => {
+      let img: SourceImage | null = null;
+      if (sourceFile) {
+        try {
+          const buffer = await sourceFile.arrayBuffer();
+          img = { buffer, mime: sourceFile.type || 'image/png' };
+        } catch { /* ignore */ }
+      }
+      sourceImageRef.current = img;
+      const id = await saveNewSession(comp, cropMode, pre, reqParams, img);
+      activeSessionIdRef.current = id;
+      setActiveSessionId(id);
+    });
+  }
+
+  // ── Proceed from state JSON import (no source bitmap) ────────────────────
+  function handleProceedFromState(comp: CompositionState) {
+    activeSessionIdRef.current = null;
+    setActiveSessionId(null);
+
+    setComposition(comp);
+    setSourceBitmap(null);
+    setSourceFrames(null);
+    setImportReqParams(null);
+    sourceImageRef.current = null;
+    latestCompRef.current  = comp;
+    setStep('edit');
+    setRestoreNotice(null);
+    sessionStorage.removeItem('loominary_fresh');
+    void saveNewSession(comp, importCropMode, importPre, null, null).then(id => {
+      activeSessionIdRef.current = id;
+      setActiveSessionId(id);
+    });
+  }
+
+  // ── Load a session from history ───────────────────────────────────────────
+  async function handleLoadSession(id: string) {
+    // Clear source state immediately — don't show the previous session's image
+    // while the IDB read is in flight.
+    setSourceBitmap(null);
+    setSourceFrames(null);
+    sourceImageRef.current = null;
+
+    const s = await loadSessionById(id);
+    if (!s) return;
+    try {
+      const comp = sessionToComposition(s);
+      setComposition(comp);
+      setImportCropMode(s.cropMode);
+      setImportPre(s.pre);
+      if (s.reqParams) setImportReqParams(s.reqParams);
+      latestCompRef.current      = comp;
+      activeSessionIdRef.current = id;
+      setActiveSessionId(id);
+      setStep('edit');
+      setRestoreNotice('Session restored — saved ' + savedAgoLabel(s.savedAt));
+      sessionStorage.removeItem('loominary_fresh');
+      void restoreSourceImage(s.sourceImageBuffer ?? null, s.sourceImageMime ?? null);
+    } catch { /* corrupt session */ }
   }
 
   // ── Step navigation ────────────────────────────────────────────────────────
@@ -250,8 +361,8 @@ export function App() {
       setComposition(latestCompRef.current);
     }
     if (s === 'import') {
-      // User is explicitly going back to start fresh — clear saved session.
-      void clearSession();
+      // Flag so the next page load doesn't auto-restore into Edit.
+      sessionStorage.setItem('loominary_fresh', '1');
       setRestoreNotice(null);
     }
     setStep(s);
@@ -316,7 +427,12 @@ export function App() {
       {/* Page content */}
       <div style={{ flex: 1, overflow: 'hidden' }}>
         {step === 'import' && (
-          <ImportPage onProceed={handleImportProceed} uiFontSize={uiFontSize} />
+          <ImportPage
+            onProceed={handleImportProceed}
+            onProceedFromState={handleProceedFromState}
+            onLoadSession={handleLoadSession}
+            uiFontSize={uiFontSize}
+          />
         )}
 
         {step === 'edit' && composition && (

@@ -132,8 +132,9 @@ out float vLight;
 
 void main() {
   gl_Position = uVP * vec4(aXYZ.x + aPos.x, aXYZ.y + aPos.y, aXYZ.z + aPos.z, 1.0);
-  vec3 L = normalize(vec3(0.6, 2.0, 0.8));
-  vLight = max(dot(normalize(aNor), L), 0.0) * 0.65 + 0.35;
+  // Hemisphere lighting: top faces = 1.0, side faces ≈ 0.87, bottom = 0.74.
+  float hemi = dot(normalize(aNor), vec3(0.0, 1.0, 0.0)) * 0.5 + 0.5;
+  vLight = hemi * 0.26 + 0.74;
   vColor = aRGB;
 }`;
 
@@ -142,7 +143,7 @@ precision mediump float;
 in vec3 vColor;
 in float vLight;
 out vec4 fragColor;
-void main() { fragColor = vec4(vColor * vLight, 1.0); }`;
+void main() { fragColor = vec4(vColor * min(vLight, 1.0), 1.0); }`;
 
 // ─── WebGL helpers ────────────────────────────────────────────────────────────
 

@@ -1451,6 +1451,7 @@ export function Editor({
         tool.onPointerEvent?.(gx, gy, button, buttons, ctx);
         setComp({ ...compRef.current });
         setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+        onCompChangeRef.current?.(compRef.current);
 
         // Rebuild heatmap after paint operations
         if (heatmapOnRef.current && canvasRef.current) {
@@ -1459,6 +1460,7 @@ export function Editor({
       },
       onPointerUp: () => {
         TOOL_MAP.get(activeToolIdRef.current)?.onPointerUp?.(getCtx());
+        onCompChangeRef.current?.(compRef.current);
       },
       onPointerHover: (gx, gy) => {
         setCursorGx(gx); setCursorGy(gy);

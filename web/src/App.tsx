@@ -318,7 +318,7 @@ export function App() {
       activeSessionIdRef.current  = id;
       sourceImageSavedRef.current = img !== null;
       setActiveSessionId(id);
-    });
+    })();
   }
 
   // ── Proceed from state JSON import (no source bitmap) ────────────────────

@@ -217,11 +217,30 @@ How to install in-game (carpet codecs)
 For multi-tile grids, repeat steps 2-5 for each .litematic file.
 Files are named  loominary_carpet_r<row>_c<col>.litematic.
 
-Banner codec note
------------------
-If you exported with the banner codec, there are no .litematic files.
-Banners are placed automatically by the mod from the state JSON — no schematic needed.
-Simply copy loominary_state.json and approach the blank banners in-game.
+Banner codec (no carpet platform needed)
+----------------------------------------
+If you exported with the banner codec there are no .litematic files.
+The full workflow:
+
+1. Copy loominary_state.json to your config directory (see path above).
+
+2. In-game, open an anvil with unnamed banners and empty bundles in your
+   inventory.  The mod reads ACTIVE_CHUNKS from the state JSON and renames
+   one banner per tick automatically.  You need 1 XP level per banner and
+   up to 63 banners per map tile.
+
+3. Place the renamed banners in the world near where your map will hang.
+
+4. Hold the target map and right-click each banner (or run
+   /loominary click to automate this).  The server records each banner's
+   name as a decoration on the map — this is the only server interaction.
+
+5. Place the map in an item frame.  Any player running Loominary within
+   32 blocks will see your image rendered client-side.  The banner pins
+   are suppressed automatically so they don't clutter the image.
+
+For multi-tile grids, use /loominary tile next to step through tiles
+and repeat from step 2 for each one.
 
 More info: https://github.com/ZeroHPMinecraft/loominary
 `;

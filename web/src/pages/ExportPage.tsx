@@ -229,15 +229,19 @@ The full workflow:
    one banner per tick automatically.  You need 1 XP level per banner and
    up to 63 banners per map tile.
 
-3. Place the renamed banners in the world near where your map will hang.
+3. Place the renamed banners anywhere inside the 128x128 overworld area
+   that the map represents (the map's grid tile).  They do not need to
+   stay near the item frame — once the decorations are registered the
+   map can hang anywhere.
 
 4. Hold the target map and right-click each banner (or run
    /loominary click to automate this).  The server records each banner's
    name as a decoration on the map — this is the only server interaction.
 
-5. Place the map in an item frame.  Any player running Loominary within
-   32 blocks will see your image rendered client-side.  The banner pins
-   are suppressed automatically so they don't clutter the image.
+5. Lock the map in a cartography table, then place it in an item frame
+   wherever you like.  Any player running Loominary within 32 blocks
+   will see your image rendered client-side.  The banner pins are
+   suppressed automatically so they don't clutter the image.
 
 For multi-tile grids, use /loominary tile next to step through tiles
 and repeat from step 2 for each one.

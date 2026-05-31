@@ -76,7 +76,7 @@ The full encode → place → decode cycle:
 
 1. **Import**: the image is quantized to the map palette, a manifest header is prepended (title, author, grid position, CRC32), and the combined bytes are zstd-compressed. The compressed payload is CJK-encoded using a 14-bit alphabet — each banner holds a 2-char hex index followed by 48 CJK characters (84 bytes of payload). The resulting chunk strings are stored in the batch state as `ACTIVE_CHUNKS`. Up to 63 banners fit per tile: **5,290 bytes** of capacity.
 
-2. **Place**: open an anvil with unnamed banners in your inventory. The mod renames one banner per tick from `ACTIVE_CHUNKS` using the anvil, and packs renamed banners into bundles automatically. Place the renamed banners in the world near your map.
+2. **Place**: open an anvil with unnamed banners in your inventory. The mod renames one banner per tick from `ACTIVE_CHUNKS` using the anvil, and packs renamed banners into bundles automatically. Place the renamed banners anywhere inside the 128×128 overworld area the map represents.
 
 3. **Register**: hold the target map and right-click each banner, or run `/loominary click` to automate it. The server records each banner's custom name as a `MapDecoration` in the map's NBT — this is the only server interaction.
 

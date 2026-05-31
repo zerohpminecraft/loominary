@@ -36,7 +36,7 @@ This works on **any vanilla server**. The primary encoding mode uses carpet bloc
 - **Persistent state** survives game restarts; pick up any unfinished batch
 - **Configurable hotkeys** for the most-used actions
 - **Crosshair-targeted commands** — preview, revert, edit, and steal use whatever framed map you're looking at
-- **Legacy banner-only mode**: add `banners` to any import command for servers where carpet placement isn't feasible
+- **Banner-only mode**: add `banners` to any import command for servers where carpet placement isn't feasible — 63 CJK-encoded banners, no schematic required
 
 ## Requirements
 
@@ -68,11 +68,19 @@ You'll see `[Loominary] Client-side mod initialized successfully!` in the log.
 9. Hold the map you want to encode onto. Run `/loominary click`, then walk near your placed banners — the mod right-clicks each one automatically. Or right-click them manually.
 10. Place the map in an item frame. Anyone with Loominary installed and within 32 blocks will see your image.
 
-**Legacy: banner-only mode** — add `banners` to use the original encoding on any server where carpet placement isn't an option:
+**Banner-only mode** — use this on servers where placing carpet blocks isn't possible:
 ```
 /loominary import <filename> banners
 ```
-This uses up to 63 named CJK-encoded banners and 5,292 bytes of capacity.
+The full encode → place → decode cycle:
+
+1. **Import**: the image is quantized to the map palette, a manifest header is prepended (title, author, grid position, CRC32), and the combined bytes are zstd-compressed. The compressed payload is CJK-encoded using a 14-bit alphabet — each banner holds a 2-char hex index followed by 48 CJK characters (84 bytes of payload). The resulting chunk strings are stored in the batch state as `ACTIVE_CHUNKS`. Up to 63 banners fit per tile: **5,290 bytes** of capacity.
+
+2. **Place**: open an anvil with unnamed banners in your inventory. The mod renames one banner per tick from `ACTIVE_CHUNKS` using the anvil, and packs renamed banners into bundles automatically. Place the renamed banners in the world near your map.
+
+3. **Register**: hold the target map and right-click each banner, or run `/loominary click` to automate it. The server records each banner's custom name as a `MapDecoration` in the map's NBT — this is the only server interaction.
+
+4. **Decode**: any player running Loominary within 32 blocks sees the image automatically. The decoder scans nearby item frames every second, collects all hex-indexed decorations from each map, sorts them by index, CJK-decodes and decompresses the payload, and writes the result directly into the client's `MapState.colors` buffer. The banner pins are cleared client-side so they don't obscure the image.
 
 ### Encoding an animated GIF
 
@@ -127,7 +135,7 @@ All functionality is under a single `/loominary` command. Type `/loominary` and 
 ### Importing payloads
 
 - `/loominary import <filename>` — Import an image from `loominary_data/` using carpet encoding (default). State is auto-saved to `loominary_saves/` on import.
-- `/loominary import <filename> banners` — Import using legacy banner-only encoding.
+- `/loominary import <filename> banners` — Import using banner-only encoding (no carpet platform required).
 - `/loominary import <filename> [cols rows] [allshades] [dither] [linked]` — Import with grid and/or options. Add `linked` for shared-dictionary multi-tile animated GIFs (FLAG_LINKED).
 - `/loominary import steal` — Append the framed map at your crosshair as a new carpet tile.
 - `/loominary import steal banners` — Same, using legacy banner encoding.
@@ -258,6 +266,8 @@ Loominary exploits a chain of Minecraft mechanics that aren't normally connected
 
 **The client renders maps from a `byte[16384]` color array.** Loominary intercepts maps whose banner markers include an LC/LS decoration, reads the carpet nibbles and shade bytes from the map's existing color array, reassembles any overflow chunks in order, CJK-decodes and zstd-decompresses the combined payload, and overwrites the client's local color array. The server is unaware.
 
+**Banner-only mode skips the carpet entirely.** When carpet placement isn't possible, Loominary encodes the full payload into named banners alone. The image is quantized, a manifest is prepended, and the result is zstd-compressed exactly as in carpet mode. The compressed bytes are then CJK-encoded and split into up to 63 indexed chunks (same 2-char hex index + 48 CJK chars format), stored as `ACTIVE_CHUNKS` in the batch state. The anvil handler works through that list one banner per tick, renaming blanks via `RenameItemC2SPacket`. The player right-clicks each placed banner with their map — or uses `/loominary click` for automation — and the server records the names as `MapDecoration` entries. The decoder finds those hex-indexed decorations, sorts them, reassembles and decompresses the payload, and writes it to the color buffer identically to the carpet path. No carpet, no schematic — only banners and the map.
+
 **The encoding works in map-color space.** The image is quantized to Minecraft's map palette using Oklab perceptual distance, then the resulting `byte[16384]` is compressed. Spatial coherence in the quantized output makes zstd very effective — most images compress to 1,500–6,000 bytes.
 
 **Animated payloads concatenate frames.** For GIFs, all frames are stored back-to-back in the payload after the manifest header. Zstd exploits inter-frame repetition naturally. The decoder advances frames on a wall-clock timer, culls by distance, and syncs multi-tile murals so the full grid never shows mixed frames.
@@ -291,7 +301,7 @@ Minecraft's map palette has ~62 base colors with up to 4 brightness shades. Phot
 
 ### I keep getting "OVER BUDGET."
 
-Use `/loominary reduce` to merge the rarest colors into their nearest neighbors. You can also target a specific ceiling: `/loominary reduce 50`. Undo with `/loominary reduce undo`. Carpet mode has ~15,414 bytes of capacity; banner-only mode (legacy) has ~5,292 bytes at the 63-banner limit.
+Use `/loominary reduce` to merge the rarest colors into their nearest neighbors. You can also target a specific ceiling: `/loominary reduce 50`. Undo with `/loominary reduce undo`. Carpet mode has ~15,414 bytes of capacity; banner-only mode has ~5,290 bytes at the 63-banner limit.
 
 ### What is the "legal palette" vs "all shades"?
 
@@ -311,7 +321,7 @@ The manifest banner is the decoder trigger — without it, Loominary has no way 
 
 ### Why 63 banners?
 
-The hard limit of 63 banners per map was observed on 2b2t. Vanilla servers nominally allow 255, but the mod targets the more restrictive limit by default. Each overflow banner now carries 84 bytes (CJK encoding), so 63 banners at 84 bytes each = 5,292 bytes — 2.33× the 2,268 bytes that base64 delivered at the same banner count.
+The hard limit of 63 banners per map was observed on 2b2t. Vanilla servers nominally allow 255, but the mod targets the more restrictive limit by default. Each banner carries 84 bytes of payload (48 CJK characters × 14 bits each), so 63 banners yield 5,292 gross bytes minus the codec's 2-byte length header = **5,290 bytes** net — 2.33× what base64 delivered at the same banner count.
 
 ### What happens if I run out of XP, banners, or bundles mid-batch?
 

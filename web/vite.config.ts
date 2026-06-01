@@ -1,7 +1,10 @@
 import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // Project GitHub Pages serves under https://<user>.github.io/<repo>/, so built
+  // asset URLs must be prefixed with /loominary/. The dev server stays at / .
+  base: command === 'build' ? '/loominary/' : '/',
   plugins: [preact()],
   worker: {
     format: 'es',  // ESM workers support dynamic imports (needed by compress-worker)
@@ -15,4 +18,4 @@ export default defineConfig({
   optimizeDeps: {
     include: ['zstd-codec'],
   },
-});
+}));

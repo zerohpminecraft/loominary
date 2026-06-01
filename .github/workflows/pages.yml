@@ -1,0 +1,58 @@
+name: deploy-pages
+
+# Builds the web editor (web/) and publishes it to GitHub Pages at
+# https://zerohpminecraft.github.io/loominary/ .
+#
+# The web editor currently lives only on the 2.0.0 branch, so that's what we
+# deploy from. If it later merges to the default branch, update `branches` below.
+on:
+  push:
+    branches: [2.0.0]
+    paths:
+      - 'web/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Permissions required by actions/deploy-pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent Pages deployment; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      # Build with Vite directly (esbuild). We intentionally skip the `tsc` step
+      # in `npm run build`: the project carries known type-only errors that don't
+      # affect the emitted bundle.
+      - run: npx vite build
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

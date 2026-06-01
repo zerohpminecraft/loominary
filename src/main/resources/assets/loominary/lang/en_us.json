@@ -6,5 +6,6 @@
     "key.loominary.tile_next": "Switch to next incomplete tile",
     "key.loominary.status": "Show batch status",
     "key.loominary.edit": "Open map editor",
-    "key.loominary.decode_toggle": "Toggle Loominary decoding (raw/decoded)"
+    "key.loominary.decode_toggle": "Toggle Loominary decoding (raw/decoded)",
+    "key.loominary.carpet_balance": "Balance carpets to Litematica materials"
 }

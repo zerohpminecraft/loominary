@@ -4,6 +4,20 @@
 
 ---
 
+## v1.21.0
+
+### Feat: `/loominary carpets balance` — lay out carpets to match a Litematica material list
+
+A new command (and bindable hotkey) that reads the open Litematica schematic's material list and rearranges your inventory carpets into a canonical placing layout, so you can run through an assorted pile and end up with the right amount of every color.
+
+- **Layout** — the two highest-count colors (by material count, usually white + one other) each get **3 stacks (192)**; every other carpet color in the list gets **2 stacks (128)**. Anything over those targets, and any carpet color not in the list, is dropped on the ground. Stacks need not be full.
+- **Slot reservation** — every allotted slot is seeded with at least one carpet (e.g. 7 brown across 2 slots becomes `[6, 1]`, a full stack across 2 slots becomes `[63, 1]`), so each slot is claimed by its color and a later pickup run fills them without other colors intruding.
+- **Scan-then-plan** — the inventory is scanned once and goal slots are assigned around what's already there: slots holding non-carpet items (firework rockets, food) are never used, so those items are never moved or dropped, and each color prefers the slots it already occupies to minimize shuffling.
+- **Soft dependency** — the Litematica material list is read by reflection (`DataManager.getMaterialList()`), so the mod still loads cleanly when Litematica isn't installed; the command then reports a friendly error.
+- **Hotkey** — bind *Balance carpets to Litematica materials* under Controls → Loominary (unbound by default). Runs against the open survival inventory; the command/hotkey opens it for you.
+
+---
+
 ## v1.20.0
 
 ### Fix: mux now works for BANNER codec; donor count correctly estimates overhead

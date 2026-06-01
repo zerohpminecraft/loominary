@@ -28,6 +28,7 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.zerohpminecraft.AnvilAutoFillHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
+import net.zerohpminecraft.CarpetBalanceHandler;
 import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CodecMode;
 import net.zerohpminecraft.MapBannerDecoder;
@@ -1721,6 +1722,11 @@ public class LoominaryCommand {
                                     .executes(ctx -> clickToggle(ctx.getSource()))
                                     .then(ClientCommandManager.literal("stop")
                                             .executes(ctx -> clickStop(ctx.getSource()))))
+
+                            // ── carpets ────────────────────────────────────────
+                            .then(ClientCommandManager.literal("carpets")
+                                    .then(ClientCommandManager.literal("balance")
+                                            .executes(ctx -> carpetBalance(ctx.getSource()))))
 
                             // ── whitelist ──────────────────────────────────────
                             .then(ClientCommandManager.literal("whitelist")
@@ -4643,6 +4649,12 @@ public class LoominaryCommand {
         }
         BannerAutoClickHandler.stop();
         source.sendFeedback(Text.literal("§aAuto-click stopped."));
+        return 1;
+    }
+
+    private static int carpetBalance(FabricClientCommandSource source) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        CarpetBalanceHandler.activate(client);
         return 1;
     }
 

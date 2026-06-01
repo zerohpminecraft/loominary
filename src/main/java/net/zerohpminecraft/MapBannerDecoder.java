@@ -73,6 +73,8 @@ public class MapBannerDecoder {
     private static final int PAINT_LOG_LIMIT = 3;
     /** Map IDs we've already logged a first-unlock for. */
     private static final Set<Integer> unlockLogged = new HashSet<>();
+    /** Map IDs whose LOOM header we've already logged (once per session). */
+    private static final Set<Integer> loomHeaderSeen = new HashSet<>();
 
     public static boolean decodingEnabled = true;
 
@@ -311,7 +313,13 @@ public class MapBannerDecoder {
             return;
         }
 
-        if (decorations.isEmpty())
+        // A LOOM carpet tile carries its data in the carpet channel, not in
+        // decorations, so it can legitimately have *no* decorations — e.g. a
+        // pure-CARPET tile, or a blank mux donor whose only job is to carry
+        // guest payload. Such tiles must still be processed; skipping them here
+        // is why muxed walls failed to decode until a donor was replaced (which
+        // happened to re-trigger a scan once its colours had synced).
+        if (decorations.isEmpty() && !CarpetChannel.peekLoomMagic(mapState.colors))
             return;
 
         // 1. LR banner — legacy carpet mux receiver.
@@ -645,6 +653,9 @@ public class MapBannerDecoder {
     private static void processLoomCarpetFrame(MinecraftClient client,
             MapIdComponent mapId, MapState mapState,
             Map<String, MapDecoration> decorations, ItemFrameEntity frame) {
+        // Hoist header outside the try-catch so the catch block can tailor its message
+        // based on what kind of tile this is (mux receiver vs. standalone/donor).
+        CarpetChannel.LoomHeader header = null;
         try {
             // Two-pass read: first decode just the fixed LOOM header (16 bytes = 32 nibbles)
             // to learn the actual cargo size, then decode only as many bytes as the header
@@ -660,7 +671,20 @@ public class MapBannerDecoder {
             byte[] headerBytes = guestCount > 0
                     ? CarpetChannel.decodeBytes(mapState.colors, fullHeaderSize)
                     : fixedHeader;
-            CarpetChannel.LoomHeader header = CarpetChannel.decodeLoomHeader(headerBytes);
+            header = CarpetChannel.decodeLoomHeader(headerBytes);
+
+            if (loomHeaderSeen.add(mapId.id())) {
+                System.out.println(TAG + " LOOM header map " + mapId.id()
+                        + " flags=0x" + Integer.toHexString(header.flags)
+                        + (header.isMuxRx()    ? " [MUX_RX]"    : "")
+                        + (header.isMuxDonor() ? " [MUX_DONOR]" : "")
+                        + (header.hasShade()   ? " [SHADE]"      : "")
+                        + (header.hasBanners() ? " [BANNERS]"    : "")
+                        + " col=" + header.col + " row=" + header.row
+                        + " ownBytes=" + header.ownBytes
+                        + " totalBytes=" + header.totalBytes
+                        + " guestCount=" + header.guestCount);
+            }
 
             // Total cargo size = dataOffset (header+descriptors) + ownBytes + guest bytes.
             int guestTotal = 0;
@@ -749,20 +773,36 @@ public class MapBannerDecoder {
                 claimedMaps.add(mapId.id());
                 decorations.clear();
                 checkMuxCompletion(key, client);
+                // If completion didn't fire, the receiver is waiting for donor tiles.
+                MuxBuffer afterCheck = muxBuffers.get(key);
+                if (afterCheck != null && afterCheck.received < afterCheck.data.length) {
+                    System.out.println(TAG + " Mux receiver (" + col + "," + row + ") map "
+                            + mapId.id() + " awaiting donor tiles — received "
+                            + afterCheck.received + " / " + afterCheck.data.length + " bytes.");
+                }
 
             } else {
                 // Non-receiver: decode own zstd frame at cargo[dataOffset..dataOffset+ownBytes).
-                byte[] compressed = Arrays.copyOfRange(cargo, header.dataOffset,
-                        header.dataOffset + header.ownBytes);
-                if (MapEncryption.isEncrypted(compressed)) {
-                    submitDecryptAndProcess(client, mapId, mapState, frame, compressed, decorations);
-                    return;
+                // ownBytes may legitimately be 0 for blank donor tiles whose only job is to
+                // carry guest payload — in that case skip decompression entirely.
+                if (header.ownBytes > 0) {
+                    byte[] compressed = Arrays.copyOfRange(cargo, header.dataOffset,
+                            header.dataOffset + header.ownBytes);
+                    if (MapEncryption.isEncrypted(compressed)) {
+                        submitDecryptAndProcess(client, mapId, mapState, frame, compressed, decorations);
+                        return;
+                    }
+                    long frameSize = Zstd.getFrameContentSize(compressed);
+                    if (frameSize < 0)
+                        throw new IllegalStateException("Invalid zstd frame in LOOM tile (map " + mapId.id() + ")");
+                    byte[] full = Zstd.decompress(compressed, (int) frameSize);
+                    processDecompressedPayload(client, mapId, mapState, frame, full);
+                } else {
+                    // Blank donor: it carries no image of its own, only guest payload.
+                    // Render it as fully transparent (map colour id 0) so the wall shows
+                    // a clean hole instead of the raw carpet-encoding noise.
+                    paintMap(client, mapId, mapState, new byte[MAP_BYTES]);
                 }
-                long frameSize = Zstd.getFrameContentSize(compressed);
-                if (frameSize < 0)
-                    throw new IllegalStateException("Invalid zstd frame in LOOM tile (map " + mapId.id() + ")");
-                byte[] full = Zstd.decompress(compressed, (int) frameSize);
-                processDecompressedPayload(client, mapId, mapState, frame, full);
 
                 // Route LOOM guest descriptors (CARPET_ONLY mux donor).
                 if (header.isMuxDonor() && header.guestCount > 0) {
@@ -812,9 +852,19 @@ public class MapBannerDecoder {
             }
 
         } catch (Exception e) {
-            System.err.println(TAG + " LOOM decode failed for map " + mapId.id()
-                    + ": " + e.getMessage());
-            e.printStackTrace();
+            if (header != null && header.isMuxRx()) {
+                // The receiver tile's own carpet data couldn't be read — this is a placement
+                // issue with the receiver tile itself, not a missing-donor problem.
+                System.err.println(TAG + " LOOM mux receiver (" + header.col + "," + header.row
+                        + ") map " + mapId.id() + " carpet read failed: " + e.getMessage());
+                System.err.println(TAG + "   Receiver tile carpet is incomplete or misread."
+                        + " Donor tiles are placed separately and are not the cause of this error.");
+                e.printStackTrace();
+            } else {
+                System.err.println(TAG + " LOOM decode failed for map " + mapId.id()
+                        + ": " + e.getMessage());
+                e.printStackTrace();
+            }
         }
     }
 
@@ -1581,6 +1631,7 @@ public class MapBannerDecoder {
         scanSeen.clear();
         paintLogCount.clear();
         unlockLogged.clear();
+        loomHeaderSeen.clear();
         pendingDecrypts.clear();
         encryptedNoPass.clear();
         MapEncryption.clearCache();

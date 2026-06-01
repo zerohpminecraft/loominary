@@ -4,6 +4,21 @@
 
 ---
 
+## v1.21.1
+
+### Fix: muxed tiles decode on sight; blank donors render transparent
+
+Two decoder bugs around carpet mux tiles.
+
+- **Muxed tiles failed to decode on initial view** — `processFrame` bailed out whenever a map had no banner decorations, but a LOOM carpet tile carries its data in the carpet channel and can legitimately have none (a pure-CARPET tile, or a blank mux donor that only carries guest payload). Those tiles were skipped, so a donor's guest segments never reached the receiver and the receiver waited forever; removing and replacing a donor only "fixed" it by coincidentally re-triggering a scan after its colors had synced. The empty-decorations guard now also checks `CarpetChannel.peekLoomMagic`, so LOOM tiles are always processed and muxed walls decode on sight.
+- **Blank donor tiles showed encoding noise** — a donor with no image of its own (`ownBytes == 0`) was left displaying its raw carpet bytes. It's now painted fully transparent (map color id 0) so the wall shows a clean hole; guest routing is unaffected.
+
+### Fix: carpet balance never discards needed carpet
+
+The balancer could still drop carpet of a needed color when its goal slots were temporarily blocked by another color and the inventory was too full to park the held stack. Dropping is now count-based and provably safe — a stack is dropped only when at least the keep amount (allotted slots × 64) of that color remains — and blocked goal slots are resolved with a swap that needs no free slot, so needed carpet is always placed via seed/fill/swap and never discarded.
+
+---
+
 ## v1.21.0
 
 ### Feat: `/loominary carpets balance` — lay out carpets to match a Litematica material list

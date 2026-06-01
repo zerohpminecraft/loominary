@@ -3,11 +3,11 @@ name: deploy-pages
 # Builds the web editor (web/) and publishes it to GitHub Pages at
 # https://zerohpminecraft.github.io/loominary/ .
 #
-# The web editor currently lives only on the 2.0.0 branch, so that's what we
-# deploy from. If it later merges to the default branch, update `branches` below.
+# Deploys from master (the integration branch). Runs only when the web editor
+# or this workflow changes, plus on manual dispatch.
 on:
   push:
-    branches: [2.0.0]
+    branches: [master]
     paths:
       - 'web/**'
       - '.github/workflows/pages.yml'

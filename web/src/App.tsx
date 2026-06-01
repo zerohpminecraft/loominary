@@ -141,6 +141,26 @@ function StepBar({
         />
         <span style={{ fontSize: 11, color: '#666', minWidth: 22 }}>{uiFontSize}</span>
       </label>
+
+      {/* GitHub link */}
+      <a
+        href="https://github.com/zerohpminecraft/loominary"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="View Loominary on GitHub"
+        style={{
+          display:      'flex',
+          alignItems:   'center',
+          gap:           4,
+          marginLeft:    8,
+          color:        '#aaa',
+          textDecoration:'none',
+          fontSize:      12,
+          whiteSpace:   'nowrap',
+        }}
+      >
+        <span style={{ fontSize: 14 }}>⭐</span> GitHub
+      </a>
     </div>
   );
 }

@@ -1,5 +1,9 @@
 # Loominary
 
+### 🎨 [Try the web editor →](https://zerohpminecraft.github.io/loominary/)
+
+Design, encode, and export carpet schematics right in your browser — no install required.
+
 A Fabric mod for Minecraft 1.21.4 that encodes images as map art and plays them back client-side, with no server modification required.
 
 Loominary encodes image data into colored carpet blocks and named banners, then renders it client-side as custom map art. Place the carpet schematic, click the banner marker(s) with a map, and anyone running Loominary sees your image painted on the map — including animated GIFs. Without the mod, viewers see a normal map.

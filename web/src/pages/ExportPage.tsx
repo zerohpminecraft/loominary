@@ -592,7 +592,9 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     try {
       const files: ZipEntry[] = [];
       const nonceVal = nonce ? ((Math.random() * 0x100000000) >>> 0) : 0;
-      const baseName = title.trim() || 'loominary';
+      const baseName  = title.trim() || 'loominary';
+      // Filesystem-safe slug for schematic filenames inside the ZIP.
+      const schemBase = baseName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'loominary';
 
       // 1 — State JSON (with mux/encryption if active)
       setStatus('Building ZIP… encoding state');
@@ -611,23 +613,37 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         const artCount  = comp.gridCols * comp.gridRows;
         const multiTile = artCount > 1 || extraDonors > 0;
         const schTotal  = artCount + extraDonors;
+        const useBanners = codec === 'CARPET_BANNERS' || codec === 'CARPET_BANNERS_SHADE' || codec === 'CARPET_SHADE_BANNERS';
         for (let ti = 0; ti < artCount; ti++) {
           const tileCol = ti % comp.gridCols, tileRow = Math.floor(ti / comp.gridCols);
           const tile    = ps.tiles[ti];
+          const role    = muxAlloc?.roles[ti];
           const b64     = tile?.muxCargoB64 ?? tile?.carpetCompressedB64;
           if (!b64) continue;
           const suffix  = multiTile ? `_r${tileRow}_c${tileCol}` : '';
-          const name    = `loominary_carpet${suffix}`;
+          const name    = `${schemBase}${suffix}`;
           setStatus(`Building ZIP… schematic ${ti + 1}/${schTotal}`);
-          files.push({ name: `${name}.litematic`, data: await exportCarpetSchematic(b64, name, author.trim() || 'Loominary', tileCol, tileRow, codec) });
+          // Pass mux role so the LOOM header gets the correct flags and ownBytes/totalBytes.
+          const muxRole     = role?.role ?? 'normal';
+          const muxTotal    = muxRole === 'receiver' ? role!.totalBytes : undefined;
+          const muxOwn      = muxRole === 'donor' ? role!.ownBytes : undefined;
+          const muxGuests   = (muxRole === 'donor' && !useBanners)
+            ? role!.guests.map(g => ({ tCol: g.rxTi % comp.gridCols, tRow: Math.floor(g.rxTi / comp.gridCols), tOffset: g.rxOffset, tLen: g.len }))
+            : undefined;
+          files.push({ name: `${name}.litematic`, data: await exportCarpetSchematic(b64, name, author.trim() || 'Loominary', tileCol, tileRow, codec, muxRole, muxTotal, muxOwn, muxGuests) });
         }
         for (let i = 0; i < extraDonors; i++) {
           const tile = ps.tiles[artCount + i];
+          const role = muxAlloc?.roles[artCount + i];
           const b64  = tile?.muxCargoB64;
           if (!b64) continue;
-          const name = `loominary_carpet_donor${extraDonors > 1 ? i + 1 : ''}`;
+          const name = `${schemBase}_donor${extraDonors > 1 ? i + 1 : ''}`;
           setStatus(`Building ZIP… donor schematic ${i + 1}/${extraDonors}`);
-          files.push({ name: `${name}.litematic`, data: await exportCarpetSchematic(b64, name, author.trim() || 'Loominary', 0, 0, codec) });
+          const muxOwn    = role?.ownBytes;
+          const muxGuests = (!useBanners && role)
+            ? role.guests.map(g => ({ tCol: g.rxTi % comp.gridCols, tRow: Math.floor(g.rxTi / comp.gridCols), tOffset: g.rxOffset, tLen: g.len }))
+            : undefined;
+          files.push({ name: `${name}.litematic`, data: await exportCarpetSchematic(b64, name, author.trim() || 'Loominary', 0, 0, codec, 'donor', undefined, muxOwn, muxGuests) });
         }
       }
 

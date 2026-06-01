@@ -16,7 +16,7 @@ import { gzip } from 'pako';
 import {
   encodeNibbles, computeHeights,
   buildLoomHeader,
-  LOOM_FLAG_SHADE, LOOM_FLAG_BANNERS,
+  LOOM_FLAG_SHADE, LOOM_FLAG_BANNERS, LOOM_FLAG_MUX_RX, LOOM_FLAG_MUX_DONOR,
   MAX_CARPET_BYTES, MAX_SHADE_BYTES, LOOM_FIXED_HEADER,
 } from './carpet.js';
 import type { CodecMode } from './codec-mode.js';
@@ -433,6 +433,11 @@ function buildStaircaseCarpetSchematic(
   return w.bytes();
 }
 
+/** Guest descriptor shape matching LoomHeader's guestDescs[][] layout. */
+export interface GuestDesc {
+  tCol: number; tRow: number; tOffset: number; tLen: number;
+}
+
 /**
  * Export a carpet schematic for one tile.
  *
@@ -441,12 +446,20 @@ function buildStaircaseCarpetSchematic(
  * a flat or staircase litematic depending on whether the codec uses the shade
  * channel.  Mirrors SchematicExporter.exportCarpetTile / exportCarpetStaircase.
  *
- * @param carpetCompressedB64  Base64-encoded zstd payload (TileData.carpetCompressedB64)
+ * @param carpetCompressedB64  Base64-encoded payload.
+ *   - Normal/receiver tiles: the tile's own segment (muxCargoB64 or full payload).
+ *   - Donor tiles: own frame + guest bytes concatenated (muxCargoB64).
  * @param name                 Schematic name (region name + file stem)
  * @param author               Author string embedded in NBT metadata
  * @param tileCol              Tile column in the grid (for LOOM header)
  * @param tileRow              Tile row in the grid (for LOOM header)
  * @param codec                Active codec mode (drives shade/banner channel split)
+ * @param muxRole              Mux role of this tile (default: 'normal')
+ * @param muxTotalBytes        Receivers only: full payload length (sets totalBytes in LOOM header)
+ * @param muxOwnBytes          Donors only: own-frame byte count within the payload
+ *                             (sets ownBytes in LOOM header; the rest are guest bytes)
+ * @param muxGuestDescs        CARPET/CARPET_SHADE donors only: guest descriptors to embed
+ *                             in the LOOM header (used by the decoder to route guest segments)
  */
 export async function exportCarpetSchematic(
   carpetCompressedB64: string,
@@ -455,6 +468,10 @@ export async function exportCarpetSchematic(
   tileCol = 0,
   tileRow = 0,
   codec: CodecMode = 'CARPET_BANNERS_SHADE',
+  muxRole: 'normal' | 'receiver' | 'donor' = 'normal',
+  muxTotalBytes?: number,
+  muxOwnBytes?: number,
+  muxGuestDescs?: GuestDesc[],
 ): Promise<Uint8Array> {
   const useShade   = codec === 'CARPET_SHADE' || codec === 'CARPET_BANNERS_SHADE' || codec === 'CARPET_SHADE_BANNERS';
   const useBanners = codec === 'CARPET_BANNERS' || codec === 'CARPET_BANNERS_SHADE' || codec === 'CARPET_SHADE_BANNERS';
@@ -462,10 +479,23 @@ export async function exportCarpetSchematic(
   // Decode the stored compressed payload
   const compressed = Uint8Array.from(atob(carpetCompressedB64), c => c.charCodeAt(0));
 
-  // Build LOOM cargo: header + compressed payload
-  const flags      = (useShade ? LOOM_FLAG_SHADE : 0) | (useBanners ? LOOM_FLAG_BANNERS : 0);
-  const loomHeader = buildLoomHeader(flags, tileCol, tileRow, compressed.length, compressed.length);
-  const cargo      = new Uint8Array(loomHeader.length + compressed.length);
+  // Build LOOM flags: base channel flags + mux role flags.
+  // CARPET/CARPET_SHADE donors embed guest descriptors in the header (MUX_DONOR flag).
+  // CARPET_BANNERS donors use MG routing banners instead (no MUX_DONOR flag).
+  let flags = (useShade ? LOOM_FLAG_SHADE : 0) | (useBanners ? LOOM_FLAG_BANNERS : 0);
+  if (muxRole === 'receiver') flags |= LOOM_FLAG_MUX_RX;
+  if (muxRole === 'donor' && !useBanners) flags |= LOOM_FLAG_MUX_DONOR;
+
+  // Build LOOM header with correct ownBytes/totalBytes.
+  // Receivers: ownBytes = own segment length, totalBytes = full payload length.
+  // Donors: ownBytes = own frame length (guest bytes follow in the same cargo buffer).
+  // Normal: ownBytes = totalBytes = full compressed length (no mux).
+  const ownBytes   = muxRole === 'donor' ? (muxOwnBytes ?? compressed.length) : compressed.length;
+  const totalBytes = muxRole === 'receiver' ? (muxTotalBytes ?? compressed.length) : ownBytes;
+  const guestDescArrays = muxGuestDescs?.map(d => [d.tCol, d.tRow, d.tOffset, d.tLen]);
+  const loomHeader = buildLoomHeader(flags, tileCol, tileRow, ownBytes, totalBytes, guestDescArrays);
+
+  const cargo = new Uint8Array(loomHeader.length + compressed.length);
   cargo.set(loomHeader, 0);
   cargo.set(compressed, loomHeader.length);
 

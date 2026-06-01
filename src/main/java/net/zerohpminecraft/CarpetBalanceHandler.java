@@ -286,13 +286,16 @@ public class CarpetBalanceHandler {
         }
 
         // ── 4. Drop surplus / foreign carpet from non-goal slots ───────────
+        // Safe by counting: drop a whole non-goal stack only if doing so still
+        // leaves at least the keep amount (slots × 64) of that color in slots.
+        // Foreign colors have keep 0, so they drop entirely. This guarantees we
+        // never discard carpet we still need, regardless of fill ordering.
         for (int slot = FIRST_MAIN_SLOT; slot <= LAST_HOTBAR_SLOT; slot++) {
             if (slotGoal.containsKey(slot)) continue;
             ItemStack s = handler.getSlot(slot).getStack();
             if (s.isEmpty() || !isCarpet(s)) continue;
             Item color = s.getItem();
-            // Only drop once this color is fully satisfied (or it's foreign).
-            if (colorSlots.containsKey(color) && hasRoom(handler, color)) continue;
+            if (totalInSlots(handler, color) - s.getCount() < keep(color)) continue;
             droppedTotal += s.getCount();
             click(client, handler, slot, RIGHT_CLICK, SlotActionType.THROW); // whole stack
             return;
@@ -324,22 +327,34 @@ public class CarpetBalanceHandler {
                     click(client, handler, dest, LEFT_CLICK, SlotActionType.PICKUP);
                     return;
                 }
-                // No empty and no room. If the goal slots are genuinely full of
-                // this color, the rest is surplus → drop. Otherwise they're
-                // still blocked by another color we haven't relocated yet — park
-                // this carpet in a free slot and retry; never drop carpet we
-                // still need just because its slots are temporarily occupied.
-                if (!allGoalSlotsFull(handler, color)) {
-                    int park = findEmptyNonGoalSlot(handler);
-                    if (park != -1) {
-                        click(client, handler, park, LEFT_CLICK, SlotActionType.PICKUP);
-                        return;
-                    }
+                // No empty, no room. A goal slot is blocked by a different
+                // carpet. Swap ours in (claiming the slot) and lift the blocker
+                // onto the cursor to re-home next tick — this resolves mutual
+                // blocks without needing any free slot, so we never have to
+                // drop carpet we still need.
+                int blocked = firstBlockedGoalSlot(handler, color);
+                if (blocked != -1) {
+                    click(client, handler, blocked, LEFT_CLICK, SlotActionType.PICKUP);
+                    return;
                 }
+                // Otherwise every goal slot is full of this color — the rest is
+                // genuine surplus and falls through to the safe drop below.
             }
-            // Surplus, foreign, or nowhere to park — drop it.
-            droppedTotal += cursor.getCount();
-            click(client, handler, OUTSIDE_SLOT, LEFT_CLICK, SlotActionType.PICKUP); // drop whole cursor
+            // Drop only when it's provably safe: we already hold at least the
+            // keep amount (slots × 64) of this color in slots, so the cursor is
+            // pure surplus. Foreign colors have keep 0 and always drop. If it
+            // isn't safe to drop, the carpet is still needed — park it (or, as a
+            // last resort, leave it on the cursor for the watchdog) rather than
+            // discard it.
+            if (totalInSlots(handler, color) >= keep(color)) {
+                droppedTotal += cursor.getCount();
+                click(client, handler, OUTSIDE_SLOT, LEFT_CLICK, SlotActionType.PICKUP);
+                return;
+            }
+            int park = findEmptyNonGoalSlot(handler);
+            if (park != -1) {
+                click(client, handler, park, LEFT_CLICK, SlotActionType.PICKUP);
+            }
             return;
         }
         // Non-carpet (rockets/food/etc.): never drop — park in an empty non-goal slot.
@@ -360,6 +375,33 @@ public class CarpetBalanceHandler {
         return firstGoalSlotWithRoom(handler, color) != -1;
     }
 
+    /** How many of this color we intend to keep: its allotted slot count × 64 (0 if unlisted). */
+    private static int keep(Item color) {
+        List<Integer> slots = colorSlots.get(color);
+        return slots == null ? 0 : slots.size() * MAX_STACK;
+    }
+
+    /** Total count of this color across all usable slots (excludes the cursor). */
+    private static int totalInSlots(ScreenHandler handler, Item color) {
+        int n = 0;
+        for (int slot = FIRST_MAIN_SLOT; slot <= LAST_HOTBAR_SLOT; slot++) {
+            ItemStack s = handler.getSlot(slot).getStack();
+            if (s.getItem() == color) n += s.getCount();
+        }
+        return n;
+    }
+
+    /** First allotted slot for this color that is blocked by a different carpet, or -1. */
+    private static int firstBlockedGoalSlot(ScreenHandler handler, Item color) {
+        List<Integer> slots = colorSlots.get(color);
+        if (slots == null) return -1;
+        for (int slot : slots) {
+            ItemStack s = handler.getSlot(slot).getStack();
+            if (!s.isEmpty() && s.getItem() != color) return slot;
+        }
+        return -1;
+    }
+
     private static int firstGoalSlotWithRoom(ScreenHandler handler, Item color) {
         List<Integer> slots = colorSlots.get(color);
         if (slots == null) return -1;
@@ -369,17 +411,6 @@ public class CarpetBalanceHandler {
             if (s.getItem() == color && s.getCount() < MAX_STACK) return slot;
         }
         return -1;
-    }
-
-    /** True only when every allotted slot for this color holds 64 of it. */
-    private static boolean allGoalSlotsFull(ScreenHandler handler, Item color) {
-        List<Integer> slots = colorSlots.get(color);
-        if (slots == null || slots.isEmpty()) return false;
-        for (int slot : slots) {
-            ItemStack s = handler.getSlot(slot).getStack();
-            if (s.getItem() != color || s.getCount() < MAX_STACK) return false;
-        }
-        return true;
     }
 
     /** First allotted slot for this color that is currently empty, or -1. */

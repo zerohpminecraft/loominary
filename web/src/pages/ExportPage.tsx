@@ -22,6 +22,7 @@ import {
   type MuxAllocation,
 } from '../mux.js';
 import { compress }                      from '../compression.js';
+import { track }                         from '../analytics.js';
 import {
   toBytesV2, toBytesAnimated, crc32,
   FLAG_ALL_SHADES, FLAG_ANIMATED, FLAG_MUX, FLAG_DELTA_FRAMES, FLAG_SPARSE_FRAMES,
@@ -589,6 +590,12 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const handleZipExport = useCallback(async () => {
     if (!canExport) return;
     setExporting(true); setStatus('Building ZIP…');
+    track('export_started', {
+      tiles: comp.gridCols * comp.gridRows,
+      codec,
+      encrypted: encryptOn,
+      donors: extraDonors,
+    });
     try {
       const files: ZipEntry[] = [];
       const nonceVal = nonce ? ((Math.random() * 0x100000000) >>> 0) : 0;
@@ -675,6 +682,13 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
       a.download = `${baseName}_export.zip`; a.click();
       setTimeout(() => URL.revokeObjectURL(url), 5000);
 
+      track('export_completed', {
+        tiles: comp.gridCols * comp.gridRows,
+        codec,
+        encrypted: encryptOn,
+        animated: isAnimated,
+        schematics: schematicsAvailable,
+      });
       setStatus('ZIP exported ✓'); setTimeout(() => setStatus(null), 3000);
     } catch (err) { setStatus(`Error: ${err}`); setTimeout(() => setStatus(null), 4000); }
     finally { setExporting(false); setExportProg(null); }

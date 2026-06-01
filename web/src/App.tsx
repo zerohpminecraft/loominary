@@ -22,6 +22,7 @@ import {
   sessionToComposition, savedAgoLabel,
   type SourceImage,
 } from './persistence.js';
+import { track } from './analytics.js';
 
 // ─── Step type ────────────────────────────────────────────────────────────────
 
@@ -181,6 +182,13 @@ export function App() {
 
   // Track the Editor's latest composition for export (without losing edits).
   const latestCompRef = useRef<CompositionState | null>(null);
+
+  // Analytics funnel: record reaching each stage. Visitors/pageviews are
+  // captured automatically by Umami; export_completed is fired from ExportPage.
+  useEffect(() => {
+    if (step === 'edit') track('editor_opened');
+    else if (step === 'export') track('export_opened');
+  }, [step]);
 
   // ── Session persistence ───────────────────────────────────────────────────
   const [restoreNotice,   setRestoreNotice]   = useState<string | null>(null);

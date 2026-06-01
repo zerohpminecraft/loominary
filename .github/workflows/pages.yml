@@ -41,7 +41,15 @@ jobs:
       # Build with Vite directly (esbuild). We intentionally skip the `tsc` step
       # in `npm run build`: the project carries known type-only errors that don't
       # affect the emitted bundle.
+      #
+      # Umami analytics config is injected from repo Variables (Settings →
+      # Secrets and variables → Actions → Variables). These values are public
+      # (they appear in the page source), so Variables — not Secrets — is correct.
+      # If unset, analytics simply stays disabled in the build.
       - run: npx vite build
+        env:
+          VITE_UMAMI_SRC: ${{ vars.UMAMI_SRC }}
+          VITE_UMAMI_WEBSITE_ID: ${{ vars.UMAMI_WEBSITE_ID }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

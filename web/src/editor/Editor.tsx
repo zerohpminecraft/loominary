@@ -91,8 +91,15 @@ function getCompressPool(): Worker[] {
  * `dispatchOne(worker, taskIndex)` sends one task to a worker.
  * Each `onResult` call receives the structured-cloned message from the worker.
  */
+// NOTE: the worker is created via a factory, not a passed-in URL. Vite only
+// recognises (and bundles) a worker when `new URL('./x.ts', import.meta.url)`
+// appears *literally* inside `new Worker(...)`. Passing the URL indirectly made
+// Vite treat the .ts as a generic asset and inline it as a `data:video/mp2t`
+// URL, which a module worker refuses to execute on the built site (it works in
+// dev only because the dev server serves the .ts directly). Keeping the
+// `new Worker(new URL(...))` literal at each call site fixes that.
 function runWorkerPool<R>(
-  workerUrl: URL,
+  makeWorker: () => Worker,
   total: number,
   dispatchOne: (worker: Worker, taskIndex: number) => void,
   onResult:   (data: R, taskIndex: number) => void,
@@ -111,7 +118,7 @@ function runWorkerPool<R>(
     }
 
     for (let i = 0; i < concurrency; i++) {
-      const w = new Worker(workerUrl, { type: 'module' });
+      const w = makeWorker();
       w.onmessage = ({ data }: MessageEvent<R & { frameIndex?: number; taskIndex?: number }>) => {
         onResult(data as R, (data.frameIndex ?? data.taskIndex)!);
         if (++finished === total) { terminateAll(); resolve(); }
@@ -993,7 +1000,7 @@ export function Editor({
       let done = 0;
 
       await runWorkerPool<{ frameIndex: number; tileBuffers: ArrayBuffer[] }>(
-        new URL('../filter-worker.ts', import.meta.url),
+        () => new Worker(new URL('../filter-worker.ts', import.meta.url), { type: 'module' }),
         total,
         (worker, jobIdx) => {
           const fi = frameIdxs[jobIdx];
@@ -1315,7 +1322,7 @@ export function Editor({
       let done = 0;
 
       await runWorkerPool<{ frameIndex: number; tileBuffers: ArrayBuffer[] }>(
-        new URL('../quantize-worker.ts', import.meta.url),
+        () => new Worker(new URL('../quantize-worker.ts', import.meta.url), { type: 'module' }),
         total,
         (worker, jobIdx) => {
           const src = allSources[jobIdx];

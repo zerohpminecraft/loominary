@@ -1,6 +1,11 @@
 package net.zerohpminecraft;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.reflect.TypeToken;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.ChestBlock;
 import net.minecraft.block.enums.ChestType;
@@ -17,11 +22,14 @@ import net.minecraft.screen.slot.Slot;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -80,19 +88,31 @@ public class CarpetFillHandler {
     /** Chests already opened this run (never reopened). */
     private static final Set<BlockPos> visited = new HashSet<>();
     /**
-     * Session memory of each chest's carpet contents (what's left after our last visit),
-     * keyed by position. Persists across fill runs while the game is open; lets later
-     * runs skip chests known to hold nothing we need. Cleared on disconnect.
+     * Memory of each chest's carpet contents (what's left after our last visit), keyed
+     * by position, for the CURRENT world only. Lets later runs skip chests known to hold
+     * nothing we need. Persisted to disk per server+dimension (see {@link #diskModel}).
      */
     private static final Map<BlockPos, Map<Item, Integer>> chestMemory = new HashMap<>();
     /** The chest opened in the current cycle (for recording memory on close). */
     private static BlockPos currentChestPos = null;
 
+    // ── Persistence ──────────────────────────────────────────────────────────
+    private static final String MEMORY_FILE = "loominary_chest_memory.json";
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+    /** All worlds: worldKey → ("x,y,z" → (itemId → count)). The on-disk model. */
+    private static final Map<String, Map<String, Map<String, Integer>>> diskModel = new HashMap<>();
+    /** Key for the world {@link #chestMemory} currently reflects ("server@dimension"). */
+    private static String worldKey = null;
+
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(CarpetFillHandler::onTick);
-        // Session memory of chest contents is per-connection; drop it on disconnect.
-        net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.DISCONNECT
-                .register((handler, client) -> chestMemory.clear());
+        loadDisk();
+        // Bind chest memory to the joined world; flush + unbind on disconnect.
+        ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> ensureWorld(client));
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            chestMemory.clear();
+            worldKey = null;
+        });
     }
 
     public static boolean isActive() {
@@ -114,6 +134,7 @@ public class CarpetFillHandler {
             feedback(client, "§e" + TAG + " Carpet fill already running.");
             return false;
         }
+        ensureWorld(client);   // bind chest memory to the current world (handles dimension changes)
 
         // Validate we have demand before opening anything (the goal itself is
         // (re)built after the balance pass, since balance rearranges inventory).
@@ -363,6 +384,88 @@ public class CarpetFillHandler {
                     chestMemory.put(n, contents);
                 }
             }
+        }
+        saveDisk();
+    }
+
+    // ── Persistence (per server + dimension) ─────────────────────────────────
+
+    private static Path memoryFile() {
+        return FabricLoader.getInstance().getConfigDir().resolve(MEMORY_FILE);
+    }
+
+    /** Stable id for the current world: "<server-or-singleplayer>@<dimension>". */
+    private static String worldKey(MinecraftClient client) {
+        var entry = client.getCurrentServerEntry();
+        String place = (entry != null && entry.address != null) ? entry.address : "singleplayer";
+        String dim = client.world != null ? client.world.getRegistryKey().getValue().toString() : "unknown";
+        return place + "@" + dim;
+    }
+
+    /** Binds {@link #chestMemory} to the current world, loading its remembered chests. */
+    private static void ensureWorld(MinecraftClient client) {
+        String wk = worldKey(client);
+        if (wk.equals(worldKey)) return;
+        worldKey = wk;
+        chestMemory.clear();
+        Map<String, Map<String, Integer>> section = diskModel.get(wk);
+        if (section == null) return;
+        for (Map.Entry<String, Map<String, Integer>> e : section.entrySet()) {
+            BlockPos p = parsePos(e.getKey());
+            if (p == null) continue;
+            Map<Item, Integer> contents = new HashMap<>();
+            for (Map.Entry<String, Integer> ce : e.getValue().entrySet()) {
+                Identifier id = Identifier.tryParse(ce.getKey());
+                if (id == null) continue;
+                Item it = Registries.ITEM.get(id);
+                if (CarpetBalanceHandler.isCarpet(it)) contents.put(it, ce.getValue());
+            }
+            chestMemory.put(p, contents);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void loadDisk() {
+        diskModel.clear();
+        Path path = memoryFile();
+        if (!Files.exists(path)) return;
+        try {
+            String json = Files.readString(path);
+            var type = new TypeToken<Map<String, Map<String, Map<String, Integer>>>>() {}.getType();
+            Map<String, Map<String, Map<String, Integer>>> parsed = GSON.fromJson(json, type);
+            if (parsed != null) diskModel.putAll(parsed);
+        } catch (Exception e) {
+            System.err.println(TAG + " Couldn't read chest memory: " + e.getMessage());
+        }
+    }
+
+    /** Serializes {@link #chestMemory} into {@link #diskModel} for the current world and writes the file. */
+    private static void saveDisk() {
+        if (worldKey == null) return;
+        Map<String, Map<String, Integer>> section = new HashMap<>();
+        for (Map.Entry<BlockPos, Map<Item, Integer>> e : chestMemory.entrySet()) {
+            BlockPos p = e.getKey();
+            Map<String, Integer> m = new HashMap<>();
+            for (Map.Entry<Item, Integer> ce : e.getValue().entrySet()) {
+                m.put(Registries.ITEM.getId(ce.getKey()).toString(), ce.getValue());
+            }
+            section.put(p.getX() + "," + p.getY() + "," + p.getZ(), m);
+        }
+        diskModel.put(worldKey, section);
+        try {
+            Files.writeString(memoryFile(), GSON.toJson(diskModel));
+        } catch (Exception e) {
+            System.err.println(TAG + " Couldn't write chest memory: " + e.getMessage());
+        }
+    }
+
+    private static BlockPos parsePos(String key) {
+        String[] xyz = key.split(",");
+        if (xyz.length != 3) return null;
+        try {
+            return new BlockPos(Integer.parseInt(xyz[0]), Integer.parseInt(xyz[1]), Integer.parseInt(xyz[2]));
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 

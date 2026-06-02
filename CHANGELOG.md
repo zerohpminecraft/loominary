@@ -4,6 +4,24 @@
 
 ---
 
+## v1.22.0
+
+### Feat: `/loominary carpets fill` and smarter proportional balancing
+
+Adds a carpet-gathering companion to `/loominary carpets balance` and makes the balance layout track what the build actually needs. Both are bindable under Controls → Loominary.
+
+- **`/loominary carpets fill`** — tops up your carpet stacks from nearby chests. It tells you what it wants (e.g. "Need 192 brown — open a chest with it"), takes exactly the carpet needed from whatever chest you open (returning any excess), marks needed chests in-world, and walks you only short hops (≤5 blocks) — never across the room. Run it again to stop.
+- **Chest memory** — remembers each chest's carpet contents (carpet counts only) per server + dimension, persisted to `config/loominary_chest_memory.json`, so later runs go straight to the chests that have what's needed. Empty/ambiguous reads are never recorded, and contents are only trusted once the server has synced them (fixes stocked chests being seen as empty on laggy servers).
+- **Proportional allocation** — balance now sizes each color's stacks proportionally to its Litematica material count (capped at what's actually needed: a color needing one stack gets one slot, not several), instead of a fixed 3/3/2 split.
+- **Closest-incomplete targeting** — balance/fill gather the nearest *unplaced* part of the build (read from Litematica's schematic world), capped at one inventory-load, swept in a predictable order from your side of the build, so each trip maps to a contiguous build frontier. Falls back to whole-build totals when the placement isn't loaded nearby.
+- **Fresh material counts** — read directly from the selected schematic placement each run, so stale or unopened material lists no longer skew the layout.
+
+### Web editor
+
+The web editor is now published at **https://zerohpminecraft.github.io/loominary/** (GitHub Pages), with muxed-schematic export, a worker-loading fix, and privacy-friendly usage analytics. (Web only; not part of the mod jar.)
+
+---
+
 ## v1.21.1
 
 ### Fix: muxed tiles decode on sight; blank donors render transparent

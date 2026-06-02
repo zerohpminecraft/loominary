@@ -4,6 +4,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.block.entity.ChestBlockEntity;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
@@ -52,19 +53,22 @@ public class CarpetFillHandler {
     private static final int    MAX_STACK          = CarpetBalanceHandler.MAX_STACK;
 
     private static final int    ACTION_COOLDOWN_TICKS  = 4;
-    private static final int    OPEN_TIMEOUT_TICKS     = 40;
+    private static final int    OPEN_TIMEOUT_TICKS     = 60;
+    private static final int    OPEN_RETRY_INTERVAL    = 15;   // re-send interact this often while waiting
+    private static final int    MAX_OPEN_ATTEMPTS      = 3;
     private static final int    BETWEEN_CHESTS_TICKS   = 10;
-    private static final int    WATCHDOG_TICKS         = 2400;
+    private static final int    WATCHDOG_TICKS         = 6000;
 
     private static final int LEFT_CLICK = 0;
 
-    private enum State { SCAN, WAIT_OPEN, GRAB, COOLDOWN }
+    private enum State { BALANCE_WAIT, SCAN, WAIT_OPEN, GRAB, COOLDOWN }
 
     // ── Run state ──────────────────────────────────────────────────────────
     private static boolean active = false;
     private static State   state  = State.SCAN;
     private static int     cooldown   = 0;
     private static int     openWait   = 0;
+    private static int     openAttempts = 0;
     private static int     totalTicks = 0;
     private static int     initialNeed = 0;
 
@@ -97,9 +101,9 @@ public class CarpetFillHandler {
     }
 
     /**
-     * Recomputes the balance goal, works out what's needed to fill it to 64, and
-     * begins the chest-walking cycle. Returns false (with a chat message) if
-     * there's nothing to do.
+     * Runs a balance first (so the proportional layout is in place and the right
+     * proportions are gathered every time), then walks nearby chests to top the
+     * stacks up. Returns false (with a chat message) if there's nothing to do.
      */
     public static boolean start(MinecraftClient client) {
         if (client.player == null) return false;
@@ -108,6 +112,8 @@ public class CarpetFillHandler {
             return false;
         }
 
+        // Validate we have demand before opening anything (the goal itself is
+        // (re)built after the balance pass, since balance rearranges inventory).
         Map<Item, Integer> materials;
         try {
             materials = CarpetBalanceHandler.carpetDemand(client);
@@ -124,24 +130,33 @@ public class CarpetFillHandler {
             return false;
         }
 
-        buildGoal(client, materials);
-        if (goal.isEmpty()) {
-            feedback(client, "§c" + TAG + " No usable carpet slots to fill.");
-            return false;
-        }
-
-        initialNeed = totalNeed(client.player.getInventory());
-        if (initialNeed == 0) {
-            feedback(client, "§a" + TAG + " All carpet stacks are already full — nothing to fill.");
-            return false;
-        }
-
         active     = true;
-        state      = State.SCAN;
+        state      = State.BALANCE_WAIT;
         cooldown   = 0;
         openWait   = 0;
         totalTicks = 0;
         visited.clear();
+        CarpetBalanceHandler.activate(client);   // arrange the proportional layout first
+        feedback(client, "§a" + TAG + " Balancing, then filling from nearby chests…");
+        return true;
+    }
+
+    /** Builds the fill goal from current (post-balance) inventory; false if nothing to fill. */
+    private static boolean computeFillGoal(MinecraftClient client) {
+        Map<Item, Integer> materials;
+        try {
+            materials = CarpetBalanceHandler.carpetDemand(client);
+        } catch (Exception e) {
+            return false;
+        }
+        if (materials == null || materials.isEmpty()) return false;
+        buildGoal(client, materials);
+        if (goal.isEmpty()) return false;
+        initialNeed = totalNeed(client.player.getInventory());
+        if (initialNeed == 0) {
+            feedback(client, "§a" + TAG + " Carpet stacks already full — nothing to fill.");
+            return false;
+        }
         feedback(client, "§a" + TAG + " Filling carpets from nearby chests (need "
                 + initialNeed + ")…");
         return true;
@@ -204,6 +219,7 @@ public class CarpetFillHandler {
         }
 
         switch (state) {
+            case BALANCE_WAIT -> balanceWaitStep(client);
             case SCAN -> {
                 if (cooldown > 0) { cooldown--; return; }
                 scanStep(client);
@@ -220,6 +236,15 @@ public class CarpetFillHandler {
         }
     }
 
+    private static void balanceWaitStep(MinecraftClient client) {
+        if (CarpetBalanceHandler.isActive()) return;     // wait for the balance pass to finish
+        // Balance done — close the inventory it opened, then plan the fill.
+        if (client.currentScreen instanceof InventoryScreen) client.player.closeHandledScreen();
+        if (!computeFillGoal(client)) { active = false; return; }
+        state = State.COOLDOWN;                          // brief settle before opening chests
+        cooldown = BETWEEN_CHESTS_TICKS;
+    }
+
     private static void scanStep(MinecraftClient client) {
         BlockPos chest = findNextChest(client);
         if (chest == null) {
@@ -230,8 +255,9 @@ public class CarpetFillHandler {
         }
         visited.add(chest);
         currentChestPos = chest;
-        openChest(client, chest);
         openWait = 0;
+        openAttempts = 1;
+        openChest(client, chest);
         state = State.WAIT_OPEN;
     }
 
@@ -241,8 +267,15 @@ public class CarpetFillHandler {
             cooldown = ACTION_COOLDOWN_TICKS;
             return;
         }
-        if (++openWait > OPEN_TIMEOUT_TICKS) {
-            // Couldn't open (out of reach, blocked, …) — skip; it's already marked visited.
+        openWait++;
+        // Re-send the interact a couple of times in case the first packet was dropped/rejected.
+        if (openWait % OPEN_RETRY_INTERVAL == 0 && openAttempts < MAX_OPEN_ATTEMPTS) {
+            openAttempts++;
+            openChest(client, currentChestPos);
+        }
+        if (openWait > OPEN_TIMEOUT_TICKS) {
+            System.out.println(TAG + " Chest at " + currentChestPos + " did not open after "
+                    + openAttempts + " attempt(s) — skipping (out of reach or blocked?).");
             state = State.COOLDOWN;
             cooldown = BETWEEN_CHESTS_TICKS;
         }
@@ -426,6 +459,10 @@ public class CarpetFillHandler {
     }
 
     private static void openChest(MinecraftClient client, BlockPos pos) {
+        // Turn to look at the chest first — some server anticheat requires the
+        // interaction's look direction to actually point at the block.
+        faceBlock(client, pos);
+
         Vec3d center = new Vec3d(pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
         Vec3d diff = client.player.getEyePos().subtract(center);
         Direction face = Direction.getFacing((float) diff.x, (float) diff.y, (float) diff.z);
@@ -435,6 +472,21 @@ public class CarpetFillHandler {
                 pos.getZ() + 0.5 + face.getOffsetZ() * 0.5);
         BlockHitResult hit = new BlockHitResult(hitPos, face, pos, false);
         client.interactionManager.interactBlock(client.player, Hand.MAIN_HAND, hit);
+        double dist = Math.sqrt(client.player.squaredDistanceTo(center));
+        System.out.println(TAG + " Opening chest at " + pos + " (dist "
+                + String.format("%.1f", dist) + ", attempt " + openAttempts + ")");
+    }
+
+    /** Points the player's view at the centre of the block. */
+    private static void faceBlock(MinecraftClient client, BlockPos pos) {
+        Vec3d eye = client.player.getEyePos();
+        double dx = pos.getX() + 0.5 - eye.x;
+        double dy = pos.getY() + 0.5 - eye.y;
+        double dz = pos.getZ() + 0.5 - eye.z;
+        double yaw = Math.toDegrees(Math.atan2(dz, dx)) - 90.0;
+        double pitch = -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        client.player.setYaw((float) yaw);
+        client.player.setPitch((float) pitch);
     }
 
     private static boolean isContainerOpen(MinecraftClient client) {

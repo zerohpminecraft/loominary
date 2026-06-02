@@ -229,42 +229,57 @@ public class CarpetBalanceHandler {
         int[] alloc = new int[k];
         if (k == 0 || n <= 0) return alloc;
 
-        // Fewer slots than colors: the top-n colors each get one, rest get none.
-        if (n < k) {
-            for (int i = 0; i < n; i++) alloc[i] = 1;
-            return alloc;
-        }
-
+        // Per-color cap: never allocate more slots than the color actually needs
+        // (a color needing 64 carpets gets at most one slot, regardless of how its
+        // count compares to others). Total demand bounds how many slots we use.
+        int[] cap = new int[k];
         long total = 0;
-        for (Map.Entry<Item, Integer> e : sorted) total += Math.max(0, e.getValue());
+        int sumCap = 0;
+        int withDemand = 0;
+        for (int i = 0; i < k; i++) {
+            int c = Math.max(0, sorted.get(i).getValue());
+            total += c;
+            cap[i] = (c + MAX_STACK - 1) / MAX_STACK;   // ceil(c / 64); 0 when c == 0
+            sumCap += cap[i];
+            if (c > 0) withDemand++;
+        }
+        if (total <= 0) return alloc;
 
-        if (total <= 0) {
-            // Degenerate (no counts): spread as evenly as possible.
-            for (int i = 0; i < n; i++) alloc[i % k]++;
+        // Use only as many slots as are both available and demanded.
+        int target = Math.min(n, sumCap);
+
+        // More demanded colors than slots to give: the highest-count ones get one each
+        // (sorted is count-desc).
+        if (target < withDemand) {
+            for (int i = 0, given = 0; i < k && given < target; i++) {
+                if (cap[i] > 0) { alloc[i] = 1; given++; }
+            }
             return alloc;
         }
 
-        // Largest-remainder apportionment.
-        double[] frac = new double[k];
-        int assigned = 0;
-        for (int i = 0; i < k; i++) {
-            double quota = (double) n * Math.max(0, sorted.get(i).getValue()) / total;
-            alloc[i] = (int) Math.floor(quota);
-            frac[i] = quota - alloc[i];
-            assigned += alloc[i];
+        // Water-fill `target` slots: each goes to the color furthest below its
+        // proportional ideal that hasn't hit its cap. Naturally proportional for
+        // large demand, and exactly "one stack each" when demand is small.
+        for (int placed = 0; placed < target; placed++) {
+            int best = -1;
+            double bestScore = Double.NEGATIVE_INFINITY;
+            for (int i = 0; i < k; i++) {
+                if (cap[i] == 0 || alloc[i] >= cap[i]) continue;
+                double ideal = (double) target * Math.max(0, sorted.get(i).getValue()) / total;
+                double score = ideal - alloc[i];
+                if (score > bestScore) { bestScore = score; best = i; }
+            }
+            if (best == -1) break;
+            alloc[best]++;
         }
-        Integer[] byFrac = new Integer[k];
-        for (int i = 0; i < k; i++) byFrac[i] = i;
-        java.util.Arrays.sort(byFrac, (a, b) -> Double.compare(frac[b], frac[a]));
-        for (int r = 0; r < n - assigned; r++) alloc[byFrac[r]]++;
 
-        // Guarantee every color at least one slot (n ≥ k here), stealing from the
-        // largest allocation so the total stays exactly n.
+        // Guarantee every demanded color at least one slot (target ≥ withDemand here),
+        // stealing from the largest allocation so the total stays the same.
         for (int i = 0; i < k; i++) {
-            if (alloc[i] != 0) continue;
-            int max = 0;
-            for (int j = 1; j < k; j++) if (alloc[j] > alloc[max]) max = j;
-            if (alloc[max] > 1) { alloc[max]--; alloc[i] = 1; }
+            if (cap[i] == 0 || alloc[i] > 0) continue;
+            int max = -1;
+            for (int j = 0; j < k; j++) if (alloc[j] > 1 && (max == -1 || alloc[j] > alloc[max])) max = j;
+            if (max != -1) { alloc[max]--; alloc[i] = 1; }
         }
         return alloc;
     }
@@ -595,7 +610,7 @@ public class CarpetBalanceHandler {
         return readCarpetMaterials();
     }
 
-    private static final int LOCAL_SCAN_MAX_RADIUS = 48;
+    private static final int LOCAL_SCAN_MAX_RADIUS = 256;
 
     /**
      * Counts the carpets the schematic still needs *near the player* — positions where
@@ -627,28 +642,28 @@ public class CarpetBalanceHandler {
         int cap = usable * MAX_STACK;
         if (cap <= 0) return null;
 
-        // Expanding cubic shells around the player; stop once we've gathered ≥ cap.
+        // Expanding horizontal rings at the player's Y (carpet builds are a single
+        // layer, so fixing Y keeps a 256-block search cheap). Stop once we've
+        // gathered ≥ cap incomplete carpets.
         record Hit(Item color, long distSq) {}
         List<Hit> hits = new ArrayList<>();
         BlockPos origin = client.player.getBlockPos();
+        int py = origin.getY();
         BlockPos.Mutable pos = new BlockPos.Mutable();
         for (int r = 0; r <= LOCAL_SCAN_MAX_RADIUS; r++) {
             for (int dx = -r; dx <= r; dx++) {
-                for (int dy = -r; dy <= r; dy++) {
-                    for (int dz = -r; dz <= r; dz++) {
-                        // Only the new outer shell at radius r.
-                        if (Math.max(Math.abs(dx), Math.max(Math.abs(dy), Math.abs(dz))) != r) continue;
-                        pos.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
-                        try {
-                            BlockState exp = schematic.getBlockState(pos);
-                            Item carpet = exp.getBlock().asItem();
-                            if (!isCarpet(carpet)) continue;
-                            if (client.world.getBlockState(pos).getBlock() == exp.getBlock()) continue; // already placed
-                            long ddx = dx, ddy = dy, ddz = dz;
-                            hits.add(new Hit(carpet, ddx * ddx + ddy * ddy + ddz * ddz));
-                        } catch (Exception ignored) {
-                            // unloaded schematic chunk etc. — skip
-                        }
+                for (int dz = -r; dz <= r; dz++) {
+                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) continue;  // only the new ring
+                    pos.set(origin.getX() + dx, py, origin.getZ() + dz);
+                    try {
+                        BlockState exp = schematic.getBlockState(pos);
+                        Item carpet = exp.getBlock().asItem();
+                        if (!isCarpet(carpet)) continue;
+                        if (client.world.getBlockState(pos).getBlock() == exp.getBlock()) continue; // already placed
+                        long ddx = dx, ddz = dz;
+                        hits.add(new Hit(carpet, ddx * ddx + ddz * ddz));
+                    } catch (Exception ignored) {
+                        // unloaded schematic chunk etc. — skip
                     }
                 }
             }

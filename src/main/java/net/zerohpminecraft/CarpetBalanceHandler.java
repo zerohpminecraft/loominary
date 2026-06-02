@@ -582,12 +582,43 @@ public class CarpetBalanceHandler {
     @SuppressWarnings("unchecked")
     private static Map<Item, Integer> readCarpetMaterials() throws Exception {
         Class<?> dataManager = Class.forName("fi.dy.masa.litematica.data.DataManager");
+
+        // Preferred path: compute totals fresh from the currently SELECTED
+        // schematic placement. MaterialListUtils.createMaterialListFor reads the
+        // schematic data directly and returns synchronously, so the counts always
+        // reflect the schematic you have selected right now — no stale numbers
+        // from a previously generated list, and no need to open or refresh
+        // Litematica's Material List GUI by hand.
+        try {
+            Object spm = dataManager.getMethod("getSchematicPlacementManager").invoke(null);
+            Object placement = spm.getClass().getMethod("getSelectedSchematicPlacement").invoke(spm);
+            if (placement != null) {
+                Object schematic = placement.getClass().getMethod("getSchematic").invoke(placement);
+                if (schematic != null) {
+                    Class<?> utils = Class.forName("fi.dy.masa.litematica.materials.MaterialListUtils");
+                    Class<?> schemClass = Class.forName("fi.dy.masa.litematica.schematic.LitematicaSchematic");
+                    Object entries = utils.getMethod("createMaterialListFor", schemClass)
+                            .invoke(null, schematic);
+                    Map<Item, Integer> fresh = parseCarpetCounts(entries);
+                    if (fresh != null && !fresh.isEmpty()) return fresh;
+                }
+            }
+        } catch (Throwable t) {
+            System.out.println(TAG + " Couldn't build a fresh material list ("
+                    + t.getMessage() + "); falling back to the loaded one.");
+        }
+
+        // Fallback: whatever material list is already loaded in Litematica
+        // (e.g. the user has no placement selected but generated one manually).
         Object materialList = dataManager.getMethod("getMaterialList").invoke(null);
         if (materialList == null) return null;
-
         Object allObj = materialList.getClass().getMethod("getMaterialsAll").invoke(materialList);
-        if (!(allObj instanceof List<?> entries) || entries.isEmpty()) return null;
+        return parseCarpetCounts(allObj);
+    }
 
+    /** Sums total required counts per carpet item from a list of MaterialListEntry. */
+    private static Map<Item, Integer> parseCarpetCounts(Object listObj) throws Exception {
+        if (!(listObj instanceof List<?> entries) || entries.isEmpty()) return null;
         Map<Item, Integer> counts = new HashMap<>();
         for (Object entry : entries) {
             ItemStack stack = (ItemStack) entry.getClass().getMethod("getStack").invoke(entry);

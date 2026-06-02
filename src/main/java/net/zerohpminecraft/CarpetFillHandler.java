@@ -20,6 +20,7 @@ import net.minecraft.util.math.Vec3d;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -71,9 +72,20 @@ public class CarpetFillHandler {
     private static final Map<Item, List<Integer>> goal = new LinkedHashMap<>();
     /** Chests already opened this run (never reopened). */
     private static final Set<BlockPos> visited = new HashSet<>();
+    /**
+     * Session memory of each chest's carpet contents (what's left after our last visit),
+     * keyed by position. Persists across fill runs while the game is open; lets later
+     * runs skip chests known to hold nothing we need. Cleared on disconnect.
+     */
+    private static final Map<BlockPos, Map<Item, Integer>> chestMemory = new HashMap<>();
+    /** The chest opened in the current cycle (for recording memory on close). */
+    private static BlockPos currentChestPos = null;
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(CarpetFillHandler::onTick);
+        // Session memory of chest contents is per-connection; drop it on disconnect.
+        net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.DISCONNECT
+                .register((handler, client) -> chestMemory.clear());
     }
 
     public static boolean isActive() {
@@ -98,7 +110,7 @@ public class CarpetFillHandler {
 
         Map<Item, Integer> materials;
         try {
-            materials = CarpetBalanceHandler.readCarpetMaterials();
+            materials = CarpetBalanceHandler.carpetDemand(client);
         } catch (ClassNotFoundException e) {
             feedback(client, "§c" + TAG + " Litematica is not installed.");
             return false;
@@ -209,14 +221,15 @@ public class CarpetFillHandler {
     }
 
     private static void scanStep(MinecraftClient client) {
-        BlockPos chest = findNearestUnvisitedChest(client);
+        BlockPos chest = findNextChest(client);
         if (chest == null) {
             finish(client, "§a" + TAG + " Carpet fill done — filled "
                     + (initialNeed - totalNeed(client.player.getInventory())) + " carpets"
                     + " (" + visited.size() + " chest" + (visited.size() == 1 ? "" : "s") + " opened).");
             return;
         }
-        visited.add(chest.toImmutable());
+        visited.add(chest);
+        currentChestPos = chest;
         openChest(client, chest);
         openWait = 0;
         state = State.WAIT_OPEN;
@@ -273,9 +286,24 @@ public class CarpetFillHandler {
     }
 
     private static void closeAndCooldown(MinecraftClient client) {
+        recordChestMemory(client.player.currentScreenHandler, client.player.getInventory());
         client.player.closeHandledScreen();   // cursor is always empty at this point
         state = State.COOLDOWN;
         cooldown = BETWEEN_CHESTS_TICKS;
+    }
+
+    /** Remembers the chest's remaining carpet contents (after our grab) for this session. */
+    private static void recordChestMemory(ScreenHandler h, PlayerInventory inv) {
+        if (currentChestPos == null) return;
+        Map<Item, Integer> contents = new HashMap<>();
+        for (int i = 0; i < h.slots.size(); i++) {
+            Slot slot = h.getSlot(i);
+            if (slot.inventory == inv) continue;                 // chest slots only
+            ItemStack s = slot.getStack();
+            if (s.isEmpty() || !CarpetBalanceHandler.isCarpet(s.getItem())) continue;
+            contents.merge(s.getItem(), s.getCount(), Integer::sum);
+        }
+        chestMemory.put(currentChestPos, contents);
     }
 
     // ── Need accounting (live, from PlayerInventory) ─────────────────────────
@@ -355,25 +383,46 @@ public class CarpetFillHandler {
 
     // ── World interaction ────────────────────────────────────────────────────
 
-    private static BlockPos findNearestUnvisitedChest(MinecraftClient client) {
+    /**
+     * Picks the next chest to open. Unknown chests (not yet in {@link #chestMemory})
+     * are preferred — nearest first — so memory gets built; once none remain, the
+     * nearest known chest that still holds a needed color is chosen. Known chests with
+     * nothing we need are skipped entirely.
+     */
+    private static BlockPos findNextChest(MinecraftClient client) {
+        PlayerInventory inv = client.player.getInventory();
         BlockPos origin = client.player.getBlockPos();
-        BlockPos best = null;
-        double bestDistSq = Double.MAX_VALUE;
+        BlockPos bestUnknown = null; double bestUnknownDist = Double.MAX_VALUE;
+        BlockPos bestKnown   = null; double bestKnownDist   = Double.MAX_VALUE;
+
         for (int dx = -SCAN_RANGE; dx <= SCAN_RANGE; dx++) {
             for (int dy = -SCAN_RANGE; dy <= SCAN_RANGE; dy++) {
                 for (int dz = -SCAN_RANGE; dz <= SCAN_RANGE; dz++) {
                     BlockPos pos = origin.add(dx, dy, dz);
                     double distSq = client.player.squaredDistanceTo(
                             pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
-                    if (distSq > REACH_SQ || distSq >= bestDistSq) continue;
+                    if (distSq > REACH_SQ) continue;
                     if (visited.contains(pos)) continue;
                     if (!(client.world.getBlockEntity(pos) instanceof ChestBlockEntity)) continue;
-                    best = pos;
-                    bestDistSq = distSq;
+
+                    Map<Item, Integer> known = chestMemory.get(pos);
+                    if (known == null) {
+                        if (distSq < bestUnknownDist) { bestUnknownDist = distSq; bestUnknown = pos; }
+                    } else if (chestHasNeeded(known, inv) && distSq < bestKnownDist) {
+                        bestKnownDist = distSq; bestKnown = pos;
+                    }
                 }
             }
         }
-        return best;
+        return bestUnknown != null ? bestUnknown : bestKnown;
+    }
+
+    /** True if a remembered chest still holds carpet of a color we currently need. */
+    private static boolean chestHasNeeded(Map<Item, Integer> known, PlayerInventory inv) {
+        for (Map.Entry<Item, Integer> e : known.entrySet()) {
+            if (e.getValue() > 0 && need(inv, e.getKey()) > 0) return true;
+        }
+        return false;
     }
 
     private static void openChest(MinecraftClient client, BlockPos pos) {

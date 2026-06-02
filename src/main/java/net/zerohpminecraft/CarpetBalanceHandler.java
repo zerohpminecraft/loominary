@@ -1,14 +1,18 @@
 package net.zerohpminecraft;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
+import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
 import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -93,7 +97,7 @@ public class CarpetBalanceHandler {
 
         Map<Item, Integer> carpetCounts;
         try {
-            carpetCounts = readCarpetMaterials();
+            carpetCounts = carpetDemand(client);
         } catch (ClassNotFoundException e) {
             feedback(client, "§c" + TAG + " Litematica is not installed.");
             return;
@@ -580,6 +584,89 @@ public class CarpetBalanceHandler {
      * @throws ClassNotFoundException if Litematica isn't on the classpath
      */
     @SuppressWarnings("unchecked")
+    /**
+     * The carpet demand to balance/fill against: the nearest *unplaced* carpets in
+     * the schematic (capped at one inventory-load) when the placement is loaded near
+     * the player, otherwise the whole-build material totals.
+     */
+    static Map<Item, Integer> carpetDemand(MinecraftClient client) throws Exception {
+        Map<Item, Integer> local = localCarpetDemand(client);
+        if (local != null && !local.isEmpty()) return local;
+        return readCarpetMaterials();
+    }
+
+    private static final int LOCAL_SCAN_MAX_RADIUS = 48;
+
+    /**
+     * Counts the carpets the schematic still needs *near the player* — positions where
+     * Litematica's schematic world has a carpet but the real world doesn't match yet —
+     * nearest first, up to one inventory-load worth. Returns null when the schematic
+     * world isn't available (Litematica absent / nothing loaded), so callers fall back
+     * to whole-build totals.
+     */
+    private static Map<Item, Integer> localCarpetDemand(MinecraftClient client) {
+        if (client.player == null || client.world == null) return null;
+
+        World schematic;
+        try {
+            Object sw = Class.forName("fi.dy.masa.litematica.world.SchematicWorldHandler")
+                    .getMethod("getSchematicWorld").invoke(null);
+            if (!(sw instanceof World w)) return null;
+            schematic = w;
+        } catch (Throwable t) {
+            return null;
+        }
+
+        // One inventory-load = usable carpet slots × 64.
+        PlayerInventory inv = client.player.getInventory();
+        int usable = 0;
+        for (int i = 0; i <= 35; i++) {
+            ItemStack s = inv.getStack(i);
+            if (s.isEmpty() || isCarpet(s.getItem())) usable++;
+        }
+        int cap = usable * MAX_STACK;
+        if (cap <= 0) return null;
+
+        // Expanding cubic shells around the player; stop once we've gathered ≥ cap.
+        record Hit(Item color, long distSq) {}
+        List<Hit> hits = new ArrayList<>();
+        BlockPos origin = client.player.getBlockPos();
+        BlockPos.Mutable pos = new BlockPos.Mutable();
+        for (int r = 0; r <= LOCAL_SCAN_MAX_RADIUS; r++) {
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dy = -r; dy <= r; dy++) {
+                    for (int dz = -r; dz <= r; dz++) {
+                        // Only the new outer shell at radius r.
+                        if (Math.max(Math.abs(dx), Math.max(Math.abs(dy), Math.abs(dz))) != r) continue;
+                        pos.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
+                        try {
+                            BlockState exp = schematic.getBlockState(pos);
+                            Item carpet = exp.getBlock().asItem();
+                            if (!isCarpet(carpet)) continue;
+                            if (client.world.getBlockState(pos).getBlock() == exp.getBlock()) continue; // already placed
+                            long ddx = dx, ddy = dy, ddz = dz;
+                            hits.add(new Hit(carpet, ddx * ddx + ddy * ddy + ddz * ddz));
+                        } catch (Exception ignored) {
+                            // unloaded schematic chunk etc. — skip
+                        }
+                    }
+                }
+            }
+            if (hits.size() >= cap) break;
+        }
+        if (hits.isEmpty()) return null;
+
+        hits.sort(Comparator.comparingLong(Hit::distSq));
+        Map<Item, Integer> demand = new HashMap<>();
+        int taken = 0;
+        for (Hit h : hits) {
+            if (taken >= cap) break;
+            demand.merge(h.color(), 1, Integer::sum);
+            taken++;
+        }
+        return demand;
+    }
+
     static Map<Item, Integer> readCarpetMaterials() throws Exception {
         Class<?> dataManager = Class.forName("fi.dy.masa.litematica.data.DataManager");
 

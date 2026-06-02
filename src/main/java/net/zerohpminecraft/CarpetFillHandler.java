@@ -65,13 +65,13 @@ public class CarpetFillHandler {
 
     private static final String TAG = "[Loominary]";
 
-    private static final int    DETECT_RANGE       = 24;       // how far we look for chests
-    private static final double REACH_SQ           = 4.5 * 4.5; // how close to actually open one
+    private static final double REACH_SQ           = 4.5 * 4.5; // how close to actually open a chest
     private static final int    LAST_INV_SLOT      = 35;   // 0–8 hotbar, 9–35 main; 36+ armor/offhand
     private static final int    MAX_STACK          = CarpetBalanceHandler.MAX_STACK;
 
     private static final int    ACTION_COOLDOWN_TICKS  = 4;
-    private static final int    SETTLE_TICKS           = 10;   // wait after open for contents to sync
+    private static final int    SETTLE_TICKS           = 10;   // initial wait after open before reading
+    private static final int    SYNC_WAIT_MAX          = 60;   // keep waiting (up to this) while the chest reads empty
     private static final int    OPEN_TIMEOUT_TICKS     = 60;
     private static final int    OPEN_RETRY_INTERVAL    = 15;   // re-send interact this often while waiting
     private static final int    MAX_OPEN_ATTEMPTS      = 3;
@@ -88,6 +88,7 @@ public class CarpetFillHandler {
     private static State   state  = State.SCAN;
     private static int     cooldown   = 0;
     private static int     openWait   = 0;
+    private static int     syncWait   = 0;
     private static int     openAttempts = 0;
     private static int     totalTicks = 0;
     private static int     approachTimer = 0;
@@ -363,9 +364,10 @@ public class CarpetFillHandler {
     private static void waitOpenStep(MinecraftClient client) {
         if (isContainerOpen(client)) {
             // Wait a beat before reading: the container's contents arrive a tick or
-            // more after the open packet, so reading immediately can see an empty
-            // chest and wrongly record it as empty.
+            // more after the open packet (and much later on a laggy server), so
+            // reading immediately can see an empty chest and wrongly record it empty.
             state = State.GRAB;
+            syncWait = 0;
             cooldown = SETTLE_TICKS;
             return;
         }
@@ -394,6 +396,15 @@ public class CarpetFillHandler {
         ScreenHandler h = client.player.currentScreenHandler;
         PlayerInventory inv = client.player.getInventory();
         ItemStack cursor = h.getCursorStack();
+
+        // The server sends the chest's contents a moment after it opens; until then the
+        // container reads empty. Keep waiting (up to SYNC_WAIT_MAX) rather than trusting
+        // an empty read — that's what was recording stocked chests as empty.
+        if (cursor.isEmpty() && !containerHasItem(h, inv) && syncWait < SYNC_WAIT_MAX) {
+            syncWait++;
+            cooldown = 2;
+            return;
+        }
 
         if (cursor.isEmpty()) {
             if (totalNeed(inv) == 0) { closeAndCooldown(client); return; }
@@ -440,6 +451,14 @@ public class CarpetFillHandler {
             if (s.isEmpty() || !CarpetBalanceHandler.isCarpet(s.getItem())) continue;
             contents.merge(s.getItem(), s.getCount(), Integer::sum);
         }
+
+        // Never persist an "empty" reading: an empty container is ambiguous (truly empty
+        // vs. contents not yet synced), and a false empty would permanently hide a stocked
+        // chest. Forget it instead, so it's treated as unknown and re-checked later.
+        if (contents.isEmpty()) {
+            if (chestMemory.remove(currentChestPos) != null) saveDisk();
+            return;
+        }
         chestMemory.put(currentChestPos, contents);
 
         // A double chest is two block entities sharing one inventory (54 slots). Mark
@@ -457,6 +476,16 @@ public class CarpetFillHandler {
             }
         }
         saveDisk();
+    }
+
+    /** True if the open chest has any item at all — our signal that its contents have synced. */
+    private static boolean containerHasItem(ScreenHandler h, PlayerInventory inv) {
+        for (int i = 0; i < h.slots.size(); i++) {
+            Slot slot = h.getSlot(i);
+            if (slot.inventory == inv) continue;     // chest slots only
+            if (!slot.getStack().isEmpty()) return true;
+        }
+        return false;
     }
 
     // ── Persistence (per server + dimension) ─────────────────────────────────
@@ -491,7 +520,9 @@ public class CarpetFillHandler {
                 Item it = Registries.ITEM.get(id);
                 if (CarpetBalanceHandler.isCarpet(it)) contents.put(it, ce.getValue());
             }
-            chestMemory.put(p, contents);
+            // Skip empty entries: a chest remembered as empty (possibly a stale false
+            // empty) is treated as unknown so it gets re-checked rather than ignored.
+            if (!contents.isEmpty()) chestMemory.put(p, contents);
         }
     }
 
@@ -621,10 +652,10 @@ public class CarpetFillHandler {
      * Picks the next chest to head for. KNOWN chests come from {@link #chestMemory} by
      * their stored positions, at <em>any</em> distance — so a needed chest across a big
      * storage room is still found and the APPROACH state walks the player to it. UNKNOWN
-     * chests are discovered by a bounded world scan around the player (out to
-     * {@link #DETECT_RANGE}) and preferred first, so memory keeps filling in. Chests known
-     * to hold nothing we need are skipped. Also refreshes {@link #markerChests} for the
-     * in-world markers.
+     * (uncatalogued) chests are only opened when you're <em>already next to one</em>: we
+     * never walk you across the room to a chest whose contents we don't know (which led to
+     * trekking to chests that turned out to hold carpet you don't need). Chests known to
+     * hold nothing we need are skipped. Also refreshes {@link #markerChests}.
      */
     private static BlockPos findNextChest(MinecraftClient client) {
         PlayerInventory inv = client.player.getInventory();
@@ -642,19 +673,21 @@ public class CarpetFillHandler {
             if (distSq < bestKnownDist) { bestKnownDist = distSq; bestKnown = pos; }
         }
 
-        // Unknown chests near the player — bounded world scan; preferred to build memory.
+        // Unknown chests — only catalogue ones already within reach; never walk to them.
         BlockPos bestUnknown = null; double bestUnknownDist = Double.MAX_VALUE;
         BlockPos origin = client.player.getBlockPos();
-        for (int dx = -DETECT_RANGE; dx <= DETECT_RANGE; dx++) {
-            for (int dy = -DETECT_RANGE; dy <= DETECT_RANGE; dy++) {
-                for (int dz = -DETECT_RANGE; dz <= DETECT_RANGE; dz++) {
+        int r = (int) Math.ceil(Math.sqrt(REACH_SQ)) + 1;
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
                     BlockPos pos = origin.add(dx, dy, dz);
                     if (visited.contains(pos) || chestMemory.containsKey(pos)) continue;
+                    double distSq = client.player.squaredDistanceTo(
+                            pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+                    if (distSq > REACH_SQ) continue;   // only chests you're already standing at
                     if (!(client.world.getBlockEntity(pos) instanceof ChestBlockEntity)) continue;
                     BlockPos ip = pos.toImmutable();
                     markerChests.add(ip);
-                    double distSq = client.player.squaredDistanceTo(
-                            pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
                     if (distSq < bestUnknownDist) { bestUnknownDist = distSq; bestUnknown = ip; }
                 }
             }

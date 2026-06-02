@@ -613,11 +613,11 @@ public class CarpetBalanceHandler {
     private static final int LOCAL_SCAN_MAX_RADIUS = 256;
 
     /**
-     * Counts the carpets the schematic still needs *near the player* — positions where
+     * Counts the carpets the schematic still needs near the player — positions where
      * Litematica's schematic world has a carpet but the real world doesn't match yet —
-     * nearest first, up to one inventory-load worth. Returns null when the schematic
-     * world isn't available (Litematica absent / nothing loaded), so callers fall back
-     * to whole-build totals.
+     * swept NW→SE and capped at one inventory-load, so the gathered mix maps to a
+     * predictable build frontier. Returns null when the schematic world isn't available
+     * (Litematica absent / nothing loaded), so callers fall back to whole-build totals.
      */
     private static Map<Item, Integer> localCarpetDemand(MinecraftClient client) {
         if (client.player == null || client.world == null) return null;
@@ -642,44 +642,33 @@ public class CarpetBalanceHandler {
         int cap = usable * MAX_STACK;
         if (cap <= 0) return null;
 
-        // Expanding horizontal rings at the player's Y (carpet builds are a single
-        // layer, so fixing Y keeps a 256-block search cheap). Stop once we've
-        // gathered ≥ cap incomplete carpets.
-        record Hit(Item color, long distSq) {}
-        List<Hit> hits = new ArrayList<>();
+        // Sweep the player's Y layer north→south, west→east (NW corner first), taking
+        // the first `cap` incomplete carpets. A fixed reading order makes it
+        // predictable where to carry the load — you always advance NW→SE — and a
+        // single Y layer keeps a 256-block search cheap.
+        Map<Item, Integer> demand = new HashMap<>();
+        int taken = 0;
         BlockPos origin = client.player.getBlockPos();
         int py = origin.getY();
         BlockPos.Mutable pos = new BlockPos.Mutable();
-        for (int r = 0; r <= LOCAL_SCAN_MAX_RADIUS; r++) {
-            for (int dx = -r; dx <= r; dx++) {
-                for (int dz = -r; dz <= r; dz++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dz)) != r) continue;  // only the new ring
-                    pos.set(origin.getX() + dx, py, origin.getZ() + dz);
-                    try {
-                        BlockState exp = schematic.getBlockState(pos);
-                        Item carpet = exp.getBlock().asItem();
-                        if (!isCarpet(carpet)) continue;
-                        if (client.world.getBlockState(pos).getBlock() == exp.getBlock()) continue; // already placed
-                        long ddx = dx, ddz = dz;
-                        hits.add(new Hit(carpet, ddx * ddx + ddz * ddz));
-                    } catch (Exception ignored) {
-                        // unloaded schematic chunk etc. — skip
-                    }
+        int R = LOCAL_SCAN_MAX_RADIUS;
+        outer:
+        for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {        // north → south
+            for (int x = origin.getX() - R; x <= origin.getX() + R; x++) {    // west → east
+                pos.set(x, py, z);
+                try {
+                    BlockState exp = schematic.getBlockState(pos);
+                    Item carpet = exp.getBlock().asItem();
+                    if (!isCarpet(carpet)) continue;
+                    if (client.world.getBlockState(pos).getBlock() == exp.getBlock()) continue; // already placed
+                    demand.merge(carpet, 1, Integer::sum);
+                    if (++taken >= cap) break outer;
+                } catch (Exception ignored) {
+                    // unloaded schematic chunk etc. — skip
                 }
             }
-            if (hits.size() >= cap) break;
         }
-        if (hits.isEmpty()) return null;
-
-        hits.sort(Comparator.comparingLong(Hit::distSq));
-        Map<Item, Integer> demand = new HashMap<>();
-        int taken = 0;
-        for (Hit h : hits) {
-            if (taken >= cap) break;
-            demand.merge(h.color(), 1, Integer::sum);
-            taken++;
-        }
-        return demand;
+        return demand.isEmpty() ? null : demand;
     }
 
     static Map<Item, Integer> readCarpetMaterials() throws Exception {

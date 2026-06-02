@@ -1,6 +1,9 @@
 package net.zerohpminecraft;
 
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.ChestBlock;
+import net.minecraft.block.enums.ChestType;
 import net.minecraft.block.entity.ChestBlockEntity;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
@@ -246,6 +249,13 @@ public class CarpetFillHandler {
     }
 
     private static void scanStep(MinecraftClient client) {
+        // Stop as soon as the inventory can't hold any more of what we need — don't
+        // keep opening (even unknown) chests once every goal slot is full.
+        if (totalNeed(client.player.getInventory()) == 0) {
+            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed "
+                    + "carpets (" + visited.size() + " chest" + (visited.size() == 1 ? "" : "s") + " opened).");
+            return;
+        }
         BlockPos chest = findNextChest(client);
         if (chest == null) {
             finish(client, "§a" + TAG + " Carpet fill done — filled "
@@ -319,24 +329,41 @@ public class CarpetFillHandler {
     }
 
     private static void closeAndCooldown(MinecraftClient client) {
-        recordChestMemory(client.player.currentScreenHandler, client.player.getInventory());
+        recordChestMemory(client, client.player.currentScreenHandler, client.player.getInventory());
         client.player.closeHandledScreen();   // cursor is always empty at this point
         state = State.COOLDOWN;
         cooldown = BETWEEN_CHESTS_TICKS;
     }
 
     /** Remembers the chest's remaining carpet contents (after our grab) for this session. */
-    private static void recordChestMemory(ScreenHandler h, PlayerInventory inv) {
+    private static void recordChestMemory(MinecraftClient client, ScreenHandler h, PlayerInventory inv) {
         if (currentChestPos == null) return;
         Map<Item, Integer> contents = new HashMap<>();
+        int containerSlots = 0;
         for (int i = 0; i < h.slots.size(); i++) {
             Slot slot = h.getSlot(i);
             if (slot.inventory == inv) continue;                 // chest slots only
+            containerSlots++;
             ItemStack s = slot.getStack();
             if (s.isEmpty() || !CarpetBalanceHandler.isCarpet(s.getItem())) continue;
             contents.merge(s.getItem(), s.getCount(), Integer::sum);
         }
         chestMemory.put(currentChestPos, contents);
+
+        // A double chest is two block entities sharing one inventory (54 slots). Mark
+        // the connected half visited and remember it too, so we don't reopen the same
+        // storage as if it were a separate chest.
+        if (containerSlots > 27 && client.world != null) {
+            for (Direction d : Direction.Type.HORIZONTAL) {
+                BlockPos n = currentChestPos.offset(d);
+                BlockState ns = client.world.getBlockState(n);
+                if (ns.getBlock() instanceof ChestBlock && ns.get(ChestBlock.CHEST_TYPE) != ChestType.SINGLE
+                        && client.world.getBlockEntity(n) instanceof ChestBlockEntity) {
+                    visited.add(n);
+                    chestMemory.put(n, contents);
+                }
+            }
+        }
     }
 
     // ── Need accounting (live, from PlayerInventory) ─────────────────────────

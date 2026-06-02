@@ -615,10 +615,13 @@ public class CarpetBalanceHandler {
     /**
      * Counts the carpets the schematic still needs near the player — positions where
      * Litematica's schematic world has a carpet but the real world doesn't match yet —
-     * swept west→east (each column north→south) and capped at one inventory-load, so the
-     * gathered mix maps to a predictable build frontier — the westmost unbuilt column
-     * first. Returns null when the schematic world isn't available
-     * (Litematica absent / nothing loaded), so callers fall back to whole-build totals.
+     * capped at one inventory-load, so the gathered mix maps to a predictable build
+     * frontier. Each column is swept north→south; the column order depends on which side
+     * of the build's east-west midpoint the player stands: on the west side it sweeps
+     * west→east (NW→SE), on the east side east→west (NE→SW), so you always gather the
+     * unbuilt columns nearest you first. Returns null when the schematic world isn't
+     * available (Litematica absent / nothing loaded), so callers fall back to whole-build
+     * totals.
      */
     private static Map<Item, Integer> localCarpetDemand(MinecraftClient client) {
         if (client.player == null || client.world == null) return null;
@@ -643,19 +646,23 @@ public class CarpetBalanceHandler {
         int cap = usable * MAX_STACK;
         if (cap <= 0) return null;
 
-        // Sweep the player's Y layer west→east, each column north→south (west-banded),
-        // taking the first `cap` incomplete carpets. A fixed reading order makes it
-        // predictable where to carry the load — you finish the westmost unbuilt column
-        // top-to-bottom, then advance east — and a single Y layer keeps a 256-block
-        // search cheap.
+        // Sweep the player's Y layer one column at a time, each column north→south,
+        // taking the first `cap` incomplete carpets. The column order starts from the
+        // player's side of the build: west→east on the west half (NW→SE), east→west on
+        // the east half (NE→SW), so you always gather the unbuilt columns nearest you.
+        // A fixed order makes it predictable where to carry the load; a single Y layer
+        // keeps a 256-block search cheap.
+        boolean eastSide = isEastOfBuildCenter(client);
         Map<Item, Integer> demand = new HashMap<>();
         int taken = 0;
         BlockPos origin = client.player.getBlockPos();
         int py = origin.getY();
         BlockPos.Mutable pos = new BlockPos.Mutable();
         int R = LOCAL_SCAN_MAX_RADIUS;
+        int minX = origin.getX() - R, maxX = origin.getX() + R;
         outer:
-        for (int x = origin.getX() - R; x <= origin.getX() + R; x++) {        // west → east
+        for (int i = 0; i <= 2 * R; i++) {
+            int x = eastSide ? (maxX - i) : (minX + i);   // east→west on the east half, else west→east
             for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {    // north → south
                 pos.set(x, py, z);
                 try {
@@ -671,6 +678,28 @@ public class CarpetBalanceHandler {
             }
         }
         return demand.isEmpty() ? null : demand;
+    }
+
+    /**
+     * True when the player is east of the selected placement's east-west midpoint. Used to
+     * flip the local-demand sweep so it starts from the player's side of the build.
+     * Defaults to false (west side / west→east) if the placement bounds aren't available.
+     */
+    private static boolean isEastOfBuildCenter(MinecraftClient client) {
+        try {
+            Object spm = Class.forName("fi.dy.masa.litematica.data.DataManager")
+                    .getMethod("getSchematicPlacementManager").invoke(null);
+            Object placement = spm.getClass().getMethod("getSelectedSchematicPlacement").invoke(spm);
+            if (placement == null) return false;
+            Object box = placement.getClass().getMethod("getEclosingBox").invoke(placement);
+            if (box == null) return false;
+            BlockPos p1 = (BlockPos) box.getClass().getMethod("getPos1").invoke(box);
+            BlockPos p2 = (BlockPos) box.getClass().getMethod("getPos2").invoke(box);
+            double midX = (p1.getX() + p2.getX()) / 2.0;
+            return client.player.getX() > midX;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     static Map<Item, Integer> readCarpetMaterials() throws Exception {

@@ -54,7 +54,7 @@ public class CarpetBalanceHandler {
     /** Usable player-inventory slot range (inclusive) in PlayerScreenHandler. */
     private static final int FIRST_MAIN_SLOT = 9;
     private static final int LAST_HOTBAR_SLOT = 44;   // 45 = offhand (excluded)
-    private static final int MAX_STACK = 64;
+    static final int MAX_STACK = 64;
 
     private static final int ACTION_COOLDOWN_TICKS = 3;
     private static final int WATCHDOG_TICKS = 400;    // abort if not done in time
@@ -220,7 +220,7 @@ public class CarpetBalanceHandler {
      *
      * @return an array of slot counts aligned with {@code sorted}
      */
-    private static int[] allocateProportionalSlots(List<Map.Entry<Item, Integer>> sorted, int n) {
+    static int[] allocateProportionalSlots(List<Map.Entry<Item, Integer>> sorted, int n) {
         int k = sorted.size();
         int[] alloc = new int[k];
         if (k == 0 || n <= 0) return alloc;
@@ -541,7 +541,7 @@ public class CarpetBalanceHandler {
         return !stack.isEmpty() && isCarpet(stack.getItem());
     }
 
-    private static boolean isCarpet(Item item) {
+    static boolean isCarpet(Item item) {
         return Registries.ITEM.getId(item).getPath().endsWith("_carpet");
     }
 
@@ -580,7 +580,7 @@ public class CarpetBalanceHandler {
      * @throws ClassNotFoundException if Litematica isn't on the classpath
      */
     @SuppressWarnings("unchecked")
-    private static Map<Item, Integer> readCarpetMaterials() throws Exception {
+    static Map<Item, Integer> readCarpetMaterials() throws Exception {
         Class<?> dataManager = Class.forName("fi.dy.masa.litematica.data.DataManager");
 
         // Preferred path: compute totals fresh from the currently SELECTED

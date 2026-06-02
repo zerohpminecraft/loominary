@@ -29,6 +29,7 @@ import net.minecraft.util.math.Vec3d;
 import net.zerohpminecraft.AnvilAutoFillHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.CarpetBalanceHandler;
+import net.zerohpminecraft.CarpetFillHandler;
 import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CodecMode;
 import net.zerohpminecraft.MapBannerDecoder;
@@ -1726,7 +1727,9 @@ public class LoominaryCommand {
                             // ── carpets ────────────────────────────────────────
                             .then(ClientCommandManager.literal("carpets")
                                     .then(ClientCommandManager.literal("balance")
-                                            .executes(ctx -> carpetBalance(ctx.getSource()))))
+                                            .executes(ctx -> carpetBalance(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("fill")
+                                            .executes(ctx -> carpetFill(ctx.getSource()))))
 
                             // ── whitelist ──────────────────────────────────────
                             .then(ClientCommandManager.literal("whitelist")
@@ -4655,6 +4658,17 @@ public class LoominaryCommand {
     private static int carpetBalance(FabricClientCommandSource source) {
         MinecraftClient client = MinecraftClient.getInstance();
         CarpetBalanceHandler.activate(client);
+        return 1;
+    }
+
+    private static int carpetFill(FabricClientCommandSource source) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (CarpetFillHandler.isActive()) {
+            CarpetFillHandler.stop();
+            source.sendFeedback(Text.literal("§7Carpet fill stopped."));
+            return 1;
+        }
+        CarpetFillHandler.start(client);
         return 1;
     }
 

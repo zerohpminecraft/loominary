@@ -7,5 +7,6 @@
     "key.loominary.status": "Show batch status",
     "key.loominary.edit": "Open map editor",
     "key.loominary.decode_toggle": "Toggle Loominary decoding (raw/decoded)",
-    "key.loominary.carpet_balance": "Balance carpets to Litematica materials"
+    "key.loominary.carpet_balance": "Balance carpets to Litematica materials",
+    "key.loominary.carpet_fill": "Fill carpet stacks from nearby chests"
 }

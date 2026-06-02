@@ -66,6 +66,7 @@ public class CarpetFillHandler {
     private static final String TAG = "[Loominary]";
 
     private static final double REACH_SQ           = 4.5 * 4.5; // how close to actually open a chest
+    private static final double WALK_LIMIT_SQ      = 5.0 * 5.0;  // never auto-guide farther than this
     private static final int    LAST_INV_SLOT      = 35;   // 0–8 hotbar, 9–35 main; 36+ armor/offhand
     private static final int    MAX_STACK          = CarpetBalanceHandler.MAX_STACK;
 
@@ -81,7 +82,7 @@ public class CarpetFillHandler {
 
     private static final int LEFT_CLICK = 0;
 
-    private enum State { BALANCE_WAIT, SCAN, APPROACH, WAIT_OPEN, GRAB, COOLDOWN }
+    private enum State { BALANCE_WAIT, SCAN, APPROACH, WAIT_OPEN, COOLDOWN }
 
     // ── Run state ──────────────────────────────────────────────────────────
     private static boolean active = false;
@@ -107,8 +108,15 @@ public class CarpetFillHandler {
      * nothing we need. Persisted to disk per server+dimension (see {@link #diskModel}).
      */
     private static final Map<BlockPos, Map<Item, Integer>> chestMemory = new HashMap<>();
-    /** The chest opened in the current cycle (for recording memory on close). */
+    /** The chest the tool is currently targeting/guiding to (for markers + auto-open). */
     private static BlockPos currentChestPos = null;
+    /** Whether the tool itself opened the currently-open chest (vs the player opening one). */
+    private static boolean toolOpened = false;
+    /** Per-open bookkeeping for whatever chest is currently open (player- or tool-opened). */
+    private static boolean inOpenChest = false;
+    private static boolean recordedThisOpen = false;
+    private static boolean tookFromThisOpen = false;
+    private static BlockPos openChestPos = null;
 
     // ── Persistence ──────────────────────────────────────────────────────────
     private static final String MEMORY_FILE = "loominary_chest_memory.json";
@@ -258,6 +266,23 @@ public class CarpetFillHandler {
             return;
         }
 
+        // Any open chest — whether the tool opened it or you did — is handled here:
+        // grab the carpet we need from it and remember its contents. This lets you help
+        // by simply opening a chest you know holds what's wanted.
+        if (isContainerOpen(client)) {
+            if (!inOpenChest) {                       // a chest just opened
+                inOpenChest = true;
+                syncWait = 0;
+                recordedThisOpen = false;
+                tookFromThisOpen = false;
+                openChestPos = nearestChestInReach(client);   // the chest you're standing at
+            }
+            if (cooldown > 0) { cooldown--; return; }
+            grabStep(client);
+            return;
+        }
+        inOpenChest = false;
+
         switch (state) {
             case BALANCE_WAIT -> balanceWaitStep(client);
             case SCAN -> {
@@ -266,10 +291,6 @@ public class CarpetFillHandler {
             }
             case APPROACH -> approachStep(client);
             case WAIT_OPEN -> waitOpenStep(client);
-            case GRAB -> {
-                if (cooldown > 0) { cooldown--; return; }
-                grabStep(client);
-            }
             case COOLDOWN -> {
                 if (cooldown > 0) { cooldown--; return; }
                 state = State.SCAN;
@@ -287,26 +308,50 @@ public class CarpetFillHandler {
     }
 
     private static void scanStep(MinecraftClient client) {
-        // Stop as soon as the inventory can't hold any more of what we need — don't
-        // keep opening (even unknown) chests once every goal slot is full.
-        if (totalNeed(client.player.getInventory()) == 0) {
-            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed "
-                    + "carpets (" + visited.size() + " chest" + (visited.size() == 1 ? "" : "s") + " opened).");
+        PlayerInventory inv = client.player.getInventory();
+        if (totalNeed(inv) == 0) {
+            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed carpets.");
             return;
         }
-        BlockPos chest = findNextChest(client);   // also refreshes markerChests
-        if (chest == null) {
-            finish(client, "§a" + TAG + " Carpet fill done — filled "
-                    + (initialNeed - totalNeed(client.player.getInventory())) + " carpets"
-                    + " (" + visited.size() + " chest" + (visited.size() == 1 ? "" : "s") + " opened)."
-                    + (totalNeed(client.player.getInventory()) > 0
-                        ? " §7No more reachable chests with what's needed." : ""));
-            return;
+        BlockPos chest = findNextChest(client);   // nearest known-needed chest; refreshes markers
+        currentChestPos = chest;                  // marker target (may be far / null)
+
+        // Only auto-walk you to a chest within a few blocks. For anything farther — or if
+        // we don't know a chest with it — just say what's wanted and wait: open any chest
+        // that has it (the tool grabs from whatever you open) or walk over yourself.
+        if (chest != null) {
+            double distSq = client.player.squaredDistanceTo(
+                    chest.getX() + 0.5, chest.getY() + 0.5, chest.getZ() + 0.5);
+            if (distSq <= WALK_LIMIT_SQ) {
+                approachTimer = 0;
+                lastApproachDistSq = Double.MAX_VALUE;
+                toolOpened = false;
+                state = State.APPROACH;
+                return;
+            }
         }
-        currentChestPos = chest;
-        approachTimer = 0;
-        lastApproachDistSq = Double.MAX_VALUE;
-        state = State.APPROACH;   // walk into reach (or open immediately if already close)
+        client.inGameHud.setOverlayMessage(Text.literal(needHint(client, inv, chest)), false);
+        state = State.COOLDOWN;
+        cooldown = 10;   // re-check shortly; grabs immediately if you open a chest meanwhile
+    }
+
+    /** "Need 192 brown — open a chest with it (nearest known: x,y,z, N blocks)". */
+    private static String needHint(MinecraftClient client, PlayerInventory inv, BlockPos nearestKnown) {
+        Item top = null; int topNeed = 0;
+        for (Item color : goal.keySet()) {
+            int n = need(inv, color);
+            if (n > topNeed) { topNeed = n; top = color; }
+        }
+        String want = top == null ? totalNeed(inv) + " carpet"
+                : topNeed + " " + Registries.ITEM.getId(top).getPath().replace("_carpet", "");
+        String hint = "§e" + TAG + " Need §f" + want + "§e — open a chest with it";
+        if (nearestKnown != null) {
+            double d = Math.sqrt(client.player.squaredDistanceTo(
+                    nearestKnown.getX() + 0.5, nearestKnown.getY() + 0.5, nearestKnown.getZ() + 0.5));
+            hint += String.format(" §7(nearest known: %d,%d,%d, %.0f blocks)",
+                    nearestKnown.getX(), nearestKnown.getY(), nearestKnown.getZ(), d);
+        }
+        return hint;
     }
 
     private static void approachStep(MinecraftClient client) {
@@ -322,6 +367,14 @@ public class CarpetFillHandler {
         double distSq = client.player.squaredDistanceTo(
                 currentChestPos.getX() + 0.5, currentChestPos.getY() + 0.5, currentChestPos.getZ() + 0.5);
 
+        // If you've moved past the short auto-walk cap, stop guiding to this one and
+        // re-evaluate (you may be heading to a closer chest, or opening one yourself).
+        if (distSq > WALK_LIMIT_SQ) {
+            state = State.COOLDOWN;
+            cooldown = BETWEEN_CHESTS_TICKS;
+            return;
+        }
+
         if (distSq <= REACH_SQ) {
             // In reach now (so the chunk is loaded) — verify a chest is actually there.
             if (!(client.world.getBlockEntity(currentChestPos) instanceof ChestBlockEntity)) {
@@ -335,6 +388,7 @@ public class CarpetFillHandler {
             visited.add(currentChestPos);
             openWait = 0;
             openAttempts = 1;
+            toolOpened = true;
             openChest(client, currentChestPos);
             state = State.WAIT_OPEN;
             return;
@@ -362,15 +416,8 @@ public class CarpetFillHandler {
     }
 
     private static void waitOpenStep(MinecraftClient client) {
-        if (isContainerOpen(client)) {
-            // Wait a beat before reading: the container's contents arrive a tick or
-            // more after the open packet (and much later on a laggy server), so
-            // reading immediately can see an empty chest and wrongly record it empty.
-            state = State.GRAB;
-            syncWait = 0;
-            cooldown = SETTLE_TICKS;
-            return;
-        }
+        // (Once the chest actually opens, the open-chest handler at the top of onTick
+        // takes over — this state only covers the gap before the open registers.)
         openWait++;
         // Re-send the interact a couple of times in case the first packet was dropped/rejected.
         if (openWait % OPEN_RETRY_INTERVAL == 0 && openAttempts < MAX_OPEN_ATTEMPTS) {
@@ -406,11 +453,28 @@ public class CarpetFillHandler {
             return;
         }
 
+        // Now that contents have synced, remember this chest's carpet — for any chest you
+        // open, not just ones the tool opened.
+        if (!recordedThisOpen) {
+            recordChestMemory(client, h, inv, openChestPos);
+            recordedThisOpen = true;
+        }
+
         if (cursor.isEmpty()) {
             if (totalNeed(inv) == 0) { closeAndCooldown(client); return; }
             int cs = firstNeededChestSlot(h, inv);
-            if (cs == -1) { closeAndCooldown(client); return; }  // nothing useful in this chest
-            click(client, h, cs);                                 // pick up the whole chest stack
+            if (cs != -1) {
+                click(client, h, cs);          // pick up a needed stack
+                tookFromThisOpen = true;
+                return;
+            }
+            // Nothing (more) we need in this chest. If we opened it, or took from it,
+            // close and move on. If you opened it and it had nothing for us, leave it be.
+            if (toolOpened || tookFromThisOpen) {
+                closeAndCooldown(client);
+            } else {
+                client.inGameHud.setOverlayMessage(Text.literal(needHint(client, inv, currentChestPos)), false);
+            }
             return;
         }
 
@@ -432,15 +496,16 @@ public class CarpetFillHandler {
     }
 
     private static void closeAndCooldown(MinecraftClient client) {
-        recordChestMemory(client, client.player.currentScreenHandler, client.player.getInventory());
         client.player.closeHandledScreen();   // cursor is always empty at this point
+        toolOpened = false;
+        currentChestPos = null;
         state = State.COOLDOWN;
         cooldown = BETWEEN_CHESTS_TICKS;
     }
 
-    /** Remembers the chest's remaining carpet contents (after our grab) for this session. */
-    private static void recordChestMemory(MinecraftClient client, ScreenHandler h, PlayerInventory inv) {
-        if (currentChestPos == null) return;
+    /** Remembers a chest's carpet-only contents (counts) for this session, at {@code pos}. */
+    private static void recordChestMemory(MinecraftClient client, ScreenHandler h, PlayerInventory inv, BlockPos pos) {
+        if (pos == null) return;
         Map<Item, Integer> contents = new HashMap<>();
         int containerSlots = 0;
         for (int i = 0; i < h.slots.size(); i++) {
@@ -448,7 +513,7 @@ public class CarpetFillHandler {
             if (slot.inventory == inv) continue;                 // chest slots only
             containerSlots++;
             ItemStack s = slot.getStack();
-            if (s.isEmpty() || !CarpetBalanceHandler.isCarpet(s.getItem())) continue;
+            if (s.isEmpty() || !CarpetBalanceHandler.isCarpet(s.getItem())) continue;  // carpet only
             contents.merge(s.getItem(), s.getCount(), Integer::sum);
         }
 
@@ -456,17 +521,17 @@ public class CarpetFillHandler {
         // vs. contents not yet synced), and a false empty would permanently hide a stocked
         // chest. Forget it instead, so it's treated as unknown and re-checked later.
         if (contents.isEmpty()) {
-            if (chestMemory.remove(currentChestPos) != null) saveDisk();
+            if (chestMemory.remove(pos) != null) saveDisk();
             return;
         }
-        chestMemory.put(currentChestPos, contents);
+        chestMemory.put(pos, contents);
 
         // A double chest is two block entities sharing one inventory (54 slots). Mark
         // the connected half visited and remember it too, so we don't reopen the same
         // storage as if it were a separate chest.
         if (containerSlots > 27 && client.world != null) {
             for (Direction d : Direction.Type.HORIZONTAL) {
-                BlockPos n = currentChestPos.offset(d);
+                BlockPos n = pos.offset(d);
                 BlockState ns = client.world.getBlockState(n);
                 if (ns.getBlock() instanceof ChestBlock && ns.get(ChestBlock.CHEST_TYPE) != ChestType.SINGLE
                         && client.world.getBlockEntity(n) instanceof ChestBlockEntity) {
@@ -476,6 +541,29 @@ public class CarpetFillHandler {
             }
         }
         saveDisk();
+    }
+
+    /** Nearest chest block within reach — used to attribute a player-opened chest to a position. */
+    private static BlockPos nearestChestInReach(MinecraftClient client) {
+        if (client.world == null) return null;
+        BlockPos origin = client.player.getBlockPos();
+        int r = (int) Math.ceil(Math.sqrt(REACH_SQ)) + 1;
+        BlockPos best = null;
+        double bestDistSq = Double.MAX_VALUE;
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    BlockPos pos = origin.add(dx, dy, dz);
+                    double distSq = client.player.squaredDistanceTo(
+                            pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+                    if (distSq > REACH_SQ || distSq >= bestDistSq) continue;
+                    if (!(client.world.getBlockEntity(pos) instanceof ChestBlockEntity)) continue;
+                    best = pos.toImmutable();
+                    bestDistSq = distSq;
+                }
+            }
+        }
+        return best;
     }
 
     /** True if the open chest has any item at all — our signal that its contents have synced. */

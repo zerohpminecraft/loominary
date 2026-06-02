@@ -5,7 +5,14 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.render.RenderLayer;
+import net.minecraft.client.render.VertexConsumer;
+import net.minecraft.client.render.VertexConsumerProvider;
+import net.minecraft.client.render.VertexRendering;
+import net.minecraft.client.util.math.MatrixStack;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.ChestBlock;
 import net.minecraft.block.enums.ChestType;
@@ -58,21 +65,23 @@ public class CarpetFillHandler {
 
     private static final String TAG = "[Loominary]";
 
-    private static final int    SCAN_RANGE         = 5;
-    private static final double REACH_SQ           = 4.5 * 4.5;
+    private static final int    DETECT_RANGE       = 24;       // how far we look for chests
+    private static final double REACH_SQ           = 4.5 * 4.5; // how close to actually open one
     private static final int    LAST_INV_SLOT      = 35;   // 0–8 hotbar, 9–35 main; 36+ armor/offhand
     private static final int    MAX_STACK          = CarpetBalanceHandler.MAX_STACK;
 
     private static final int    ACTION_COOLDOWN_TICKS  = 4;
+    private static final int    SETTLE_TICKS           = 10;   // wait after open for contents to sync
     private static final int    OPEN_TIMEOUT_TICKS     = 60;
     private static final int    OPEN_RETRY_INTERVAL    = 15;   // re-send interact this often while waiting
     private static final int    MAX_OPEN_ATTEMPTS      = 3;
+    private static final int    APPROACH_TIMEOUT_TICKS = 1200;  // give up guiding to one chest after ~60s
     private static final int    BETWEEN_CHESTS_TICKS   = 10;
-    private static final int    WATCHDOG_TICKS         = 6000;
+    private static final int    WATCHDOG_TICKS         = 36000;
 
     private static final int LEFT_CLICK = 0;
 
-    private enum State { BALANCE_WAIT, SCAN, WAIT_OPEN, GRAB, COOLDOWN }
+    private enum State { BALANCE_WAIT, SCAN, APPROACH, WAIT_OPEN, GRAB, COOLDOWN }
 
     // ── Run state ──────────────────────────────────────────────────────────
     private static boolean active = false;
@@ -81,12 +90,15 @@ public class CarpetFillHandler {
     private static int     openWait   = 0;
     private static int     openAttempts = 0;
     private static int     totalTicks = 0;
+    private static int     approachTimer = 0;
     private static int     initialNeed = 0;
 
     /** carpet Item → its goal slots, as PlayerInventory indices. */
     private static final Map<Item, List<Integer>> goal = new LinkedHashMap<>();
     /** Chests already opened this run (never reopened). */
     private static final Set<BlockPos> visited = new HashSet<>();
+    /** Chests still worth visiting this run (unknown or known-needed), for in-world markers. */
+    private static final Set<BlockPos> markerChests = new HashSet<>();
     /**
      * Memory of each chest's carpet contents (what's left after our last visit), keyed
      * by position, for the CURRENT world only. Lets later runs skip chests known to hold
@@ -106,6 +118,7 @@ public class CarpetFillHandler {
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(CarpetFillHandler::onTick);
+        WorldRenderEvents.AFTER_ENTITIES.register(CarpetFillHandler::renderMarkers);
         loadDisk();
         // Bind chest memory to the joined world; flush + unbind on disconnect.
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> ensureWorld(client));
@@ -121,6 +134,7 @@ public class CarpetFillHandler {
 
     public static void stop() {
         active = false;
+        markerChests.clear();
     }
 
     /**
@@ -248,6 +262,7 @@ public class CarpetFillHandler {
                 if (cooldown > 0) { cooldown--; return; }
                 scanStep(client);
             }
+            case APPROACH -> approachStep(client);
             case WAIT_OPEN -> waitOpenStep(client);
             case GRAB -> {
                 if (cooldown > 0) { cooldown--; return; }
@@ -277,25 +292,62 @@ public class CarpetFillHandler {
                     + "carpets (" + visited.size() + " chest" + (visited.size() == 1 ? "" : "s") + " opened).");
             return;
         }
-        BlockPos chest = findNextChest(client);
+        BlockPos chest = findNextChest(client);   // also refreshes markerChests
         if (chest == null) {
             finish(client, "§a" + TAG + " Carpet fill done — filled "
                     + (initialNeed - totalNeed(client.player.getInventory())) + " carpets"
-                    + " (" + visited.size() + " chest" + (visited.size() == 1 ? "" : "s") + " opened).");
+                    + " (" + visited.size() + " chest" + (visited.size() == 1 ? "" : "s") + " opened)."
+                    + (totalNeed(client.player.getInventory()) > 0
+                        ? " §7No more reachable chests with what's needed." : ""));
             return;
         }
-        visited.add(chest);
         currentChestPos = chest;
-        openWait = 0;
-        openAttempts = 1;
-        openChest(client, chest);
-        state = State.WAIT_OPEN;
+        approachTimer = 0;
+        state = State.APPROACH;   // walk into reach (or open immediately if already close)
+    }
+
+    private static void approachStep(MinecraftClient client) {
+        if (totalNeed(client.player.getInventory()) == 0) {
+            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed carpets.");
+            return;
+        }
+        if (currentChestPos == null
+                || !(client.world.getBlockEntity(currentChestPos) instanceof ChestBlockEntity)) {
+            state = State.COOLDOWN;   // chest gone / invalid — rescan
+            cooldown = BETWEEN_CHESTS_TICKS;
+            return;
+        }
+        double distSq = client.player.squaredDistanceTo(
+                currentChestPos.getX() + 0.5, currentChestPos.getY() + 0.5, currentChestPos.getZ() + 0.5);
+        if (distSq <= REACH_SQ) {
+            visited.add(currentChestPos);
+            openWait = 0;
+            openAttempts = 1;
+            openChest(client, currentChestPos);
+            state = State.WAIT_OPEN;
+            return;
+        }
+        // Out of reach — guide the player to it and wait (don't skip).
+        client.inGameHud.setOverlayMessage(Text.literal(String.format(
+                "§e%s Walk to chest §f%d,%d,%d§e — §f%.0f§e blocks (need %d)",
+                TAG, currentChestPos.getX(), currentChestPos.getY(), currentChestPos.getZ(),
+                Math.sqrt(distSq), totalNeed(client.player.getInventory()))), false);
+        if (++approachTimer > APPROACH_TIMEOUT_TICKS) {
+            System.out.println(TAG + " Gave up walking to chest at " + currentChestPos
+                    + " after ~" + (APPROACH_TIMEOUT_TICKS / 20) + "s — skipping.");
+            visited.add(currentChestPos);   // don't keep re-selecting it this run
+            state = State.COOLDOWN;
+            cooldown = BETWEEN_CHESTS_TICKS;
+        }
     }
 
     private static void waitOpenStep(MinecraftClient client) {
         if (isContainerOpen(client)) {
+            // Wait a beat before reading: the container's contents arrive a tick or
+            // more after the open packet, so reading immediately can see an empty
+            // chest and wrongly record it as empty.
             state = State.GRAB;
-            cooldown = ACTION_COOLDOWN_TICKS;
+            cooldown = SETTLE_TICKS;
             return;
         }
         openWait++;
@@ -547,32 +599,37 @@ public class CarpetFillHandler {
     // ── World interaction ────────────────────────────────────────────────────
 
     /**
-     * Picks the next chest to open. Unknown chests (not yet in {@link #chestMemory})
-     * are preferred — nearest first — so memory gets built; once none remain, the
-     * nearest known chest that still holds a needed color is chosen. Known chests with
-     * nothing we need are skipped entirely.
+     * Picks the next chest to head for, searching out to {@link #DETECT_RANGE} (not just
+     * arm's reach — the APPROACH state walks the player in). Unknown chests are preferred
+     * — nearest first — so memory gets built; once none remain, the nearest known chest
+     * that still holds a needed color is chosen. Known chests with nothing we need are
+     * skipped. Also refreshes {@link #markerChests} (every candidate worth visiting) for
+     * the in-world markers.
      */
     private static BlockPos findNextChest(MinecraftClient client) {
         PlayerInventory inv = client.player.getInventory();
         BlockPos origin = client.player.getBlockPos();
         BlockPos bestUnknown = null; double bestUnknownDist = Double.MAX_VALUE;
         BlockPos bestKnown   = null; double bestKnownDist   = Double.MAX_VALUE;
+        markerChests.clear();
 
-        for (int dx = -SCAN_RANGE; dx <= SCAN_RANGE; dx++) {
-            for (int dy = -SCAN_RANGE; dy <= SCAN_RANGE; dy++) {
-                for (int dz = -SCAN_RANGE; dz <= SCAN_RANGE; dz++) {
+        for (int dx = -DETECT_RANGE; dx <= DETECT_RANGE; dx++) {
+            for (int dy = -DETECT_RANGE; dy <= DETECT_RANGE; dy++) {
+                for (int dz = -DETECT_RANGE; dz <= DETECT_RANGE; dz++) {
                     BlockPos pos = origin.add(dx, dy, dz);
-                    double distSq = client.player.squaredDistanceTo(
-                            pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
-                    if (distSq > REACH_SQ) continue;
                     if (visited.contains(pos)) continue;
                     if (!(client.world.getBlockEntity(pos) instanceof ChestBlockEntity)) continue;
+                    double distSq = client.player.squaredDistanceTo(
+                            pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
 
                     Map<Item, Integer> known = chestMemory.get(pos);
+                    boolean worth = (known == null) || chestHasNeeded(known, inv);
+                    if (!worth) continue;
+                    markerChests.add(pos.toImmutable());
                     if (known == null) {
-                        if (distSq < bestUnknownDist) { bestUnknownDist = distSq; bestUnknown = pos; }
-                    } else if (chestHasNeeded(known, inv) && distSq < bestKnownDist) {
-                        bestKnownDist = distSq; bestKnown = pos;
+                        if (distSq < bestUnknownDist) { bestUnknownDist = distSq; bestUnknown = pos.toImmutable(); }
+                    } else if (distSq < bestKnownDist) {
+                        bestKnownDist = distSq; bestKnown = pos.toImmutable();
                     }
                 }
             }
@@ -633,10 +690,40 @@ public class CarpetFillHandler {
 
     private static void finish(MinecraftClient client, String msg) {
         active = false;
+        markerChests.clear();
         feedback(client, msg);
     }
 
     private static void feedback(MinecraftClient client, String msg) {
         if (client.player != null) client.player.sendMessage(Text.literal(msg), false);
+    }
+
+    // ── In-world markers ───────────────────────────────────────────────────────
+
+    /** Draws a box over every chest still worth visiting; the active target is brighter. */
+    private static void renderMarkers(WorldRenderContext context) {
+        if (!active || markerChests.isEmpty()) return;
+        VertexConsumerProvider consumers = context.consumers();
+        if (consumers == null) return;
+
+        MatrixStack matrices = context.matrixStack();
+        Vec3d camPos = context.camera().getPos();
+        VertexConsumer lines = consumers.getBuffer(RenderLayer.getLines());
+
+        for (BlockPos pos : markerChests) {
+            boolean target = pos.equals(currentChestPos);
+            double ox = pos.getX() - camPos.x;
+            double oy = pos.getY() - camPos.y;
+            double oz = pos.getZ() - camPos.z;
+            // Target chest: bright yellow and full-block; others: dim blue and small.
+            float r = target ? 1.0f : 0.3f;
+            float g = target ? 0.9f : 0.6f;
+            float b = target ? 0.1f : 1.0f;
+            double pad = target ? 0.02 : 0.15;
+            VertexRendering.drawBox(matrices, lines,
+                    ox + pad, oy + pad, oz + pad,
+                    ox + 1 - pad, oy + 1 - pad, oz + 1 - pad,
+                    r, g, b, 0.9f);
+        }
     }
 }

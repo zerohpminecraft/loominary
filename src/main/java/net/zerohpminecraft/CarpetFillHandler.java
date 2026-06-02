@@ -91,6 +91,7 @@ public class CarpetFillHandler {
     private static int     openAttempts = 0;
     private static int     totalTicks = 0;
     private static int     approachTimer = 0;
+    private static double  lastApproachDistSq = Double.MAX_VALUE;
     private static int     initialNeed = 0;
 
     /** carpet Item → its goal slots, as PlayerInventory indices. */
@@ -303,6 +304,7 @@ public class CarpetFillHandler {
         }
         currentChestPos = chest;
         approachTimer = 0;
+        lastApproachDistSq = Double.MAX_VALUE;
         state = State.APPROACH;   // walk into reach (or open immediately if already close)
     }
 
@@ -311,15 +313,24 @@ public class CarpetFillHandler {
             finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed carpets.");
             return;
         }
-        if (currentChestPos == null
-                || !(client.world.getBlockEntity(currentChestPos) instanceof ChestBlockEntity)) {
-            state = State.COOLDOWN;   // chest gone / invalid — rescan
+        if (currentChestPos == null) {
+            state = State.COOLDOWN;
             cooldown = BETWEEN_CHESTS_TICKS;
             return;
         }
         double distSq = client.player.squaredDistanceTo(
                 currentChestPos.getX() + 0.5, currentChestPos.getY() + 0.5, currentChestPos.getZ() + 0.5);
+
         if (distSq <= REACH_SQ) {
+            // In reach now (so the chunk is loaded) — verify a chest is actually there.
+            if (!(client.world.getBlockEntity(currentChestPos) instanceof ChestBlockEntity)) {
+                System.out.println(TAG + " Chest at " + currentChestPos + " is gone — forgetting it.");
+                visited.add(currentChestPos);
+                if (chestMemory.remove(currentChestPos) != null) saveDisk();
+                state = State.COOLDOWN;
+                cooldown = BETWEEN_CHESTS_TICKS;
+                return;
+            }
             visited.add(currentChestPos);
             openWait = 0;
             openAttempts = 1;
@@ -327,18 +338,26 @@ public class CarpetFillHandler {
             state = State.WAIT_OPEN;
             return;
         }
-        // Out of reach — guide the player to it and wait (don't skip).
+
+        // Out of reach (possibly far/unloaded — trust memory) — guide the player there and
+        // wait. The give-up timer only counts while you're NOT getting closer, so a long
+        // walk never times out as long as you're making progress.
         client.inGameHud.setOverlayMessage(Text.literal(String.format(
                 "§e%s Walk to chest §f%d,%d,%d§e — §f%.0f§e blocks (need %d)",
                 TAG, currentChestPos.getX(), currentChestPos.getY(), currentChestPos.getZ(),
                 Math.sqrt(distSq), totalNeed(client.player.getInventory()))), false);
-        if (++approachTimer > APPROACH_TIMEOUT_TICKS) {
+        if (distSq < lastApproachDistSq - 0.25) {
+            approachTimer = 0;            // made progress this tick
+        } else if (++approachTimer > APPROACH_TIMEOUT_TICKS) {
             System.out.println(TAG + " Gave up walking to chest at " + currentChestPos
-                    + " after ~" + (APPROACH_TIMEOUT_TICKS / 20) + "s — skipping.");
+                    + " after ~" + (APPROACH_TIMEOUT_TICKS / 20) + "s with no progress — skipping.");
             visited.add(currentChestPos);   // don't keep re-selecting it this run
             state = State.COOLDOWN;
             cooldown = BETWEEN_CHESTS_TICKS;
+            lastApproachDistSq = Double.MAX_VALUE;
+            return;
         }
+        lastApproachDistSq = distSq;
     }
 
     private static void waitOpenStep(MinecraftClient client) {
@@ -599,38 +618,44 @@ public class CarpetFillHandler {
     // ── World interaction ────────────────────────────────────────────────────
 
     /**
-     * Picks the next chest to head for, searching out to {@link #DETECT_RANGE} (not just
-     * arm's reach — the APPROACH state walks the player in). Unknown chests are preferred
-     * — nearest first — so memory gets built; once none remain, the nearest known chest
-     * that still holds a needed color is chosen. Known chests with nothing we need are
-     * skipped. Also refreshes {@link #markerChests} (every candidate worth visiting) for
-     * the in-world markers.
+     * Picks the next chest to head for. KNOWN chests come from {@link #chestMemory} by
+     * their stored positions, at <em>any</em> distance — so a needed chest across a big
+     * storage room is still found and the APPROACH state walks the player to it. UNKNOWN
+     * chests are discovered by a bounded world scan around the player (out to
+     * {@link #DETECT_RANGE}) and preferred first, so memory keeps filling in. Chests known
+     * to hold nothing we need are skipped. Also refreshes {@link #markerChests} for the
+     * in-world markers.
      */
     private static BlockPos findNextChest(MinecraftClient client) {
         PlayerInventory inv = client.player.getInventory();
-        BlockPos origin = client.player.getBlockPos();
-        BlockPos bestUnknown = null; double bestUnknownDist = Double.MAX_VALUE;
-        BlockPos bestKnown   = null; double bestKnownDist   = Double.MAX_VALUE;
         markerChests.clear();
 
+        // Known chests with a needed color — from memory, no distance limit.
+        BlockPos bestKnown = null; double bestKnownDist = Double.MAX_VALUE;
+        for (Map.Entry<BlockPos, Map<Item, Integer>> e : chestMemory.entrySet()) {
+            BlockPos pos = e.getKey();
+            if (visited.contains(pos)) continue;
+            if (!chestHasNeeded(e.getValue(), inv)) continue;
+            markerChests.add(pos);
+            double distSq = client.player.squaredDistanceTo(
+                    pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
+            if (distSq < bestKnownDist) { bestKnownDist = distSq; bestKnown = pos; }
+        }
+
+        // Unknown chests near the player — bounded world scan; preferred to build memory.
+        BlockPos bestUnknown = null; double bestUnknownDist = Double.MAX_VALUE;
+        BlockPos origin = client.player.getBlockPos();
         for (int dx = -DETECT_RANGE; dx <= DETECT_RANGE; dx++) {
             for (int dy = -DETECT_RANGE; dy <= DETECT_RANGE; dy++) {
                 for (int dz = -DETECT_RANGE; dz <= DETECT_RANGE; dz++) {
                     BlockPos pos = origin.add(dx, dy, dz);
-                    if (visited.contains(pos)) continue;
+                    if (visited.contains(pos) || chestMemory.containsKey(pos)) continue;
                     if (!(client.world.getBlockEntity(pos) instanceof ChestBlockEntity)) continue;
+                    BlockPos ip = pos.toImmutable();
+                    markerChests.add(ip);
                     double distSq = client.player.squaredDistanceTo(
                             pos.getX() + 0.5, pos.getY() + 0.5, pos.getZ() + 0.5);
-
-                    Map<Item, Integer> known = chestMemory.get(pos);
-                    boolean worth = (known == null) || chestHasNeeded(known, inv);
-                    if (!worth) continue;
-                    markerChests.add(pos.toImmutable());
-                    if (known == null) {
-                        if (distSq < bestUnknownDist) { bestUnknownDist = distSq; bestUnknown = pos.toImmutable(); }
-                    } else if (distSq < bestKnownDist) {
-                        bestKnownDist = distSq; bestKnown = pos.toImmutable();
-                    }
+                    if (distSq < bestUnknownDist) { bestUnknownDist = distSq; bestUnknown = ip; }
                 }
             }
         }

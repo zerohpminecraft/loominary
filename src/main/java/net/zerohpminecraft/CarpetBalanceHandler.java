@@ -615,8 +615,9 @@ public class CarpetBalanceHandler {
     /**
      * Counts the carpets the schematic still needs near the player — positions where
      * Litematica's schematic world has a carpet but the real world doesn't match yet —
-     * swept NW→SE and capped at one inventory-load, so the gathered mix maps to a
-     * predictable build frontier. Returns null when the schematic world isn't available
+     * swept west→east (each column north→south) and capped at one inventory-load, so the
+     * gathered mix maps to a predictable build frontier — the westmost unbuilt column
+     * first. Returns null when the schematic world isn't available
      * (Litematica absent / nothing loaded), so callers fall back to whole-build totals.
      */
     private static Map<Item, Integer> localCarpetDemand(MinecraftClient client) {
@@ -642,10 +643,11 @@ public class CarpetBalanceHandler {
         int cap = usable * MAX_STACK;
         if (cap <= 0) return null;
 
-        // Sweep the player's Y layer north→south, west→east (NW corner first), taking
-        // the first `cap` incomplete carpets. A fixed reading order makes it
-        // predictable where to carry the load — you always advance NW→SE — and a
-        // single Y layer keeps a 256-block search cheap.
+        // Sweep the player's Y layer west→east, each column north→south (west-banded),
+        // taking the first `cap` incomplete carpets. A fixed reading order makes it
+        // predictable where to carry the load — you finish the westmost unbuilt column
+        // top-to-bottom, then advance east — and a single Y layer keeps a 256-block
+        // search cheap.
         Map<Item, Integer> demand = new HashMap<>();
         int taken = 0;
         BlockPos origin = client.player.getBlockPos();
@@ -653,8 +655,8 @@ public class CarpetBalanceHandler {
         BlockPos.Mutable pos = new BlockPos.Mutable();
         int R = LOCAL_SCAN_MAX_RADIUS;
         outer:
-        for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {        // north → south
-            for (int x = origin.getX() - R; x <= origin.getX() + R; x++) {    // west → east
+        for (int x = origin.getX() - R; x <= origin.getX() + R; x++) {        // west → east
+            for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {    // north → south
                 pos.set(x, py, z);
                 try {
                     BlockState exp = schematic.getBlockState(pos);

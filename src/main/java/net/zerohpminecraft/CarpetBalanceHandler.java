@@ -56,9 +56,6 @@ public class CarpetBalanceHandler {
     private static final int LAST_HOTBAR_SLOT = 44;   // 45 = offhand (excluded)
     private static final int MAX_STACK = 64;
 
-    private static final int MAIN_TARGET_SLOTS  = 3;  // top-2 colors → 3 stacks
-    private static final int OTHER_TARGET_SLOTS = 2;  // every other color → 2 stacks
-
     private static final int ACTION_COOLDOWN_TICKS = 3;
     private static final int WATCHDOG_TICKS = 400;    // abort if not done in time
 
@@ -132,15 +129,15 @@ public class CarpetBalanceHandler {
         watchdog = 0;
         droppedTotal = 0;
 
-        int mains = 0;
+        int totalSlots = 0;
         StringBuilder sb = new StringBuilder();
         for (Map.Entry<Item, List<Integer>> e : colorSlots.entrySet()) {
             int n = e.getValue().size();
-            if (n == MAIN_TARGET_SLOTS) mains++;
+            totalSlots += n;
             sb.append("§7").append(itemName(e.getKey())).append("§8×").append(n).append(" ");
         }
-        System.out.println(TAG + " Carpet balance: " + colorSlots.size() + " colors ("
-                + mains + " main) — " + sb);
+        System.out.println(TAG + " Carpet balance: " + colorSlots.size() + " colors across "
+                + totalSlots + " slots (proportional) — " + sb);
         feedback(client, "§a" + TAG + " Balancing " + colorSlots.size()
                 + " carpet colors to the material list…");
     }
@@ -153,11 +150,15 @@ public class CarpetBalanceHandler {
 
     /**
      * Scans the current inventory and assigns each carpet color a fixed set of
-     * goal slots. Two rules keep the layout stable and non-destructive:
+     * goal slots, sized <b>proportionally to its Litematica material count</b>:
+     * a color that's half the total demand gets about half the usable slots.
+     * Rules that keep the layout stable and non-destructive:
      * <ul>
      *   <li>Slots holding non-carpet items (rockets, food, …) are <b>off-limits</b>
      *       — they're never chosen as goal slots, so those items never have to
      *       move and can never be dropped.</li>
+     *   <li>Every needed color gets <b>at least one</b> slot (when they fit), so
+     *       no color is starved.</li>
      *   <li>A color is assigned, where possible, the slots it <b>already</b>
      *       occupies, so carpet that's already in place stays put and we only
      *       move what we must.</li>
@@ -179,22 +180,25 @@ public class CarpetBalanceHandler {
         for (int i = 36; i <= LAST_HOTBAR_SLOT; i++) addIfAssignable(handler, i, candidates);
         for (int i = FIRST_MAIN_SLOT; i <= 35; i++) addIfAssignable(handler, i, candidates);
 
+        // How many slots each color gets, proportional to its material count.
+        int[] want = allocateProportionalSlots(sorted, candidates.size());
+
         java.util.Set<Integer> used = new java.util.HashSet<>();
         for (int c = 0; c < sorted.size(); c++) {
             Item color = sorted.get(c).getKey();
-            int want = (c < 2) ? MAIN_TARGET_SLOTS : OTHER_TARGET_SLOTS;
+            if (want[c] <= 0) continue;
             List<Integer> slots = new ArrayList<>();
 
             // Pass 1: reuse slots this color already sits in.
             for (int slot : candidates) {
-                if (slots.size() >= want) break;
+                if (slots.size() >= want[c]) break;
                 if (used.contains(slot)) continue;
                 ItemStack s = handler.getSlot(slot).getStack();
                 if (!s.isEmpty() && s.getItem() == color) slots.add(slot);
             }
             // Pass 2: fill the rest from any free candidate slot.
             for (int slot : candidates) {
-                if (slots.size() >= want) break;
+                if (slots.size() >= want[c]) break;
                 if (used.contains(slot) || slots.contains(slot)) continue;
                 slots.add(slot);
             }
@@ -205,6 +209,60 @@ public class CarpetBalanceHandler {
             }
             if (!slots.isEmpty()) colorSlots.put(color, slots);
         }
+    }
+
+    /**
+     * Distributes {@code n} slots across the colors (already sorted by count
+     * desc) proportionally to their material counts, using the largest-remainder
+     * method so the parts sum to exactly {@code n}. Every color is guaranteed at
+     * least one slot when there's room ({@code n} ≥ color count); if there are
+     * more colors than slots, only the {@code n} highest-count colors get one.
+     *
+     * @return an array of slot counts aligned with {@code sorted}
+     */
+    private static int[] allocateProportionalSlots(List<Map.Entry<Item, Integer>> sorted, int n) {
+        int k = sorted.size();
+        int[] alloc = new int[k];
+        if (k == 0 || n <= 0) return alloc;
+
+        // Fewer slots than colors: the top-n colors each get one, rest get none.
+        if (n < k) {
+            for (int i = 0; i < n; i++) alloc[i] = 1;
+            return alloc;
+        }
+
+        long total = 0;
+        for (Map.Entry<Item, Integer> e : sorted) total += Math.max(0, e.getValue());
+
+        if (total <= 0) {
+            // Degenerate (no counts): spread as evenly as possible.
+            for (int i = 0; i < n; i++) alloc[i % k]++;
+            return alloc;
+        }
+
+        // Largest-remainder apportionment.
+        double[] frac = new double[k];
+        int assigned = 0;
+        for (int i = 0; i < k; i++) {
+            double quota = (double) n * Math.max(0, sorted.get(i).getValue()) / total;
+            alloc[i] = (int) Math.floor(quota);
+            frac[i] = quota - alloc[i];
+            assigned += alloc[i];
+        }
+        Integer[] byFrac = new Integer[k];
+        for (int i = 0; i < k; i++) byFrac[i] = i;
+        java.util.Arrays.sort(byFrac, (a, b) -> Double.compare(frac[b], frac[a]));
+        for (int r = 0; r < n - assigned; r++) alloc[byFrac[r]]++;
+
+        // Guarantee every color at least one slot (n ≥ k here), stealing from the
+        // largest allocation so the total stays exactly n.
+        for (int i = 0; i < k; i++) {
+            if (alloc[i] != 0) continue;
+            int max = 0;
+            for (int j = 1; j < k; j++) if (alloc[j] > alloc[max]) max = j;
+            if (alloc[max] > 1) { alloc[max]--; alloc[i] = 1; }
+        }
+        return alloc;
     }
 
     private static void addIfAssignable(ScreenHandler handler, int slot, List<Integer> out) {

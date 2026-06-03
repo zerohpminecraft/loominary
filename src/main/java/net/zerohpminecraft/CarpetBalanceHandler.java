@@ -617,8 +617,8 @@ public class CarpetBalanceHandler {
      * Litematica's schematic world has a carpet but the real world doesn't match yet —
      * capped at one inventory-load, so the gathered mix maps to a predictable build
      * frontier. Each column is swept north→south; the column order depends on which side
-     * of the build's east-west midpoint the player stands: on the west side it sweeps
-     * west→east (NW→SE), on the east side east→west (NE→SW), so you always gather the
+     * of the *unbuilt* region's east-west midpoint the player stands: on the west side it
+     * sweeps west→east (NW→SE), on the east side east→west (NE→SW), so you always gather the
      * unbuilt columns nearest you first. Returns null when the schematic world isn't
      * available (Litematica absent / nothing loaded), so callers fall back to whole-build
      * totals.
@@ -646,60 +646,57 @@ public class CarpetBalanceHandler {
         int cap = usable * MAX_STACK;
         if (cap <= 0) return null;
 
-        // Sweep the player's Y layer one column at a time, each column north→south,
-        // taking the first `cap` incomplete carpets. The column order starts from the
-        // player's side of the build: west→east on the west half (NW→SE), east→west on
-        // the east half (NE→SW), so you always gather the unbuilt columns nearest you.
-        // A fixed order makes it predictable where to carry the load; a single Y layer
-        // keeps a 256-block search cheap.
-        boolean eastSide = isEastOfBuildCenter(client);
-        Map<Item, Integer> demand = new HashMap<>();
-        int taken = 0;
+        // First, find every unbuilt carpet in the player's Y layer — positions where the
+        // schematic wants a carpet the real world doesn't have yet — grouped by column (x),
+        // each column kept north→south. We also track the east-west extent of that
+        // *remaining* work so the band direction can key off the player's side of it.
         BlockPos origin = client.player.getBlockPos();
         int py = origin.getY();
         BlockPos.Mutable pos = new BlockPos.Mutable();
         int R = LOCAL_SCAN_MAX_RADIUS;
-        int minX = origin.getX() - R, maxX = origin.getX() + R;
-        outer:
-        for (int i = 0; i <= 2 * R; i++) {
-            int x = eastSide ? (maxX - i) : (minX + i);   // east→west on the east half, else west→east
-            for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {    // north → south
+        Map<Integer, List<Item>> byColumn = new HashMap<>();
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        for (int x = origin.getX() - R; x <= origin.getX() + R; x++) {
+            for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {   // north → south
                 pos.set(x, py, z);
                 try {
                     BlockState exp = schematic.getBlockState(pos);
                     Item carpet = exp.getBlock().asItem();
                     if (!isCarpet(carpet)) continue;
                     if (client.world.getBlockState(pos).getBlock() == exp.getBlock()) continue; // already placed
-                    demand.merge(carpet, 1, Integer::sum);
-                    if (++taken >= cap) break outer;
+                    byColumn.computeIfAbsent(x, k -> new ArrayList<>()).add(carpet);
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
                 } catch (Exception ignored) {
                     // unloaded schematic chunk etc. — skip
                 }
             }
         }
-        return demand.isEmpty() ? null : demand;
-    }
+        if (byColumn.isEmpty()) return null;
 
-    /**
-     * True when the player is east of the selected placement's east-west midpoint. Used to
-     * flip the local-demand sweep so it starts from the player's side of the build.
-     * Defaults to false (west side / west→east) if the placement bounds aren't available.
-     */
-    private static boolean isEastOfBuildCenter(MinecraftClient client) {
-        try {
-            Object spm = Class.forName("fi.dy.masa.litematica.data.DataManager")
-                    .getMethod("getSchematicPlacementManager").invoke(null);
-            Object placement = spm.getClass().getMethod("getSelectedSchematicPlacement").invoke(spm);
-            if (placement == null) return false;
-            Object box = placement.getClass().getMethod("getEclosingBox").invoke(placement);
-            if (box == null) return false;
-            BlockPos p1 = (BlockPos) box.getClass().getMethod("getPos1").invoke(box);
-            BlockPos p2 = (BlockPos) box.getClass().getMethod("getPos2").invoke(box);
-            double midX = (p1.getX() + p2.getX()) / 2.0;
-            return client.player.getX() > midX;
-        } catch (Throwable t) {
-            return false;
+        // Band from the player's side of the *unbuilt* region: east of its midpoint sweeps
+        // east→west (NE→SW), otherwise west→east (NW→SE). Each column is already north→south,
+        // so we gather complete columns nearest your working edge first, up to one
+        // inventory-load. Keying off the live extent (not Litematica's selected-placement
+        // bounds) keeps this working without a placement selected and tracks the frontier as
+        // the build fills in.
+        boolean eastSide = client.player.getX() > (minX + maxX) / 2.0;
+        System.out.println(TAG + " local demand: unbuilt X=[" + minX + ".." + maxX + "], playerX="
+                + String.format("%.1f", client.player.getX()) + " → "
+                + (eastSide ? "east side (NE→SW)" : "west side (NW→SE)"));
+
+        Map<Item, Integer> demand = new HashMap<>();
+        int taken = 0;
+        for (int i = 0; i <= maxX - minX; i++) {
+            int x = eastSide ? (maxX - i) : (minX + i);   // east→west on the east half, else west→east
+            List<Item> column = byColumn.get(x);
+            if (column == null) continue;
+            for (Item carpet : column) {
+                demand.merge(carpet, 1, Integer::sum);
+                if (++taken >= cap) return demand;
+            }
         }
+        return demand.isEmpty() ? null : demand;
     }
 
     static Map<Item, Integer> readCarpetMaterials() throws Exception {

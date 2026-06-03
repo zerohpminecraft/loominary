@@ -5,6 +5,7 @@
   "client": [
     "AnvilScreenAccessor",
     "AnvilScreenHandlerAccessor",
+    "KeyboardInputMixin",
     "MapRendererMixin",
     "MapStateAccessor"
   ],

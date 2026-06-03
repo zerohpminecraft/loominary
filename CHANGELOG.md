@@ -4,6 +4,33 @@
 
 ---
 
+## v1.23.0
+
+### Fix: carpet fill goes to the right chest
+
+The fill tool was filing each opened chest's contents under the wrong position — it attributed them to the chest block nearest your feet, which in a wall of chests is rarely the one you opened, and the double-chest pass then stamped neighbours too. Over a session one chest's contents smeared across many positions, so fill sent you to a "magenta" chest for black, ignored the chest you were standing in front of, and reopened the same chest repeatedly. Attribution is now exact.
+
+- **Exact attribution** — a chest's contents are recorded against the block the tool actually interacted with (or, for chests you open yourself, the block under your crosshair), falling back to nearest-in-reach only when neither is available. No more smearing one chest across the wall.
+- **Proximity-first selection** — fill now heads to whichever needed chest is actually nearest, instead of always preferring an uncatalogued chest in reach. Standing in front of the black chest opens *it*.
+- **No more reopen loop** — once a chest opens, the state machine leaves `WAIT_OPEN`, so closing a chest (yours or ours) re-scans instead of re-firing the open and reopening it.
+- **Memory stays accurate** — a chest's remembered contents are refreshed when we close it, so a drained chest isn't remembered as still full.
+- **Auto-guide range** raised from 5 to 16 blocks; fill cadence roughly halved (snappier grabbing) while the anti-false-empty and give-up safety caps are unchanged.
+
+> Note: existing `config/loominary_chest_memory.json` files written before this release may contain smeared positions. Delete the file to let it rebuild cleanly; it repopulates as you open chests.
+
+### Fix: side-aware banding actually works
+
+The "sweep from your side of the build" logic silently defaulted to west→east: it detected your side via Litematica's selected-placement reflection wrapped in a catch-all that returned `false` on any hiccup (e.g. no placement *selected*). The NE→SW band never ran. Side detection now keys off the live extent of the *unbuilt* carpets the scan already finds — self-contained, no placement selection required, and tracking the frontier as the build fills in.
+
+### Feat: `/loominary walk` — duty-cycle auto-walk
+
+A bindable hands-free forward walk on a duty cycle, for tracing a build edge while you balance/fill or print.
+
+- **Hotkey toggles** auto-walk on/off (Controls → Loominary, unbound by default); **`/loominary walk <on> <off>`** sets the on/off durations in ticks that the hotkey follows (default 10t forward / 20t pause = 0.5s / 1.0s). `/loominary walk` toggles; `/loominary walk stop` stops.
+- **Coexists with the Litematica printer** — it forces forward into the computed movement input (via a `KeyboardInput` mixin) rather than pressing the forward key, so the printer's per-tick key resets no longer cancel it. Pauses while a GUI/container is open so the printer can restock without you walking off.
+
+---
+
 ## v1.22.0
 
 ### Feat: `/loominary carpets fill` and smarter proportional balancing

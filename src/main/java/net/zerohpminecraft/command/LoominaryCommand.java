@@ -27,6 +27,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.zerohpminecraft.AnvilAutoFillHandler;
+import net.zerohpminecraft.AutoWalkHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.CarpetBalanceHandler;
 import net.zerohpminecraft.CarpetFillHandler;
@@ -1730,6 +1731,19 @@ public class LoominaryCommand {
                                             .executes(ctx -> carpetBalance(ctx.getSource())))
                                     .then(ClientCommandManager.literal("fill")
                                             .executes(ctx -> carpetFill(ctx.getSource()))))
+
+                            // ── walk ───────────────────────────────────────────
+                            // No args: toggle (same as the hotkey). Two ints (forward ticks,
+                            // pause ticks): set the timings the hotkey follows.
+                            .then(ClientCommandManager.literal("walk")
+                                    .executes(ctx -> autoWalkToggle(ctx.getSource()))
+                                    .then(ClientCommandManager.literal("stop")
+                                            .executes(ctx -> autoWalkStop(ctx.getSource())))
+                                    .then(ClientCommandManager.argument("on", IntegerArgumentType.integer(1, 12000))
+                                            .then(ClientCommandManager.argument("off", IntegerArgumentType.integer(0, 12000))
+                                                    .executes(ctx -> autoWalkSetTimings(ctx.getSource(),
+                                                            IntegerArgumentType.getInteger(ctx, "on"),
+                                                            IntegerArgumentType.getInteger(ctx, "off"))))))
 
                             // ── whitelist ──────────────────────────────────────
                             .then(ClientCommandManager.literal("whitelist")
@@ -4669,6 +4683,23 @@ public class LoominaryCommand {
             return 1;
         }
         CarpetFillHandler.start(client);
+        return 1;
+    }
+
+    /** No-arg /loominary walk: toggle the duty-cycle auto-walk (same as the hotkey). */
+    private static int autoWalkToggle(FabricClientCommandSource source) {
+        AutoWalkHandler.toggle(MinecraftClient.getInstance());
+        return 1;
+    }
+
+    /** /loominary walk <on> <off>: set the timings the hotkey follows (doesn't start it). */
+    private static int autoWalkSetTimings(FabricClientCommandSource source, int onTicks, int offTicks) {
+        AutoWalkHandler.setTimings(MinecraftClient.getInstance(), onTicks, offTicks);
+        return 1;
+    }
+
+    private static int autoWalkStop(FabricClientCommandSource source) {
+        AutoWalkHandler.stop(MinecraftClient.getInstance());
         return 1;
     }
 

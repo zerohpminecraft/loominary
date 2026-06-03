@@ -66,18 +66,18 @@ public class CarpetFillHandler {
     private static final String TAG = "[Loominary]";
 
     private static final double REACH_SQ           = 4.5 * 4.5; // how close to actually open a chest
-    private static final double WALK_LIMIT_SQ      = 5.0 * 5.0;  // never auto-guide farther than this
+    private static final double WALK_LIMIT_SQ      = 16.0 * 16.0; // never auto-guide farther than this
     private static final int    LAST_INV_SLOT      = 35;   // 0–8 hotbar, 9–35 main; 36+ armor/offhand
     private static final int    MAX_STACK          = CarpetBalanceHandler.MAX_STACK;
 
-    private static final int    ACTION_COOLDOWN_TICKS  = 4;
-    private static final int    SETTLE_TICKS           = 10;   // initial wait after open before reading
+    private static final int    ACTION_COOLDOWN_TICKS  = 2;    // between clicks (was 4) — fill cadence
+    private static final int    SETTLE_TICKS           = 5;    // initial wait after open before reading (was 10)
     private static final int    SYNC_WAIT_MAX          = 60;   // keep waiting (up to this) while the chest reads empty
     private static final int    OPEN_TIMEOUT_TICKS     = 60;
-    private static final int    OPEN_RETRY_INTERVAL    = 15;   // re-send interact this often while waiting
+    private static final int    OPEN_RETRY_INTERVAL    = 8;    // re-send interact this often while waiting (was 15)
     private static final int    MAX_OPEN_ATTEMPTS      = 3;
     private static final int    APPROACH_TIMEOUT_TICKS = 1200;  // give up guiding to one chest after ~60s
-    private static final int    BETWEEN_CHESTS_TICKS   = 10;
+    private static final int    BETWEEN_CHESTS_TICKS   = 5;    // pause between chests (was 10)
     private static final int    WATCHDOG_TICKS         = 36000;
 
     private static final int LEFT_CLICK = 0;
@@ -275,7 +275,16 @@ public class CarpetFillHandler {
                 syncWait = 0;
                 recordedThisOpen = false;
                 tookFromThisOpen = false;
-                openChestPos = nearestChestInReach(client);   // the chest you're standing at
+                openChestPos = openedChestPos(client);         // the chest actually opened
+                // The open registered, so the WAIT_OPEN gap is over: drop to COOLDOWN. If the
+                // chest now closes (you close it, or we do), we re-scan instead of falling back
+                // into waitOpenStep, which would re-send the interact and reopen the chest.
+                state = State.COOLDOWN;
+                // Hold the container open for a settle window before grabbing/closing. This
+                // also keeps us compatible with mods (e.g. Ev's) that cache the open
+                // container's slots lazily on a steady tick and dereference them on close —
+                // opening and closing within one tick would leave that cache null (NPE).
+                cooldown = SETTLE_TICKS;
             }
             if (cooldown > 0) { cooldown--; return; }
             grabStep(client);
@@ -332,7 +341,7 @@ public class CarpetFillHandler {
         }
         client.inGameHud.setOverlayMessage(Text.literal(needHint(client, inv, chest)), false);
         state = State.COOLDOWN;
-        cooldown = 10;   // re-check shortly; grabs immediately if you open a chest meanwhile
+        cooldown = 5;    // re-check shortly; grabs immediately if you open a chest meanwhile
     }
 
     /** "Need 192 brown — open a chest with it (nearest known: x,y,z, N blocks)". */
@@ -449,7 +458,7 @@ public class CarpetFillHandler {
         // an empty read — that's what was recording stocked chests as empty.
         if (cursor.isEmpty() && !containerHasItem(h, inv) && syncWait < SYNC_WAIT_MAX) {
             syncWait++;
-            cooldown = 2;
+            cooldown = 1;
             return;
         }
 
@@ -496,6 +505,14 @@ public class CarpetFillHandler {
     }
 
     private static void closeAndCooldown(MinecraftClient client) {
+        // Re-record what's actually left after grabbing, so a chest we just drained isn't
+        // remembered as still full (which would send us back to an empty chest next run).
+        // The open-time record reflected pre-grab contents; this overwrites it with the
+        // post-grab truth, or forgets the chest entirely if we cleared its carpet.
+        if (tookFromThisOpen && isContainerOpen(client)) {
+            recordChestMemory(client, client.player.currentScreenHandler,
+                    client.player.getInventory(), openChestPos);
+        }
         client.player.closeHandledScreen();   // cursor is always empty at this point
         toolOpened = false;
         currentChestPos = null;
@@ -543,7 +560,29 @@ public class CarpetFillHandler {
         saveDisk();
     }
 
-    /** Nearest chest block within reach — used to attribute a player-opened chest to a position. */
+    /**
+     * The position of the chest that just opened. Attribution must be exact: filing contents
+     * under the wrong block (e.g. the chest nearest your feet rather than the one you opened)
+     * smears one chest's contents across a whole storage wall and wrecks navigation. So:
+     * <ol>
+     *   <li>If the tool opened it, we know the exact block we interacted with ({@link #currentChestPos}).</li>
+     *   <li>Otherwise it's the block under the crosshair — what you actually clicked to open.</li>
+     *   <li>Only as a last resort fall back to the nearest chest in reach.</li>
+     * </ol>
+     */
+    private static BlockPos openedChestPos(MinecraftClient client) {
+        if (toolOpened && currentChestPos != null
+                && client.world.getBlockEntity(currentChestPos) instanceof ChestBlockEntity) {
+            return currentChestPos;
+        }
+        if (client.crosshairTarget instanceof BlockHitResult bhr
+                && client.world.getBlockEntity(bhr.getBlockPos()) instanceof ChestBlockEntity) {
+            return bhr.getBlockPos().toImmutable();
+        }
+        return nearestChestInReach(client);
+    }
+
+    /** Nearest chest block within reach — last-resort attribution when we can't tell exactly. */
     private static BlockPos nearestChestInReach(MinecraftClient client) {
         if (client.world == null) return null;
         BlockPos origin = client.player.getBlockPos();
@@ -780,7 +819,10 @@ public class CarpetFillHandler {
                 }
             }
         }
-        return bestUnknown != null ? bestUnknown : bestKnown;
+        // Go to whichever is actually nearer. Standing in front of a chest that holds what
+        // you need opens it, rather than detouring to an uncatalogued chest across the room.
+        if (bestKnown != null && (bestUnknown == null || bestKnownDist <= bestUnknownDist)) return bestKnown;
+        return bestUnknown;
     }
 
     /** True if a remembered chest still holds carpet of a color we currently need. */

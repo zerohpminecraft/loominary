@@ -36,6 +36,7 @@ public class LoominaryKeybindings {
     private static KeyBinding keyDecodeToggle;
     private static KeyBinding keyCarpetBalance;
     private static KeyBinding keyCarpetFill;
+    private static KeyBinding keyWalk;
 
     public static void register() {
         keySteal        = registerUnbound("key.loominary.steal");
@@ -48,6 +49,7 @@ public class LoominaryKeybindings {
         keyDecodeToggle = registerUnbound("key.loominary.decode_toggle");
         keyCarpetBalance = registerUnbound("key.loominary.carpet_balance");
         keyCarpetFill    = registerUnbound("key.loominary.carpet_fill");
+        keyWalk          = registerUnbound("key.loominary.walk");
 
         ClientTickEvents.END_CLIENT_TICK.register(LoominaryKeybindings::onTick);
     }
@@ -75,6 +77,7 @@ public class LoominaryKeybindings {
         while (keyDecodeToggle.wasPressed()) MapBannerDecoder.toggle(client);
         while (keyCarpetBalance.wasPressed()) runCommand(client, "loominary carpets balance");
         while (keyCarpetFill.wasPressed())    runCommand(client, "loominary carpets fill");
+        while (keyWalk.wasPressed())          AutoWalkHandler.toggle(client);
     }
 
     private static void runCommand(MinecraftClient client, String command) {

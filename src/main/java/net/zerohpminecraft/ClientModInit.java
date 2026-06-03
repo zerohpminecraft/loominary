@@ -26,5 +26,6 @@ public class ClientModInit implements ClientModInitializer {
         BannerAutoClickHandler.register();
         CarpetBalanceHandler.register();
         CarpetFillHandler.register();
+        AutoWalkHandler.register();
     }
 }

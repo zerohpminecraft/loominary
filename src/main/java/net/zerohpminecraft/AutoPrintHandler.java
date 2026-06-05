@@ -7,7 +7,9 @@ import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.text.Text;
+import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -56,6 +58,7 @@ public final class AutoPrintHandler {
     private static final int RECOVERY_RADIUS    = 12;   // how far back/aside to look for a miss
     private static final int MISS_SCAN_INTERVAL = 8;    // ticks between miss scans
     private static final int RECOVER_TIMEOUT    = 60;   // give up on one miss after this
+    private static final int MAX_WRONG_BREAKS   = 3;    // break a wrong-coloured carpet at most this often
 
     private enum State { PLAN, RESTOCK_CHECK, CATALOGUE, RESTOCK, PRINTING, DONE }
 
@@ -71,12 +74,15 @@ public final class AutoPrintHandler {
     private static boolean planEastSide;
     private static int  wpIndex = 0;
     private static boolean printerEngaged = false;
+    private static boolean positioning = false;   // travelling to the sweep start with the printer off
 
     // Missed-cell recovery state.
     private static boolean recovering = false;
     private static BlockPos recoverTarget = null;
     private static int      recoverTimer = 0;
     private static int      missScanCooldown = 0;
+    private static int      wrongBreaks = 0;       // wrong carpets broken at the current target
+    private static boolean  breakingWrong = false; // mid-break of a wrong carpet at the current target
     private static final Set<Long> recoverSkip = new HashSet<>();   // misses we gave up on this load
 
     private static boolean restockPending = false;
@@ -108,6 +114,7 @@ public final class AutoPrintHandler {
         demand = null;
         wpIndex = 0;
         printerEngaged = false;
+        positioning = false;
         restockPending = false;
         restockAttempts = 0;
         triedCatalogue = false;
@@ -134,6 +141,7 @@ public final class AutoPrintHandler {
         unbuilt = null;
         recovering = false;
         recoverTarget = null;
+        positioning = false;
     }
 
     private static void onTick(MinecraftClient client) {
@@ -234,11 +242,13 @@ public final class AutoPrintHandler {
         restockAttempts = 0;
         wpIndex = 0;
         state = State.PRINTING;
-        engagePrinter();
+        // Travel to the sweep start with the printer OFF — after a restock the player is at the
+        // chests, and printing the whole way back across unbuilt floor would corrupt the plan's
+        // demand/unbuilt math. The printer engages only on arrival at waypoints.get(0).
+        positioning = true;
+        disengagePrinter();
         WaypointMover.setPitch(PRINT_PITCH);
-        // Pace the print walk on the shared /loominary walk duty cycle so the printer keeps up
-        // (off == 0 ⇒ continuous). Chest navigation clears this and runs at full speed.
-        WaypointMover.setDutyCycle(AutoWalkHandler.getOnTicks(), AutoWalkHandler.getOffTicks());
+        WaypointMover.clearDutyCycle();   // full speed to the start; the sweep sets its own pace
         WaypointMover.setWaypoint(waypoints.get(0));
     }
 
@@ -249,6 +259,7 @@ public final class AutoPrintHandler {
             state = State.PLAN;
             return;
         }
+        if (positioning) { positioningStep(client); return; }
         engagePrinter();   // idempotent; re-assert in case anything toggled it off
 
         if (recovering) { recoverStep(client); return; }
@@ -262,6 +273,8 @@ public final class AutoPrintHandler {
                 recovering = true;
                 recoverTarget = missed;
                 recoverTimer = 0;
+                wrongBreaks = 0;
+                breakingWrong = false;
                 WaypointMover.clearDutyCycle();            // full speed back to it
                 WaypointMover.setWaypoint(missed);
                 return;
@@ -290,37 +303,114 @@ public final class AutoPrintHandler {
         }
     }
 
-    /** Walk back to a missed cell until the printer lays it (or we time out), then resume. */
+    /** Walk to the sweep start with the printer off; engage and begin printing only on arrival. */
+    private static void positioningStep(MinecraftClient client) {
+        disengagePrinter();   // stay off the whole way to the start — no printing across the floor
+        if (WaypointMover.stuck()) {
+            WaypointMover.stop();
+            state = State.PLAN;            // couldn't reach the start — replan from here
+            return;
+        }
+        if (WaypointMover.arrived()) {
+            positioning = false;
+            engagePrinter();
+            // Pace the sweep on the shared /loominary walk duty cycle so the printer keeps up.
+            WaypointMover.setDutyCycle(AutoWalkHandler.getOnTicks(), AutoWalkHandler.getOffTicks());
+            if (waypoints.size() > 1) {
+                wpIndex = 1;
+                WaypointMover.setWaypoint(waypoints.get(1));   // sweep toward the band's far end
+            } else {
+                WaypointMover.setWaypoint(waypoints.get(0));
+            }
+            return;
+        }
+        if (!WaypointMover.isActive()) WaypointMover.setWaypoint(waypoints.get(0));
+    }
+
+    /**
+     * Walk back to a missed cell until the printer lays it (or we time out). A cell already occupied
+     * by the <em>wrong</em> carpet (a printer-fork glitch) is broken so the printer gets another go.
+     * When the cell resolves, chain straight to the next nearby miss instead of resuming the sweep —
+     * so a whole skipped patch is cleared in one excursion rather than thrashing back and forth.
+     */
     private static void recoverStep(MinecraftClient client) {
         long key = CarpetBalanceHandler.cellKey(recoverTarget.getX(), recoverTarget.getZ());
         Item expected = unbuilt.get(key);
         boolean done = expected == null || isBuilt(client, recoverTarget, expected);
-        if (done || ++recoverTimer > RECOVER_TIMEOUT || WaypointMover.stuck()) {
+        boolean giveUp = ++recoverTimer > RECOVER_TIMEOUT || WaypointMover.stuck()
+                || wrongBreaks >= MAX_WRONG_BREAKS;
+        if (done || giveUp) {
             if (!done) recoverSkip.add(key);   // couldn't lay it — don't keep darting back forever
-            recovering = false;
-            recoverTarget = null;
-            if (waypoints != null && wpIndex < waypoints.size()) {
-                WaypointMover.setWaypoint(waypoints.get(wpIndex));   // resume the serpentine
-            }
+            advanceRecovery(client);
             return;
         }
         double reachSq = LitematicaBridge.printerRange() * LitematicaBridge.printerRange();
         double distSq = client.player.squaredDistanceTo(
                 recoverTarget.getX() + 0.5, recoverTarget.getY() + 0.5, recoverTarget.getZ() + 0.5);
-        if (distSq <= reachSq) {
-            WaypointMover.stop();                                   // in reach — hold, let the printer lay it
-        } else if (!WaypointMover.isActive()) {
-            WaypointMover.setWaypoint(recoverTarget);
+        if (distSq > reachSq) {
+            if (!WaypointMover.isActive()) WaypointMover.setWaypoint(recoverTarget);
+            return;
+        }
+        // In reach — hold position and let the printer lay it. If the cell is occupied by the wrong
+        // carpet, break it first so the printer can try again on the now-empty cell.
+        WaypointMover.stop();
+        Item world = worldItemAt(client, recoverTarget);
+        if (world != null && world != expected && CarpetBalanceHandler.isCarpet(world)) {
+            breakBlockAt(client, recoverTarget);
+            breakingWrong = true;
+        } else if (breakingWrong) {
+            wrongBreaks++;          // a wrong carpet we were breaking has just cleared
+            breakingWrong = false;
         }
     }
 
+    /** Chain to the next nearby miss (fixing the whole patch in one trip), else resume the sweep. */
+    private static void advanceRecovery(MinecraftClient client) {
+        wrongBreaks = 0;
+        breakingWrong = false;
+        BlockPos next = findMissedCell(client);
+        if (next != null) {
+            recoverTarget = next;
+            recoverTimer = 0;
+            WaypointMover.clearDutyCycle();   // full speed to the next miss
+            WaypointMover.setWaypoint(next);
+            return;
+        }
+        recovering = false;
+        recoverTarget = null;
+        missScanCooldown = 0;                 // re-scan promptly once we're back on the line
+        if (waypoints != null && wpIndex < waypoints.size()) {
+            WaypointMover.setWaypoint(waypoints.get(wpIndex));   // resume the serpentine
+        }
+    }
+
+    private static Item worldItemAt(MinecraftClient client, BlockPos pos) {
+        return client.world == null ? null : client.world.getBlockState(pos).getBlock().asItem();
+    }
+
+    /** Aim at and mine the carpet at {@code pos} (it breaks in a few ticks). */
+    private static void breakBlockAt(MinecraftClient client, BlockPos pos) {
+        if (client.interactionManager == null || client.player == null) return;
+        double ex = client.player.getX(), ey = client.player.getEyeY(), ez = client.player.getZ();
+        double dx = pos.getX() + 0.5 - ex, dy = pos.getY() + 0.5 - ey, dz = pos.getZ() + 0.5 - ez;
+        double horiz = Math.sqrt(dx * dx + dz * dz);
+        client.player.setYaw((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
+        client.player.setPitch((float) (-Math.toDegrees(Math.atan2(dy, horiz))));
+        // updateBlockBreakingProgress self-starts the break when not already mining this cell.
+        client.interactionManager.updateBlockBreakingProgress(pos, Direction.UP);
+        client.player.swingHand(Hand.MAIN_HAND);
+    }
+
     /**
-     * The nearest genuinely-missed cell: one still unbuilt (a colour we hold) sitting in a band the
-     * sweep has <em>already passed</em>. Band membership comes straight from the plan's geometry —
-     * the sweep runs band 0 (working edge) inward, so a cell whose band index is below the band the
-     * player is currently in is on the worked side and won't be revisited; cells in the current or
-     * not-yet-reached bands are excluded (they get printed normally). No east/west assumption — it
-     * just follows whichever way this load's sweep actually goes. Null if none nearby.
+     * The nearest genuinely-missed cell: one still unbuilt (a colour we hold) that the sweep has
+     * <em>already gone past</em>. Two cases, both from the plan's geometry: a cell in a band below the
+     * one the player is in (the sweep runs band 0 — the working edge — inward, so lower bands are on
+     * the worked side and won't be revisited); or a cell in the <em>current</em> band that the player
+     * has walked past out of printer range (its offset projects behind the travel direction by more
+     * than the printer's reach) — this catches a strip skipped on the current pass immediately rather
+     * than one band later, on the return. Cells ahead, within reach, or in not-yet-reached bands are
+     * excluded (they get printed normally). No east/west assumption — it follows whichever way this
+     * load's sweep actually goes. Null if none nearby.
      */
     private static BlockPos findMissedCell(MinecraftClient client) {
         if (unbuilt == null || unbuilt.isEmpty() || client.player == null) return null;
@@ -329,17 +419,26 @@ public final class AutoPrintHandler {
 
         int bx = client.player.getBlockX(), bz = client.player.getBlockZ();
         int curBand = CarpetBalanceHandler.bandOf(bx, planMinX, planMaxX, planBandW, planEastSide);
-        if (curBand <= 0) return null;   // still on the working edge — nothing passed yet
 
         double px = client.player.getX(), pz = client.player.getZ();
+        double[] fwd = forwardVector(client);
+        double fx = fwd[0], fz = fwd[1];
+        double range = LitematicaBridge.printerRange();
         double radSq = RECOVERY_RADIUS * RECOVERY_RADIUS;
         BlockPos best = null;
         double bestSq = Double.MAX_VALUE;
         for (int dx = -RECOVERY_RADIUS; dx <= RECOVERY_RADIUS; dx++) {
             for (int dz = -RECOVERY_RADIUS; dz <= RECOVERY_RADIUS; dz++) {
                 int cx = bx + dx, cz = bz + dz;
-                if (CarpetBalanceHandler.bandOf(cx, planMinX, planMaxX, planBandW, planEastSide) >= curBand) {
-                    continue;   // current or upcoming band — printed normally
+                int cellBand = CarpetBalanceHandler.bandOf(cx, planMinX, planMaxX, planBandW, planEastSide);
+                if (cellBand > curBand) continue;   // upcoming band — printed normally on a later sweep
+                if (cellBand == curBand) {
+                    // Same band the player is in: a miss only once we've walked past it out of printer
+                    // range. Project the cell onto the travel direction — ahead or still within reach
+                    // means it'll be printed normally, so don't dart back for it yet. This catches a
+                    // skipped strip the moment it leaves range instead of waiting for the next band.
+                    double along = (cx + 0.5 - px) * fx + (cz + 0.5 - pz) * fz;
+                    if (along > -range) continue;
                 }
                 long key = CarpetBalanceHandler.cellKey(cx, cz);
                 if (recoverSkip.contains(key)) continue;
@@ -422,10 +521,13 @@ public final class AutoPrintHandler {
                 int cx = (int) Math.floor(px + d * fx + w * rx);
                 int cz = (int) Math.floor(pz + d * fz + w * rz);
                 Item colour = unbuilt.get(CarpetBalanceHandler.cellKey(cx, cz));
-                if (colour != null && have.contains(colour)) {
-                    count++;
-                    coloursAhead.add(colour);
-                }
+                if (colour == null || !have.contains(colour)) continue;
+                // Skip cells the printer has already filled — the plan's unbuilt map is a static
+                // snapshot, so without this freshly-laid (and pre-existing) floor keeps reading as
+                // work to do and we crawl over ground that's actually done.
+                if (isBuilt(client, new BlockPos(cx, planY, cz), colour)) continue;
+                count++;
+                coloursAhead.add(colour);
             }
         }
         return count;

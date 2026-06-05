@@ -22,10 +22,16 @@ function adaptiveLevel(payloadSize: number): number {
   return 3;
 }
 
-// Above this size the Simple API's all-at-once WASM allocation OOMs.
-// The Streaming API processes one chunk at a time and stays within limits.
-const STREAMING_THRESHOLD = 16 * 1024 * 1024; // 16 MB
-const STREAMING_CHUNK     =  4 * 1024 * 1024; // 4 MB per chunk
+// The zstd-codec WASM module has a fixed 16 MB heap with no growth
+// (abortOnCannotGrowMemory → abort("OOM")).  The Simple API copies the whole
+// input plus a compressBound-sized output buffer into that heap, so it OOMs
+// well before 16 MB — empirically at ~2.25 MB with the level-9 compressor used
+// for 256 KB–4 MB payloads.  The Streaming API feeds one chunk at a time into
+// the heap (the output accumulates in a JS-side buffer) and stays bounded to
+// tens of MB, producing byte-identical output.  Keep the Simple-API threshold
+// safely under the level-9 OOM point and use small chunks for streaming.
+const STREAMING_THRESHOLD = 1.5 * 1024 * 1024; // 1.5 MB
+const STREAMING_CHUNK     =       1024 * 1024; // 1 MB per chunk
 
 /**
  * Compress `data` with zstd at an adaptively chosen level.

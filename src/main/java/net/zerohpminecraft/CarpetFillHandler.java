@@ -67,12 +67,14 @@ public class CarpetFillHandler {
 
     private static final double REACH_SQ           = 4.5 * 4.5; // how close to actually open a chest
     private static final double WALK_LIMIT_SQ      = 16.0 * 16.0; // never auto-guide farther than this
+    private static final int    PATH_RADIUS        = 96;   // A* search box half-width for chest approach
     private static final int    LAST_INV_SLOT      = 35;   // 0–8 hotbar, 9–35 main; 36+ armor/offhand
     private static final int    MAX_STACK          = CarpetBalanceHandler.MAX_STACK;
 
     private static final int    ACTION_COOLDOWN_TICKS  = 2;    // between clicks (was 4) — fill cadence
     private static final int    SETTLE_TICKS           = 5;    // initial wait after open before reading (was 10)
     private static final int    SYNC_WAIT_MAX          = 60;   // keep waiting (up to this) while the chest reads empty
+    private static final int    SYNC_STABLE_TICKS      = 3;    // record only after the carpet total holds steady this long
     private static final int    OPEN_TIMEOUT_TICKS     = 60;
     private static final int    OPEN_RETRY_INTERVAL    = 8;    // re-send interact this often while waiting (was 15)
     private static final int    MAX_OPEN_ATTEMPTS      = 3;
@@ -84,16 +86,37 @@ public class CarpetFillHandler {
 
     private enum State { BALANCE_WAIT, SCAN, APPROACH, WAIT_OPEN, COOLDOWN }
 
+    /** When driven by {@link AutoPrintHandler}: walk the player to chests ourselves and
+     *  range across the whole storage room, instead of only guiding within {@link #WALK_LIMIT_SQ}. */
+    private static final double AUTO_WALK_LIMIT_SQ = 128.0 * 128.0;
+
+    /** Catalogue scan reach: how far around the player we look for chests to open + record. */
+    private static final int CATALOGUE_RADIUS_H = 48;
+    private static final int CATALOGUE_RADIUS_V = 6;
+
     // ── Run state ──────────────────────────────────────────────────────────
     private static boolean active = false;
+    private static boolean autonomous = false;
+    /** Catalogue mode: visit + record every chest in range (no grabbing), to build fresh memory. */
+    private static boolean cataloguing = false;
+    /** When set (autonomous print), the exact load to gather, instead of recomputing local demand. */
+    private static Map<Item, Integer> forcedDemand = null;
+    private static final List<BlockPos> catalogueQueue = new ArrayList<>();
+    private static int catalogued = 0;
     private static State   state  = State.SCAN;
     private static int     cooldown   = 0;
     private static int     openWait   = 0;
     private static int     syncWait   = 0;
+    private static int     lastSyncCarpet = -1;   // container carpet total last tick (sync-stability)
+    private static int     syncStableTicks = 0;
     private static int     openAttempts = 0;
     private static int     totalTicks = 0;
     private static int     approachTimer = 0;
     private static double  lastApproachDistSq = Double.MAX_VALUE;
+    /** A* route to the current chest (cells to walk to), or null when steering straight-line. */
+    private static List<BlockPos> approachPath = null;
+    private static int     approachPathIdx = 0;
+    private static boolean approachRepathed = false;
     private static int     initialNeed = 0;
 
     /** carpet Item → its goal slots, as PlayerInventory indices. */
@@ -102,6 +125,15 @@ public class CarpetFillHandler {
     private static final Set<BlockPos> visited = new HashSet<>();
     /** Chests still worth visiting this run (unknown or known-needed), for in-world markers. */
     private static final Set<BlockPos> markerChests = new HashSet<>();
+    /**
+     * Outline rectangles of the region the last completed fill is meant to print —
+     * at most two ({minX,minZ,maxX,maxZ}, inclusive): the full bands and the partial
+     * cut-off band. Painted 4 blocks tall, persists after the run until the next fill
+     * completes or the world is left. Not gated on {@link #active}.
+     */
+    private static final List<int[]> coveredRegions = new ArrayList<>();
+    /** The Y layer {@link #coveredRegions} sit on. */
+    private static int coveredY;
     /**
      * Memory of each chest's carpet contents (what's left after our last visit), keyed
      * by position, for the CURRENT world only. Lets later runs skip chests known to hold
@@ -129,11 +161,13 @@ public class CarpetFillHandler {
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(CarpetFillHandler::onTick);
         WorldRenderEvents.AFTER_ENTITIES.register(CarpetFillHandler::renderMarkers);
+        WorldRenderEvents.AFTER_ENTITIES.register(CarpetFillHandler::renderCoveredRegions);
         loadDisk();
         // Bind chest memory to the joined world; flush + unbind on disconnect.
         ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> ensureWorld(client));
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             chestMemory.clear();
+            coveredRegions.clear();   // don't leak fill outlines across worlds
             worldKey = null;
         });
     }
@@ -142,9 +176,39 @@ public class CarpetFillHandler {
         return active;
     }
 
+    /**
+     * True if remembered chests (loaded from disk for the current world) already hold every color
+     * in {@code demand} — so a restock can find them without a fresh catalogue pass. Lets the
+     * auto-printer skip re-cataloguing on every run once the storage has been catalogued once.
+     */
+    public static boolean chestMemoryCovers(MinecraftClient client, Map<Item, Integer> demand) {
+        ensureWorld(client);                       // make sure this world's memory is loaded first
+        if (demand == null || demand.isEmpty()) return true;
+        if (chestMemory.isEmpty()) return false;   // nothing remembered → catalogue
+        for (Item color : demand.keySet()) {
+            boolean known = false;
+            for (Map<Item, Integer> contents : chestMemory.values()) {
+                if (contents.getOrDefault(color, 0) > 0) { known = true; break; }
+            }
+            if (!known) return false;              // a needed color isn't in any known chest
+        }
+        return true;
+    }
+
     public static void stop() {
         active = false;
+        autonomous = false;
+        cataloguing = false;
+        forcedDemand = null;
+        catalogueQueue.clear();
+        approachPath = null;
         markerChests.clear();
+        WaypointMover.stop();
+    }
+
+    /** How far we'll walk to a chest: across the whole storage room when autonomous. */
+    private static double walkLimitSq() {
+        return autonomous ? AUTO_WALK_LIMIT_SQ : WALK_LIMIT_SQ;
     }
 
     /**
@@ -153,18 +217,38 @@ public class CarpetFillHandler {
      * stacks up. Returns false (with a chat message) if there's nothing to do.
      */
     public static boolean start(MinecraftClient client) {
+        return start(client, false, null);
+    }
+
+    public static boolean start(MinecraftClient client, boolean auto) {
+        return start(client, auto, null);
+    }
+
+    /**
+     * @param auto   when true (driven by {@link AutoPrintHandler}), the tool walks the player to
+     *               chests itself ({@link WaypointMover}) and ranges across the whole storage room,
+     *               rather than only guiding the player within {@link #WALK_LIMIT_SQ}.
+     * @param demand the exact per-colour load to gather (the auto-printer's planned load). When
+     *               non-null we gather precisely this, instead of recomputing the local demand —
+     *               which would key off the player's <em>current</em> position (e.g. at the chests
+     *               after cataloguing) and gather the wrong mix, so the orchestrator's coverage
+     *               check could never pass. Null = recompute (the standalone command).
+     */
+    public static boolean start(MinecraftClient client, boolean auto, Map<Item, Integer> demand) {
         if (client.player == null) return false;
         if (active) {
             feedback(client, "§e" + TAG + " Carpet fill already running.");
             return false;
         }
+        autonomous = auto;
+        forcedDemand = demand;
         ensureWorld(client);   // bind chest memory to the current world (handles dimension changes)
 
         // Validate we have demand before opening anything (the goal itself is
         // (re)built after the balance pass, since balance rearranges inventory).
         Map<Item, Integer> materials;
         try {
-            materials = CarpetBalanceHandler.carpetDemand(client);
+            materials = forcedDemand != null ? forcedDemand : CarpetBalanceHandler.carpetDemand(client);
         } catch (ClassNotFoundException e) {
             feedback(client, "§c" + TAG + " Litematica is not installed.");
             return false;
@@ -178,22 +262,79 @@ public class CarpetFillHandler {
             return false;
         }
 
-        active     = true;
-        state      = State.BALANCE_WAIT;
-        cooldown   = 0;
-        openWait   = 0;
-        totalTicks = 0;
+        active      = true;
+        cataloguing = false;
+        state       = State.BALANCE_WAIT;
+        cooldown    = 0;
+        openWait    = 0;
+        totalTicks  = 0;
         visited.clear();
-        CarpetBalanceHandler.activate(client);   // arrange the proportional layout first
-        feedback(client, "§a" + TAG + " Balancing, then filling from nearby chests…");
+        CarpetBalanceHandler.activate(client, autonomous);   // arrange the layout; keep surplus when autonomous
+        feedback(client, "§a" + TAG + " Balancing, then filling from nearby chests… §7(serpentine band "
+                + CarpetBalanceHandler.getBandWidth() + " wide)");
         return true;
+    }
+
+    /**
+     * Catalogue pass: walk to and open every chest within range once, recording its carpet
+     * contents, to build authoritative {@link #chestMemory}. This is what lets autonomous
+     * restock always know where each color lives, so the "open a chest with X" hint never
+     * needs the player to step in. Always autonomous (walks the player itself).
+     */
+    public static boolean startCatalogue(MinecraftClient client) {
+        if (client.player == null) return false;
+        if (active) {
+            feedback(client, "§e" + TAG + " Carpet fill already running.");
+            return false;
+        }
+        ensureWorld(client);
+        List<BlockPos> chests = scanChestsAround(client);
+        if (chests.isEmpty()) {
+            feedback(client, "§e" + TAG + " Catalogue: no chests found within "
+                    + CATALOGUE_RADIUS_H + " blocks.");
+            return false;
+        }
+        active      = true;
+        autonomous  = true;
+        cataloguing = true;
+        forcedDemand = null;
+        catalogued  = 0;
+        catalogueQueue.clear();
+        catalogueQueue.addAll(chests);
+        state       = State.SCAN;
+        cooldown    = 0;
+        openWait    = 0;
+        totalTicks  = 0;
+        visited.clear();
+        feedback(client, "§a" + TAG + " Cataloguing " + chests.size() + " chest(s) nearby…");
+        return true;
+    }
+
+    /** All chest-block positions in a box around the player, nearest-first. */
+    private static List<BlockPos> scanChestsAround(MinecraftClient client) {
+        List<BlockPos> out = new ArrayList<>();
+        if (client.world == null) return out;
+        BlockPos origin = client.player.getBlockPos();
+        for (int dx = -CATALOGUE_RADIUS_H; dx <= CATALOGUE_RADIUS_H; dx++) {
+            for (int dz = -CATALOGUE_RADIUS_H; dz <= CATALOGUE_RADIUS_H; dz++) {
+                for (int dy = -CATALOGUE_RADIUS_V; dy <= CATALOGUE_RADIUS_V; dy++) {
+                    BlockPos pos = origin.add(dx, dy, dz);
+                    if (client.world.getBlockEntity(pos) instanceof ChestBlockEntity) {
+                        out.add(pos.toImmutable());
+                    }
+                }
+            }
+        }
+        out.sort(Comparator.comparingDouble(p -> client.player.squaredDistanceTo(
+                p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5)));
+        return out;
     }
 
     /** Builds the fill goal from current (post-balance) inventory; false if nothing to fill. */
     private static boolean computeFillGoal(MinecraftClient client) {
         Map<Item, Integer> materials;
         try {
-            materials = CarpetBalanceHandler.carpetDemand(client);
+            materials = forcedDemand != null ? forcedDemand : CarpetBalanceHandler.carpetDemand(client);
         } catch (Exception e) {
             return false;
         }
@@ -273,8 +414,11 @@ public class CarpetFillHandler {
             if (!inOpenChest) {                       // a chest just opened
                 inOpenChest = true;
                 syncWait = 0;
+                lastSyncCarpet = -1;
+                syncStableTicks = 0;
                 recordedThisOpen = false;
                 tookFromThisOpen = false;
+                WaypointMover.stop();                          // don't walk while looting
                 openChestPos = openedChestPos(client);         // the chest actually opened
                 // The open registered, so the WAIT_OPEN gap is over: drop to COOLDOWN. If the
                 // chest now closes (you close it, or we do), we re-scan instead of falling back
@@ -317,31 +461,109 @@ public class CarpetFillHandler {
     }
 
     private static void scanStep(MinecraftClient client) {
+        if (cataloguing) { catalogueScan(client); return; }
         PlayerInventory inv = client.player.getInventory();
         if (totalNeed(inv) == 0) {
-            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed carpets.");
+            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed carpets.", true);
             return;
         }
         BlockPos chest = findNextChest(client);   // nearest known-needed chest; refreshes markers
         currentChestPos = chest;                  // marker target (may be far / null)
 
-        // Only auto-walk you to a chest within a few blocks. For anything farther — or if
-        // we don't know a chest with it — just say what's wanted and wait: open any chest
-        // that has it (the tool grabs from whatever you open) or walk over yourself.
+        // Walk to a known-needed chest within the walk limit (a few blocks when guiding the
+        // player, the whole storage room when autonomous). Farther — or unknown — chests:
+        // manual mode just says what's wanted and waits; autonomous mode gives up so the
+        // orchestrator can stop (Phase 3's catalogue pass is what makes a chest known).
         if (chest != null) {
             double distSq = client.player.squaredDistanceTo(
                     chest.getX() + 0.5, chest.getY() + 0.5, chest.getZ() + 0.5);
-            if (distSq <= WALK_LIMIT_SQ) {
-                approachTimer = 0;
-                lastApproachDistSq = Double.MAX_VALUE;
+            if (distSq <= walkLimitSq()) {
                 toolOpened = false;
-                state = State.APPROACH;
+                if (autonomous) {
+                    beginApproach(client, chest);   // plan a route + walk ourselves there
+                } else {
+                    approachTimer = 0;
+                    lastApproachDistSq = Double.MAX_VALUE;
+                    state = State.APPROACH;
+                }
                 return;
             }
+        }
+        if (autonomous) {
+            finish(client, "§e" + TAG + " Carpet fill: no reachable chest with the carpet still "
+                    + "needed — stopping. §7(catalogue the storage so chests are known)");
+            return;
         }
         client.inGameHud.setOverlayMessage(Text.literal(needHint(client, inv, chest)), false);
         state = State.COOLDOWN;
         cooldown = 5;    // re-check shortly; grabs immediately if you open a chest meanwhile
+    }
+
+    /** Catalogue mode: head to the next un-opened chest in the queue, recording each in turn. */
+    private static void catalogueScan(MinecraftClient client) {
+        // Greedy nearest-neighbour tour: from where we are NOW, go to the closest chest we
+        // haven't opened yet. A fixed distance-from-start order interleaves chests on different
+        // walls and ping-pongs across the room; re-picking the nearest each time follows the
+        // walls. (A full TSP isn't worth it for a few hundred chests along walls.)
+        BlockPos next = null;
+        double bestSq = Double.MAX_VALUE;
+        for (var it = catalogueQueue.iterator(); it.hasNext(); ) {
+            BlockPos p = it.next();
+            if (visited.contains(p)) { it.remove(); continue; }   // already opened (e.g. a partner half)
+            double d = client.player.squaredDistanceTo(p.getX() + 0.5, p.getY() + 0.5, p.getZ() + 0.5);
+            if (d < bestSq) { bestSq = d; next = p; }
+        }
+        if (next == null) {
+            finish(client, "§a" + TAG + " Catalogue done — recorded " + catalogued + " chest(s).");
+            return;
+        }
+        catalogueQueue.remove(next);
+        toolOpened = false;
+        beginApproach(client, next);
+        client.inGameHud.setOverlayMessage(Text.literal(String.format(
+                "§e%s Cataloguing… (%d left)", TAG, catalogueQueue.size())), false);
+    }
+
+    // ── Autonomous chest approach: A* route around walls, straight-line fallback ────────────
+
+    /** Plan a route to a stand-spot beside {@code chest} and start walking it. */
+    private static void beginApproach(MinecraftClient client, BlockPos chest) {
+        currentChestPos = chest;
+        approachTimer = 0;
+        lastApproachDistSq = Double.MAX_VALUE;
+        approachRepathed = false;
+        planApproachPath(client, chest);
+        state = State.APPROACH;
+    }
+
+    /** (Re)compute the A* route from the player's current cell; fall back to straight-line. */
+    private static void planApproachPath(MinecraftClient client, BlockPos chest) {
+        BlockPos stand = standPositionFor(client, chest);
+        approachPath = (stand == null) ? null
+                : Pathfinder.findPath(client.world, client.player.getBlockPos(), stand, PATH_RADIUS);
+        approachPathIdx = 0;
+        if (approachPath != null && !approachPath.isEmpty()) {
+            WaypointMover.setWaypoint(approachPath.get(0));
+        } else {
+            approachPath = null;                       // no route → steer straight at the chest
+            WaypointMover.setWaypoint(chest);
+        }
+    }
+
+    /** A walkable cell beside the chest to open it from — the one nearest the player. */
+    private static BlockPos standPositionFor(MinecraftClient client, BlockPos chest) {
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (Direction d : Direction.Type.HORIZONTAL) {
+            for (int dy = 0; dy >= -1; dy--) {              // same level, then one step down
+                BlockPos cand = chest.offset(d).up(dy);
+                if (!Pathfinder.walkable(client.world, cand)) continue;
+                double dist = client.player.squaredDistanceTo(
+                        cand.getX() + 0.5, cand.getY(), cand.getZ() + 0.5);
+                if (dist < bestDist) { bestDist = dist; best = cand; }
+            }
+        }
+        return best;
     }
 
     /** "Need 192 brown — open a chest with it (nearest known: x,y,z, N blocks)". */
@@ -365,7 +587,7 @@ public class CarpetFillHandler {
 
     private static void approachStep(MinecraftClient client) {
         if (totalNeed(client.player.getInventory()) == 0) {
-            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed carpets.");
+            finish(client, "§a" + TAG + " Carpet fill done — inventory full of the needed carpets.", true);
             return;
         }
         if (currentChestPos == null) {
@@ -376,15 +598,19 @@ public class CarpetFillHandler {
         double distSq = client.player.squaredDistanceTo(
                 currentChestPos.getX() + 0.5, currentChestPos.getY() + 0.5, currentChestPos.getZ() + 0.5);
 
-        // If you've moved past the short auto-walk cap, stop guiding to this one and
-        // re-evaluate (you may be heading to a closer chest, or opening one yourself).
-        if (distSq > WALK_LIMIT_SQ) {
+        // If you've moved past the auto-walk cap, stop guiding to this one and re-evaluate
+        // (you may be heading to a closer chest, or opening one yourself).
+        if (distSq > walkLimitSq()) {
+            WaypointMover.stop();
+            approachPath = null;
             state = State.COOLDOWN;
             cooldown = BETWEEN_CHESTS_TICKS;
             return;
         }
 
         if (distSq <= REACH_SQ) {
+            WaypointMover.stop();   // arrived — stop walking before we open and loot
+            approachPath = null;
             // In reach now (so the chunk is loaded) — verify a chest is actually there.
             if (!(client.world.getBlockEntity(currentChestPos) instanceof ChestBlockEntity)) {
                 System.out.println(TAG + " Chest at " + currentChestPos + " is gone — forgetting it.");
@@ -403,19 +629,59 @@ public class CarpetFillHandler {
             return;
         }
 
-        // Out of reach (possibly far/unloaded — trust memory) — guide the player there and
-        // wait. The give-up timer only counts while you're NOT getting closer, so a long
-        // walk never times out as long as you're making progress.
-        client.inGameHud.setOverlayMessage(Text.literal(String.format(
-                "§e%s Walk to chest §f%d,%d,%d§e — §f%.0f§e blocks (need %d)",
-                TAG, currentChestPos.getX(), currentChestPos.getY(), currentChestPos.getZ(),
-                Math.sqrt(distSq), totalNeed(client.player.getInventory()))), false);
+        // Out of reach. Autonomous: walk ourselves there along the planned A* route (or straight
+        // line if none), re-routing once around an obstacle if the mover gets stuck. Manual:
+        // guide the player with an overlay and wait. The give-up timer only counts while NOT
+        // getting closer, so a long approach never times out while progress is being made.
+        if (autonomous) {
+            if (WaypointMover.stuck()) {
+                if (!approachRepathed) {
+                    approachRepathed = true;
+                    System.out.println(TAG + " Mover stuck approaching " + currentChestPos
+                            + " — re-routing around the obstacle.");
+                    planApproachPath(client, currentChestPos);   // re-plan from here; reissues a waypoint
+                } else {
+                    System.out.println(TAG + " Couldn't walk to chest at " + currentChestPos
+                            + " (stuck after re-route) — skipping.");
+                    WaypointMover.stop();
+                    visited.add(currentChestPos);
+                    approachPath = null;
+                    state = State.COOLDOWN;
+                    cooldown = BETWEEN_CHESTS_TICKS;
+                    lastApproachDistSq = Double.MAX_VALUE;
+                    return;
+                }
+            } else if (approachPath != null) {
+                // Following a route — advance through its waypoints; progress resets the timer.
+                if (WaypointMover.arrived()) {
+                    approachTimer = 0;
+                    approachPathIdx++;
+                    if (approachPathIdx < approachPath.size()) {
+                        WaypointMover.setWaypoint(approachPath.get(approachPathIdx));
+                    } else {
+                        approachPath = null;                     // route consumed — close the last gap
+                        WaypointMover.setWaypoint(currentChestPos);
+                    }
+                } else if (!WaypointMover.isActive()) {
+                    WaypointMover.setWaypoint(approachPath.get(approachPathIdx));
+                }
+            } else if (!WaypointMover.isActive()) {
+                WaypointMover.setWaypoint(currentChestPos);      // straight-line fallback
+            }
+        } else {
+            client.inGameHud.setOverlayMessage(Text.literal(String.format(
+                    "§e%s Walk to chest §f%d,%d,%d§e — §f%.0f§e blocks (need %d)",
+                    TAG, currentChestPos.getX(), currentChestPos.getY(), currentChestPos.getZ(),
+                    Math.sqrt(distSq), totalNeed(client.player.getInventory()))), false);
+        }
         if (distSq < lastApproachDistSq - 0.25) {
             approachTimer = 0;            // made progress this tick
         } else if (++approachTimer > APPROACH_TIMEOUT_TICKS) {
             System.out.println(TAG + " Gave up walking to chest at " + currentChestPos
                     + " after ~" + (APPROACH_TIMEOUT_TICKS / 20) + "s with no progress — skipping.");
             visited.add(currentChestPos);   // don't keep re-selecting it this run
+            WaypointMover.stop();
+            approachPath = null;
             state = State.COOLDOWN;
             cooldown = BETWEEN_CHESTS_TICKS;
             lastApproachDistSq = Double.MAX_VALUE;
@@ -451,23 +717,31 @@ public class CarpetFillHandler {
 
         ScreenHandler h = client.player.currentScreenHandler;
         PlayerInventory inv = client.player.getInventory();
-        ItemStack cursor = h.getCursorStack();
 
-        // The server sends the chest's contents a moment after it opens; until then the
-        // container reads empty. Keep waiting (up to SYNC_WAIT_MAX) rather than trusting
-        // an empty read — that's what was recording stocked chests as empty.
-        if (cursor.isEmpty() && !containerHasItem(h, inv) && syncWait < SYNC_WAIT_MAX) {
-            syncWait++;
-            cooldown = 1;
-            return;
-        }
-
-        // Now that contents have synced, remember this chest's carpet — for any chest you
-        // open, not just ones the tool opened.
+        // Wait for the chest's contents to FULLY sync before recording. On a laggy server the
+        // slots arrive over several ticks, so don't trust the first non-empty read — keep waiting
+        // until the carpet total holds steady for SYNC_STABLE_TICKS (or we hit SYNC_WAIT_MAX).
+        // Recording mid-sync is what produced undercounts (a full double chest remembered as a
+        // couple hundred) and false empties (a stocked chest hidden).
         if (!recordedThisOpen) {
+            int carpetNow = containerCarpetCount(h, inv);
+            if (carpetNow != lastSyncCarpet) { lastSyncCarpet = carpetNow; syncStableTicks = 0; }
+            else syncStableTicks++;
+            boolean nothingYet = carpetNow == 0 && !containerHasItem(h, inv);
+            if (syncWait < SYNC_WAIT_MAX && (nothingYet || syncStableTicks < SYNC_STABLE_TICKS)) {
+                syncWait++;
+                cooldown = 1;
+                return;
+            }
             recordChestMemory(client, h, inv, openChestPos);
             recordedThisOpen = true;
+            if (cataloguing) catalogued++;
         }
+
+        ItemStack cursor = h.getCursorStack();
+
+        // Catalogue mode only records; it never takes carpet. Close and move to the next chest.
+        if (cataloguing) { closeAndCooldown(client); return; }
 
         if (cursor.isEmpty()) {
             if (totalNeed(inv) == 0) { closeAndCooldown(client); return; }
@@ -516,6 +790,7 @@ public class CarpetFillHandler {
         client.player.closeHandledScreen();   // cursor is always empty at this point
         toolOpened = false;
         currentChestPos = null;
+        approachPath = null;
         state = State.COOLDOWN;
         cooldown = BETWEEN_CHESTS_TICKS;
     }
@@ -543,21 +818,38 @@ public class CarpetFillHandler {
         }
         chestMemory.put(pos, contents);
 
-        // A double chest is two block entities sharing one inventory (54 slots). Mark
-        // the connected half visited and remember it too, so we don't reopen the same
-        // storage as if it were a separate chest.
-        if (containerSlots > 27 && client.world != null) {
-            for (Direction d : Direction.Type.HORIZONTAL) {
-                BlockPos n = pos.offset(d);
-                BlockState ns = client.world.getBlockState(n);
-                if (ns.getBlock() instanceof ChestBlock && ns.get(ChestBlock.CHEST_TYPE) != ChestType.SINGLE
-                        && client.world.getBlockEntity(n) instanceof ChestBlockEntity) {
-                    visited.add(n);
-                    chestMemory.put(n, contents);
-                }
+        // A double chest is two block entities sharing one inventory (54 slots). Mark the
+        // connected half visited and remember it too, so we don't reopen the same storage as a
+        // separate chest. Resolve the ONE true partner from the chest's own geometry — NOT by
+        // scanning all neighbours: carpet stations pack double chests wall-to-wall, so a half of
+        // this chest sits beside a half of a *different-colour* chest. Clobbering that neighbour
+        // (or marking it visited) is what smeared memory and sent restock across stations.
+        if (client.world != null) {
+            BlockPos partner = doubleChestPartner(client, pos);
+            if (partner != null && client.world.getBlockEntity(partner) instanceof ChestBlockEntity) {
+                visited.add(partner);
+                chestMemory.put(partner, contents);
             }
         }
         saveDisk();
+    }
+
+    /**
+     * The position of the other half of the double chest at {@code pos}, or null if it's a single
+     * chest. A double chest's two halves face the same way and connect perpendicular to that
+     * facing: the LEFT half's partner is clockwise of facing, the RIGHT half's counter-clockwise
+     * (vanilla {@code ChestBlock.getFacing}). This is exact — unlike scanning neighbours, it never
+     * mistakes an adjacent unrelated chest for the partner.
+     */
+    private static BlockPos doubleChestPartner(MinecraftClient client, BlockPos pos) {
+        BlockState st = client.world.getBlockState(pos);
+        if (!(st.getBlock() instanceof ChestBlock)) return null;
+        ChestType type = st.get(ChestBlock.CHEST_TYPE);
+        if (type == ChestType.SINGLE) return null;
+        Direction facing = st.get(ChestBlock.FACING);
+        Direction toPartner = (type == ChestType.LEFT)
+                ? facing.rotateYClockwise() : facing.rotateYCounterclockwise();
+        return pos.offset(toPartner);
     }
 
     /**
@@ -613,6 +905,18 @@ public class CarpetFillHandler {
             if (!slot.getStack().isEmpty()) return true;
         }
         return false;
+    }
+
+    /** Total carpet items in the open container's slots (not the player's) — the sync-stability signal. */
+    private static int containerCarpetCount(ScreenHandler h, PlayerInventory inv) {
+        int n = 0;
+        for (int i = 0; i < h.slots.size(); i++) {
+            Slot slot = h.getSlot(i);
+            if (slot.inventory == inv) continue;     // chest slots only
+            ItemStack s = slot.getStack();
+            if (!s.isEmpty() && CarpetBalanceHandler.isCarpet(s.getItem())) n += s.getCount();
+        }
+        return n;
     }
 
     // ── Persistence (per server + dimension) ─────────────────────────────────
@@ -877,8 +1181,27 @@ public class CarpetFillHandler {
     }
 
     private static void finish(MinecraftClient client, String msg) {
+        finish(client, msg, false);
+    }
+
+    /**
+     * Ends the run. When {@code paintRegion} (a real completion, not a timeout), replaces
+     * the persistent outline with the rectangles the just-gathered load is meant to print.
+     */
+    private static void finish(MinecraftClient client, String msg, boolean paintRegion) {
         active = false;
+        autonomous = false;
+        cataloguing = false;
+        forcedDemand = null;
+        catalogueQueue.clear();
+        approachPath = null;
         markerChests.clear();
+        WaypointMover.stop();
+        if (paintRegion) {
+            coveredRegions.clear();
+            for (int[] r : CarpetBalanceHandler.lastLoadRegions) coveredRegions.add(r.clone());
+            coveredY = CarpetBalanceHandler.lastLoadY;
+        }
         feedback(client, msg);
     }
 
@@ -912,6 +1235,36 @@ public class CarpetFillHandler {
                     ox + pad, oy + pad, oz + pad,
                     ox + 1 - pad, oy + 1 - pad, oz + 1 - pad,
                     r, g, b, 0.9f);
+        }
+    }
+
+    /**
+     * Draws a 4-block-tall wireframe over the region the last completed fill is meant to
+     * print: the full-bands rectangle in green, the partial cut-off band in orange.
+     * Persists after the run (not gated on {@link #active}).
+     */
+    private static void renderCoveredRegions(WorldRenderContext context) {
+        if (coveredRegions.isEmpty()) return;
+        VertexConsumerProvider consumers = context.consumers();
+        if (consumers == null) return;
+
+        MatrixStack matrices = context.matrixStack();
+        Vec3d camPos = context.camera().getPos();
+        VertexConsumer lines = consumers.getBuffer(RenderLayer.getLines());
+
+        for (int[] r : coveredRegions) {   // {minX, minZ, maxX, maxZ, full}
+            // full-bands rectangle in green, partial cut-off band in orange.
+            boolean full = r[4] == 1;
+            float cr = full ? 0.2f : 1.0f;
+            float cg = full ? 0.9f : 0.6f;
+            float cb = full ? 0.2f : 0.1f;
+            double x1 = r[0]     - camPos.x;
+            double z1 = r[1]     - camPos.z;
+            double x2 = r[2] + 1 - camPos.x;
+            double z2 = r[3] + 1 - camPos.z;
+            double y1 = coveredY     - camPos.y;
+            double y2 = coveredY + 4 - camPos.y;
+            VertexRendering.drawBox(matrices, lines, x1, y1, z1, x2, y2, z2, cr, cg, cb, 0.9f);
         }
     }
 }

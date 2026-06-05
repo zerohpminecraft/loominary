@@ -36,6 +36,10 @@ public class AutoWalkHandler {
         return active;
     }
 
+    /** The duty-cycle timings (also reused to pace the auto-print walk). off == 0 ⇒ continuous. */
+    public static int getOnTicks()  { return onTicks; }
+    public static int getOffTicks() { return offTicks; }
+
     /** Queried by {@code KeyboardInputMixin} each tick: should we hold forward right now? */
     public static boolean shouldForceForward() {
         if (!active || !phaseOn) return false;

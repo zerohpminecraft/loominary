@@ -27,12 +27,15 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.zerohpminecraft.AnvilAutoFillHandler;
+import net.zerohpminecraft.AutoPrintHandler;
 import net.zerohpminecraft.AutoWalkHandler;
 import net.zerohpminecraft.BannerAutoClickHandler;
 import net.zerohpminecraft.CarpetBalanceHandler;
 import net.zerohpminecraft.CarpetFillHandler;
 import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CodecMode;
+import net.zerohpminecraft.LitematicaBridge;
+import net.zerohpminecraft.WaypointMover;
 import net.zerohpminecraft.MapBannerDecoder;
 import net.zerohpminecraft.MapEncryption;
 import net.zerohpminecraft.PayloadManifest;
@@ -1451,6 +1454,13 @@ public class LoominaryCommand {
                     ClientCommandManager.literal("loominary")
                             .executes(ctx -> status(ctx.getSource()))
 
+                            // ── stop ───────────────────────────────────────────
+                            // Panic button: halt every Loominary automation at once
+                            // (auto-print, carpet fill, catalogue, auto-walk). Also bindable
+                            // to a key (Controls → Loominary → "Stop all").
+                            .then(ClientCommandManager.literal("stop")
+                                    .executes(ctx -> stopAll(ctx.getSource())))
+
                             // ── import ─────────────────────────────────────────
                             // Default: carpet encoding. Add "banners" for legacy mode.
                             .then(ClientCommandManager.literal("import")
@@ -1729,8 +1739,16 @@ public class LoominaryCommand {
                             .then(ClientCommandManager.literal("carpets")
                                     .then(ClientCommandManager.literal("balance")
                                             .executes(ctx -> carpetBalance(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("catalogue")
+                                            .executes(ctx -> carpetCatalogue(ctx.getSource())))
                                     .then(ClientCommandManager.literal("fill")
-                                            .executes(ctx -> carpetFill(ctx.getSource()))))
+                                            .executes(ctx -> carpetFill(ctx.getSource()))
+                                            .then(ClientCommandManager.argument("width", IntegerArgumentType.integer(1, 64))
+                                                    .executes(ctx -> {
+                                                        CarpetBalanceHandler.setBandWidth(
+                                                                IntegerArgumentType.getInteger(ctx, "width"));
+                                                        return carpetFill(ctx.getSource());
+                                                    }))))
 
                             // ── walk ───────────────────────────────────────────
                             // No args: toggle (same as the hotkey). Two ints (forward ticks,
@@ -1739,6 +1757,21 @@ public class LoominaryCommand {
                                     .executes(ctx -> autoWalkToggle(ctx.getSource()))
                                     .then(ClientCommandManager.literal("stop")
                                             .executes(ctx -> autoWalkStop(ctx.getSource())))
+                                    .then(ClientCommandManager.literal("printer")
+                                            .then(ClientCommandManager.literal("on")
+                                                    .executes(ctx -> printerDebug(ctx.getSource(), true)))
+                                            .then(ClientCommandManager.literal("off")
+                                                    .executes(ctx -> printerDebug(ctx.getSource(), false))))
+                                    .then(ClientCommandManager.literal("print")
+                                            .executes(ctx -> autoPrintStart(ctx.getSource()))
+                                            .then(ClientCommandManager.literal("stop")
+                                                    .executes(ctx -> autoPrintStop(ctx.getSource())))
+                                            .then(ClientCommandManager.argument("width", IntegerArgumentType.integer(1, 64))
+                                                    .executes(ctx -> {
+                                                        CarpetBalanceHandler.setBandWidth(
+                                                                IntegerArgumentType.getInteger(ctx, "width"));
+                                                        return autoPrintStart(ctx.getSource());
+                                                    })))
                                     .then(ClientCommandManager.argument("on", IntegerArgumentType.integer(1, 12000))
                                             .then(ClientCommandManager.argument("off", IntegerArgumentType.integer(0, 12000))
                                                     .executes(ctx -> autoWalkSetTimings(ctx.getSource(),
@@ -4700,6 +4733,57 @@ public class LoominaryCommand {
 
     private static int autoWalkStop(FabricClientCommandSource source) {
         AutoWalkHandler.stop(MinecraftClient.getInstance());
+        return 1;
+    }
+
+    /** /loominary carpets catalogue: walk + open every nearby chest once to build chest memory. */
+    private static int carpetCatalogue(FabricClientCommandSource source) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (CarpetFillHandler.isActive()) {
+            CarpetFillHandler.stop();
+            source.sendFeedback(Text.literal("§7Carpet catalogue stopped."));
+            return 1;
+        }
+        CarpetFillHandler.startCatalogue(client);
+        return 1;
+    }
+
+    /** /loominary stop: halt every Loominary automation at once (the panic button). */
+    private static int stopAll(FabricClientCommandSource source) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        boolean any = AutoPrintHandler.isActive() || CarpetFillHandler.isActive()
+                || AutoWalkHandler.isActive();
+        AutoPrintHandler.stop(client);              // also stops a fill/catalogue it's driving
+        if (CarpetFillHandler.isActive()) CarpetFillHandler.stop();   // a standalone fill/catalogue
+        AutoWalkHandler.stop(client);
+        WaypointMover.stop();
+        source.sendFeedback(Text.literal(any
+                ? "§e§lLoominary§r §7stopped all automation."
+                : "§7Loominary: nothing was running."));
+        return 1;
+    }
+
+    /** /loominary walk print: autonomously walk the serpentine and print carpets with the printer. */
+    private static int autoPrintStart(FabricClientCommandSource source) {
+        AutoPrintHandler.start(MinecraftClient.getInstance());
+        return 1;
+    }
+
+    private static int autoPrintStop(FabricClientCommandSource source) {
+        AutoPrintHandler.stop(MinecraftClient.getInstance());
+        return 1;
+    }
+
+    /** Debug: toggle the Litematica printer directly, to confirm the reflection binding works. */
+    private static int printerDebug(FabricClientCommandSource source, boolean on) {
+        boolean ok = LitematicaBridge.setPrinter(on);
+        if (ok) {
+            source.sendFeedback(Text.literal("§a§lLoominary§r §7printer → " + (on ? "§aON" : "§eOFF")
+                    + " §7(now reads " + LitematicaBridge.isPrinterOn() + ")"));
+        } else {
+            source.sendFeedback(Text.literal("§c§lLoominary§r §7couldn't toggle the printer — "
+                    + "litematica-printer fork not found."));
+        }
         return 1;
     }
 

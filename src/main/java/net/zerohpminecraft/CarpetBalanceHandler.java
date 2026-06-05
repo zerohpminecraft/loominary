@@ -78,6 +78,27 @@ public class CarpetBalanceHandler {
     private static final Map<Item, List<Integer>> colorSlots = new LinkedHashMap<>();
     /** carpet Item → how many of it the player started with (for the summary). */
     private static int droppedTotal = 0;
+    /** When true (autonomous print flow), keep surplus in inventory instead of dropping it on the
+     *  ground — dropped carpet lands where the bot walks and gets re-collected, churning. */
+    private static boolean noDrop = false;
+
+    // ── Serpentine selection config + last-load region ───────────────────────
+    /** Width (in columns) of the serpentine print band; settable via {@code /loominary fill <n>}. */
+    private static int bandWidth = 5;
+    public static int  getBandWidth()      { return bandWidth; }
+    public static void setBandWidth(int w) { bandWidth = Math.max(1, w); }
+
+    /**
+     * Bounding rectangles of the cells the most recent {@link #localCarpetDemand}
+     * load is meant to print — at most two: the full bands, plus the partial
+     * cut-off band. Each entry is {minX, minZ, maxX, maxZ, full} (inclusive bounds;
+     * full = 1 for the full-bands rectangle, 0 for the partial band). Read by
+     * {@link CarpetFillHandler} to paint the completed-region outline. Empty when
+     * the last demand fell back to whole-build totals.
+     */
+    static final List<int[]> lastLoadRegions = new ArrayList<>();
+    /** The Y layer the {@link #lastLoadRegions} sit on. */
+    static int lastLoadY;
 
     public static void register() {
         ClientTickEvents.END_CLIENT_TICK.register(CarpetBalanceHandler::onTick);
@@ -88,12 +109,21 @@ public class CarpetBalanceHandler {
      * the Litematica material list, opens the inventory, and starts balancing.
      */
     public static void activate(MinecraftClient client) {
+        activate(client, false);
+    }
+
+    /**
+     * @param keepSurplus when true (autonomous print), surplus carpet is parked in inventory
+     *                    rather than dropped, so loose carpet doesn't pile up where the bot walks.
+     */
+    public static void activate(MinecraftClient client, boolean keepSurplus) {
         if (client.player == null) return;
 
         if (active) {
             feedback(client, "§e" + TAG + " Carpet balance already running.");
             return;
         }
+        noDrop = keepSurplus;
 
         Map<Item, Integer> carpetCounts;
         try {
@@ -373,6 +403,7 @@ public class CarpetBalanceHandler {
             if (s.isEmpty() || !isCarpet(s)) continue;
             Item color = s.getItem();
             if (totalInSlots(handler, color) - s.getCount() < keep(color)) continue;
+            if (noDrop) continue;   // autonomous: leave surplus parked in its non-goal slot
             droppedTotal += s.getCount();
             click(client, handler, slot, RIGHT_CLICK, SlotActionType.THROW); // whole stack
             return;
@@ -424,6 +455,12 @@ public class CarpetBalanceHandler {
             // last resort, leave it on the cursor for the watchdog) rather than
             // discard it.
             if (totalInSlots(handler, color) >= keep(color)) {
+                // Autonomous: park surplus in inventory rather than dropping it on the ground;
+                // only drop as a last resort if there's truly nowhere to set it down.
+                if (noDrop) {
+                    int park = findEmptyNonGoalSlot(handler);
+                    if (park != -1) { click(client, handler, park, LEFT_CLICK, SlotActionType.PICKUP); return; }
+                }
                 droppedTotal += cursor.getCount();
                 click(client, handler, OUTSIDE_SLOT, LEFT_CLICK, SlotActionType.PICKUP);
                 return;
@@ -615,15 +652,59 @@ public class CarpetBalanceHandler {
     /**
      * Counts the carpets the schematic still needs near the player — positions where
      * Litematica's schematic world has a carpet but the real world doesn't match yet —
-     * capped at one inventory-load, so the gathered mix maps to a predictable build
-     * frontier. Each column is swept north→south; the column order depends on which side
-     * of the *unbuilt* region's east-west midpoint the player stands: on the west side it
-     * sweeps west→east (NW→SE), on the east side east→west (NE→SW), so you always gather the
-     * unbuilt columns nearest you first. Returns null when the schematic world isn't
-     * available (Litematica absent / nothing loaded), so callers fall back to whole-build
-     * totals.
+     * capped at one inventory-load of <b>full stacks</b>, so the gathered mix (rounded up
+     * to whole stacks per color) exactly fills the usable slots and covers every cell of
+     * the region it spans. The unbuilt cells are walked in the player's real
+     * <b>serpentine</b> print order: columns are grouped into bands {@link #bandWidth}
+     * wide, swept from the player's working edge inward (west side → west→east, east side
+     * → east→west), and within each band the rows are taken north→south or south→north —
+     * alternating per band, starting away from the player's current end. This makes the
+     * cells counted equal to the cells the player actually lays first.
+     *
+     * <p>As a side effect it records {@link #lastLoadRegions}/{@link #lastLoadY}: the
+     * bounding rectangles of the taken cells (the full bands as one rectangle, the
+     * partial cut-off band as another) for the completed-region outline.
+     *
+     * <p>Returns null when the schematic world isn't available (Litematica absent /
+     * nothing loaded), so callers fall back to whole-build totals.
      */
     private static Map<Item, Integer> localCarpetDemand(MinecraftClient client) {
+        PrintPlan plan = planLoad(client);
+        return (plan == null || plan.demand.isEmpty()) ? null : plan.demand;
+    }
+
+    /**
+     * The capped serpentine load near the player: the ordered list of unbuilt cells to
+     * walk/print next (one inventory-load of full stacks) and the matching per-color carpet
+     * demand. The walked path and the gathered mix stay in lock-step (same cells, same cap).
+     * Returns null when no schematic is loaded near the player or nothing's left to build.
+     * Used by {@link AutoPrintHandler} to drive the print walk.
+     */
+    public static PrintPlan computePrintPath(MinecraftClient client) {
+        return planLoad(client);
+    }
+
+    /** The capped serpentine waypoints + their carpet demand for one inventory-load. */
+    public static final class PrintPlan {
+        public final List<BlockPos> waypoints;   // capped, in serpentine print order
+        public final Map<Item, Integer> demand;  // capped per-color carpet demand
+        public final int y;                      // the Y layer the cells sit on
+        /** All unbuilt carpet cells scanned this plan: packed pos ({@link #cellKey}) → carpet
+         *  item — for the auto-printer's lookahead pacing (cell count + colours just ahead). */
+        public final Map<Long, Item> unbuilt;
+        // Band geometry (for direction-agnostic missed-cell recovery): a cell's band index is
+        // bandOf(x, minX, maxX, bandW, eastSide); the sweep runs from band 0 (working edge) inward.
+        public final int minX, maxX, bandW;
+        public final boolean eastSide;
+        PrintPlan(List<BlockPos> waypoints, Map<Item, Integer> demand, int y, Map<Long, Item> unbuilt,
+                  int minX, int maxX, int bandW, boolean eastSide) {
+            this.waypoints = waypoints; this.demand = demand; this.y = y; this.unbuilt = unbuilt;
+            this.minX = minX; this.maxX = maxX; this.bandW = bandW; this.eastSide = eastSide;
+        }
+    }
+
+    private static PrintPlan planLoad(MinecraftClient client) {
+        lastLoadRegions.clear();
         if (client.player == null || client.world == null) return null;
 
         World schematic;
@@ -636,67 +717,154 @@ public class CarpetBalanceHandler {
             return null;
         }
 
-        // One inventory-load = usable carpet slots × 64.
+        // One inventory-load = the number of usable carpet slots, each of which the player
+        // will carry as a *full* stack. We cap the walk by stacks (not raw cells) so the
+        // gathered mix — rounded up to whole stacks per color — exactly fills these slots
+        // AND covers every cell of the selected region (see the stack tracker below).
         PlayerInventory inv = client.player.getInventory();
         int usable = 0;
         for (int i = 0; i <= 35; i++) {
             ItemStack s = inv.getStack(i);
             if (s.isEmpty() || isCarpet(s.getItem())) usable++;
         }
-        int cap = usable * MAX_STACK;
-        if (cap <= 0) return null;
+        if (usable <= 0) return null;
 
-        // First, find every unbuilt carpet in the player's Y layer — positions where the
-        // schematic wants a carpet the real world doesn't have yet — grouped by column (x),
-        // each column kept north→south. We also track the east-west extent of that
-        // *remaining* work so the band direction can key off the player's side of it.
+        // Find every unbuilt carpet in the player's Y layer — positions where the schematic
+        // wants a carpet the real world doesn't have yet — keyed by (x,z). Track the full
+        // east-west and north-south extent of that remaining work so the band order can key
+        // off the player's side and end of it.
         BlockPos origin = client.player.getBlockPos();
         int py = origin.getY();
         BlockPos.Mutable pos = new BlockPos.Mutable();
         int R = LOCAL_SCAN_MAX_RADIUS;
-        Map<Integer, List<Item>> byColumn = new HashMap<>();
+        Map<Long, Item> cells = new HashMap<>();
         int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+        int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
         for (int x = origin.getX() - R; x <= origin.getX() + R; x++) {
-            for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {   // north → south
+            for (int z = origin.getZ() - R; z <= origin.getZ() + R; z++) {
                 pos.set(x, py, z);
                 try {
                     BlockState exp = schematic.getBlockState(pos);
                     Item carpet = exp.getBlock().asItem();
                     if (!isCarpet(carpet)) continue;
                     if (client.world.getBlockState(pos).getBlock() == exp.getBlock()) continue; // already placed
-                    byColumn.computeIfAbsent(x, k -> new ArrayList<>()).add(carpet);
+                    cells.put(cellKey(x, z), carpet);
                     if (x < minX) minX = x;
                     if (x > maxX) maxX = x;
+                    if (z < minZ) minZ = z;
+                    if (z > maxZ) maxZ = z;
                 } catch (Exception ignored) {
                     // unloaded schematic chunk etc. — skip
                 }
             }
         }
-        if (byColumn.isEmpty()) return null;
+        if (cells.isEmpty()) return null;
 
         // Band from the player's side of the *unbuilt* region: east of its midpoint sweeps
-        // east→west (NE→SW), otherwise west→east (NW→SE). Each column is already north→south,
-        // so we gather complete columns nearest your working edge first, up to one
-        // inventory-load. Keying off the live extent (not Litematica's selected-placement
-        // bounds) keeps this working without a placement selected and tracks the frontier as
-        // the build fills in.
-        boolean eastSide = client.player.getX() > (minX + maxX) / 2.0;
-        System.out.println(TAG + " local demand: unbuilt X=[" + minX + ".." + maxX + "], playerX="
-                + String.format("%.1f", client.player.getX()) + " → "
-                + (eastSide ? "east side (NE→SW)" : "west side (NW→SE)"));
+        // east→west (NE→SW), otherwise west→east (NW→SE). Keying off the live extent (not
+        // Litematica's selected-placement bounds) keeps this working without a placement
+        // selected and tracks the frontier as the build fills in.
+        boolean eastSide  = client.player.getX() > (minX + maxX) / 2.0;
+        // Within a band the player walks away from their current end first: standing at the
+        // north end (small z) they head south, else north; bands then alternate.
+        boolean southBase = client.player.getZ() <= (minZ + maxZ) / 2.0;
+        int W = bandWidth;
+        int numBands = (maxX - minX) / W + 1;
+        System.out.println(TAG + " local demand: unbuilt X=[" + minX + ".." + maxX + "] Z=[" + minZ
+                + ".." + maxZ + "], band " + W + " wide → "
+                + (eastSide ? "east side (NE→SW)" : "west side (NW→SE)") + ", "
+                + (southBase ? "first band N→S" : "first band S→N"));
 
+        // Per-band bookkeeping so we can split the taken cells into the full-bands rectangle
+        // and the (at most one) partial cut-off band rectangle afterward.
+        int[] total = new int[numBands];
+        int[] tkn   = new int[numBands];
+        int[] bMinX = new int[numBands], bMaxX = new int[numBands];
+        int[] bMinZ = new int[numBands], bMaxZ = new int[numBands];
+        for (long key : cells.keySet()) total[bandOf(unpackX(key), minX, maxX, W, eastSide)]++;
+
+        // Take cells in serpentine order, capping by *stacks*: requiredStacks tracks
+        // sum(ceil(demand_c / 64)) — the full stacks needed to carry the gathered mix. A
+        // cell of a color currently at count c opens a new stack only when c is a multiple
+        // of 64 (covers the 0→1 first-stack case). We stop before any cell would need more
+        // stacks than we can carry, so the prefix needs exactly `usable` full stacks: the
+        // mix then fills every slot AND every cell of the region it covers.
         Map<Item, Integer> demand = new HashMap<>();
-        int taken = 0;
-        for (int i = 0; i <= maxX - minX; i++) {
-            int x = eastSide ? (maxX - i) : (minX + i);   // east→west on the east half, else west→east
-            List<Item> column = byColumn.get(x);
-            if (column == null) continue;
-            for (Item carpet : column) {
-                demand.merge(carpet, 1, Integer::sum);
-                if (++taken >= cap) return demand;
+        int requiredStacks = 0;
+        outer:
+        for (int b = 0; b < numBands; b++) {
+            // The W columns of this band, measured from the working edge.
+            int c0 = eastSide ? (maxX - b * W) : (minX + b * W);
+            boolean south = (b % 2 == 0) == southBase;   // alternate the N/S direction each band
+            int zFrom = south ? minZ : maxZ;
+            int zTo   = south ? maxZ : minZ;
+            int zStep = south ? 1 : -1;
+            for (int z = zFrom; z != zTo + zStep; z += zStep) {   // rows in the band's direction
+                for (int k = 0; k < W; k++) {
+                    int x = eastSide ? (c0 - k) : (c0 + k);
+                    if (x < minX || x > maxX) continue;
+                    Item carpet = cells.get(cellKey(x, z));
+                    if (carpet == null) continue;
+                    int c = demand.getOrDefault(carpet, 0);
+                    int delta = (c % 64 == 0) ? 1 : 0;        // does this cell open a new stack?
+                    if (requiredStacks + delta > usable) break outer;
+                    demand.put(carpet, c + 1);
+                    requiredStacks += delta;
+                    if (tkn[b] == 0) { bMinX[b] = bMaxX[b] = x; bMinZ[b] = bMaxZ[b] = z; }
+                    else {
+                        if (x < bMinX[b]) bMinX[b] = x; if (x > bMaxX[b]) bMaxX[b] = x;
+                        if (z < bMinZ[b]) bMinZ[b] = z; if (z > bMaxZ[b]) bMaxZ[b] = z;
+                    }
+                    tkn[b]++;
+                }
             }
         }
-        return demand.isEmpty() ? null : demand;
+
+        // Build the outline regions: merge every fully-taken band into one rectangle, and
+        // keep the single partially-taken band (the one the cap cut off) as a second.
+        int fMinX = Integer.MAX_VALUE, fMaxX = Integer.MIN_VALUE;
+        int fMinZ = Integer.MAX_VALUE, fMaxZ = Integer.MIN_VALUE;
+        boolean haveFull = false;
+        for (int b = 0; b < numBands; b++) {
+            if (tkn[b] == 0) continue;
+            if (tkn[b] < total[b]) {                       // partial cut-off band
+                lastLoadRegions.add(new int[]{bMinX[b], bMinZ[b], bMaxX[b], bMaxZ[b], 0});
+            } else {                                        // fully taken → merge
+                haveFull = true;
+                if (bMinX[b] < fMinX) fMinX = bMinX[b]; if (bMaxX[b] > fMaxX) fMaxX = bMaxX[b];
+                if (bMinZ[b] < fMinZ) fMinZ = bMinZ[b]; if (bMaxZ[b] > fMaxZ) fMaxZ = bMaxZ[b];
+            }
+        }
+        if (haveFull) lastLoadRegions.add(0, new int[]{fMinX, fMinZ, fMaxX, fMaxZ, 1});
+        lastLoadY = py;
+
+        // Walk path: one straight segment down each taken band's centre line (the printer's
+        // reach fills the band's width as the player passes), entering from the end the
+        // serpentine direction starts at — so consecutive bands connect at a shared corner.
+        // Bands are already ordered from the player's working edge inward, so the path starts
+        // next to the player.
+        List<BlockPos> waypoints = new ArrayList<>();
+        for (int b = 0; b < numBands; b++) {
+            if (tkn[b] == 0) continue;
+            int cx = (bMinX[b] + bMaxX[b]) / 2;
+            boolean south = (b % 2 == 0) == southBase;
+            int zStart = south ? bMinZ[b] : bMaxZ[b];
+            int zEnd   = south ? bMaxZ[b] : bMinZ[b];
+            waypoints.add(new BlockPos(cx, py, zStart));
+            waypoints.add(new BlockPos(cx, py, zEnd));
+        }
+
+        return demand.isEmpty() ? null
+                : new PrintPlan(waypoints, demand, py, new HashMap<>(cells), minX, maxX, W, eastSide);
+    }
+
+    // Pack/unpack an (x,z) pair into a single long key for the unbuilt-cell scan.
+    static long cellKey(int x, int z) { return ((long) x << 32) | (z & 0xffffffffL); }
+    private static int  unpackX(long key)      { return (int) (key >> 32); }
+
+    /** Band index of column {@code x}, counted from the player's working edge. */
+    static int bandOf(int x, int minX, int maxX, int W, boolean eastSide) {
+        return (eastSide ? (maxX - x) : (x - minX)) / W;
     }
 
     static Map<Item, Integer> readCarpetMaterials() throws Exception {

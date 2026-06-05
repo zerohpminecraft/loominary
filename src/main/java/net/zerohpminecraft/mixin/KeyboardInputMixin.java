@@ -3,14 +3,16 @@ package net.zerohpminecraft.mixin;
 import net.minecraft.client.input.Input;
 import net.minecraft.client.input.KeyboardInput;
 import net.minecraft.util.PlayerInput;
-import net.zerohpminecraft.AutoWalkHandler;
+import net.zerohpminecraft.LoominaryMovement;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Forces forward movement for {@link AutoWalkHandler}'s duty-cycle walk.
+ * Forces player movement for loominary's autonomous walkers (the duty-cycle
+ * {@code AutoWalkHandler} and the target-directed {@code WaypointMover}), arbitrated by
+ * {@link LoominaryMovement}.
  *
  * <p>Injected at the tail of {@link KeyboardInput#tick()}, i.e. after the movement input
  * has been computed from the key bindings. Doing it here (instead of pressing the forward
@@ -23,10 +25,11 @@ public abstract class KeyboardInputMixin extends Input {
 
     @Inject(method = "tick", at = @At("TAIL"))
     private void loominaryForceForward(CallbackInfo ci) {
-        if (!AutoWalkHandler.shouldForceForward()) return;
+        LoominaryMovement.ForcedInput fi = LoominaryMovement.beforeMovement();
+        if (fi == null) return;
         PlayerInput p = this.playerInput;
-        this.playerInput = new PlayerInput(true, p.backward(), p.left(), p.right(),
-                p.jump(), p.sneak(), p.sprint());
-        this.movementForward = 1.0f;
+        this.playerInput = new PlayerInput(fi.forward(), p.backward(), p.left(), p.right(),
+                fi.jump() || p.jump(), p.sneak(), p.sprint());
+        if (fi.forward()) this.movementForward = 1.0f;
     }
 }

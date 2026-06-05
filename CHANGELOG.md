@@ -4,6 +4,43 @@
 
 ---
 
+## v1.24.0
+
+### Feat: `/loominary walk print` — fully autonomous carpet printing
+
+Prints an entire Litematica carpet placement hands-free. The bot walks the unbuilt region in serpentine order with the Litematica printer on, notices when it's running low, walks itself to the chests and restocks, and resumes — looping until the floor is done, with no intervention. Placement is done by the **Icetank/aleksilassila `litematica-printer` fork** (the continuous printer); loominary only toggles it and drives the movement. Run `/loominary walk print [width]` (default band width 5; 8 works well with a printer range ≥ 4). `/loominary walk print stop` stops it.
+
+- **Serpentine print walk** — reuses the side-aware banding (`computePrintPath`): from the east it sweeps NE→SW, from the west NW→SE, one inventory-load at a time, walking each band's centre line while the printer fills its width.
+- **Autonomous restock** — when a load needs more carpet than you're carrying, it balances, walks to the right chests itself, grabs exactly the planned load, and resumes. It gathers the *exact* planned load regardless of where it ends up, so it never chases a moving target.
+- **Printer toggle** — `LitematicaBridge` flips the fork's `PRINT_MODE` config by reflection; the printer is held on **only** while laying carpet and forced off while navigating, restocking, or stopped. Verify the binding with `/loominary walk printer on|off`.
+
+### Feat: adaptive print pacing
+
+The print walk paces itself on the same duty cycle as `/loominary walk` (`<on> <off>` ticks; `off 0` = continuous), but scales the pause to the real cost of the floor just ahead — so it crawls through dense, many-colour work and sprints across sparse or finished stretches.
+
+- **Placement cost** — only counts cells whose colour you actually hold (cells you can't print are skipped, not slowed for).
+- **Colour-swap cost** — distinct colours ahead beyond the printer's hotbar capacity (`PRINTER_HOTBAR_SLOTS`, ≤ 9) force item swaps that steal placement ticks, so they slow the walk further; a dense single-colour band stays faster than a dense many-colour one.
+
+### Feat: missed-cell recovery
+
+A few edge cells the printer skips (band wider than its reach, or timing) used to compound into orphan strips that never got revisited. The bot now darts back at full speed to lay any unbuilt cell sitting in a band the sweep has already passed, then resumes — direction-agnostic, driven by the plan's actual band order, so it never wanders into not-yet-printed bands. Keep band width ≤ 2× the printer's range for efficiency.
+
+### Feat: chest cataloguing, navigation, and a stop button
+
+- **`/loominary carpets catalogue`** — walks and opens every chest within range once (a greedy nearest-neighbour tour, so it follows the walls instead of ping-ponging) to build authoritative chest memory. Auto-print runs it only when the persisted memory doesn't already know a chest for every needed colour, so a catalogued storage isn't re-walked every session.
+- **Pathfinding** — restock/catalogue navigation now routes **around walls** with a bounded any-angle A\* (8-connected + line-of-sight smoothing), falling back to straight-line steering when no route is found.
+- **`/loominary stop`** and a bindable **"Stop all"** key — halt every loominary automation (print, fill, catalogue, walk) at once.
+
+### Fix: chest memory corruption and loose carpet
+
+- **Double-chest partner** — recording a double chest no longer scans all neighbours (which, in a wall of chests, stamped a neighbour's contents onto a *different* chest and marked it visited). It resolves the one true partner from chest geometry, so memory stays clean and restock stops trekking across stations.
+- **Sync stability** — chest contents are recorded only once the carpet total holds steady for a few ticks, so a half-synced read on a laggy server no longer persists an undercount.
+- **No loose carpet** — during autonomous print the balance keeps surplus in inventory instead of dropping it on the floor where the bot would walk over and re-collect it.
+
+> Note: delete `config/loominary_chest_memory.json` and re-run `/loominary carpets catalogue` once after updating, to purge any smeared entries written by earlier versions.
+
+---
+
 ## v1.23.0
 
 ### Fix: carpet fill goes to the right chest

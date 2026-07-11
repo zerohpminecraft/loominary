@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Install MC Map Palette Bookmarklet</title>
+<style>
+  * { box-sizing: border-box; }
+  body { background: #111; color: #ddd; font: 15px/1.6 system-ui, sans-serif; margin: 0; padding: 32px 24px; max-width: 680px; }
+  h1 { color: #5af; margin: 0 0 8px; }
+  p { color: #aaa; margin: 0 0 16px; }
+  code { background: #1e1e1e; border: 1px solid #333; padding: 2px 6px; border-radius: 3px; font-size: .9em; color: #8cf; }
+  .card { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 20px; margin-bottom: 24px; }
+  .card h2 { color: #5af; margin: 0 0 10px; font-size: 1.05em; }
+  a.bookmarklet {
+    display: inline-block;
+    background: #1b3556; border: 2px solid #4a9eff; border-radius: 5px;
+    color: #8cf; font: bold 15px monospace; padding: 10px 18px;
+    text-decoration: none; cursor: grab; user-select: none;
+    transition: background .15s;
+  }
+  a.bookmarklet:hover { background: #1f4070; }
+  .drag-hint { color: #666; font-size: .82em; margin-top: 8px; }
+  .step { display: flex; gap: 10px; margin-bottom: 8px; align-items: flex-start; }
+  .step-num { background: #5af; color: #111; border-radius: 50%; width: 22px; height: 22px;
+    display: flex; align-items: center; justify-content: center; font-weight: bold;
+    font-size: .85em; flex-shrink: 0; margin-top: 2px; }
+  .step-text { color: #bbb; font-size: .92em; }
+  #url-box { width: 100%; background: #0d0d0d; border: 1px solid #333; color: #888;
+    font: 11px monospace; padding: 8px; border-radius: 4px; margin-top: 8px;
+    resize: vertical; min-height: 60px; }
+  button { background: #252525; border: 1px solid #555; color: #ccc; padding: 6px 14px;
+    border-radius: 4px; cursor: pointer; font-size: .88em; margin-top: 6px; }
+  button:hover { background: #333; }
+  .note { color: #555; font-size: .82em; margin-top: 12px; border-top: 1px solid #222; padding-top: 10px; }
+</style>
+</head>
+<body>
+<h1>🧵 MC Map Palette Coverage Bookmarklet</h1>
+<p>Scores every image on any web page by how well the Minecraft 1.21.4 legal map-colour
+palette can represent it, then replaces the page with a ranked list.</p>
+
+<div class="card">
+  <h2>Method 1 — Drag to bookmarks bar (easiest)</h2>
+  <p style="color:#888;font-size:.9em">Drag this link to your bookmarks bar:</p>
+  <a class="bookmarklet" id="bm-link" href="#">🧵 MC Palette Score</a>
+  <div class="drag-hint">← Drag me to your bookmarks bar. Then click it on any page with images.</div>
+</div>
+
+<div class="card">
+  <h2>Method 2 — Copy URL manually</h2>
+  <div class="step"><div class="step-num">1</div><div class="step-text">Click <b>Copy URL</b> below.</div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-text">Open your browser's bookmark manager and create a new bookmark.</div></div>
+  <div class="step"><div class="step-num">3</div><div class="step-text">Paste the copied text as the URL. Give it any name (e.g. <em>MC Palette Score</em>).</div></div>
+  <textarea id="url-box" readonly>Generating…</textarea>
+  <br>
+  <button onclick="copyUrl()">📋 Copy URL</button>
+  <span id="copy-msg" style="color:#7f7;font-size:.85em;margin-left:8px;display:none">Copied!</span>
+</div>
+
+<div class="card">
+  <h2>How it works</h2>
+  <p style="color:#888;font-size:.9em;margin:0">
+    For each image, every opaque pixel is compared against all 186 legal map colours using
+    OKLab ΔE (the same metric the Loominary editor uses). The score = % of pixels whose
+    nearest-palette match is within ΔE ≤ 0.05 — roughly "how many pixels can the palette
+    represent accurately?"<br><br>
+    <b style="color:#7f7">≥ 75%</b> = good palette fit ·
+    <b style="color:#fc6">50–74%</b> = moderate ·
+    <b style="color:#f77">&lt; 50%</b> = palette will lose a lot of colour information<br><br>
+    Images on other origins may show "CORS – pixel data unavailable" unless the server
+    includes <code>Access-Control-Allow-Origin</code> headers.
+  </p>
+</div>
+
+<div class="note">
+  Source: <code>bookmarklet.js</code> in the Loominary web project.
+  Palette data: Minecraft 1.21.4 via <code>/loominary dumppalette</code>.
+</div>
+
+<script>
+// Read bookmarklet.js, minify it (basic), and set as the href.
+fetch('bookmarklet.js')
+  .then(r => r.text())
+  .then(src => {
+    // Basic minification: strip comments, collapse whitespace, trim.
+    const min = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')   // block comments
+      .replace(/\/\/[^\n]*/g, '')          // line comments
+      .replace(/\n\s*/g, ' ')             // newlines + leading spaces → single space
+      .replace(/\s{2,}/g, ' ')            // multiple spaces → one
+      .trim();
+    const url = 'javascript:' + encodeURIComponent(min);
+    document.getElementById('bm-link').href = url;
+    document.getElementById('url-box').value = url;
+  })
+  .catch(() => {
+    // If fetch fails (file:// protocol), show fallback instructions.
+    document.getElementById('url-box').value =
+      '(Cannot auto-generate: open this file via a local web server, or minify bookmarklet.js manually and prepend javascript:)';
+  });
+
+function copyUrl() {
+  const box = document.getElementById('url-box');
+  box.select();
+  navigator.clipboard.writeText(box.value).then(() => {
+    const msg = document.getElementById('copy-msg');
+    msg.style.display = 'inline';
+    setTimeout(() => { msg.style.display = 'none'; }, 2000);
+  }).catch(() => {
+    document.execCommand('copy');
+  });
+}
+</script>
+</body>
+</html>

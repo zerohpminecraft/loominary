@@ -33,12 +33,15 @@ export const DEFAULT_PREPROCESS: PreprocessParams = {
  *
  * Preprocessing is applied to the full-resolution source before downscaling.
  */
+import { downscale, type DownscaleStyle } from './ml/pixelize.js';
+
 export async function prepareSourceImage(
   bmp:      ImageBitmap,
   targetW:  number,
   targetH:  number,
   cropMode: 'scale' | 'center',
   pre:      PreprocessParams,
+  downscaleStyle: DownscaleStyle = 'bilinear',
 ): Promise<ImageData> {
   // Cap the intermediate resolution to avoid creating huge OffscreenCanvas
   // objects for large source images.  4× the target is more than enough
@@ -56,23 +59,35 @@ export async function prepareSourceImage(
   const processed = applyPreprocess(raw, pre);
   if (processed !== raw) srcCtx.putImageData(processed, 0, 0);
 
-  // Scale/crop to target dimensions.
+  // Determine the crop rectangle (in intermediate/source pixels).
+  let sx = 0, sy = 0, sw = srcW, sh = srcH;
+  if (cropMode === 'center') {
+    const srcAR = srcW / srcH;
+    const dstAR = targetW / targetH;
+    if (srcAR > dstAR) { sw = srcH * dstAR; sx = (srcW - sw) / 2; }
+    else               { sh = srcW / dstAR; sy = (srcH - sh) / 2; }
+  }
+
+  // Content-adaptive downscale styles operate on the cropped, preprocessed
+  // intermediate (up to 4× the target res) → target. Bilinear lets the canvas
+  // do it. All styles only produce RGBA; quantization stays downstream.
+  if (downscaleStyle !== 'bilinear') {
+    const cx = Math.max(0, Math.floor(sx)), cy = Math.max(0, Math.floor(sy));
+    const cw = Math.max(1, Math.min(srcW - cx, Math.round(sw)));
+    const ch = Math.max(1, Math.min(srcH - cy, Math.round(sh)));
+    const crop = srcCtx.getImageData(cx, cy, cw, ch);
+    const reduced = downscale(crop.data, cw, ch, targetW, targetH, downscaleStyle);
+    const out = new ImageData(targetW, targetH);
+    out.data.set(reduced);
+    return out;
+  }
+
+  // Bilinear scale/crop to target dimensions.
   const dstCanvas = new OffscreenCanvas(targetW, targetH);
   const dstCtx    = dstCanvas.getContext('2d')!;
   dstCtx.imageSmoothingEnabled = true;
   dstCtx.imageSmoothingQuality = 'high';
-
-  if (cropMode === 'center') {
-    const srcAR = srcW / srcH;
-    const dstAR = targetW / targetH;
-    let sx = 0, sy = 0, sw = srcW, sh = srcH;
-    if (srcAR > dstAR) { sw = srcH * dstAR; sx = (srcW - sw) / 2; }
-    else               { sh = srcW / dstAR; sy = (srcH - sh) / 2; }
-    dstCtx.drawImage(srcCanvas, sx, sy, sw, sh, 0, 0, targetW, targetH);
-  } else {
-    dstCtx.drawImage(srcCanvas, 0, 0, targetW, targetH);
-  }
-
+  dstCtx.drawImage(srcCanvas, sx, sy, sw, sh, 0, 0, targetW, targetH);
   return dstCtx.getImageData(0, 0, targetW, targetH);
 }
 

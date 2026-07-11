@@ -33,6 +33,10 @@ export interface ToolContext {
   setColor:    (mapByte: number) => void;
   setSelMask:  (mask: Uint8Array | null) => void;
   getSelMask:  () => Uint8Array | null;
+  /** Full-res source bitmap for the active frame, or null (used by Smart Wand). */
+  getSourceBitmap?: () => ImageBitmap | null;
+  /** Surface a transient status message (used by async tools). */
+  setStatus?: (msg: string) => void;
 }
 
 // ─── Tool interface ───────────────────────────────────────────────────────────

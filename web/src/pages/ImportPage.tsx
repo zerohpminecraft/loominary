@@ -28,6 +28,9 @@ import {
   DEFAULT_PREPROCESS,
   prepareSourceImage,
 } from '../preprocess.js';
+import {
+  type DownscaleStyle, DOWNSCALE_STYLES, DOWNSCALE_LABEL, DOWNSCALE_HINT,
+} from '../ml/pixelize.js';
 import { rgbToOklab } from '../oklab.js';
 import { MC_PALETTE }  from '../palette.js';
 import { updateCarpetTables } from '../carpet.js';
@@ -132,8 +135,9 @@ async function computePreview(
   palRestriction: PaletteRestriction,
   reqP:           RequantizeParams,
   greyThreshold:  number,
+  downscaleStyle: DownscaleStyle = 'bilinear',
 ): Promise<{ tiles: Uint8Array[]; quality: MatchQuality }> {
-  const img = await prepareSourceImage(bmp, cols * 128, rows * 128, cropMode, pre);
+  const img = await prepareSourceImage(bmp, cols * 128, rows * 128, cropMode, pre, downscaleStyle);
   const dummyComp: CompositionState = {
     gridCols:      cols,
     gridRows:      rows,
@@ -422,6 +426,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
   const [rowsManual, setRowsManual] = useState<number | null>(null);
   const [autoGrid,   setAutoGrid]   = useState<[number, number] | null>(null);
   const [cropMode, setCropMode] = useState<'scale' | 'center'>('center');
+  const [downscaleStyle, setDownscaleStyle] = useState<DownscaleStyle>('bilinear');
   const [isGif,      setIsGif]      = useState(false);
 
   // ── Image adjustments ──────────────────────────────────────────────────────
@@ -674,7 +679,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       setPreviewStatus('computing');
       try {
         const reqP = buildReqParams();
-        const { tiles, quality } = await computePreview(bmp, effectiveCols, effectiveRows, cropMode, pre, palRestriction, reqP, greyThreshold);
+        const { tiles, quality } = await computePreview(bmp, effectiveCols, effectiveRows, cropMode, pre, palRestriction, reqP, greyThreshold, downscaleStyle);
         setMatchQuality(quality);
         const imgData = mapBytesToImageData(tiles.map(t => [t]), 0, effectiveCols, effectiveRows);
 
@@ -700,7 +705,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
     }, 600);
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sourceBitmap, effectiveCols, effectiveRows, cropMode, pre, palRestriction, greyThreshold, dither, metric, chromaBoost,
+  }, [sourceBitmap, effectiveCols, effectiveRows, cropMode, downscaleStyle, pre, palRestriction, greyThreshold, dither, metric, chromaBoost,
       fsStrength, atkStrength, sierraStr, sierra2Str, sierraLiteStr, shiauFanStr, jjnStr, stuckiStr,
       serpentine, bayerScale, bayerSize, tilePalette]);
 
@@ -744,7 +749,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
         setPreviewStatus(`Preparing ${total} frames…`);
         const preparedImages = await Promise.all(
           gifFrames.map(({ bitmap: fb }) =>
-            prepareSourceImage(fb, eCols * 128, eRows * 128, cropMode, pre)
+            prepareSourceImage(fb, eCols * 128, eRows * 128, cropMode, pre, downscaleStyle)
           )
         );
 
@@ -774,7 +779,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
         const sourceBitmaps = gifFrames.map(f => f.bitmap);
         onProceed(comp, sourceBitmaps[0], reqP, cropMode, pre, sourceBitmaps, latestFileRef.current);
       } else {
-        const { tiles } = await computePreview(bmp, eCols, eRows, cropMode, pre, palRestriction, reqP, greyThreshold);
+        const { tiles } = await computePreview(bmp, eCols, eRows, cropMode, pre, palRestriction, reqP, greyThreshold, downscaleStyle);
         onProceed(compositionFromState(ps, tiles.map(t => [t])), bmp, reqP, cropMode, pre, null, latestFileRef.current);
       }
     } catch (err) {
@@ -784,7 +789,28 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       setProceedProgress(0);
       setProceedTotal(0);
     }
-  }, [buildReqParams, colsManual, rowsManual, autoGrid, cropMode, pre, palRestriction, greyThreshold, onProceed]);
+  }, [buildReqParams, colsManual, rowsManual, autoGrid, cropMode, downscaleStyle, pre, palRestriction, greyThreshold, onProceed]);
+
+  // ── Saliency auto-crop (Phase 2) ────────────────────────────────────────────
+  const [autoCropBusy, setAutoCropBusy] = useState(false);
+  const handleAutoCrop = useCallback(async () => {
+    const bmp = latestBmpRef.current;
+    if (!bmp || autoCropBusy) return;
+    setAutoCropBusy(true);
+    try {
+      const { computeAutoCrop } = await import('../ml/features/autoCrop.js');
+      const res = await computeAutoCrop(bmp);
+      if (res) {
+        latestBmpRef.current = res.bitmap;
+        setSourceBitmap(res.bitmap);
+        setCropMode('scale'); // already square-cropped to the subject
+      }
+    } catch (err) {
+      console.error('[Loominary AI] auto-crop', err);
+    } finally {
+      setAutoCropBusy(false);
+    }
+  }, [autoCropBusy]);
 
   // ── Status display ─────────────────────────────────────────────────────────
 
@@ -956,6 +982,33 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
             </label>
           ))}
         </div>
+
+        <div style={{ marginBottom: 6 }}>
+          <div style={{ color: '#aaa', fontSize: '0.58em', marginBottom: 2 }}>Downscale style</div>
+          <select
+            value={downscaleStyle}
+            onChange={(e) => setDownscaleStyle((e.target as HTMLSelectElement).value as DownscaleStyle)}
+            style={{ width: '100%', background: '#1e1e1e', color: '#ddd', border: '1px solid #333', borderRadius: 4, padding: '3px 5px', fontSize: '0.58em' }}>
+            {DOWNSCALE_STYLES.map(s => (
+              <option key={s} value={s}>{DOWNSCALE_LABEL[s]}</option>
+            ))}
+          </select>
+          <div style={{ color: '#666', fontSize: '0.52em', marginTop: 2 }}>{DOWNSCALE_HINT[downscaleStyle]}</div>
+        </div>
+
+        <button
+          disabled={!sourceBitmap || autoCropBusy}
+          onClick={() => void handleAutoCrop()}
+          title="Use AI to find the subject and crop to it (downloads a model on first use)"
+          style={{
+            width: '100%', marginBottom: 6, padding: '4px 6px', fontSize: '0.56em',
+            background: (!sourceBitmap || autoCropBusy) ? '#252525' : '#2a2a3a',
+            color: (!sourceBitmap || autoCropBusy) ? '#555' : '#bcd',
+            border: '1px solid #3a3a4a', borderRadius: 4,
+            cursor: (!sourceBitmap || autoCropBusy) ? 'not-allowed' : 'pointer',
+          }}>
+          {autoCropBusy ? '✨ Finding subject…' : '✨ Auto-crop to subject'}
+        </button>
 
         <Step n={3} title="Adjustments"
           hint="Pre-processing applied before colour matching. Boosting saturation often improves results — the Minecraft palette has a limited colour range, so vivid sources map better." />

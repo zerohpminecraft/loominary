@@ -1,0 +1,17 @@
+{
+  "manifest_version": 2,
+  "name": "MC Map Palette Score",
+  "version": "1.0",
+  "description": "Scores every image on the page by Minecraft 1.21.4 legal map-colour palette coverage and ranks them.",
+  "permissions": ["activeTab", "<all_urls>"],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+  "browser_action": {
+    "default_title": "Score images for MC map art palette coverage"
+  },
+  "icons": {
+    "128": "icon.png"
+  }
+}

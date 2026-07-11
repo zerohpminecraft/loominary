@@ -44,11 +44,14 @@ import { FillTool }       from './tools/Fill.js';
 import { RectSelectTool } from './tools/Select.js';
 import { LassoTool }      from './tools/Lasso.js';
 import { MagicWandTool }  from './tools/MagicWand.js';
+import { SmartWandTool }  from './tools/SmartWand.js';
 import type { Tool, ToolContext } from './tools/Tool.js';
 import {
   dilateSelMask, erodeSelMask,
   readPixel, writePixel, MAP_SIZE,
 } from './tools/Tool.js';
+import { openAiMenu } from '../ml/aiMenu.js';
+import type { EditorBridge } from '../ml/bridge.js';
 
 // ─── Data / compression types ─────────────────────────────────────────────────
 
@@ -212,8 +215,9 @@ const fillTool   = new FillTool();
 const rectSelect = new RectSelectTool();
 const lasso      = new LassoTool();
 const magicWand  = new MagicWandTool();
+const smartWand  = new SmartWandTool();
 
-const ALL_TOOLS: Tool[] = [brushTool, fillTool, rectSelect, lasso, magicWand];
+const ALL_TOOLS: Tool[] = [brushTool, fillTool, rectSelect, lasso, magicWand, smartWand];
 const TOOL_MAP = new Map(ALL_TOOLS.map(t => [t.id, t]));
 
 // ─── Default empty composition ────────────────────────────────────────────────
@@ -767,6 +771,52 @@ export function Editor({
     setColor:      (b: number) => setActiveColor(b),
     setSelMask,
     getSelMask:    () => selMaskRef.current,
+    getSourceBitmap: () => sourceFramesRef.current?.[compRef.current.activeFrame] ?? sourceBitmapRef.current ?? null,
+    setStatus:     (m: string) => setStatusMsg(m),
+  })).current;
+
+  // ── ML / AI bridge ────────────────────────────────────────────────────────
+  // Narrow surface the AI features use to read editor state and apply results.
+  // Built fresh on each open so it reads current refs. Results are shown as a
+  // previewComp, so the editor's existing Enter=keep / Esc=discard handlers make
+  // every AI edit undoable for free.
+  const getBridge = useRef((): EditorBridge => ({
+    getComp:         () => compRef.current,
+    getSourceBitmap: () => sourceFramesRef.current?.[compRef.current.activeFrame] ?? sourceBitmapRef.current ?? null,
+    getSelMask:      () => selMaskRef.current,
+    setSelMask,
+    getReqParams:    () => {
+      const { customPalette, tilePalette: tp } = buildReqPalette();
+      return {
+        legalOnly:          !compRef.current.allShades,
+        customPalette,
+        dither:             reqAlgoRef.current,
+        metric:             reqMetricRef.current,
+        fsStrength:         reqFsStrRef.current,
+        atkStrength:        reqAtkStrRef.current,
+        sierraStrength:     reqSierraStrRef.current,
+        sierra2Strength:    reqSierra2StrRef.current,
+        sierraLiteStrength: reqSierraLiteStrRef.current,
+        shiauFanStrength:   reqShiauFanStrRef.current,
+        jjnStrength:        reqJjnStrRef.current,
+        stuckiStrength:     reqStuckiStrRef.current,
+        serpentine:         reqSerpentineRef.current,
+        bayerScale:         reqBayerRef.current,
+        bayerSize:          reqBayerSizeRef.current,
+        chromaBoost:        reqChromaRef.current,
+        tilePalette:        tp,
+        useCustomDither:    false,
+        ditherMask:         null,
+      };
+    },
+    showPreview:     (c) => setPreviewComp(c),
+    commit:          (next) => {
+      historyRef.current.snapshot(compRef.current.frames);
+      syncComp(next);
+      setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+      void computeDataStatsRef.current();
+    },
+    setStatus:       (m) => setStatusMsg(m),
   })).current;
 
   // ── Tool switching ──────────────────────────────────────────────────────────
@@ -1918,6 +1968,7 @@ export function Editor({
     { id:'select', label:'▭ Select', key:'S', hint:'drag: marquee · Ctrl: subtract' },
     { id:'lasso',  label:'⬡ Lasso',  key:'L', hint:'drag: freehand · click: add vertex · dbl-click: close polygon · Ctrl: subtract' },
     { id:'wand',   label:'✦ Wand',   key:'W', hint:'click: add · Ctrl: subtract · scroll: tol' },
+    { id:'smartwand', label:'✨ Smart', key:'', hint:'AI: click a subject to select it · Shift: add · Ctrl: subtract · downloads a model on first use' },
   ] as const;
 
   const activeTool   = TOOL_MAP.get(activeToolId) ?? brushTool;
@@ -2316,6 +2367,15 @@ export function Editor({
           Apply (P)
         </button>
         <div style={{ fontSize:'0.71em', color:'#555', marginTop:1 }}>Shift+P: cycle type</div>
+
+        <div style={DIVIDER} />
+
+        {/* ── AI tools section ────────────────────────────────────────────── */}
+        <div style={SECTION_LABEL}>AI tools</div>
+        <button style={{ ...SEL_BTN, marginTop:2 }} onClick={() => openAiMenu(getBridge())}>
+          ✨ AI tools…
+        </button>
+        <div style={{ fontSize:'0.71em', color:'#555', marginTop:1 }}>Runs in-browser · downloads a model on first use</div>
 
         <div style={DIVIDER} />
 

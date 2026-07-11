@@ -12,6 +12,26 @@ export const FLAG_ANIMATED     = 0x02;
 export const FLAG_MUX          = 0x04;
 export const FLAG_DELTA_FRAMES = 0x08;
 export const FLAG_SPARSE_FRAMES = 0x10;
+/**
+ * Frames 1..N stored as a lossless AV1 bitstream (length-prefixed temporal units after the
+ * header), decoding to 128×128 monochrome planes of *permuted* palette indices (see
+ * palette-perm.ts INV_PERM). Requires FLAG_ANIMATED; mutually exclusive with delta/sparse.
+ */
+export const FLAG_AV1          = 0x20;
+/**
+ * AV1 stream is LOSSY colour (4:2:0) rather than lossless monochrome indices. Decode maps each
+ * pixel's RGB to the nearest palette entry (no INV_PERM). Implies FLAG_AV1. The in-game art is a
+ * close approximation of the original, not byte-identical.
+ */
+export const FLAG_AV1_LOSSY    = 0x40;
+/**
+ * The lossy AV1 stream covers the ENTIRE composition at (cols·128)×(rows·128) — encoded once,
+ * so no per-tile seams — and this tile carries only a byte-segment of it.  Segments concatenate
+ * in tile-index order (tileRow·cols + tileCol) to rebuild the stream; each decoded frame is
+ * cropped to the tile's 128×128 window.  Implies FLAG_AV1 | FLAG_AV1_LOSSY.  Every tile of the
+ * composition must be decoded before any of them can display.
+ */
+export const FLAG_AV1_COMPOSITE = 0x80;
 
 const MAP_BYTES = 128 * 128; // 16384
 
@@ -47,6 +67,18 @@ export function animated(m: Manifest): boolean   { return (m.flags & FLAG_ANIMAT
 export function muxed(m: Manifest): boolean      { return (m.flags & FLAG_MUX)        !== 0; }
 export function deltaFrames(m: Manifest): boolean { return (m.flags & FLAG_DELTA_FRAMES) !== 0; }
 export function sparseFrames(m: Manifest): boolean { return (m.flags & FLAG_SPARSE_FRAMES) !== 0; }
+export function av1(m: Manifest): boolean         { return (m.flags & FLAG_AV1)          !== 0; }
+export function av1Lossy(m: Manifest): boolean    { return (m.flags & FLAG_AV1_LOSSY)    !== 0; }
+export function av1Composite(m: Manifest): boolean { return (m.flags & FLAG_AV1_COMPOSITE) !== 0; }
+
+/**
+ * Byte offset where an AV1 stream begins.  For v5 (per-frame delays that overflow the header)
+ * the delay table is stored as a `frameCount × u16` PREFIX after the header; v≤4 stores delays
+ * in the header, so the stream starts right at headerSize.
+ */
+export function av1StreamOffset(m: Manifest): number {
+  return m.headerSize + (m.manifestVersion >= 5 ? m.frameCount * 2 : 0);
+}
 
 // ─── CRC32 ────────────────────────────────────────────────────────────────────
 
@@ -227,8 +259,10 @@ export function fromBytes(data: Uint8Array): Manifest {
       } else if (delayMode === 1) {
         frameDelays = new Array(frameCount).fill(100);
         if (ver >= 5) {
-          // Trailing: delay table is after all frame data.
-          let dt = headerSize + frameCount * MAP_BYTES;
+          // v5 delay table: AV1 stores it as a PREFIX right after the header (the AV1 stream is
+          // variable-length, so the trailing position isn't computable); raw/delta/sparse store
+          // it trailing, after frameCount fixed-size frames.
+          let dt = (flags & FLAG_AV1) !== 0 ? headerSize : headerSize + frameCount * MAP_BYTES;
           for (let f = 0; f < frameCount && dt + 2 <= data.length; f++, dt += 2) {
             frameDelays[f] = (data[dt] << 8) | data[dt + 1];
           }
@@ -253,6 +287,7 @@ export function fromBytes(data: Uint8Array): Manifest {
  * Handles delta and sparse encoding (v6).
  */
 export function extractFrames(full: Uint8Array, manifest: Manifest): Uint8Array[] {
+  if (av1(manifest)) throw new Error('AV1 frames require the async decodeAv1() path, not extractFrames()');
   const { headerSize, frameCount } = manifest;
   const frames: Uint8Array[] = [];
 

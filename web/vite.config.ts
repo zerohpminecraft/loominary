@@ -16,6 +16,8 @@ export default defineConfig(({ command }) => ({
     assetsInlineLimit: 1024 * 1024, // 1 MB
   },
   optimizeDeps: {
-    include: ['zstd-codec'],
+    // @bokuweb/zstd-wasm is Emscripten-based; pre-bundling breaks its wasm URL resolution
+    // in dev (the wasm 404s → "magic number" error).  Exclude it so it's served from source.
+    exclude: ['@bokuweb/zstd-wasm'],
   },
 }));

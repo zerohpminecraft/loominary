@@ -179,6 +179,89 @@ class PayloadManifestTest {
     }
 
     @Test
+    void roundtrip_av1Flag() {
+        byte[] bytes = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1,
+                2, 1, 0, 0, 0xABCDL,
+                "Artist", "Anim Title", 0,
+                4, 0, new int[]{100});
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+
+        assertTrue(m.animated());
+        assertTrue(m.av1(), "FLAG_AV1 must survive manifest roundtrip");
+        assertFalse(m.deltaFrames());
+        assertFalse(m.sparseFrames());
+        assertEquals(4, m.frameCount);
+    }
+
+    @Test
+    void av1V5_perFrameDelaysReadFromPrefix() {
+        // Many per-frame delays overflow the 255-byte header → v5.  For AV1 the delay table is a
+        // PREFIX after the header (not trailing after frames), so fromBytes must read it there.
+        int n = 130;
+        int[] delays = new int[n];
+        for (int f = 0; f < n; f++) delays[f] = 40 + (f % 13) * 5;
+
+        byte[] header = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1,
+                1, 1, 0, 0, 0L, "a", "t", 0, n, 0, delays);
+        assertEquals(5, header[0] & 0xFF, "should be v5 for 130 per-frame delays");
+
+        // Combined = header ++ prefix delay table ++ (stand-in AV1 stream bytes).
+        byte[] prefix = new byte[n * 2];
+        for (int f = 0; f < n; f++) { prefix[f * 2] = (byte) (delays[f] >> 8); prefix[f * 2 + 1] = (byte) delays[f]; }
+        byte[] combined = new byte[header.length + prefix.length + 32];
+        System.arraycopy(header, 0, combined, 0, header.length);
+        System.arraycopy(prefix, 0, combined, header.length, prefix.length);
+
+        PayloadManifest m = PayloadManifest.fromBytes(combined);
+        assertEquals(5, m.manifestVersion);
+        assertTrue(m.av1());
+        assertEquals(n, m.frameCount);
+        assertArrayEquals(delays, m.frameDelays, "v5 AV1 per-frame delays must parse from the prefix");
+    }
+
+    @Test
+    void av1Flag_defaultsFalse() {
+        PayloadManifest m = PayloadManifest.fromBytes(
+                PayloadManifest.toBytes(PayloadManifest.FLAG_ANIMATED,
+                        1, 1, 0, 0, 0L, null, null, 0, 2, 0, new int[]{100}));
+        assertFalse(m.av1());
+    }
+
+    @Test
+    void roundtrip_av1CompositeFlag() {
+        byte[] bytes = PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1
+                        | PayloadManifest.FLAG_AV1_LOSSY | PayloadManifest.FLAG_AV1_COMPOSITE,
+                3, 2, 2, 1, 0xABCDL,
+                "Artist", "Seamless", 0,
+                8, 0, new int[]{100});
+
+        PayloadManifest m = PayloadManifest.fromBytes(bytes);
+
+        assertTrue(m.animated());
+        assertTrue(m.av1());
+        assertTrue(m.av1Lossy());
+        assertTrue(m.av1Composite(), "FLAG_AV1_COMPOSITE must survive manifest roundtrip");
+        assertEquals(3, m.cols);
+        assertEquals(2, m.rows);
+        assertEquals(2, m.tileCol);
+        assertEquals(1, m.tileRow);
+        assertEquals(8, m.frameCount);
+    }
+
+    @Test
+    void av1CompositeFlag_defaultsFalse() {
+        PayloadManifest m = PayloadManifest.fromBytes(
+                PayloadManifest.toBytes(
+                        PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1 | PayloadManifest.FLAG_AV1_LOSSY,
+                        1, 1, 0, 0, 0L, null, null, 0, 2, 0, new int[]{100}));
+        assertFalse(m.av1Composite());
+    }
+
+    @Test
     void roundtrip_v4_perFrameDelays() {
         int[] delays = {100, 200, 150, 300};
         byte[] bytes = PayloadManifest.toBytes(

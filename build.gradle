@@ -6,6 +6,11 @@ plugins {
 version = project.mod_version
 group = project.maven_group
 
+// Build-time-only source set holding the Chicory wasm→bytecode generator entry point.
+sourceSets {
+	chicoryGen
+}
+
 repositories {
 	// Add repositories to retrieve artifacts from in here.
 	// You should only use this when depending on other mods because
@@ -26,6 +31,21 @@ dependencies {
     implementation "com.github.luben:zstd-jni:1.5.6-6"
     include       "com.github.luben:zstd-jni:1.5.6-6"
 
+    // AV1 decode runs a wasm module inside the JVM (pure Java, single cross-platform jar).
+    // The wasm is compiled to JVM bytecode AT BUILD TIME (generateAv1Machine below) — the
+    // interpreter decodes at ~12 s per composite frame, and RUNTIME compilation is off the
+    // table: chicory-compiler needs ASM 9.9+, while nesting our own ASM collides with the
+    // copy fabric-loader puts on the game classpath (Sodium crashed on the duplicate).
+    implementation "com.dylibso.chicory:runtime:1.7.5"
+    implementation "com.dylibso.chicory:wasi:1.7.5"
+    // include is not transitive — nest every Chicory module the runtime/wasi need.
+    include        "com.dylibso.chicory:runtime:1.7.5"
+    include        "com.dylibso.chicory:wasm:1.7.5"
+    include        "com.dylibso.chicory:wasi:1.7.5"
+    include        "com.dylibso.chicory:log:1.7.5"
+
+    chicoryGenImplementation "com.dylibso.chicory:build-time-compiler:1.7.5"
+
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
     testRuntimeOnly   'org.junit.platform:junit-platform-launcher'
 }
@@ -36,6 +56,50 @@ processResources {
 	filesMatching("fabric.mod.json") {
 		expand "version": inputs.properties.version
 	}
+
+	// The raw wasm is only the INPUT to generateAv1Machine; at runtime the decoder loads the
+	// generated machine classes + stripped .meta module instead. Keep 1.2 MB out of the jar.
+	exclude "av1/av1-decode.wasm"
+}
+
+// ── Chicory build-time compilation of av1-decode.wasm ─────────────────────────
+// Produces: compiled machine .class files, the Av1DecodeMachine factory source, and a stripped
+// "meta" wasm (module structure without function bodies) that the factory loads at runtime.
+def chicoryClassesDir = layout.buildDirectory.dir("generated/chicory/classes")
+def chicorySourcesDir = layout.buildDirectory.dir("generated/chicory/sources")
+def chicoryWasmDir    = layout.buildDirectory.dir("generated/chicory/resources")
+
+def generateAv1Machine = tasks.register('generateAv1Machine', JavaExec) {
+	def wasmFile = file('src/main/resources/av1/av1-decode.wasm')
+	def machineName = 'net.zerohpminecraft.av1.Av1DecodeMachine'
+	classpath = sourceSets.chicoryGen.runtimeClasspath
+	mainClass = 'net.zerohpminecraft.gen.GenAv1Machine'
+	inputs.file(wasmFile)
+	inputs.property('machineName', machineName) // JavaExec args aren't tracked for up-to-date
+	outputs.dir(chicoryClassesDir)
+	outputs.dir(chicorySourcesDir)
+	outputs.dir(chicoryWasmDir)
+	args wasmFile.absolutePath,
+	     machineName,
+	     chicoryClassesDir.get().asFile.absolutePath,
+	     chicorySourcesDir.get().asFile.absolutePath,
+	     chicoryWasmDir.get().asFile.absolutePath
+	doFirst {
+		// A wasm rebuild can change the generated class set; stale orphans would be jarred.
+		delete(chicoryClassesDir, chicorySourcesDir, chicoryWasmDir)
+	}
+}
+
+sourceSets.main.java.srcDir(files(chicorySourcesDir).builtBy(generateAv1Machine))
+// The pre-compiled machine classes and the meta wasm ride along in main's output: onto the jar
+// and every downstream (test, dev run) classpath.
+sourceSets.main.output.dir(chicoryClassesDir, builtBy: generateAv1Machine)
+sourceSets.main.output.dir(chicoryWasmDir, builtBy: generateAv1Machine)
+
+compileJava {
+	dependsOn generateAv1Machine
+	// The generated factory source references the machine classes, which exist only as bytecode.
+	classpath += files(chicoryClassesDir)
 }
 
 tasks.withType(JavaCompile).configureEach {

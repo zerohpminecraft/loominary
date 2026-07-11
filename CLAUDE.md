@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./gradlew build --info   # verbose output for debugging Loom/mixin issues
 ```
 
-There are currently no tests. The CI workflow (`.github/workflows/build.yml`) only runs `./gradlew build`.
+JUnit tests live under `src/test/java/` and run as part of `./gradlew build` (or `./gradlew test`). Web-side Node tests live in `web/test/*.test.mjs` and run individually with `node test/<name>.test.mjs` from `web/`. The CI workflow (`.github/workflows/build.yml`) runs `./gradlew build`.
 
 ## Release process
 
@@ -24,7 +24,15 @@ There are currently no tests. The CI workflow (`.github/workflows/build.yml`) on
 
 - Fabric mod loader, Minecraft 1.21.4, Java 21, Gradle
 - Yarn mappings (`1.21.4+build.8`) — use Yarn names when referencing Minecraft internals
-- `zstd-jni 1.5.6-6` bundled in the jar (the only non-Minecraft dependency)
+- `zstd-jni 1.5.6-6` bundled in the jar
+- `com.dylibso.chicory` (runtime/wasm/wasi/log, 1.7.5) — pure-Java WebAssembly runtime, used to
+  run `av1-decode.wasm` in-JVM for animated AV1 decode (see below). The wasm is compiled **to JVM
+  bytecode at build time** by the `generateAv1Machine` Gradle task (Chicory build-time compiler →
+  generated `net.zerohpminecraft.av1.Av1DecodeMachine` + machine classes + stripped `.meta`
+  module; ~50× the interpreter, which took minutes per animation). Do NOT switch to Chicory's
+  runtime compiler or nest ASM: the compiler needs ASM 9.9+ and a nested ASM collides with
+  fabric-loader's copy (Sodium preLaunch crash). Chicory is nested in the jar with `include`
+  alongside zstd-jni, so the mod is still a single cross-platform jar.
 - Client-side only (`"environment": "client"` in `fabric.mod.json`)
 
 ## Architecture
@@ -38,6 +46,18 @@ All source is under `src/main/java/net/zerohpminecraft/`.
 **Place** (`AnvilAutoFillHandler`): When the player opens an anvil, a tick-based handler iterates `PayloadState.ACTIVE_CHUNKS`, renames unnamed banners one at a time via `RenameItemC2SPacket`, and packs them into bundles. It pauses automatically if XP/banners/bundles run out and resumes when they're restocked.
 
 **Decode** (`MapBannerDecoder`): Every 20 ticks, scans item frames within 32 blocks of the player. For each framed map, reads its `MapDecoration` list via `MapStateAccessor`. Decorations whose names match the `[0-9a-f]{2}.*` pattern are banner chunks. After sorting and concatenating them, it base64-decodes → zstd-decompresses → writes directly into `MapState.colors`, then calls `MapTextureManager.setNeedsUpdate()` to redraw. Decorations are cleared from the client-side `MapState` to suppress the banner pins.
+
+### Animated art & the AV1 codec
+
+Animated tiles carry N frames. `PayloadManifest` (v4/v5) holds `frameCount`/`frameDelays`; `MapBannerDecoder.extractFrames` returns `byte[][]` and `AnimatedMapState` cycles them onto `MapState.colors` on the render thread. Frames 1..N may be stored four ways, selected by manifest flags: raw, `FLAG_DELTA_FRAMES` (XOR), `FLAG_SPARSE_FRAMES` (change lists), or **`FLAG_AV1`** — a lossless AV1 bitstream (length-prefixed temporal units after the header). The web editor's `encode.ts` produces AV1 for animations when it's smaller than the raw path; the encoder/decoder is a libaom build (`native/av1/`, wasi-sdk) exposed through the `shim.c` ABI. Frames are coded as a monochrome plane of palette indices after the fixed OKLab permutation in `PalettePermutation.java` / `web/src/palette-perm.ts` (regenerate both with `node --experimental-strip-types web/scripts/gen-palette-perm.ts`). `Av1FrameDecoder` runs `av1-decode.wasm` (from `src/main/resources/av1/`) via Chicory and applies `INV_PERM`; the web editor decodes the same binary in the browser (`web/src/av1/codec.ts`). Rebuild the wasm with `native/av1/build.sh` (see its README — the `try_table` EH and no-SIMD flags are load-bearing for Chicory).
+
+There is also an **optional lossy mode** (`FLAG_AV1_LOSSY`, opt-in via the export page's "Lossy animation" toggle) for when lossless can't shrink dithered art: frames are encoded as lossy AV1 colour (4:2:0) and the wasm decoder reconstructs RGB and picks the nearest palette entry (using `MapPalette.RGB_ENTRIES`, generated alongside the permutation from the same web palette so the mod's result matches the export preview exactly). The export preview runs the identical encode→decode pipeline; `Av1LossyRoundtripTest` locks web↔mod parity.
+
+**Multi-tile lossy is composition-wide** (`FLAG_AV1_COMPOSITE`): the whole grid is encoded as ONE lossy stream at `(cols·128)×(rows·128)` — no per-tile seams — and the stream bytes are split evenly across the tiles' payloads (segments concatenate in tile-index order). The mod's `MapBannerDecoder` buffers segments per composition (keyed by grid/frames/nonce/author/title) and decodes once off-thread when all `cols×rows` tiles have been seen; until then composite tiles paint transparent. Web side: `encodeCompositionLossy` in `encode.ts` (raw per-tile stays the fallback floor), reassembly in `ImportPage.decodeStateToComposition`. Parity fixtures come from `node web/scripts/gen-av1-fixtures.mjs` (`Av1CompositeRoundtripTest`); the wire format is locked by `web/test/composite-payload.test.mjs`.
+
+### Mux (payload redistribution across tiles)
+
+Over-budget tiles (receivers) spill overflow bytes into spare capacity on donor tiles. The allocation algorithm exists twice and **must stay allocation-equivalent**: `MuxAllocator.allocate` (Java, Minecraft-free; `poolMuxTiles` in `LoominaryCommand` wraps it and encodes the chunks) and `computeMuxAllocation` in `web/src/mux.ts`. The web bakes its allocation into schematic LOOM headers at export while the mod re-runs the Java allocation from the actual payload sizes at state import — divergence corrupts muxed receivers ("Src size is incorrect"). Both must also see the same sizes: the web derives its allocation from the actual exported payload bytes (`encodeAndMux`), never from stats-pass estimates. `MuxAllocationParityTest` locks the equivalence; regenerate its fixtures with `node web/scripts/gen-mux-fixtures.mjs` whenever either implementation changes.
 
 ### State management (`PayloadState`)
 

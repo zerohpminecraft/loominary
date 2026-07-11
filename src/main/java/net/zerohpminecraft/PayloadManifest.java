@@ -94,6 +94,33 @@ public class PayloadManifest {
      */
     public static final int FLAG_SPARSE_FRAMES = 0x10;
 
+    /**
+     * Set when frames 1..N are stored as a lossless AV1 bitstream rather than raw/delta/sparse
+     * map-color arrays.  Requires {@link #FLAG_ANIMATED}.  The bytes after {@code headerSize} are
+     * {@code frameCount} length-prefixed AV1 temporal units ({@code [u32 LE len][TU bytes]} each);
+     * each decoded frame is a 128×128 monochrome plane of <em>permuted</em> palette indices
+     * ({@link PalettePermutation#INV_PERM} maps them back to map-color bytes).  Mutually exclusive
+     * with {@link #FLAG_DELTA_FRAMES}/{@link #FLAG_SPARSE_FRAMES}.
+     */
+    public static final int FLAG_AV1 = 0x20;
+
+    /**
+     * AV1 stream is LOSSY colour (4:2:0) rather than lossless monochrome indices.  Decode maps
+     * each pixel's reconstructed RGB to the nearest palette entry (no {@link PalettePermutation}
+     * inverse).  Implies {@link #FLAG_AV1}.  In-game art is a close approximation, not exact.
+     */
+    public static final int FLAG_AV1_LOSSY = 0x40;
+
+    /**
+     * The lossy AV1 stream covers the ENTIRE composition at (cols·128)×(rows·128) — encoded once
+     * so tile boundaries carry no seams — and this tile's payload holds only a byte-segment of
+     * that stream.  Segments concatenate in tile-index order ({@code tileRow*cols + tileCol}) to
+     * rebuild the stream; each decoded frame is cropped to the tile's 128×128 window.  Implies
+     * {@link #FLAG_AV1} | {@link #FLAG_AV1_LOSSY}.  All {@code cols×rows} tiles must be seen
+     * before any of them can display.
+     */
+    public static final int FLAG_AV1_COMPOSITE = 0x80;
+
     public final int manifestVersion;
     /** Total bytes consumed by this header; map colors begin at this offset. */
     public final int headerSize;
@@ -160,6 +187,18 @@ public class PayloadManifest {
 
     public boolean sparseFrames() {
         return (flags & FLAG_SPARSE_FRAMES) != 0;
+    }
+
+    public boolean av1() {
+        return (flags & FLAG_AV1) != 0;
+    }
+
+    public boolean av1Lossy() {
+        return (flags & FLAG_AV1_LOSSY) != 0;
+    }
+
+    public boolean av1Composite() {
+        return (flags & FLAG_AV1_COMPOSITE) != 0;
     }
 
     // ── CRC helper ───────────────────────────────────────────────────────
@@ -468,10 +507,11 @@ public class PayloadManifest {
                     frameDelays = new int[]{((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF)};
                 } else if (delayMode == 1) {
                     if (ver >= 5) {
-                        // v5 trailing: delay table lives after all frame data.
-                        // Location: headerSize + frameCount * MAP_BYTES.
+                        // v5 delay table.  AV1 stores it as a PREFIX right after the header (the
+                        // AV1 stream is variable-length so the trailing position isn't computable);
+                        // raw/delta/sparse store it trailing, after frameCount fixed-size frames.
                         int MAP_BYTES = 128 * 128;
-                        int dt = headerSize + frameCount * MAP_BYTES;
+                        int dt = ((flags & FLAG_AV1) != 0) ? headerSize : headerSize + frameCount * MAP_BYTES;
                         frameDelays = new int[frameCount];
                         for (int f = 0; f < frameCount && dt + 2 <= data.length; f++, dt += 2)
                             frameDelays[f] = ((data[dt] & 0xFF) << 8) | (data[dt + 1] & 0xFF);

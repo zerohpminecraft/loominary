@@ -9,9 +9,11 @@ import { h, Fragment } from 'preact';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { SchematicViewer3D } from '../SchematicViewer3D.js';
 
-import type { CompositionState }         from '../payload-state.js';
+import type { CompositionState, PayloadState } from '../payload-state.js';
 import { downloadState, emptyTileData }  from '../payload-state.js';
-import { encodeComposition }              from '../encode.js';
+import { encodeComposition, assemblePayloadState, compositeEligible } from '../encode.js';
+import { encodeTileAsync, cancelEncodes, computeCompositionAsync } from '../av1/encodeClient.js';
+import type { ComputeResult } from '../av1/computeExport.js';
 import type { CodecMode }                from '../codec-mode.js';
 import {
   CAPACITY, CODEC_LABEL, CODEC_HINT, NEEDS_CARPET, DEFAULT_CODEC,
@@ -21,10 +23,9 @@ import {
   budgetStatus, computeMuxAllocation,
   type MuxAllocation,
 } from '../mux.js';
-import { compress }                      from '../compression.js';
 import { track }                         from '../analytics.js';
 import {
-  toBytesV2, toBytesAnimated, crc32,
+  crc32,
   FLAG_ALL_SHADES, FLAG_ANIMATED, FLAG_MUX, FLAG_DELTA_FRAMES, FLAG_SPARSE_FRAMES,
 } from '../manifest.js';
 
@@ -190,7 +191,7 @@ Files in this archive
 ---------------------
   loominary_state.json         Copy to: <game dir>/config/loominary_state.json
   loominary_carpet*.litematic  Carpet platform schematic(s) — carpet codecs only
-  preview.png / preview.gif    Rendered preview of the map art
+  preview.png / preview.mp4    Rendered preview of the map art (MP4 for animations)
   README.txt                   This file
 
 How to install in-game (carpet codecs)
@@ -284,6 +285,12 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const [status,    setStatus]    = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
 
+  // Lossy AV1 (animated only): trade byte-exactness for a much smaller payload.
+  const [lossyOn,      setLossyOn]      = useState(false);
+  const [lossyQuality, setLossyQuality] = useState(60); // 1..100, higher = better/larger
+  // Map a friendly 1..100 quality to an AV1 quantizer (1 best … 63 worst).
+  const lossyQuantizer = Math.max(1, Math.min(63, Math.round(63 - (lossyQuality / 100) * 55)));
+
   // Encryption
   const [encryptOn, setEncryptOn] = useState(false);
   const [pwInput,   setPwInput]   = useState('');
@@ -292,8 +299,8 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   // Tile stats
   const [tileStats,      setTileStats]      = useState<TileStat[] | null>(null);
   const [statsComputing, setStatsComputing] = useState(false);
-  const [statsProg,      setStatsProg]      = useState<{ done: number; total: number } | null>(null);
-  const [exportProg,     setExportProg]     = useState<{ label: string; done: number; total: number } | null>(null);
+  const [statsProg,      setStatsProg]      = useState<{ done: number; total: number; detail?: string } | null>(null);
+  const [exportProg,     setExportProg]     = useState<{ label: string; done: number; total: number; onCancel?: () => void } | null>(null);
 
   // Mux
   const [muxAlloc,    setMuxAlloc]    = useState<MuxAllocation | null>(null);
@@ -303,6 +310,10 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   // 3D viewer resizable height
   const [viewerH,     setViewerH]     = useState(320);
   const viewerDragRef = useRef<{ y0: number; h0: number } | null>(null);
+  // 2D preview box height — defaults to ~half the viewport, user-resizable via a drag handle.
+  const [previewH,     setPreviewH]    = useState(() =>
+    Math.round((typeof window !== 'undefined' ? window.innerHeight : 800) * 0.5));
+  const previewDragRef = useRef<{ y0: number; h0: number } | null>(null);
 
   // Persist author to localStorage whenever it's updated.
   useEffect(() => {
@@ -310,9 +321,21 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     if (trimmed) localStorage.setItem(AUTHOR_LS_KEY, trimmed);
   }, [author]);
 
+  const maxF       = Math.max(...comp.frames.map(t => t.length), 1);
+  const isAnimated = maxF > 1;
+  // Large animations are slow to encode — defer until the user picks a mode (see statsRequested).
+  const heavyAnim  = maxF > 60;
+  // Stable identity of the frame CONTENT — cache/idempotency keys off this, not the `comp` object
+  // reference (which a parent re-render can churn without any real change).
+  const framesSig  = `${comp.gridCols}x${comp.gridRows}:${comp.frames.map(t => t.length).join(',')}`;
+  // For light art we compute sizes immediately; for heavy animations we wait for an explicit choice.
+  const [statsRequested, setStatsRequested] = useState(!(maxF > 60));
+
   // Refs for export metadata so computeStats can read them without closure-dep issues
-  const exportMetaRef = useRef({ title, author, nonce });
-  useEffect(() => { exportMetaRef.current = { title, author, nonce }; }, [title, author, nonce]);
+  const exportMetaRef = useRef({ title, author, nonce, lossyQuality: null as number | null });
+  useEffect(() => {
+    exportMetaRef.current = { title, author, nonce, lossyQuality: lossyOn && isAnimated ? lossyQuantizer : null };
+  }, [title, author, nonce, lossyOn, lossyQuantizer, isAnimated]);
 
   // Budget warning dialog
   const [budgetWarnLabel,  setBudgetWarnLabel]  = useState<string | null>(null);
@@ -320,7 +343,10 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
 
   // Preview
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [gifUrl,  setGifUrl]  = useState<string | null>(null);
+  const [previewUrl,  setPreviewUrl]  = useState<string | null>(null);
+  const [previewKind, setPreviewKind] = useState<'video' | 'image'>('video');
+  const previewUrlRef = useRef<string | null>(null);
+  const [lossyFidelity, setLossyFidelity] = useState<number | null>(null); // fraction of pixels changed
   const [show3D,  setShow3D]  = useState(false);
   const [expandedTiles, setExpandedTiles] = useState<Set<number>>(() => new Set());
 
@@ -329,9 +355,17 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     ti: number; compressedData: Uint8Array; label: string;
   } | null>(null);
 
-  const maxF       = Math.max(...comp.frames.map(t => t.length), 1);
-  const isAnimated = maxF > 1;
   const multiTile  = comp.gridCols * comp.gridRows > 1;
+
+  // Media fills the (resizable) preview box, keeping aspect ratio and crisp pixels.
+  const previewMediaStyle = {
+    maxWidth: '100%', maxHeight: '100%', width: '100%', height: '100%',
+    objectFit: 'contain' as const, imageRendering: 'pixelated' as const,
+  };
+  // Canvas (static first-frame placeholder) can't objectFit — just cap it within the box.
+  const previewCanvasStyle = {
+    maxWidth: '100%', maxHeight: '100%', imageRendering: 'pixelated' as const,
+  };
 
   // Schematics encode banner chunks and are only meaningful when combined with
   // a carpet-codec state JSON (where the carpet channel carries the payload and
@@ -344,99 +378,144 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const authorMissing = author.trim().length === 0;
   const canExport     = !titleMissing && !authorMissing;
 
-  // ── Animated GIF preview ──────────────────────────────────────────────────
-  useEffect(() => {
-    if (!isAnimated) { setGifUrl(null); return; }
-    let url = '';
-    import('../gif-encode.js').then(({ encodeAnimatedGif }) => {
-      const bytes = encodeAnimatedGif(comp, 0);
-      const blob  = new Blob([bytes.buffer as ArrayBuffer], { type: 'image/gif' });
-      url = URL.createObjectURL(blob);
-      setGifUrl(url);
-    });
-    return () => { if (url) URL.revokeObjectURL(url); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAnimated]);
+  // The animated preview is produced by computeStats (one pass, no duplicate encode) and shown via
+  // previewUrl/previewKind.  Revoke the object URL on unmount.
+  useEffect(() => () => { if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current); }, []);
 
   // ── Static canvas preview ─────────────────────────────────────────────────
+  // Draws the first/active frame.  Shown for static art, and as a placeholder for animated art
+  // whenever the animated preview isn't rendered (e.g. before the user commits to a mode).
   useEffect(() => {
-    if (isAnimated) return;
+    if (isAnimated && previewUrl) return; // the <video>/<img> is showing instead
     const canvas = canvasRef.current; if (!canvas) return;
     const imgData = mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
     canvas.width = imgData.width; canvas.height = imgData.height;
     canvas.getContext('2d')!.putImageData(imgData, 0, 0);
-  }, [comp, isAnimated, show3D]);
+  }, [comp, isAnimated, show3D, previewUrl]);
 
-  // ── Stats computation ─────────────────────────────────────────────────────
+  // ── Compute: one off-thread pass that encodes every tile AND builds the preview from that same
+  // encode (no duplicated work), keyed/cached by mode+quality so metadata edits reuse it instantly.
+  const computeCacheRef = useRef<{
+    key: string; meta: { title: string | null; author: string | null; nonce: number }; result: ComputeResult;
+  } | null>(null);
+  // The mode+quality currently reflected in tileStats.  `computedKey` (state) drives the "stale"
+  // indicator; `computedKeyRef` mirrors it for the idempotency guard inside the async callback.
+  const [computedKey, setComputedKey] = useState<string | null>(null);
+  const computedKeyRef = useRef<string | null>(null);
+  // Clear caches only when the frame CONTENT changes — not on every `comp` reference change.
+  useEffect(() => {
+    computeCacheRef.current = null; computedKeyRef.current = null;
+    setComputedKey(null); setTileStats(null);
+  }, [framesSig]);
+
+  // Supersede guard: each run bumps this; a stale run (superseded by a newer settings change) stops
+  // updating UI so it can't show the wrong label/size after the user changed their choice.
+  const statsGenRef = useRef(0);
+
+  // Signature of the settings that affect the encode (mode + quality).  A recompute is only
+  // meaningful when this differs from what's displayed.
+  const currentKey = lossyOn && isAnimated ? `lossy:${lossyQuantizer}` : 'lossless';
+  const statsStale = statsRequested && !statsComputing && computedKey != null && computedKey !== currentKey;
+
+  const showPreview = useCallback((bytes: Uint8Array | null, mime: string | null) => {
+    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+    if (!bytes) { previewUrlRef.current = null; setPreviewUrl(null); return; }
+    const url = URL.createObjectURL(new Blob([bytes.buffer as ArrayBuffer], { type: mime ?? 'image/gif' }));
+    previewUrlRef.current = url;
+    setPreviewKind(mime === 'video/mp4' ? 'video' : 'image');
+    setPreviewUrl(url);
+  }, []);
+
   const computeStats = useCallback(async () => {
-    setStatsComputing(true);
+    const gen = ++statsGenRef.current;
+    const live = () => statsGenRef.current === gen;
+    const cancel = () => {
+      statsGenRef.current++;
+      cancelEncodes();
+      setStatsComputing(false); setStatsProg(null); setExportProg(null);
+      setTileStats(null); setStatsRequested(false); // back to a clean choice prompt
+      computedKeyRef.current = null; setComputedKey(null);
+    };
     const total = comp.gridCols * comp.gridRows;
-    setStatsProg({ done: 0, total });
-    const { title: t, author: a, nonce: n } = exportMetaRef.current;
-    try {
-      const stats: TileStat[] = [];
-      for (let ti = 0; ti < total; ti++) {
-        const tileCol  = ti % comp.gridCols;
-        const tileRow  = Math.floor(ti / comp.gridCols);
-        const frames   = comp.frames[ti]      ?? [new Uint8Array(128 * 128)];
-        const delays   = comp.frameDelays[ti] ?? new Array(frames.length).fill(100);
-        const frame0   = frames[0] ?? new Uint8Array(128 * 128);
-        let flags = 0;
-        if (comp.allShades)    flags |= FLAG_ALL_SHADES;
-        if (frames.length > 1) flags |= FLAG_ANIMATED;
-        const mBytes = frames.length > 1
-          ? toBytesAnimated(flags, comp.gridCols, comp.gridRows, tileCol, tileRow,
-              crc32(frame0), a || null, t || null, n ? 1 : 0, frames.length, 0, delays)
-          : toBytesV2(flags, comp.gridCols, comp.gridRows, tileCol, tileRow,
-              crc32(frame0), a || null, t || null, n ? 1 : 0);
-        const combined = new Uint8Array(mBytes.length + frames.length * 128 * 128);
-        combined.set(mBytes, 0);
-        for (let f = 0; f < frames.length; f++)
-          combined.set(frames[f] ?? new Uint8Array(128*128), mBytes.length + f * 128*128);
-        const compressed = await compress(combined);
-        stats.push({
-          ti, tileCol, tileRow,
-          compressedBytes: compressed.length,
-          compressedData:  compressed,
-          manifest: {
-            version:     mBytes[0],
-            headerBytes: mBytes.length,
-            flags,
-            colorCrc32:  crc32(frame0),
-            username:    a || null,
-            title:       t || null,
-            nonce:       n ? 1 : 0,
-            frameCount:  frames.length,
-            loopCount:   0,
-            frameDelays: delays,
+    const { title: rawT, author: rawA, nonce: n, lossyQuality: lq } = exportMetaRef.current;
+    // Trim to match what the export uses, so the compute result is byte-reusable at export time.
+    const t = (rawT || '').trim() || null;
+    const a = (rawA || '').trim() || null;
+    const nz = n ? 1 : 0;
+    const cacheKey = lq == null ? 'lossless' : `lossy:${lq}`;
+    const label = lq == null ? 'lossless AV1' : 'lossy AV1';
+    const heavy = maxF > 60;
+
+    // Idempotent: if the displayed stats already reflect this exact mode+quality, do nothing.
+    if (computedKeyRef.current === cacheKey) return;
+
+    let result: ComputeResult;
+    if (computeCacheRef.current && computeCacheRef.current.key === cacheKey) {
+      result = computeCacheRef.current.result; // metadata-only change → reuse
+    } else {
+      setStatsComputing(true);
+      setStatsProg({ done: 0, total });
+      if (heavy) setExportProg({ label: `Encoding ${maxF.toLocaleString()} frames as ${label}…`, done: 0, total: maxF, onCancel: cancel });
+      try {
+        result = await computeCompositionAsync(
+          comp, { author: a, title: t, nonce: nz, lossyQuality: lq },
+          p => {
+            if (!live()) return;
+            const tile = p.tilesTotal > 1 ? `tile ${p.tilesDone + 1}/${p.tilesTotal} — ` : '';
+            // Each phase is a full pass over the frames; label it so a long run isn't a mystery.
+            const step =
+              p.phase === 'decode'  ? 'Decoding frames'
+            : p.phase === 'preview' ? 'Building preview'
+            : `Encoding as ${label}`;
+            const total = Math.max(1, p.frameTotal);
+            setStatsProg({ done: p.frameDone, total, detail: `${tile}${step} — ${Math.round(100 * p.frameDone / total)}%` });
+            if (heavy) setExportProg({ label: `${tile}${step} (${maxF.toLocaleString()} frames)`, done: p.frameDone, total, onCancel: cancel });
           },
-        });
-        setStatsProg({ done: ti + 1, total });
+        );
+      } catch (e) {
+        if (live()) { console.warn('[export] compute failed', e); setStatsComputing(false); setStatsProg(null); setExportProg(null); setStatsRequested(false); }
+        return;
       }
-      setTileStats(stats);
-      setMuxAlloc(null);
-      setMuxCodec(null);
-      setExtraDonors(0);
-    } finally {
-      setStatsComputing(false);
-      setStatsProg(null);
+      if (!live()) return;
+      computeCacheRef.current = { key: cacheKey, meta: { title: t, author: a, nonce: nz }, result };
     }
+
+    if (!live()) return;
+    const stats: TileStat[] = result.tiles.map((tp, ti) => {
+      const frames = comp.frames[ti] ?? [new Uint8Array(128 * 128)];
+      return {
+        ti, tileCol: ti % comp.gridCols, tileRow: Math.floor(ti / comp.gridCols),
+        compressedBytes: tp.compressed.length,
+        compressedData:  tp.compressed,
+        manifest: {
+          version: tp.manifestBytes[0], headerBytes: tp.manifestBytes.length, flags: tp.manifestBytes[2],
+          colorCrc32: crc32(frames[0] ?? new Uint8Array(128 * 128)),
+          username: a, title: t, nonce: nz,
+          frameCount: frames.length, loopCount: 0,
+          frameDelays: comp.frameDelays[ti] ?? new Array(frames.length).fill(100),
+        },
+      };
+    });
+    setTileStats(stats);
+    setMuxAlloc(null); setMuxCodec(null); setExtraDonors(0);
+    setLossyFidelity(result.changedFrac);
+    showPreview(result.previewBytes, result.previewMime);
+    computedKeyRef.current = cacheKey; setComputedKey(cacheKey);
+    setStatsComputing(false); setStatsProg(null); setExportProg(null);
   }, [comp]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Keep a stable ref so debounced triggers always call the latest version.
   const computeStatsRef = useRef(computeStats);
   useEffect(() => { computeStatsRef.current = computeStats; }, [computeStats]);
 
-  useEffect(() => { void computeStats(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Debounced rebuild when export metadata changes (title/author/nonce affect manifest).
-  const metaTriggerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Compute is EXPLICIT: light art computes once on mount; heavy art (and every recompute) is
+  // triggered by a button.  Nothing auto-recomputes on a settings change — changing the mode or
+  // quality just marks the stats stale (statsStale) and surfaces a "Recompute" button.
+  const requestCompute = useCallback(() => { setStatsRequested(true); void computeStatsRef.current(); }, []);
   useEffect(() => {
-    if (metaTriggerTimer.current) clearTimeout(metaTriggerTimer.current);
-    metaTriggerTimer.current = setTimeout(() => void computeStatsRef.current(), 600);
-    return () => { if (metaTriggerTimer.current) clearTimeout(metaTriggerTimer.current); };
+    if (statsRequested) void computeStatsRef.current(); // light art only (statsRequested starts true)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [title, author, nonce]);
+  }, []);
 
   // When tileStats refreshes (title/author/nonce) or encryption settings change,
   // rebuild the active 3D preview tile with the correct (possibly encrypted) bytes.
@@ -530,15 +609,54 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
 
   // ── Shared: encode composition + optional encryption + optional mux ────────
   //
-  // Blank donor tiles (extraDonors > 0) are appended to ps.tiles before the
-  // mux-apply functions run.  They have isDonorOnly=true and empty chunks/
-  // carpetCompressedB64, which is exactly what applyBannerMux /
-  // applyCarpetMux expect for blank donors (the functions fill in routing
-  // banners / muxCargoB64 automatically).
-  async function encodeAndMux(nonceVal: number, localExtraDonors: number, localMuxAlloc: MuxAllocation | null, skipEncrypt = false) {
-    const ps = await encodeComposition(comp, {
-      title: title.trim(), author: author.trim(), nonce: nonceVal, whitelist: [], codecMode: codec,
-    });
+  // The mux allocation is derived from the ACTUAL payload bytes produced here (after
+  // encryption) — NOT from the UI's muxAlloc, which reflects the stats pass and can be stale
+  // (settings changed since compute, resalt re-encode, encryption-overhead estimate).  The
+  // receiver's totalBytes and every guest slice must come from ONE allocation over ONE set of
+  // bytes; any size drift between them corrupts the receiver's reassembled payload ("Src size
+  // is incorrect" in the mod).  Blank donor tiles are appended as the fresh allocation
+  // requires; they have isDonorOnly=true and empty chunks/carpetCompressedB64, which is
+  // exactly what applyBannerMux / applyCarpetMux expect.
+  async function encodeAndMux(nonceVal: number, skipEncrypt = false):
+      Promise<{ ps: PayloadState; alloc: MuxAllocation | null; donors: number }> {
+    setExportProg({ label: 'Encoding', done: 0, total: 1 });
+    const eqLossy = lossyOn && isAnimated ? lossyQuantizer : null;
+    const opts = { title: title.trim(), author: author.trim(), nonce: nonceVal, whitelist: [], codecMode: codec, lossyQuality: eqLossy };
+
+    // Reuse the compute result when it was produced with the SAME frames/metadata/nonce/mode — no
+    // second encode (only possible with resalt off, where the stats nonce == the export nonce).
+    const cache = computeCacheRef.current;
+    const cacheKey = eqLossy == null ? 'lossless' : `lossy:${eqLossy}`;
+    const canReuse = !!cache && cache.key === cacheKey && nonceVal === cache.meta.nonce
+      && (title.trim() || null) === cache.meta.title && (author.trim() || null) === cache.meta.author;
+
+    let ps;
+    if (canReuse) {
+      ps = assemblePayloadState(comp, opts, cache!.result.tiles);
+    } else if (eqLossy != null && compositeEligible(comp.frames, comp.gridCols * comp.gridRows)) {
+      // Composition-wide lossy runs as ONE encode over the whole grid (seamless across tiles);
+      // it doesn't fit the per-tile hooks below, so it goes through the worker's compute path.
+      const result = await computeCompositionAsync(
+        comp, { author: opts.author, title: opts.title, nonce: nonceVal, lossyQuality: eqLossy },
+        p => {
+          const step = p.phase === 'decode' ? 'Decoding' : p.phase === 'preview' ? 'Finishing' : 'Encoding';
+          setExportProg({ label: `${step} composite lossy AV1 — ${Math.round(100 * p.frameDone / Math.max(1, p.frameTotal))}%`, done: p.frameDone, total: Math.max(1, p.frameTotal) });
+        },
+      );
+      ps = assemblePayloadState(comp, opts, result.tiles);
+    } else {
+      ps = await encodeComposition(comp, opts, {
+        encodePayload: (args, onProgress) => encodeTileAsync(args, onProgress),
+        onProgress: ({ tilesDone, tilesTotal, phase, frameDone, frameTotal }) => {
+          if (frameTotal > 1) {
+            setExportProg({ label: `Encoding tile ${Math.min(tilesDone + 1, tilesTotal)}/${tilesTotal} — ${phase} ${Math.round(100 * frameDone / frameTotal)}%`, done: frameDone, total: frameTotal });
+          } else {
+            setExportProg({ label: `Encoding tile ${tilesDone}/${tilesTotal}`, done: tilesDone, total: tilesTotal });
+          }
+        },
+      });
+    }
+    setExportProg(null);
 
     if (!skipEncrypt && encryptOn && passwords.length > 0) {
       const { encrypt } = await import('../encryption.js');
@@ -563,27 +681,44 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
       setExportProg(null);
     }
 
-    if (localMuxAlloc) {
-      for (let i = 0; i < localExtraDonors; i++) {
+    // Re-derive the mux allocation from the bytes this export actually contains.
+    const { assembleChunks: acMux } = await import('../cjk-codec.js');
+    const actualPayloads = ps.tiles.map(t => {
+      if (t.carpetCompressedB64) return fromB64(t.carpetCompressedB64);
+      const cjk = t.chunks.filter(c => c.length > 2 && c.charCodeAt(2) >= 0x4E00);
+      if (cjk.length > 0) { try { return acMux(cjk); } catch { /* fall through */ } }
+      return new Uint8Array(0);
+    });
+    const actualSizes = actualPayloads.map(p => p.length);
+    const { overBudget: actualOver } = budgetStatus(actualSizes, codec);
+
+    let exportAlloc: MuxAllocation | null = null;
+    let donorCount = 0;
+    if (actualOver.length > 0) {
+      let alloc = computeMuxAllocation(actualSizes, codec);
+      while (alloc.unresolved > 0 && donorCount < 9999) {
+        donorCount++;
+        alloc = computeMuxAllocation([...actualSizes, ...Array(donorCount).fill(0)], codec);
+      }
+      for (let i = 0; i < donorCount; i++) {
         const donor = emptyTileData();
         donor.isDonorOnly = true;
         ps.tiles.push(donor);
       }
       if (codec === 'BANNER') {
         const { applyBannerMux: mx } = await import('../mux.js');
-        const result = mx(ps.tiles, localMuxAlloc, comp.gridCols);
+        const result = mx(ps.tiles, alloc, comp.gridCols);
         if (result.unresolved > 0) setStatus(`Mux: ${result.unresolved} unresolved tile(s)`);
       } else {
-        const payloads = ps.tiles.map(t =>
-          t.carpetCompressedB64 ? fromB64(t.carpetCompressedB64) : new Uint8Array(0)
-        );
         const { applyCarpetMux: mx } = await import('../mux.js');
-        const result = mx(ps.tiles, localMuxAlloc, payloads);
+        const result = mx(ps.tiles, alloc,
+          [...actualPayloads, ...Array.from({ length: donorCount }, () => new Uint8Array(0))]);
         if (result.unresolved > 0) setStatus(`Mux: ${result.unresolved} unresolved tile(s)`);
       }
+      exportAlloc = alloc;
     }
 
-    return ps;
+    return { ps, alloc: exportAlloc, donors: donorCount };
   }
 
   // ── Export all as ZIP ─────────────────────────────────────────────────────
@@ -603,9 +738,11 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
       // Filesystem-safe slug for schematic filenames inside the ZIP.
       const schemBase = baseName.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'loominary';
 
-      // 1 — State JSON (with mux/encryption if active)
+      // 1 — State JSON (with mux/encryption if active).  exportAlloc/exportDonors are the
+      //     allocation actually applied to these bytes — the schematic headers below MUST use
+      //     them (not the UI muxAlloc) so receiver totals match the routed segments exactly.
       setStatus('Building ZIP… encoding state');
-      const ps = await encodeAndMux(nonceVal, extraDonors, muxAlloc);
+      const { ps, alloc: exportAlloc, donors: exportDonors } = await encodeAndMux(nonceVal);
       files.push({
         name: 'loominary_state.json',
         data: new TextEncoder().encode(JSON.stringify(ps, null, 2)),
@@ -618,13 +755,13 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
       if (schematicsAvailable) {
         const { exportCarpetSchematic } = await import('../schematic.js');
         const artCount  = comp.gridCols * comp.gridRows;
-        const multiTile = artCount > 1 || extraDonors > 0;
-        const schTotal  = artCount + extraDonors;
+        const multiTile = artCount > 1 || exportDonors > 0;
+        const schTotal  = artCount + exportDonors;
         const useBanners = codec === 'CARPET_BANNERS' || codec === 'CARPET_BANNERS_SHADE' || codec === 'CARPET_SHADE_BANNERS';
         for (let ti = 0; ti < artCount; ti++) {
           const tileCol = ti % comp.gridCols, tileRow = Math.floor(ti / comp.gridCols);
           const tile    = ps.tiles[ti];
-          const role    = muxAlloc?.roles[ti];
+          const role    = exportAlloc?.roles[ti];
           const b64     = tile?.muxCargoB64 ?? tile?.carpetCompressedB64;
           if (!b64) continue;
           const suffix  = multiTile ? `_r${tileRow}_c${tileCol}` : '';
@@ -639,13 +776,13 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
             : undefined;
           files.push({ name: `${name}.litematic`, data: await exportCarpetSchematic(b64, name, author.trim() || 'Loominary', tileCol, tileRow, codec, muxRole, muxTotal, muxOwn, muxGuests) });
         }
-        for (let i = 0; i < extraDonors; i++) {
+        for (let i = 0; i < exportDonors; i++) {
           const tile = ps.tiles[artCount + i];
-          const role = muxAlloc?.roles[artCount + i];
+          const role = exportAlloc?.roles[artCount + i];
           const b64  = tile?.muxCargoB64;
           if (!b64) continue;
-          const name = `${schemBase}_donor${extraDonors > 1 ? i + 1 : ''}`;
-          setStatus(`Building ZIP… donor schematic ${i + 1}/${extraDonors}`);
+          const name = `${schemBase}_donor${exportDonors > 1 ? i + 1 : ''}`;
+          setStatus(`Building ZIP… donor schematic ${i + 1}/${exportDonors}`);
           const muxOwn    = role?.ownBytes;
           const muxGuests = (!useBanners && role)
             ? role.guests.map(g => ({ tCol: g.rxTi % comp.gridCols, tRow: Math.floor(g.rxTi / comp.gridCols), tOffset: g.rxOffset, tLen: g.len }))
@@ -654,11 +791,19 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         }
       }
 
-      // 3 — Preview: animated GIF for multi-frame compositions, 4× PNG otherwise
+      // 3 — Preview: reuse the compute's preview (same encode — no re-render) when available;
+      //     otherwise build one.  4× PNG for static art.
       if (isAnimated) {
-        setStatus('Building ZIP… encoding GIF preview');
-        const { encodeAnimatedGif } = await import('../gif-encode.js');
-        files.push({ name: 'preview.gif', data: encodeAnimatedGif(comp, 0) });
+        const cached = computeCacheRef.current?.result;
+        if (cached?.previewBytes) {
+          const ext = cached.previewMime === 'video/mp4' ? 'mp4' : 'gif';
+          files.push({ name: `preview.${ext}`, data: cached.previewBytes });
+        } else {
+          setStatus('Building ZIP… encoding preview video');
+          const { buildAnimatedPreview } = await import('../av1/mp4Preview.js');
+          const { bytes, ext } = await buildAnimatedPreview(comp);
+          files.push({ name: `preview.${ext}`, data: bytes });
+        }
       } else {
         setStatus('Building ZIP… rendering preview');
         const imgData = mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
@@ -739,6 +884,56 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         borderRight:'1px solid #333', padding:'14px 12px',
         display:'flex', flexDirection:'column', gap:10, overflowY:'auto',
       }}>
+        {/* ── Prominent: lossy animation (animated art only) ── */}
+        {isAnimated && (
+          <div style={{
+            border:`1px solid ${lossyOn ? '#4a9eff' : '#3a3a3a'}`, borderRadius:6,
+            background: lossyOn ? 'rgba(74,158,255,0.08)' : '#242424', padding:'10px 12px',
+          }}>
+            <label style={{ display:'flex', alignItems:'flex-start', gap:8, cursor:'pointer' }}
+              title="Encodes the animation as lossy AV1 colour video and re-quantises to the palette on decode. Much smaller, but the in-game art is a close approximation, not byte-identical.">
+              <input type="checkbox" checked={lossyOn} onChange={e => setLossyOn((e.target as HTMLInputElement).checked)}
+                style={{ marginTop:2 }} />
+              <div>
+                <div style={{ fontSize:'0.72em', fontWeight:600, color:'#dfe8ff' }}>⚡ Lossy animation — much smaller</div>
+                <div style={{ fontSize:'0.58em', color:'#8a94a6', marginTop:2 }}>
+                  Recommended for large/detailed animations. Trades byte-exact art for a far smaller
+                  payload (fewer tiles to place). The preview at right shows the exact in-game result.
+                </div>
+              </div>
+            </label>
+            {lossyOn && (
+              <div style={{ marginTop:8 }}>
+                <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                  <span style={{ fontSize:'0.58em', color:'#9aa' }}>Quality</span>
+                  <input type="range" min={1} max={100} value={lossyQuality}
+                    onInput={e => setLossyQuality(Number((e.target as HTMLInputElement).value))}
+                    style={{ flex:1 }} />
+                  <span style={{ fontSize:'0.58em', color:'#9aa', width:28, textAlign:'right' }}>{lossyQuality}</span>
+                </div>
+                {lossyFidelity != null && (
+                  <div style={{ fontSize:'0.55em', color:'#777', marginTop:3 }}>
+                    ≈{(lossyFidelity * 100).toFixed(1)}% of pixels differ from the original
+                    (many are invisible dither shifts — trust the preview).
+                  </div>
+                )}
+              </div>
+            )}
+            {statsStale && (
+              <div style={{ marginTop:8 }}>
+                <button onClick={requestCompute}
+                  style={{ fontSize:'0.62em', padding:'7px 14px', borderRadius:4, cursor:'pointer',
+                    background:'#2b6cb0', color:'#fff', border:'1px solid #3a7bc0', fontWeight:600, width:'100%' }}>
+                  ↻ Recompute at {lossyOn ? `quality ${lossyQuality}` : 'lossless'}
+                </button>
+                <div style={{ fontSize:'0.52em', color:'#888', marginTop:3, textAlign:'center' }}>
+                  Sizes below reflect your previous setting until you recompute.
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* ── Step 1: Codec ── */}
         <Step n={1} title="Codec"
           hint="How image data is stored in-game. Carpet codecs (default) encode as a 128×128 carpet schematic. More capacity, crisper images, but require the platform to be placed in-game first. The banner codec works on any server but holds less data per tile. The stats panel on the right shows whether your image fits each codec's budget." />
@@ -829,11 +1024,25 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
           </div>
         )}
         {exportProg && (
-          <div>
-            <div style={{ fontSize:'0.58em', color:'#aaa', marginBottom:3 }}>
-              {exportProg.label} — tile {exportProg.done} / {exportProg.total}
+          <div style={{ position:'fixed', inset:0, zIndex:1000, background:'rgba(0,0,0,0.65)',
+            display:'flex', alignItems:'center', justifyContent:'center' }}
+            // Block interaction with the page while encoding/exporting.
+            onClick={e => e.stopPropagation()}>
+            <div style={{ background:'#1e1e1e', border:'1px solid #444', borderRadius:8,
+              padding:'22px 26px', minWidth:340, maxWidth:'80%', boxShadow:'0 8px 32px rgba(0,0,0,0.5)' }}>
+              <div style={{ fontSize:'0.8em', color:'#eee', marginBottom:12 }}>{exportProg.label}</div>
+              <Bar value={exportProg.done} total={exportProg.total} />
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginTop:10, gap:12 }}>
+                <div style={{ fontSize:'0.6em', color:'#888' }}>Please keep this tab open.</div>
+                {exportProg.onCancel && (
+                  <button onClick={exportProg.onCancel}
+                    style={{ fontSize:'0.6em', padding:'5px 12px', borderRadius:4, cursor:'pointer',
+                      background:'#3a3a3a', color:'#ddd', border:'1px solid #555' }}>
+                    Cancel
+                  </button>
+                )}
+              </div>
             </div>
-            <Bar value={exportProg.done} total={exportProg.total} />
           </div>
         )}
         {!canExport && <div style={{ fontSize:'0.58em', color:'#f55' }}>Fill in Title and Author before exporting.</div>}
@@ -904,13 +1113,39 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
               />
             </>
           ) : (
-            <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:4 }}>
-              {isAnimated && gifUrl
-                ? <img src={gifUrl} style={{ maxWidth:'100%', maxHeight:200, imageRendering:'pixelated', border:'1px solid #333' }} />
-                : <canvas ref={canvasRef} style={{ maxWidth:'100%', maxHeight:200, imageRendering:'pixelated', border:'1px solid #333' }} />
-              }
-              {isAnimated && !gifUrl && <div style={{ fontSize:'0.58em', color:'#666' }}>Generating preview…</div>}
-            </div>
+            <>
+              <div style={{ height:previewH, width:'100%', border:'1px solid #333', borderRadius:3,
+                overflow:'hidden', background:'#111', display:'flex', alignItems:'center', justifyContent:'center' }}>
+                {isAnimated && previewUrl
+                  ? (previewKind === 'video'
+                      ? <video src={previewUrl} autoPlay loop muted playsInline style={previewMediaStyle} />
+                      : <img src={previewUrl} style={previewMediaStyle} />)
+                  : <canvas ref={canvasRef} style={previewCanvasStyle} />
+                }
+              </div>
+              {/* Vertical resize handle */}
+              <div
+                style={{ height:5, cursor:'ns-resize', background:'#1a1a1a',
+                  borderBottom:'1px solid #2a2a2a', flexShrink:0, userSelect:'none' }}
+                onPointerDown={e => {
+                  (e.target as HTMLElement).setPointerCapture(e.pointerId);
+                  previewDragRef.current = { y0: e.clientY, h0: previewH };
+                }}
+                onPointerMove={e => {
+                  if (!previewDragRef.current) return;
+                  setPreviewH(Math.max(120, Math.min(1200,
+                    previewDragRef.current.h0 + e.clientY - previewDragRef.current.y0)));
+                }}
+                onPointerUp={() => { previewDragRef.current = null; }}
+              />
+              {isAnimated && !previewUrl && (
+                <div style={{ fontSize:'0.58em', color:'#666', textAlign:'center' }}>
+                  {statsComputing
+                    ? `Generating preview…${maxF > 500 ? ` (${maxF.toLocaleString()} frames — this can take a moment)` : ''}`
+                    : 'Showing the first frame — pick a mode and Compute to preview the animation.'}
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -921,12 +1156,39 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
             <span style={{ fontWeight:'normal', color:'#555', marginLeft:8 }}>budget {(budget/1024).toFixed(1)} KB/tile</span>
           </div>
 
+          {heavyAnim && !statsRequested && !statsComputing && !tileStats && (
+            <div style={{ border:'1px solid #3a3a3a', borderRadius:6, background:'#242424', padding:'12px 14px' }}>
+              <div style={{ fontSize:'0.72em', color:'#dfe8ff', fontWeight:600, marginBottom:6 }}>
+                Large animation — {maxF.toLocaleString()} frames
+              </div>
+              <div style={{ fontSize:'0.6em', color:'#9aa', lineHeight:1.5, marginBottom:10 }}>
+                Encoding this many frames takes a while, so pick a mode first rather than waiting on
+                one you may not want:
+                <ul style={{ margin:'6px 0 0', paddingLeft:16 }}>
+                  <li><b>Lossless</b> (leave the toggle off): art is byte-exact, but the payload can be
+                    large — more tiles to place. Slower to encode.</li>
+                  <li><b>Lossy</b> (toggle top-left): a close approximation, typically far smaller —
+                    fewer tiles. Adjust the quality slider to taste.</li>
+                </ul>
+              </div>
+              <button
+                onClick={requestCompute}
+                style={{ fontSize:'0.62em', padding:'7px 14px', borderRadius:4, cursor:'pointer',
+                  background:'#2b6cb0', color:'#fff', border:'1px solid #3a7bc0', fontWeight:600 }}>
+                Compute sizes {lossyOn ? '(lossy)' : '(lossless)'}
+              </button>
+            </div>
+          )}
+
           {statsComputing && (
             <div>
-              <div style={{ fontSize:'0.63em', color:'#666', marginBottom:4 }}>
-                {statsProg ? `Compressing tile ${statsProg.done} / ${statsProg.total}…` : 'Starting…'}
+              <div style={{ fontSize:'0.7em', color:'#cdd', marginBottom:5, fontWeight:600 }}>
+                {statsProg ? (statsProg.detail ?? `Compressing tile ${statsProg.done} / ${statsProg.total}…`) : 'Starting…'}
               </div>
               <Bar value={statsProg?.done ?? 0} total={statsProg?.total ?? 1} />
+              <div style={{ fontSize:'0.55em', color:'#777', marginTop:5 }}>
+                Encoding {maxF.toLocaleString()} frames — this can take a while for large animations.
+              </div>
             </div>
           )}
 
@@ -1119,7 +1381,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
                                 } else {
                                   // Blank donor: run encode+mux (with encryption if active) to get the routed cargo
                                   setStatus('Computing donor schematic…');
-                                  void encodeAndMux(0, extraDonors, muxAlloc).then(ps => {
+                                  void encodeAndMux(0).then(({ ps }) => {
                                     const tile = ps.tiles[r.ti];
                                     const b64  = tile?.muxCargoB64 ?? tile?.carpetCompressedB64;
                                     if (b64) {

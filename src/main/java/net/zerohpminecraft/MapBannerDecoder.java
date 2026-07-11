@@ -110,6 +110,46 @@ public class MapBannerDecoder {
     private static final Map<String, List<Integer>> muxPendingOffsets = new HashMap<>();
     private static final Map<String, List<byte[]>>  muxPendingBytes   = new HashMap<>();
 
+    // ── Composite (composition-wide lossy AV1) state ──────────────────────
+    // FLAG_AV1_COMPOSITE tiles each carry a byte-segment of ONE lossy AV1 stream that covers the
+    // whole composition at (cols·128)×(rows·128) — encoded once, so tile boundaries have no lossy
+    // seams.  Segments concatenate in tile-index order; nothing can display until every tile of
+    // the composition has been seen at least once.
+
+    /** One tile's registration inside a composite buffer (framePos null for held maps). */
+    private record CompositeTile(MapIdComponent mapId, MapState mapState, BlockPos framePos) {}
+
+    private static final class CompositeBuffer {
+        final int cols, rows, frameCount, loopCount;
+        final int[] frameDelays;
+        final String username, title;
+        final byte[][] segments;      // [tileIndex] = this tile's slice of the AV1 stream
+        final CompositeTile[] tiles;  // [tileIndex] = where to paint once decoded
+        int received;                 // distinct tiles seen
+        boolean decoding;             // completion decode submitted
+
+        CompositeBuffer(PayloadManifest m) {
+            this.cols = m.cols; this.rows = m.rows;
+            this.frameCount = Math.max(1, m.frameCount);
+            this.loopCount = m.loopCount;
+            this.frameDelays = m.frameDelays;
+            this.username = m.username; this.title = m.title;
+            this.segments = new byte[cols * rows][];
+            this.tiles = new CompositeTile[cols * rows];
+        }
+    }
+
+    /** In-progress composite compositions, keyed by grid + frames + nonce + author + title. */
+    private static final Map<String, CompositeBuffer> compositeBuffers = new HashMap<>();
+
+    /** AV1 decode is heavy (~0.1–0.25 s/frame even compiled) — keep it off the game thread. */
+    private static final ExecutorService DECODE_EXECUTOR =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "loominary-av1-decode");
+                t.setDaemon(true);
+                return t;
+            });
+
     // ── Animated map state ────────────────────────────────────────────────
 
     private static final class AnimatedMapState {
@@ -1076,7 +1116,9 @@ public class MapBannerDecoder {
         PayloadManifest manifest = PayloadManifest.fromBytes(full);
         int offset = manifest.headerSize;
 
-        if (offset + MAP_BYTES > full.length) {
+        // AV1 payloads carry a compressed stream after the header, not raw frames — it can be
+        // (much) shorter than one 16,384-byte frame, so the size floor only applies to raw tiles.
+        if (!manifest.av1() && offset + MAP_BYTES > full.length) {
             throw new IllegalStateException("header_size=" + offset + " past payload end");
         }
 
@@ -1097,7 +1139,9 @@ public class MapBannerDecoder {
             }
         }
 
-        if (manifest.colorCrc32 >= 0) {
+        // The bytes at `offset` are frame 0 only for raw payloads; AV1 payloads store a
+        // compressed stream there, so the manifest CRC can't be checked before decoding.
+        if (manifest.colorCrc32 >= 0 && !manifest.av1()) {
             byte[] frame0 = Arrays.copyOfRange(full, offset, offset + MAP_BYTES);
             long actualCrc = PayloadManifest.crc32(frame0);
             if (actualCrc != manifest.colorCrc32) {
@@ -1107,7 +1151,20 @@ public class MapBannerDecoder {
             }
         }
 
+        // Composite tiles carry only a segment of the composition-wide stream — route it to the
+        // assembler; nothing can be painted until every sibling tile has been seen.
+        if (manifest.av1Composite()) {
+            handleCompositeTile(client, mapId, mapState, frameEntity, manifest, full);
+            return;
+        }
+
         if (manifest.animated() && manifest.frameCount > 1 && frameEntity != null) {
+            if (manifest.av1()) {
+                // AV1 decode is heavy — off the game thread. Raw/delta/sparse extraction below
+                // is just array copying and stays synchronous.
+                decodeAv1Async(client, mapId, mapState, manifest, full, frameEntity.getBlockPos());
+                return;
+            }
             byte[][] frames = extractFrames(full, manifest);
             if (frames.length < 2) {
                 paintMap(client, mapId, mapState, frames[0]);
@@ -1120,10 +1177,171 @@ public class MapBannerDecoder {
             animatedMaps.put(mapId.id(), animState);
             markSyncGroupsDirty();
             paintMap(client, mapId, mapState, frames[0]);
+        } else if (manifest.av1() && manifest.frameCount > 1) {
+            // Held AV1 map (no item frame to animate in): the payload has no raw frame 0 —
+            // decode the stream off-thread and paint the first frame statically.
+            decodeAv1Async(client, mapId, mapState, manifest, full, null);
         } else {
             paintMap(client, mapId, mapState,
                     Arrays.copyOfRange(full, offset, offset + MAP_BYTES));
         }
+    }
+
+    // ── Per-tile AV1 decode (off the game thread) ─────────────────────────
+
+    /** Map ids with an AV1 decode in flight on DECODE_EXECUTOR (game-thread access only). */
+    private static final Set<Integer> pendingAv1Decodes = new HashSet<>();
+
+    /**
+     * Decodes a per-tile AV1 payload off the game thread, then (on the client thread) registers
+     * the animation when {@code framePos != null} and paints frame 0.  A 60-frame lossy tile
+     * takes several seconds even with the compiled decoder — synchronous decode froze the game.
+     *
+     * @param mapState may be null (e.g. animation re-registration where colors are already
+     *                 painted); when null nothing is painted, the animation is only registered
+     */
+    private static void decodeAv1Async(MinecraftClient client, MapIdComponent mapId,
+            MapState mapState, PayloadManifest manifest, byte[] full, BlockPos framePos) {
+        if (!pendingAv1Decodes.add(mapId.id())) return; // decode already in flight
+        // Hide the raw stream noise until frame 0 is ready (same as composite tiles).
+        if (mapState != null) paintMap(client, mapId, mapState, new byte[MAP_BYTES]);
+        DECODE_EXECUTOR.submit(() -> {
+            // Catch Throwable: submit() swallows anything thrown into an unread Future.
+            try {
+                long t0 = System.nanoTime();
+                byte[][] frames = extractFrames(full, manifest);
+                long decodeMs = (System.nanoTime() - t0) / 1_000_000;
+                client.execute(() -> {
+                    pendingAv1Decodes.remove(mapId.id());
+                    if (frames.length > 1 && framePos != null) {
+                        AnimatedMapState animState = new AnimatedMapState(
+                                mapId, frames, manifest.frameDelays, manifest.loopCount,
+                                framePos, manifest.cols, manifest.rows,
+                                manifest.username, manifest.title);
+                        animatedMaps.put(mapId.id(), animState);
+                        markSyncGroupsDirty();
+                    }
+                    if (mapState != null) paintMap(client, mapId, mapState, frames[0]);
+                    System.out.println(TAG + " AV1 map " + mapId.id() + " decoded ("
+                            + frames.length + " frames, " + decodeMs + " ms)");
+                });
+            } catch (Throwable e) {
+                System.err.println(TAG + " AV1 decode failed for map " + mapId.id() + ": " + e);
+                e.printStackTrace();
+                client.execute(() -> pendingAv1Decodes.remove(mapId.id()));
+            }
+        });
+    }
+
+    // ── Composite (composition-wide lossy AV1) assembly ───────────────────
+
+    private static String compositeKey(PayloadManifest m) {
+        return m.cols + "x" + m.rows + ":" + m.frameCount + ":" + m.nonce
+                + ":" + (m.username == null ? "" : m.username)
+                + ":" + (m.title    == null ? "" : m.title);
+    }
+
+    /** Crop one tile's 128×128 window out of a (cols·128)-wide composition frame. */
+    private static byte[][] cropCompositeTile(byte[][] frames, int tileCol, int tileRow, int cols) {
+        int w = cols * 128;
+        byte[][] out = new byte[frames.length][MAP_BYTES];
+        for (int f = 0; f < frames.length; f++)
+            for (int y = 0; y < 128; y++)
+                System.arraycopy(frames[f], (tileRow * 128 + y) * w + tileCol * 128,
+                        out[f], y * 128, 128);
+        return out;
+    }
+
+    /**
+     * Stores one composite tile's stream segment and paints the tile transparent while its
+     * siblings are still missing.  When all {@code cols×rows} segments have been seen, the full
+     * stream is decoded once (off-thread) at composition size, and every registered tile gets its
+     * cropped frames painted + animated on the game thread.
+     */
+    private static void handleCompositeTile(MinecraftClient client,
+            MapIdComponent mapId, MapState mapState,
+            ItemFrameEntity frameEntity, PayloadManifest manifest, byte[] full) {
+        int cols = manifest.cols, rows = manifest.rows;
+        if (cols < 1 || rows < 1 || manifest.tileCol >= cols || manifest.tileRow >= rows
+                || manifest.frameCount < 2) {
+            throw new IllegalStateException("Bad composite manifest: grid=" + cols + "x" + rows
+                    + " tile=(" + manifest.tileCol + "," + manifest.tileRow + ")"
+                    + " frames=" + manifest.frameCount);
+        }
+        // v5 stores the per-frame delay table as a prefix before the stream (same as extractFrames).
+        int av1Offset = manifest.headerSize
+                + (manifest.manifestVersion >= 5 ? manifest.frameCount * 2 : 0);
+        if (av1Offset > full.length) {
+            throw new IllegalStateException("Composite stream offset " + av1Offset
+                    + " past payload end (" + full.length + " bytes)");
+        }
+        byte[] segment = Arrays.copyOfRange(full, av1Offset, full.length);
+
+        String key = compositeKey(manifest);
+        CompositeBuffer buf = compositeBuffers.computeIfAbsent(key, k -> new CompositeBuffer(manifest));
+        int idx = manifest.tileRow * cols + manifest.tileCol;
+        if (buf.segments[idx] == null) buf.received++;
+        buf.segments[idx] = segment;
+        buf.tiles[idx] = new CompositeTile(mapId, mapState,
+                frameEntity != null ? frameEntity.getBlockPos() : null);
+
+        // Hide the raw carpet/banner noise until the composition is complete.
+        paintMap(client, mapId, mapState, new byte[MAP_BYTES]);
+
+        int totalTiles = cols * rows;
+        if (buf.received < totalTiles) {
+            System.out.println(TAG + " Composite tile (" + manifest.tileCol + "," + manifest.tileRow
+                    + ") map " + mapId.id() + " stored — " + buf.received + "/" + totalTiles
+                    + " tiles seen for \"" + key + "\"");
+            return;
+        }
+        if (buf.decoding) return;
+        buf.decoding = true;
+
+        int streamLen = 0;
+        for (byte[] s : buf.segments) streamLen += s.length;
+        byte[] stream = new byte[streamLen];
+        int off = 0;
+        for (byte[] s : buf.segments) {
+            System.arraycopy(s, 0, stream, off, s.length);
+            off += s.length;
+        }
+        int w = cols * 128, h = rows * 128;
+        System.out.println(TAG + " Composite \"" + key + "\" complete — decoding "
+                + streamLen + " bytes at " + w + "x" + h + " (" + buf.frameCount + " frames)");
+
+        DECODE_EXECUTOR.submit(() -> {
+            // Catch Throwable, not Exception: submit() swallows anything the task throws into an
+            // unread Future, so an Error here would kill the decode with no log line at all.
+            try {
+                long t0 = System.nanoTime();
+                byte[][] frames = Av1FrameDecoder.decode(stream, 0, buf.frameCount, true, w, h);
+                long decodeMs = (System.nanoTime() - t0) / 1_000_000;
+                client.execute(() -> {
+                    compositeBuffers.remove(key);
+                    for (int i = 0; i < buf.tiles.length; i++) {
+                        CompositeTile tile = buf.tiles[i];
+                        if (tile == null) continue;
+                        byte[][] tileFrames = cropCompositeTile(frames, i % cols, i / cols, cols);
+                        if (tileFrames.length > 1 && tile.framePos() != null) {
+                            AnimatedMapState animState = new AnimatedMapState(
+                                    tile.mapId(), tileFrames, buf.frameDelays, buf.loopCount,
+                                    tile.framePos(), cols, rows, buf.username, buf.title);
+                            animatedMaps.put(tile.mapId().id(), animState);
+                        }
+                        paintMap(client, tile.mapId(), tile.mapState(), tileFrames[0]);
+                    }
+                    markSyncGroupsDirty();
+                    System.out.println(TAG + " Composite \"" + key + "\" decoded and painted ("
+                            + frames.length + " frames × " + buf.tiles.length + " tiles, "
+                            + decodeMs + " ms)");
+                });
+            } catch (Throwable e) {
+                System.err.println(TAG + " Composite decode failed for \"" + key + "\": " + e);
+                e.printStackTrace();
+                client.execute(() -> buf.decoding = false);
+            }
+        });
     }
 
     // ── Animation tick ────────────────────────────────────────────────────
@@ -1402,6 +1620,22 @@ public class MapBannerDecoder {
 
             PayloadManifest manifest = PayloadManifest.fromBytes(full);
             if (!manifest.animated() || manifest.frameCount <= 1) return;
+            if (manifest.av1Composite()) {
+                // A lone composite segment can't be decoded — animation comes from the
+                // assembler once every sibling tile has been scanned.
+                System.out.println(TAG + " Composite tile map " + mapId.id()
+                        + " — animation registers when the whole composition is assembled");
+                return;
+            }
+
+            if (manifest.av1()) {
+                // Heavy decode — off the game thread; claim now so the scanner doesn't reset
+                // the clock while the decode is in flight. Colors are already painted here,
+                // so only the animation registers (null mapState = no paint).
+                claimedMaps.add(mapId.id());
+                decodeAv1Async(client, mapId, null, manifest, full, framePos);
+                return;
+            }
 
             byte[][] frames = extractFrames(full, manifest);
             if (frames.length < 2) return;
@@ -1456,6 +1690,19 @@ public class MapBannerDecoder {
     public static byte[][] extractFrames(byte[] full, PayloadManifest manifest) {
         int fc     = Math.max(1, manifest.frameCount);
         int offset = manifest.headerSize;
+
+        if (manifest.av1Composite()) {
+            throw new IllegalStateException("Composite lossy tile — its stream segment cannot be"
+                    + " decoded alone; all " + manifest.cols + "×" + manifest.rows
+                    + " tiles of the composition are required");
+        }
+
+        if (manifest.av1() && fc > 1) {
+            // v5 stores a frameCount×u16 per-frame delay table as a prefix before the AV1 stream.
+            int av1Offset = offset + (manifest.manifestVersion >= 5 ? fc * 2 : 0);
+            return Av1FrameDecoder.decode(full, av1Offset, fc, manifest.av1Lossy());
+        }
+
         byte[][] frames = new byte[fc][MAP_BYTES];
 
         if (manifest.sparseFrames() && fc > 1) {
@@ -1625,6 +1872,8 @@ public class MapBannerDecoder {
         muxBuffers.clear();
         muxPendingOffsets.clear();
         muxPendingBytes.clear();
+        compositeBuffers.clear();
+        pendingAv1Decodes.clear();
         rawColors.clear();
         decodedColors.clear();
         renderUpdateSeen.clear();

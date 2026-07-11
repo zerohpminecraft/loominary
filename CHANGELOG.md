@@ -4,6 +4,67 @@
 
 ---
 
+## v1.25.0
+
+### Feat: composition-wide lossy encoding (seamless multi-tile animations)
+
+Per-tile lossy encoding produced visible lines along tile boundaries on multi-tile animated art — each 128×128 tile was a separate AV1 encode, so block artifacts disagreed where tiles met. Multi-tile lossy animations are now encoded as **one AV1 stream covering the whole composition** at `(cols·128)×(rows·128)`, then the stream bytes are divided evenly across the tiles' payloads — the boundary between two tiles is just another part of one video frame, so no seams. The tradeoff: the composition is all-or-nothing — **every tile must be within scan range (seen at least once) before any of them can display**; until then composite tiles render transparent.
+
+- **Format** — new manifest flag `FLAG_AV1_COMPOSITE (0x80)` (implies `FLAG_AV1 | FLAG_AV1_LOSSY`); each tile's payload after the header is its byte-segment of the composition stream, and segments concatenate in tile-index order (`tileRow·cols + tileCol`). No new manifest fields — grid position and frame count already identify everything; compositions are keyed by grid + frame count + nonce + author + title.
+- **Mod assembly** — `MapBannerDecoder` buffers segments per composition as tiles are scanned, then decodes the full stream **once, off the game thread**, crops each tile's window, and registers the usual synced animations. Works across all transports (banner, carpet, LOOM, mux) since only the payload inside the zstd wrapper changed.
+- **Web parity** — the export preview muxes the composite stream itself into the MP4 (zero re-encode, byte-truthful), the fidelity metric compares the real decoded composite, and importing a composite state JSON reassembles it exactly like the mod. `Av1CompositeRoundtripTest` locks mod↔web decode parity at composition dimensions (fixtures via `node web/scripts/gen-av1-fixtures.mjs`); `web/test/composite-payload.test.mjs` locks the split/reassembly wire format.
+- **Fallback** — raw frames+zstd per tile remains the floor: if the composite total isn't smaller (e.g. pure-noise content), the export ships raw tiles exactly as before. Single-tile lossy animations keep the existing per-tile path. Old mod builds cannot display composite tiles (decode fails cleanly; update the mod).
+
+### Fix: AV1 decode ~50× faster and no longer dies mid-stream (build-time wasm compilation)
+
+In-game AV1 decode ran on Chicory 1.4.0's **interpreter** — roughly 12 s per composite frame, so a 60-frame 1×2 composition needed ~12 *minutes*, and about 8 minutes in it died anyway with an uncaught `WasmException` from libaom's error path. Chicory is upgraded to **1.7.5** and `av1-decode.wasm` is now compiled **to JVM bytecode at build time** (Chicory's build-time compiler, `generateAv1Machine` in `build.gradle`): the same 60-frame composition decodes in ~14 s, with no first-decode warm-up and nothing new at runtime — still pure Java, still one jar.
+
+- Build-time (not runtime) compilation matters on Fabric: Chicory's runtime compiler needs ASM 9.9+, and nesting our own ASM in the jar collides with the copy fabric-loader puts on the classpath — Sodium crashed on the duplicate at preLaunch. The pre-compiled machine classes depend only on `chicory-runtime`.
+- The raw wasm no longer ships in the jar (the generated classes + a stripped `.meta` module replace it); net jar growth ~0.6 MB.
+- The composite decode task now catches `Throwable` (an `Error` used to vanish silently into the executor's unread `Future`) and logs the decode wall time on completion.
+- **Per-tile AV1 decode moved off the game thread** too: a 60-frame single-tile lossy map used to freeze the game for several seconds (minutes, pre-compiler) when first scanned. The tile paints transparent while decoding and shows frame 0 the moment it's ready, same as composite tiles.
+
+### Hardening: web↔mod mux allocation locked by a parity test
+
+The mux allocation algorithm exists twice — `poolMuxTiles` (Java, re-run by the mod at state import) and `computeMuxAllocation` (TS, baked into schematic LOOM headers at export) — and any divergence corrupts muxed receivers. The Java algorithm is now extracted into the Minecraft-free `MuxAllocator`, and `MuxAllocationParityTest` asserts it reproduces the TS implementation's exact output across 24 fixture scenarios (all five codecs, threshold edges, partial donor spare, rollback/unresolved cases). Regenerate fixtures with `node web/scripts/gen-mux-fixtures.mjs` when either side changes.
+
+### Fix: mux corruption from stale export allocation ("Src size is incorrect")
+
+The web export computed its mux allocation (which tiles donate, receiver totals, guest slice offsets) from the **stats-pass** tile sizes, but the exported bytes could differ — recompute at changed settings, resalt re-encode, or the fixed encryption-overhead estimate. The schematic's LOOM headers then promised receiver totals that didn't match what the donors actually carried (and the mod re-pools from the *actual* sizes at import, compounding the disagreement), so muxed receivers reassembled a truncated/garbled zstd frame: `Mux completion failed … Src size is incorrect`. Composite lossy made this near-certain to bite, since its payloads are incompressible AV1 slices that always need donors.
+
+- `encodeAndMux` now derives the allocation **from the actual payload bytes it just produced** (post-encryption), escalates blank donors as needed, and the ZIP's schematic headers consume that same allocation — one allocation over one set of bytes, so web schematics and mod-generated banners always agree.
+- `web/test/composite-payload.test.mjs` now also simulates the mod's receiver reassembly (own segment + donor cargo slices per the allocation) over real composite payloads and asserts byte-exact reconstruction.
+
+### Fix: AV1 payload decode edge cases
+
+- Compact AV1 payloads (stream + header smaller than one 16,384-byte frame) no longer throw `header_size past payload end` — the raw-frame size floor now only applies to raw payloads.
+- The manifest CRC check is skipped for AV1 payloads (the bytes after the header are a compressed stream, not frame 0), silencing a spurious per-tile mismatch warning.
+- A **held** AV1 animated map (not in an item frame) now decodes and shows frame 0 instead of painting stream bytes as noise.
+
+### Feat: lossless AV1 codec for animated art
+
+Animations exported from the web editor are now encoded as a **lossless AV1** stream instead of zstd-over-concatenated-frames, cutting the compressed payload — and therefore the number of banners/carpets you place in-game — substantially by exploiting inter-frame prediction. Old-format art (raw / delta / sparse frames) still decodes unchanged; only new animated tiles use AV1, and only when it comes out smaller than the old encoding (per-tile fallback).
+
+- **Shared wasm codec** — one `av1-decode.wasm` (libaom, built via wasi-sdk) is run *inside the JVM* by the mod via [Chicory](https://github.com/dylibso/chicory) and by the web editor in the browser, so decode is byte-identical on both sides with **no native dependency** — the mod stays a single cross-platform jar (Chicory jars + the ~1.2 MB wasm are nested with `include`). Frames are coded as an 8-bit monochrome plane of palette indices after a fixed **OKLab-similarity permutation** (`PalettePermutation` / `palette-perm.ts`) so neighbouring indices are visually close, tightening lossless prediction.
+- **Format** — new manifest flag `FLAG_AV1 (0x20)`; the AV1 bitstream is stored as length-prefixed temporal units after the (v4-inline-delay) manifest header, kept inside the existing zstd wrapper so nothing in the banner/carpet/mux transport changes. See `native/av1/README.md` to rebuild the wasm.
+- **Preview** — the exported ZIP's animated preview is now an **AV1 `.mp4`** (via WebCodecs + `mp4-muxer`) instead of `preview.gif`, with a GIF fallback where AV1 encode is unavailable; the on-page export preview plays it as a looping `<video>`. Static art still exports `preview.png`.
+- **Compatibility** — a mod build predating this release cannot render AV1 animated tiles (it reads the bitstream as raw frames → noise); update the mod. Static art is unaffected.
+
+### Feat: optional lossy animation (big savings for dithered art)
+
+Lossless AV1 can't beat zstd on dithered map art (dithering is high-entropy noise). For a *much* smaller payload, the export page now has an optional **Lossy animation** toggle + quality slider: the animation is encoded as lossy AV1 colour video and re-quantised to the palette on decode, so the in-game art is a close approximation rather than byte-identical — often ~50% smaller on detailed/dithered art.
+
+- **Truthful preview** — the export preview runs the exact encode→decode→re-quantise pipeline the payload uses, so what you see is what ships. `Av1LossyRoundtripTest` proves the mod's decode matches the web decode byte-for-byte (shared wasm + a committed `MapPalette` RGB table generated from the same source as the web palette), so the preview equals the in-game result.
+- **Per-tile, opt-in** — new `FLAG_AV1_LOSSY`; the wasm decoder (both web and mod, via Chicory) reconstructs YUV→RGB and picks the nearest palette entry. Off by default; lossless remains the default path.
+
+### Feat: stronger zstd compression (web editor)
+
+The web editor now compresses payloads with **zstd level 19** (via `@bokuweb/zstd-wasm`) instead of level 9. The previous zstd build had a fixed 16 MB heap that OOM'd above ~level 9 on tile-sized (~1 MB) payloads, so animated/large tiles were under-compressed; the new build grows its memory, cutting ~20% off the highly-dithered map art that AV1 can't help. Output is still a standard zstd frame, so the mod decodes it unchanged (no mod changes). Each animated tile now picks the smaller of {raw + zstd-19, AV1}, so dithered art wins via better zstd while flat/coherent art can still win via AV1.
+
+### Fix: printing survives alt-tab
+
+Vanilla opens the pause menu ~500 ms after the window loses focus, halting input and therefore the printer. `/loominary walk print` now disables `pauseOnLostFocus` for the session (the original setting is restored when printing stops) and releases/recaptures the cursor grab on focus loss/regain, so a print keeps running while you work in another window.
+
 ## v1.24.0
 
 ### Feat: `/loominary walk print` — fully autonomous carpet printing

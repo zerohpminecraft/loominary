@@ -1,69 +1,42 @@
 /**
- * zstd compression wrapper — uses zstd-codec's Simple API.
+ * zstd compression wrapper — uses @bokuweb/zstd-wasm (growable-memory libzstd).
  *
- * The codec is loaded lazily on first use so it doesn't block page load.
+ * Replaces the older zstd-codec build, whose fixed 16 MB heap OOM'd above ~level 9 on
+ * tile-sized (~1 MB) payloads and forced a low level for animated art.  @bokuweb/zstd-wasm
+ * grows its memory, so we can use level 19 across the board — ~20% smaller output on the
+ * high-entropy (dithered) map art that dominates our payloads.  Output is a standard zstd
+ * frame, decoded unchanged by zstd-jni in the mod.
+ *
+ * The wasm is initialised lazily on first use so it doesn't block page load.
  */
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ZstdCodecModule = any;
-let _codec: ZstdCodecModule | null = null;
+import { init, compress as zCompress, decompress as zDecompress } from '@bokuweb/zstd-wasm';
 
-async function getCodec(): Promise<ZstdCodecModule> {
-  if (_codec) return _codec;
-  const { ZstdCodec } = await import('zstd-codec');
-  return new Promise((resolve) => {
-    ZstdCodec.run((c: ZstdCodecModule) => { _codec = c; resolve(c); });
-  });
+let _ready: Promise<void> | null = null;
+function ready(): Promise<void> {
+  return (_ready ??= init());
 }
 
+/**
+ * Level policy.  With growable memory the old OOM cliff is gone, so we use a high level
+ * everywhere it's affordable.  Level 19 is the sweet spot (22 gives no measurable gain on
+ * this content); very large inputs drop a bit to keep export time reasonable.
+ */
 function adaptiveLevel(payloadSize: number): number {
-  if (payloadSize <   256 * 1024) return 22;
-  if (payloadSize < 4 * 1024 * 1024) return 9;
-  return 3;
+  if (payloadSize < 4 * 1024 * 1024) return 19;
+  if (payloadSize < 16 * 1024 * 1024) return 15;
+  return 12;
 }
 
-// The zstd-codec WASM module has a fixed 16 MB heap with no growth
-// (abortOnCannotGrowMemory → abort("OOM")).  The Simple API copies the whole
-// input plus a compressBound-sized output buffer into that heap, so it OOMs
-// well before 16 MB — empirically at ~2.25 MB with the level-9 compressor used
-// for 256 KB–4 MB payloads.  The Streaming API feeds one chunk at a time into
-// the heap (the output accumulates in a JS-side buffer) and stays bounded to
-// tens of MB, producing byte-identical output.  Keep the Simple-API threshold
-// safely under the level-9 OOM point and use small chunks for streaming.
-const STREAMING_THRESHOLD = 1.5 * 1024 * 1024; // 1.5 MB
-const STREAMING_CHUNK     =       1024 * 1024; // 1 MB per chunk
-
-/**
- * Compress `data` with zstd at an adaptively chosen level.
- * Uses the streaming API for large payloads to avoid WASM OOM.
- */
+/** Compress `data` with zstd at an adaptively chosen level. */
 export async function compress(data: Uint8Array): Promise<Uint8Array> {
-  const codec = await getCodec();
-  const level = adaptiveLevel(data.length);
-
-  if (data.length <= STREAMING_THRESHOLD) {
-    const simple = new codec.Simple();
-    const result: Uint8Array | null = simple.compress(data, level);
-    if (!result) throw new Error('zstd compress returned null');
-    return result;
-  }
-
-  // Split into chunks — WASM only sees one chunk at a time.
-  const chunks: Uint8Array[] = [];
-  for (let off = 0; off < data.length; off += STREAMING_CHUNK) {
-    chunks.push(data.subarray(off, Math.min(off + STREAMING_CHUNK, data.length)));
-  }
-  // Hint: map art is very compressible; guess ~15% of input for the output buffer.
-  const sizeHint = Math.max(512 * 1024, Math.ceil(data.length * 0.15));
-  const streaming = new codec.Streaming();
-  const result: Uint8Array | null = streaming.compressChunks(chunks, sizeHint, level);
-  if (!result) throw new Error('zstd streaming compress returned null');
-  return result;
+  await ready();
+  const out = zCompress(data, adaptiveLevel(data.length));
+  if (!out) throw new Error('zstd compress returned null');
+  return out instanceof Uint8Array ? out : new Uint8Array(out);
 }
 
-/**
- * Compress a manifest prefix + map-color payload in one call.
- */
+/** Compress a manifest prefix + map-color payload in one call. */
 export async function compressCombined(prefix: Uint8Array, mapColors: Uint8Array): Promise<Uint8Array> {
   const combined = new Uint8Array(prefix.length + mapColors.length);
   combined.set(prefix, 0);
@@ -71,13 +44,10 @@ export async function compressCombined(prefix: Uint8Array, mapColors: Uint8Array
   return compress(combined);
 }
 
-/**
- * Decompress a zstd-compressed buffer.
- */
+/** Decompress a zstd-compressed buffer (any standard zstd frame). */
 export async function decompress(compressed: Uint8Array): Promise<Uint8Array> {
-  const codec  = await getCodec();
-  const simple = new codec.Simple();
-  const result: Uint8Array | null = simple.decompress(compressed);
-  if (!result) throw new Error('zstd decompress returned null');
-  return result;
+  await ready();
+  const out = zDecompress(compressed);
+  if (!out) throw new Error('zstd decompress returned null');
+  return out instanceof Uint8Array ? out : new Uint8Array(out);
 }

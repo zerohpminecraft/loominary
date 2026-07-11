@@ -180,39 +180,74 @@ async function decodeStateToComposition(
   onProgress?: (done: number, total: number) => void,
 ): Promise<CompositionState> {
   const { decompress }     = await import('../compression.js');
-  const { fromBytes: parseMf, extractFrames } = await import('../manifest.js');
+  const { fromBytes: parseMf, extractFrames, av1, av1Lossy, av1Composite, av1StreamOffset } = await import('../manifest.js');
+  const { decodeLosslessMono, decodeLossyColor } = await import('../av1/codec.js');
+  const { cropTile }       = await import('../encode.js');
   const { assembleChunks } = await import('../cjk-codec.js');
 
   const artCount = ps.columns * ps.rows;
   const pixelData: Uint8Array[][] = [];
   const BLANK = () => [new Uint8Array(128 * 128)];
 
+  // First pass: decompress every tile and parse its manifest.
+  const parsed: ({ raw: Uint8Array; mf: import('../manifest.js').Manifest } | null)[] = [];
   for (let ti = 0; ti < artCount; ti++) {
     const tile = ps.tiles[ti];
-    if (!tile) { pixelData.push(BLANK()); onProgress?.(ti + 1, artCount); continue; }
-
     let compressed: Uint8Array | null = null;
-
-    if (tile.carpetCompressedB64) {
+    if (tile?.carpetCompressedB64) {
       // Carpet / LOOM modes: full payload stored as base64 zstd.
       compressed = b64ToBytes(tile.carpetCompressedB64);
-    } else if (tile.chunks.length > 0) {
+    } else if (tile && tile.chunks.length > 0) {
       // Banner mode: CJK-encoded chunks contain the compressed payload.
       const cjk = tile.chunks.filter(c => c.length > 2 && c.charCodeAt(2) >= 0x4E00);
       if (cjk.length > 0) {
         try { compressed = assembleChunks(cjk); } catch { /* fall through to blank */ }
       }
-    } else if (tile.muxCargoB64) {
+    } else if (tile?.muxCargoB64) {
       // Muxed donor with cargo but no carpet field — try the cargo segment.
       compressed = b64ToBytes(tile.muxCargoB64);
     }
-
-    if (!compressed) { pixelData.push(BLANK()); onProgress?.(ti + 1, artCount); continue; }
-
+    if (!compressed) { parsed.push(null); continue; }
     try {
-      const raw    = await decompress(compressed);
-      const mf     = parseMf(raw);
-      const frames = extractFrames(raw, mf);
+      const raw = await decompress(compressed);
+      parsed.push({ raw, mf: parseMf(raw) });
+    } catch {
+      parsed.push(null);
+    }
+  }
+
+  // Composite payloads: every tile carries a segment of ONE composition-wide lossy stream;
+  // concatenate them in tile-index order and decode once at full composition size.
+  if (parsed.some(p => p != null && av1Composite(p.mf))) {
+    const segs = parsed.map(p => p != null && av1Composite(p.mf) ? p.raw.subarray(av1StreamOffset(p.mf)) : null);
+    if (segs.every(s => s != null)) {
+      try {
+        const stream = new Uint8Array(segs.reduce((n, s) => n + s!.length, 0));
+        let off = 0;
+        for (const s of segs) { stream.set(s!, off); off += s!.length; }
+        const frames = await decodeLossyColor(stream, 0, parsed[0]!.mf.frameCount,
+          undefined, { width: ps.columns * 128, height: ps.rows * 128 });
+        for (let ti = 0; ti < artCount; ti++) {
+          pixelData.push(frames.map(fr => cropTile(fr, ti % ps.columns, Math.floor(ti / ps.columns), ps.columns)));
+          onProgress?.(ti + 1, artCount);
+        }
+        return compositionFromState(ps, pixelData);
+      } catch { /* fall through to per-tile decode (yields blanks for composite tiles) */ }
+    }
+  }
+
+  for (let ti = 0; ti < artCount; ti++) {
+    const p = parsed[ti];
+    if (!p) { pixelData.push(BLANK()); onProgress?.(ti + 1, artCount); continue; }
+    try {
+      const { raw, mf } = p;
+      const frames = av1Composite(mf)
+        ? BLANK() // a lone composite segment can't be decoded without its siblings
+        : av1Lossy(mf)
+        ? await decodeLossyColor(raw, av1StreamOffset(mf), mf.frameCount)
+        : av1(mf)
+        ? await decodeLosslessMono(raw, av1StreamOffset(mf), mf.frameCount)
+        : extractFrames(raw, mf);
       pixelData.push(frames.length > 0 ? frames : BLANK());
     } catch {
       pixelData.push(BLANK());

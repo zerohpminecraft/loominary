@@ -76,6 +76,13 @@ public final class AutoPrintHandler {
     private static boolean printerEngaged = false;
     private static boolean positioning = false;   // travelling to the sweep start with the printer off
 
+    // Window-focus pause suppression. Vanilla opens the pause menu ~500 ms after the window loses
+    // focus (GameRenderer.render checks isWindowFocused() && options.pauseOnLostFocus), which halts
+    // input and the printer. We clear pauseOnLostFocus for the session and restore it on stop.
+    private static boolean pauseOverridden = false;
+    private static boolean savedPauseOnLostFocus = false;
+    private static boolean wasWindowFocused = true;   // for releasing the cursor grab on alt-tab
+
     // Missed-cell recovery state.
     private static boolean recovering = false;
     private static BlockPos recoverTarget = null;
@@ -115,6 +122,13 @@ public final class AutoPrintHandler {
         wpIndex = 0;
         printerEngaged = false;
         positioning = false;
+        // Don't let the game open the pause menu (and freeze the printer) when you tab away.
+        if (!pauseOverridden) {
+            savedPauseOnLostFocus = client.options.pauseOnLostFocus;
+            pauseOverridden = true;
+        }
+        client.options.pauseOnLostFocus = false;
+        wasWindowFocused = client.isWindowFocused();
         restockPending = false;
         restockAttempts = 0;
         triedCatalogue = false;
@@ -142,6 +156,11 @@ public final class AutoPrintHandler {
         recovering = false;
         recoverTarget = null;
         positioning = false;
+        if (pauseOverridden) {
+            MinecraftClient c = MinecraftClient.getInstance();
+            if (c != null && c.options != null) c.options.pauseOnLostFocus = savedPauseOnLostFocus;
+            pauseOverridden = false;
+        }
     }
 
     private static void onTick(MinecraftClient client) {
@@ -152,6 +171,8 @@ public final class AutoPrintHandler {
             hardStop();
             return;
         }
+
+        updateCursorFocus(client);
 
         switch (state) {
             case PLAN          -> planStep(client);
@@ -572,6 +593,24 @@ public final class AutoPrintHandler {
         if (printerEngaged) {
             LitematicaBridge.setPrinter(false);
             printerEngaged = false;
+        }
+    }
+
+    /**
+     * Release the cursor grab when the window loses focus, recapture it on return. With the pause
+     * menu suppressed (see {@code pauseOnLostFocus}), nothing opens a screen to free the pointer on
+     * alt-tab, so the GLFW cursor stays grabbed (DISABLED) and the mouse seems stuck to the game.
+     * {@code unlockCursor()} drops the grab without opening a screen, so the printer keeps running.
+     */
+    private static void updateCursorFocus(MinecraftClient client) {
+        boolean focused = client.isWindowFocused();
+        if (focused == wasWindowFocused) return;
+        wasWindowFocused = focused;
+        if (client.mouse == null) return;
+        if (!focused) {
+            client.mouse.unlockCursor();                 // free the OS pointer for other windows
+        } else if (client.currentScreen == null) {
+            client.mouse.lockCursor();                   // back in-game — recapture for mouse-look
         }
     }
 

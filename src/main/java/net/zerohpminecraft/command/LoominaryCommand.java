@@ -35,6 +35,7 @@ import net.zerohpminecraft.CarpetFillHandler;
 import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CodecMode;
 import net.zerohpminecraft.LitematicaBridge;
+import net.zerohpminecraft.MuxAllocator;
 import net.zerohpminecraft.WaypointMover;
 import net.zerohpminecraft.MapBannerDecoder;
 import net.zerohpminecraft.MapEncryption;
@@ -193,13 +194,7 @@ public class LoominaryCommand {
 
     /** Returns the maximum compressed-payload bytes a tile can hold given the current codec mode. */
     private static int maxBytesForMode(CodecMode mode) {
-        return switch (mode) {
-            case BANNER               -> MAX_CHUNKS * 84 - 2;
-            case CARPET               -> CarpetChannel.MAX_CARPET_PAYLOAD;
-            case CARPET_SHADE         -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
-            case CARPET_BANNERS       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
-            case CARPET_BANNERS_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
-        };
+        return MuxAllocator.budget(mode);
     }
 
     /** Returns the maximum compressed-payload bytes for a given tile. */
@@ -926,14 +921,7 @@ public class LoominaryCommand {
             }
         }
 
-        // Max own-segment bytes a receiver can hold in its own tile channels.
-        int receiverOwnMax = switch (mode) {
-            case BANNER               -> (MAX_CHUNKS - 1) * 84; // 62 payload banners (1 LB slot)
-            case CARPET               -> CarpetChannel.MAX_CARPET_PAYLOAD;
-            case CARPET_SHADE         -> CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM;
-            case CARPET_BANNERS       -> CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM;
-            case CARPET_BANNERS_SHADE -> CarpetChannel.MAX_TOTAL_BYTES_LOOM;
-        };
+        int receiverOwnMax = MuxAllocator.receiverOwnMax(mode);
 
         // Budget threshold: payload bytes that exceed this make a tile a receiver.
         int budget = maxBytesForMode(mode);
@@ -943,61 +931,26 @@ public class LoominaryCommand {
             if (payloads.get(i).length > budget) receivers.add(i);
         if (receivers.isEmpty()) return 0;
 
-        int[] cargoSize = new int[tiles.size()];
-        for (int i = 0; i < tiles.size(); i++) cargoSize[i] = payloads.get(i).length;
+        // Pure allocation (extracted so MuxAllocationParityTest can lock web↔mod equivalence).
+        int[] sizes = new int[tiles.size()];
+        for (int i = 0; i < tiles.size(); i++) sizes[i] = payloads.get(i).length;
+        MuxAllocator.Allocation alloc = MuxAllocator.allocate(sizes, mode,
+                d -> !donorOnlyMode || tiles.get(d).isDonorOnly);
+        int unresolved = alloc.unresolved;
+        List<int[]>[] guestMeta = alloc.guestMeta; // {targetIdx, offsetInPayload, len}
 
-        @SuppressWarnings("unchecked")
-        List<int[]>[] guestMeta = new List[tiles.size()]; // {targetIdx, offsetInPayload, len}
         @SuppressWarnings("unchecked")
         List<byte[]>[] guestData = new List[tiles.size()];
-        for (int i = 0; i < tiles.size(); i++) {
-            guestMeta[i] = new ArrayList<>();
-            guestData[i] = new ArrayList<>();
+        for (int d = 0; d < tiles.size(); d++) {
+            guestData[d] = new ArrayList<>();
+            for (int[] m : guestMeta[d])
+                guestData[d].add(Arrays.copyOfRange(payloads.get(m[0]), m[1], m[1] + m[2]));
         }
-
-        int unresolved = 0;
-        for (int rIdx : receivers) {
-            byte[] payload = payloads.get(rIdx);
-            int pos = receiverOwnMax;
-            boolean fits = true;
-            while (pos < payload.length) {
-                List<int[]> viable = new ArrayList<>();
-                for (int d = 0; d < tiles.size(); d++) {
-                    if (tiles.get(d).muxReceiver) continue;
-                    if (donorOnlyMode && !tiles.get(d).isDonorOnly) continue;
-                    int spare = donorSpare(d, cargoSize, guestMeta, mode);
-                    if (spare > 0) viable.add(new int[]{d, spare});
-                }
-                if (viable.isEmpty()) { fits = false; break; }
-
-                int remaining = payload.length - pos;
-                int share = (remaining + viable.size() - 1) / viable.size();
-                for (int[] dv : viable) {
-                    if (pos >= payload.length) break;
-                    int take = Math.min(Math.min(dv[1], share), payload.length - pos);
-                    if (take <= 0) continue;
-                    guestMeta[dv[0]].add(new int[]{rIdx, pos, take});
-                    guestData[dv[0]].add(Arrays.copyOfRange(payload, pos, pos + take));
-                    cargoSize[dv[0]] += take;
-                    pos += take;
-                }
+        for (int i = 0; i < tiles.size(); i++) {
+            if (alloc.receiver[i]) {
+                tiles.get(i).muxReceiver = true;
+                tiles.get(i).muxed = true;
             }
-            if (!fits) {
-                final int rIdxFinal = rIdx;
-                for (int d = 0; d < tiles.size(); d++) {
-                    for (int g = guestMeta[d].size() - 1; g >= 0; g--) {
-                        if (guestMeta[d].get(g)[0] == rIdxFinal) {
-                            cargoSize[d] -= guestMeta[d].get(g)[2];
-                            guestMeta[d].remove(g);
-                            guestData[d].remove(g);
-                        }
-                    }
-                }
-                unresolved++;
-                continue;
-            }
-            tiles.get(rIdx).muxReceiver = true;
-            tiles.get(rIdx).muxed = true;
         }
 
         // ── Encode resolved receiver tiles ──────────────────────────────────
@@ -1143,33 +1096,6 @@ public class LoominaryCommand {
             tile.muxed = true;
         }
         return unresolved;
-    }
-
-    /** Computes spare guest-byte capacity for donor {@code d} under the given codec mode. */
-    private static int donorSpare(int d, int[] cargoSize,
-                                   List<int[]>[] guestMeta, CodecMode mode) {
-        int gc = guestMeta[d].size(); // current guest count
-        return switch (mode) {
-            case BANNER ->
-                // Spare = remaining banner slots (minus one new MG slot) × 84 bytes
-                (MAX_CHUNKS - gc - 1) * 84 - cargoSize[d];
-            case CARPET ->
-                // Carpet only; guest descriptors in LOOM header (10 bytes each)
-                CarpetChannel.MAX_CARPET_PAYLOAD
-                        - (gc + 1) * CarpetChannel.LOOM_GUEST_DESC - cargoSize[d];
-            case CARPET_SHADE ->
-                // Carpet + shade; guest descriptors in LOOM header (10 bytes each)
-                CarpetChannel.MAX_CARPET_SHADE_ONLY_BYTES_LOOM
-                        - (gc + 1) * CarpetChannel.LOOM_GUEST_DESC - cargoSize[d];
-            case CARPET_BANNERS ->
-                // Carpet + overflow banners; one MG routing banner (84 bytes) per guest
-                CarpetChannel.MAX_CARPET_OVERFLOW_BYTES_LOOM
-                        - (gc + 1) * 84 - cargoSize[d];
-            case CARPET_BANNERS_SHADE ->
-                // Carpet + shade + overflow banners; one MG routing banner (84 bytes) per guest
-                CarpetChannel.MAX_TOTAL_BYTES_LOOM
-                        - (gc + 1) * 84 - cargoSize[d];
-        };
     }
 
     /** Strips the file extension from a filename (e.g. "myimage.png" → "myimage"). */

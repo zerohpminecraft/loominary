@@ -15,4 +15,4 @@ Bindable in **Options → Controls → Key Binds → Loominary**. All unbound by
 | Toggle duty-cycle auto-walk | `/loominary walk` |
 | Stop all Loominary automation | `/loominary stop` |
 
-The **decode toggle** is the one with no command equivalent: it flips between the decoded art and the raw carpet-colored map — handy for checking what players without the mod see.
+The **decode toggle** has no command equivalent. It flips between the decoded art and the raw carpet-colored map, which is handy for checking what players without the mod see.

@@ -1,6 +1,6 @@
 # Command reference
 
-Everything lives under a single `/loominary` command — type it and tab through subcommands. Image *editing* is not here by design: that's the [web editor](Web-Editor-Import)'s job.
+Everything lives under a single `/loominary` command; type it and tab through the subcommands. Image *editing* is deliberately absent, since that's the [web editor](Web-Editor-Import)'s job.
 
 ## State & batches
 
@@ -16,7 +16,7 @@ Everything lives under a single `/loominary` command — type it and tab through
 
 | Command | Effect |
 |---|---|
-| `/loominary import <file> [cols rows] [dither] [allshades] [mux]` | Encode an image from `loominary_data/` (carpet codec). Over-budget imports abort — use the web editor to shrink |
+| `/loominary import <file> [cols rows] [dither] [allshades] [mux]` | Encode an image from `loominary_data/` (carpet codec). Over-budget imports abort; use the web editor to shrink |
 | `/loominary import <file> banners [cols rows] [dither] [allshades]` | Same, banner-only codec |
 | `/loominary import steal [banners]` | Capture the framed map at your crosshair as a tile |
 | `/loominary import header <banner> <screenshot.png>` | Rebuild a payload from a map screenshot + its manifest banner string |
@@ -33,7 +33,7 @@ Everything lives under a single `/loominary` command — type it and tab through
 
 | Command | Effect |
 |---|---|
-| `/loominary preview` | Paint the active tile (or the whole discovered grid) onto framed maps at your crosshair — client-side only |
+| `/loominary preview` | Paint the active tile (or the whole discovered grid) onto framed maps at your crosshair (client-side only) |
 | `/loominary revert [all]` | Restore previewed maps to their real colors |
 
 ## Placement & automation

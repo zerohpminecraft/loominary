@@ -1,6 +1,6 @@
 # Installation
 
-Loominary is **client-side only** — you install it in your own game and it works everywhere: singleplayer, Realms, and any multiplayer server where you can place blocks.
+Loominary is **client-side only**. You install it in your own game and it works everywhere: singleplayer, Realms, and any multiplayer server where you can place blocks.
 
 ## Requirements
 
@@ -17,21 +17,21 @@ Loominary is **client-side only** — you install it in your own game and it wor
 2. Drop it into your `mods/` folder alongside [Fabric API](https://modrinth.com/mod/fabric-api).
 3. Launch the game. You'll see `[Loominary] Client-side mod initialized successfully!` in the log.
 
-That's it — the mod is passive until you use a `/loominary` command or walk near encoded map art.
+There is nothing to configure; the mod stays passive until you use a `/loominary` command or walk near encoded map art.
 
 ## Install Litematica (recommended)
 
-Carpet-based art (the default and best mode) is placed as a **[Litematica](https://modrinth.com/mod/litematica)** schematic — the web editor exports a `.litematic` file with the exact carpet layout. Install Litematica and its dependency [MaLiLib](https://modrinth.com/mod/malilib) to see a ghost preview of where every carpet goes.
+Carpet-based art (the default and best mode) is placed as a **[Litematica](https://modrinth.com/mod/litematica)** schematic. The web editor exports a `.litematic` file with the exact carpet layout, so install Litematica and its dependency [MaLiLib](https://modrinth.com/mod/malilib) to see a ghost preview of where every carpet goes.
 
 ## Optional: the printer, for hands-free building
 
-If you want `/loominary walk print` to **place all the carpets for you** (see [Autonomous Printing](Autonomous-Printing)), you also need a Litematica printer build — the commonly used fork is **[IceTank's litematica-printer](https://github.com/IceTank/litematica-printer)**. Loominary toggles it automatically while printing; you never interact with it directly.
+If you want `/loominary walk print` to place all the carpets for you (see [Autonomous Printing](Autonomous-Printing)), you also need a Litematica printer build. The commonly used fork is **[IceTank's litematica-printer](https://github.com/IceTank/litematica-printer)**. Loominary toggles it automatically while printing; you never interact with it directly.
 
-Without a printer you can still place carpets by hand from the Litematica ghost preview — it's just slower.
+Without a printer you can still place carpets by hand from the Litematica ghost preview, just more slowly.
 
 ## The web editor needs no installation
 
-All image editing happens at **https://zerohpminecraft.github.io/loominary/** — it runs entirely in your browser (nothing is uploaded anywhere; the encoding is done locally). Bookmark it; it's the first stop of every workflow.
+All image editing happens at **https://zerohpminecraft.github.io/loominary/**, which runs entirely in your browser (nothing is uploaded anywhere; the encoding is done locally). Bookmark it; it's the first stop of every workflow.
 
 ## Next step
 

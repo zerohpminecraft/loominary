@@ -175,13 +175,6 @@ public class LoominaryCommand {
         return Zstd.compress(data, level);
     }
 
-    private static final ExecutorService SAVE_EXECUTOR = Executors.newFixedThreadPool(2, r -> {
-        Thread t = new Thread(r, "loominary-save");
-        t.setDaemon(true);
-        return t;
-    });
-    /** Non-zero while async editor saves are in flight; blocks /loominary edit re-entry. */
-    public static final AtomicInteger pendingSaves = new AtomicInteger(0);
     // Carpet budget in "chunks" units so reduceToFit can use the same path.
     // Legacy LC/LS format (MAX_TOTAL_BYTES):
     private static final int MAX_CHUNKS_CARPET =
@@ -552,7 +545,7 @@ public class LoominaryCommand {
     }
 
     /**
-     * Called by {@code MapEditorScreen} on close when the tile is dirty.
+     * Re-encodes a tile's frames back into its payload chunks.
      * Handles both carpet and banner encoding, and multi-frame animated tiles.
      * {@code editorDelays} may be null to use the delays stored in the tile.
      */
@@ -647,151 +640,6 @@ public class LoominaryCommand {
 
     public static void saveEditorChanges(byte[] mapColors, int tileIdx, String playerName) {
         saveEditorChanges(new byte[][]{mapColors}, null, tileIdx, playerName);
-    }
-
-    /**
-     * Off-render-thread variant used by {@code MapEditorScreen.close()}.
-     * Snapshots everything on the calling thread, dispatches compression to
-     * {@link #SAVE_EXECUTOR}, then applies results back via {@code mc.execute()}.
-     * Increments {@link #pendingSaves} before dispatch; decrements in the callback
-     * and calls {@link PayloadState#save()} when it reaches zero.
-     * The caller must clear mux state before calling this method.
-     */
-    public static void saveEditorChangesAsync(byte[][] allFrames, int[] editorDelays,
-            int tileIdx, String playerName) {
-        if (PayloadState.tiles.isEmpty() || tileIdx >= PayloadState.tiles.size()) return;
-        MinecraftClient mc = MinecraftClient.getInstance();
-
-        // Snapshot all main-thread state before going off-thread.
-        int frameCount = allFrames.length;
-        byte[][] framesCopy = new byte[frameCount][];
-        for (int f = 0; f < frameCount; f++) framesCopy[f] = allFrames[f].clone();
-
-        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-        boolean carpetEncoded = tile.carpetEncoded;
-        int nonce = tile.nonce;
-        int flags = PayloadState.allShades ? PayloadManifest.FLAG_ALL_SHADES : 0;
-        int gridCols = PayloadState.gridColumns;
-        int gridRows = PayloadState.gridRows;
-        int col = PayloadState.tileCol(tileIdx);
-        int row = PayloadState.tileRow(tileIdx);
-        String title = PayloadState.currentTitle;
-        int activeTileIdx = PayloadState.activeTileIndex;
-
-        final int[] delays;
-        if (editorDelays != null && editorDelays.length == frameCount) {
-            delays = editorDelays.clone();
-        } else if (tile.frameDelays != null && !tile.frameDelays.isEmpty()) {
-            delays = tile.frameDelays.stream().mapToInt(Integer::intValue).toArray();
-        } else {
-            delays = new int[frameCount];
-            Arrays.fill(delays, 100);
-        }
-
-        pendingSaves.incrementAndGet();
-
-        SAVE_EXECUTOR.execute(() -> {
-            try {
-                byte[] payloadBytes = new byte[frameCount * MAP_BYTES];
-                for (int f = 0; f < frameCount; f++)
-                    System.arraycopy(framesCopy[f], 0, payloadBytes, f * MAP_BYTES, MAP_BYTES);
-
-                final byte[] manifest;
-                if (frameCount > 1) {
-                    manifest = PayloadManifest.toBytes(flags | PayloadManifest.FLAG_ANIMATED,
-                            gridCols, gridRows, col, row,
-                            PayloadManifest.crc32(framesCopy[0]),
-                            playerName, title, nonce, frameCount, 0, delays);
-                } else {
-                    manifest = PayloadManifest.toBytes(flags,
-                            gridCols, gridRows, col, row,
-                            PayloadManifest.crc32(framesCopy[0]),
-                            playerName, title, nonce);
-                }
-
-                // Append v5 trailing delay table (empty for v4/global-delay manifests).
-                byte[] effectivePayload = PayloadManifest.withTrailing(manifest, delays, payloadBytes);
-
-                final List<String> allChunks;
-                final String newCarpetB64;
-                final boolean newLoomEncoded;
-                if (carpetEncoded) {
-                    CarpetEncoding enc = buildCarpetEncoding(manifest, effectivePayload, col, row);
-                    allChunks = enc.allChunks();
-                    newCarpetB64 = Base64.getEncoder().encodeToString(enc.compressed());
-                    newLoomEncoded = (enc.headerChunk() == null);
-                } else {
-                    allChunks = buildChunks(manifest, effectivePayload);
-                    newCarpetB64 = null;
-                    newLoomEncoded = false;
-                }
-
-                mc.execute(() -> {
-                    if (tileIdx >= PayloadState.tiles.size()) {
-                        if (pendingSaves.decrementAndGet() == 0) PayloadState.save();
-                        return;
-                    }
-                    PayloadState.TileData t = PayloadState.tiles.get(tileIdx);
-                    t.chunks.clear();
-                    t.chunks.addAll(allChunks);
-                    t.currentIndex = 0;
-                    if (frameCount > 1) {
-                        t.frameCount = frameCount;
-                        t.frameDelays = new ArrayList<>();
-                        for (int d : delays) t.frameDelays.add(d);
-                    } else {
-                        t.frameCount = 1;
-                        t.frameDelays = null;
-                    }
-                    if (carpetEncoded && newCarpetB64 != null) {
-                        t.carpetCompressedB64 = newCarpetB64;
-                        t.loomEncoded = newLoomEncoded;
-                    }
-                    if (tileIdx == activeTileIdx) {
-                        PayloadState.ACTIVE_CHUNKS.clear();
-                        PayloadState.ACTIVE_CHUNKS.addAll(allChunks);
-                        PayloadState.activeChunkIndex = 0;
-                    }
-                    if (pendingSaves.decrementAndGet() == 0) PayloadState.save();
-
-                    if (mc.player != null) {
-                        String saveMsg;
-                        if (carpetEncoded && newCarpetB64 != null) {
-                            int bytes = Base64.getDecoder().decode(newCarpetB64).length;
-                            saveMsg = String.format("§aSaved %s — %d bytes.",
-                                    PayloadState.tileLabel(tileIdx), bytes);
-                        } else {
-                            List<String> saved = tileIdx == activeTileIdx
-                                    ? PayloadState.ACTIVE_CHUNKS : PayloadState.tiles.get(tileIdx).chunks;
-                            saveMsg = String.format("§aSaved %s — %d banner%s.",
-                                    PayloadState.tileLabel(tileIdx),
-                                    saved.size(), saved.size() == 1 ? "" : "s");
-                        }
-                        mc.player.sendMessage(Text.literal(saveMsg), false);
-                    }
-
-                    if (carpetEncoded && newCarpetB64 != null && mc.player != null) {
-                        byte[] dec = Base64.getDecoder().decode(newCarpetB64);
-                        int maxCap = newLoomEncoded
-                                ? maxBytesForMode(PayloadState.codecMode)
-                                : CarpetChannel.MAX_TOTAL_BYTES;
-                        if (dec.length > maxCap) {
-                            mc.player.sendMessage(Text.literal(String.format(
-                                    "§e⚠ Changes saved but tile is over budget (%d/%d bytes). " +
-                                    "Use §f/loominary reduce§e to compress further.",
-                                    dec.length, maxCap)), false);
-                        }
-                    }
-                });
-            } catch (Exception e) {
-                mc.execute(() -> {
-                    if (mc.player != null)
-                        mc.player.sendMessage(Text.literal("§cEditor save failed: " + e.getMessage()), false);
-                    System.err.println("[Loominary] Editor save failed: " + e.getMessage());
-                    if (pendingSaves.decrementAndGet() == 0) PayloadState.save();
-                });
-            }
-        });
     }
 
     /** Decodes map-color bytes for any tile (carpet or banner). */
@@ -1269,20 +1117,6 @@ public class LoominaryCommand {
     private static PngToMapColors.MatchMetric requantizeMetric = PngToMapColors.MatchMetric.OKLAB;
     /** Dither algorithm used by /loominary requantize. */
     private static PngToMapColors.DitherAlgo requantizeDitherAlgo = PngToMapColors.DitherAlgo.NONE;
-
-    /** Returns true if the tile's current encoded data exceeds its channel's budget. */
-    public static boolean isTileOverBudget(int tileIdx) {
-        if (tileIdx >= PayloadState.tiles.size()) return false;
-        PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-        if (tile.carpetEncoded) {
-            if (tile.carpetCompressedB64 == null) return false;
-            return Base64.getDecoder().decode(tile.carpetCompressedB64).length
-                    > maxBytesForTile(tile);
-        }
-        List<String> chunks = (tileIdx == PayloadState.activeTileIndex)
-                ? PayloadState.ACTIVE_CHUNKS : tile.chunks;
-        return chunks.size() > MAX_CHUNKS;
-    }
 
     /**
      * Captures the current chunk state for a tile into the pre-reduction undo cache.
@@ -1762,10 +1596,6 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.argument("name", StringArgumentType.string())
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
-
-                            // ── edit ───────────────────────────────────────────
-                            .then(ClientCommandManager.literal("edit")
-                                    .executes(ctx -> edit(ctx.getSource())))
 
                             // ── dither ─────────────────────────────────────────
                             .then(ClientCommandManager.literal("dither")
@@ -5326,40 +5156,6 @@ public class LoominaryCommand {
             source.sendFeedback(Text.literal(summary));
         }
         return 1;
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // edit
-    // ════════════════════════════════════════════════════════════════════
-
-    private static int edit(FabricClientCommandSource source) {
-        if (PayloadState.tiles.isEmpty()) {
-            source.sendError(Text.literal(
-                    "§cNo active batch. Run §f/loominary import§c first."));
-            return 0;
-        }
-        if (!activeTileHasContent()) {
-            source.sendError(Text.literal("§cActive tile has no data to edit."));
-            return 0;
-        }
-        if (pendingSaves.get() > 0) {
-            source.sendError(Text.literal("§cEditor save in progress — please wait a moment."));
-            return 0;
-        }
-        try {
-            int tileIdx = PayloadState.activeTileIndex;
-            PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
-            byte[][] frames = resolveAllFramesForTile(tile, PayloadState.ACTIVE_CHUNKS);
-            String label = PayloadState.tileLabel(tileIdx);
-
-            MinecraftClient.getInstance().send(() ->
-                    MinecraftClient.getInstance().setScreen(
-                            new net.zerohpminecraft.MapEditorScreen(frames, tileIdx, label)));
-            return 1;
-        } catch (Exception e) {
-            source.sendError(Text.literal("§cFailed to decode tile: " + e.getMessage()));
-            return 0;
-        }
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -32,7 +32,6 @@ public class LoominaryKeybindings {
     private static KeyBinding keyTileNext;
     private static KeyBinding keyTilePrev;
     private static KeyBinding keyStatus;
-    private static KeyBinding keyEdit;
     private static KeyBinding keyDecodeToggle;
     private static KeyBinding keyCarpetBalance;
     private static KeyBinding keyCarpetFill;
@@ -46,7 +45,6 @@ public class LoominaryKeybindings {
         keyTileNext     = registerUnbound("key.loominary.tile_next");
         keyTilePrev     = registerUnbound("key.loominary.tile_prev");
         keyStatus       = registerUnbound("key.loominary.status");
-        keyEdit         = registerUnbound("key.loominary.edit");
         keyDecodeToggle = registerUnbound("key.loominary.decode_toggle");
         keyCarpetBalance = registerUnbound("key.loominary.carpet_balance");
         keyCarpetFill    = registerUnbound("key.loominary.carpet_fill");
@@ -75,7 +73,6 @@ public class LoominaryKeybindings {
         while (keyTileNext.wasPressed())     runCommand(client, "loominary tile next");
         while (keyTilePrev.wasPressed())     runCommand(client, "loominary tile prev");
         while (keyStatus.wasPressed())       runCommand(client, "loominary status");
-        while (keyEdit.wasPressed())         runCommand(client, "loominary edit");
         while (keyDecodeToggle.wasPressed()) MapBannerDecoder.toggle(client);
         while (keyCarpetBalance.wasPressed()) runCommand(client, "loominary carpets balance");
         while (keyCarpetFill.wasPressed())    runCommand(client, "loominary carpets fill");

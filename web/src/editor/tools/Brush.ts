@@ -35,7 +35,7 @@ export class BrushTool implements Tool {
     if (button === 0) {
       // Initial press — snapshot before first write
       if (!this.dragging) {
-        ctx.history.snapshot(ctx.comp.frames);
+        ctx.history.snapshot(ctx.comp.frames, ctx.comp.rgbFrames);
         this.dragging  = true;
         this.dragColor = ctx.activeColor;
       }

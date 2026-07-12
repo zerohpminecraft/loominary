@@ -10,7 +10,7 @@ import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { SchematicViewer3D } from '../SchematicViewer3D.js';
 
 import type { CompositionState, PayloadState } from '../payload-state.js';
-import { downloadState, emptyTileData }  from '../payload-state.js';
+import { downloadState, emptyTileData, isSrgb }  from '../payload-state.js';
 import { encodeComposition, assemblePayloadState, compositeEligible } from '../encode.js';
 import { encodeTileAsync, cancelEncodes, computeCompositionAsync } from '../av1/encodeClient.js';
 import type { ComputeResult } from '../av1/computeExport.js';
@@ -107,6 +107,31 @@ function breakdown(bytes: number, codec: CodecMode): ChannelBreakdown {
     if (overflowBytes) overflowBanners = Math.ceil((overflowBytes + 2) / 84);
   }
   return { carpetBytes, shadeBytes, overflowBytes, overflowBanners, bannerCount:0, fits };
+}
+
+// ─── sRGB preview composition ─────────────────────────────────────────────────
+
+/** Compose per-tile packed-RGB buffers (128·128·3 each) into one grid-sized ImageData. */
+function rgbTilesToImageData(
+  tiles: (Uint8Array | null | undefined)[], gridCols: number, gridRows: number,
+): ImageData {
+  const W = gridCols * 128, H = gridRows * 128;
+  const img = new ImageData(W, H);
+  const d = img.data;
+  for (let ti = 0; ti < gridCols * gridRows; ti++) {
+    const rgb = tiles[ti];
+    if (!rgb) continue;
+    const ox = (ti % gridCols) * 128, oy = Math.floor(ti / gridCols) * 128;
+    for (let y = 0; y < 128; y++) {
+      let src = y * 128 * 3;
+      let dst = ((oy + y) * W + ox) * 4;
+      for (let x = 0; x < 128; x++) {
+        d[dst] = rgb[src]; d[dst + 1] = rgb[src + 1]; d[dst + 2] = rgb[src + 2]; d[dst + 3] = 255;
+        src += 3; dst += 4;
+      }
+    }
+  }
+  return img;
 }
 
 // ─── ZIP builder (STORE method — no external deps) ───────────────────────────
@@ -323,6 +348,9 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
 
   const maxF       = Math.max(...comp.frames.map(t => t.length), 1);
   const isAnimated = maxF > 1;
+  // sRGB comps ALWAYS encode as an AV1 colour stream — there is no lossless/raw alternative,
+  // so the quality slider is always live and lossyQuality is always passed to compute/encode.
+  const srgb       = isSrgb(comp);
   // Large animations are slow to encode — defer until the user picks a mode (see statsRequested).
   const heavyAnim  = maxF > 60;
   // Stable identity of the frame CONTENT — cache/idempotency keys off this, not the `comp` object
@@ -332,10 +360,10 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const [statsRequested, setStatsRequested] = useState(!(maxF > 60));
 
   // Refs for export metadata so computeStats can read them without closure-dep issues
-  const exportMetaRef = useRef({ title, author, nonce, lossyQuality: null as number | null });
+  const exportMetaRef = useRef({ title, author, nonce, lossyQuality: srgb ? lossyQuantizer : null as number | null });
   useEffect(() => {
-    exportMetaRef.current = { title, author, nonce, lossyQuality: lossyOn && isAnimated ? lossyQuantizer : null };
-  }, [title, author, nonce, lossyOn, lossyQuantizer, isAnimated]);
+    exportMetaRef.current = { title, author, nonce, lossyQuality: srgb ? lossyQuantizer : lossyOn && isAnimated ? lossyQuantizer : null };
+  }, [title, author, nonce, lossyOn, lossyQuantizer, isAnimated, srgb]);
 
   // Budget warning dialog
   const [budgetWarnLabel,  setBudgetWarnLabel]  = useState<string | null>(null);
@@ -347,6 +375,9 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   const [previewKind, setPreviewKind] = useState<'video' | 'image'>('video');
   const previewUrlRef = useRef<string | null>(null);
   const [lossyFidelity, setLossyFidelity] = useState<number | null>(null); // fraction of pixels changed
+  // sRGB mode: perceptual fidelity (ΔE/PSNR) + decoded frame-0 truth for the static preview.
+  const [srgbFidelity, setSrgbFidelity] = useState<{ meanDeltaE: number; psnrDb: number } | null>(null);
+  const [srgbPreview,  setSrgbPreview]  = useState<Uint8Array[] | null>(null);
   const [show3D,  setShow3D]  = useState(false);
   const [expandedTiles, setExpandedTiles] = useState<Set<number>>(() => new Set());
 
@@ -388,10 +419,17 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   useEffect(() => {
     if (isAnimated && previewUrl) return; // the <video>/<img> is showing instead
     const canvas = canvasRef.current; if (!canvas) return;
-    const imgData = mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
+    // sRGB: the truthful preview is the DECODED frame-0 truth from the compute pass; until the
+    // compute lands, fall back to the source rgbFrames (never the nearest-palette twin).
+    const imgData = srgb
+      ? rgbTilesToImageData(
+          srgbPreview ?? Array.from({ length: comp.gridCols * comp.gridRows },
+            (_, ti) => comp.rgbFrames![ti]?.[comp.activeFrame] ?? comp.rgbFrames![ti]?.[0]),
+          comp.gridCols, comp.gridRows)
+      : mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
     canvas.width = imgData.width; canvas.height = imgData.height;
     canvas.getContext('2d')!.putImageData(imgData, 0, 0);
-  }, [comp, isAnimated, show3D, previewUrl]);
+  }, [comp, isAnimated, show3D, previewUrl, srgb, srgbPreview]);
 
   // ── Compute: one off-thread pass that encodes every tile AND builds the preview from that same
   // encode (no duplicated work), keyed/cached by mode+quality so metadata edits reuse it instantly.
@@ -406,6 +444,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   useEffect(() => {
     computeCacheRef.current = null; computedKeyRef.current = null;
     setComputedKey(null); setTileStats(null);
+    setSrgbFidelity(null); setSrgbPreview(null);
   }, [framesSig]);
 
   // Supersede guard: each run bumps this; a stale run (superseded by a newer settings change) stops
@@ -414,7 +453,8 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
 
   // Signature of the settings that affect the encode (mode + quality).  A recompute is only
   // meaningful when this differs from what's displayed.
-  const currentKey = lossyOn && isAnimated ? `lossy:${lossyQuantizer}` : 'lossless';
+  const currentKey = srgb ? `srgb:${lossyQuantizer}`
+    : lossyOn && isAnimated ? `lossy:${lossyQuantizer}` : 'lossless';
   const statsStale = statsRequested && !statsComputing && computedKey != null && computedKey !== currentKey;
 
   const showPreview = useCallback((bytes: Uint8Array | null, mime: string | null) => {
@@ -442,8 +482,8 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     const t = (rawT || '').trim() || null;
     const a = (rawA || '').trim() || null;
     const nz = n ? 1 : 0;
-    const cacheKey = lq == null ? 'lossless' : `lossy:${lq}`;
-    const label = lq == null ? 'lossless AV1' : 'lossy AV1';
+    const cacheKey = srgb ? `srgb:${lq}` : lq == null ? 'lossless' : `lossy:${lq}`;
+    const label = srgb ? 'sRGB AV1' : lq == null ? 'lossless AV1' : 'lossy AV1';
     const heavy = maxF > 60;
 
     // Idempotent: if the displayed stats already reflect this exact mode+quality, do nothing.
@@ -499,6 +539,8 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
     setTileStats(stats);
     setMuxAlloc(null); setMuxCodec(null); setExtraDonors(0);
     setLossyFidelity(result.changedFrac);
+    setSrgbFidelity(result.fidelity ?? null);
+    setSrgbPreview(result.srgbPreviewRgb ?? null);
     showPreview(result.previewBytes, result.previewMime);
     computedKeyRef.current = cacheKey; setComputedKey(cacheKey);
     setStatsComputing(false); setStatsProg(null); setExportProg(null);
@@ -620,27 +662,31 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
   async function encodeAndMux(nonceVal: number, skipEncrypt = false):
       Promise<{ ps: PayloadState; alloc: MuxAllocation | null; donors: number }> {
     setExportProg({ label: 'Encoding', done: 0, total: 1 });
-    const eqLossy = lossyOn && isAnimated ? lossyQuantizer : null;
+    // sRGB always encodes as an AV1 colour stream — lossyQuality is always the slider's quantizer.
+    const eqLossy = srgb ? lossyQuantizer : lossyOn && isAnimated ? lossyQuantizer : null;
     const opts = { title: title.trim(), author: author.trim(), nonce: nonceVal, whitelist: [], codecMode: codec, lossyQuality: eqLossy };
 
     // Reuse the compute result when it was produced with the SAME frames/metadata/nonce/mode — no
     // second encode (only possible with resalt off, where the stats nonce == the export nonce).
     const cache = computeCacheRef.current;
-    const cacheKey = eqLossy == null ? 'lossless' : `lossy:${eqLossy}`;
+    const cacheKey = srgb ? `srgb:${eqLossy}` : eqLossy == null ? 'lossless' : `lossy:${eqLossy}`;
     const canReuse = !!cache && cache.key === cacheKey && nonceVal === cache.meta.nonce
       && (title.trim() || null) === cache.meta.title && (author.trim() || null) === cache.meta.author;
 
     let ps;
     if (canReuse) {
       ps = assemblePayloadState(comp, opts, cache!.result.tiles);
-    } else if (eqLossy != null && compositeEligible(comp.frames, comp.gridCols * comp.gridRows)) {
+    } else if (srgb || (eqLossy != null && compositeEligible(comp.frames, comp.gridCols * comp.gridRows))) {
       // Composition-wide lossy runs as ONE encode over the whole grid (seamless across tiles);
       // it doesn't fit the per-tile hooks below, so it goes through the worker's compute path.
+      // sRGB comps also route here: computeComposition handles them internally (worker gets
+      // rgbFrames via structured clone) and returns per-tile payloads for assembly.
+      const encLabel = srgb ? 'sRGB AV1' : 'composite lossy AV1';
       const result = await computeCompositionAsync(
         comp, { author: opts.author, title: opts.title, nonce: nonceVal, lossyQuality: eqLossy },
         p => {
           const step = p.phase === 'decode' ? 'Decoding' : p.phase === 'preview' ? 'Finishing' : 'Encoding';
-          setExportProg({ label: `${step} composite lossy AV1 — ${Math.round(100 * p.frameDone / Math.max(1, p.frameTotal))}%`, done: p.frameDone, total: Math.max(1, p.frameTotal) });
+          setExportProg({ label: `${step} ${encLabel} — ${Math.round(100 * p.frameDone / Math.max(1, p.frameTotal))}%`, done: p.frameDone, total: Math.max(1, p.frameTotal) });
         },
       );
       ps = assemblePayloadState(comp, opts, result.tiles);
@@ -806,7 +852,14 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         }
       } else {
         setStatus('Building ZIP… rendering preview');
-        const imgData = mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
+        // sRGB: render the decoded truth (or source rgbFrames) — never the nearest-palette twin.
+        const srgbTiles = srgb
+          ? (computeCacheRef.current?.result.srgbPreviewRgb
+             ?? Array.from({ length: comp.gridCols * comp.gridRows }, (_, ti) => comp.rgbFrames![ti]?.[0]))
+          : null;
+        const imgData = srgbTiles
+          ? rgbTilesToImageData(srgbTiles, comp.gridCols, comp.gridRows)
+          : mapBytesToImageData(comp.frames, comp.activeFrame, comp.gridCols, comp.gridRows);
         const oscS = new OffscreenCanvas(imgData.width, imgData.height);
         oscS.getContext('2d')!.putImageData(imgData, 0, 0);
         const osc  = new OffscreenCanvas(imgData.width * 4, imgData.height * 4);
@@ -884,25 +937,36 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
         borderRight:'1px solid #333', padding:'14px 12px',
         display:'flex', flexDirection:'column', gap:10, overflowY:'auto',
       }}>
-        {/* ── Prominent: lossy animation (animated art only) ── */}
-        {isAnimated && (
+        {/* ── Prominent: lossy animation (animated art) / sRGB quality (always-on) ── */}
+        {(isAnimated || srgb) && (
           <div style={{
-            border:`1px solid ${lossyOn ? '#4a9eff' : '#3a3a3a'}`, borderRadius:6,
-            background: lossyOn ? 'rgba(74,158,255,0.08)' : '#242424', padding:'10px 12px',
+            border:`1px solid ${srgb || lossyOn ? '#4a9eff' : '#3a3a3a'}`, borderRadius:6,
+            background: srgb || lossyOn ? 'rgba(74,158,255,0.08)' : '#242424', padding:'10px 12px',
           }}>
-            <label style={{ display:'flex', alignItems:'flex-start', gap:8, cursor:'pointer' }}
-              title="Encodes the animation as lossy AV1 colour video and re-quantises to the palette on decode. Much smaller, but the in-game art is a close approximation, not byte-identical.">
-              <input type="checkbox" checked={lossyOn} onChange={e => setLossyOn((e.target as HTMLInputElement).checked)}
-                style={{ marginTop:2 }} />
-              <div>
-                <div style={{ fontSize:'0.72em', fontWeight:600, color:'#dfe8ff' }}>⚡ Lossy animation — much smaller</div>
+            {srgb ? (
+              <div title="Full-colour art is always stored as an AV1 colour stream — there is no lossless alternative. The quality slider trades payload size against colour accuracy; the preview at right shows the exact in-game result.">
+                <div style={{ fontSize:'0.72em', fontWeight:600, color:'#dfe8ff' }}>Full color (sRGB) — AV1</div>
                 <div style={{ fontSize:'0.58em', color:'#8a94a6', marginTop:2 }}>
-                  Recommended for large/detailed animations. Trades byte-exact art for a far smaller
-                  payload (fewer tiles to place). The preview at right shows the exact in-game result.
+                  True-colour art always encodes as an AV1 colour stream. Adjust quality to trade
+                  payload size against colour accuracy — the preview at right shows the exact
+                  in-game result.
                 </div>
               </div>
-            </label>
-            {lossyOn && (
+            ) : (
+              <label style={{ display:'flex', alignItems:'flex-start', gap:8, cursor:'pointer' }}
+                title="Encodes the animation as lossy AV1 colour video and re-quantises to the palette on decode. Much smaller, but the in-game art is a close approximation, not byte-identical.">
+                <input type="checkbox" checked={lossyOn} onChange={e => setLossyOn((e.target as HTMLInputElement).checked)}
+                  style={{ marginTop:2 }} />
+                <div>
+                  <div style={{ fontSize:'0.72em', fontWeight:600, color:'#dfe8ff' }}>⚡ Lossy animation — much smaller</div>
+                  <div style={{ fontSize:'0.58em', color:'#8a94a6', marginTop:2 }}>
+                    Recommended for large/detailed animations. Trades byte-exact art for a far smaller
+                    payload (fewer tiles to place). The preview at right shows the exact in-game result.
+                  </div>
+                </div>
+              </label>
+            )}
+            {(srgb || lossyOn) && (
               <div style={{ marginTop:8 }}>
                 <div style={{ display:'flex', alignItems:'center', gap:8 }}>
                   <span style={{ fontSize:'0.58em', color:'#9aa' }}>Quality</span>
@@ -911,12 +975,16 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
                     style={{ flex:1 }} />
                   <span style={{ fontSize:'0.58em', color:'#9aa', width:28, textAlign:'right' }}>{lossyQuality}</span>
                 </div>
-                {lossyFidelity != null && (
+                {srgb ? (srgbFidelity != null && (
+                  <div style={{ fontSize:'0.55em', color:'#777', marginTop:3 }}>
+                    avg color error ΔE ≈ {srgbFidelity.meanDeltaE.toFixed(3)} · PSNR {srgbFidelity.psnrDb.toFixed(1)} dB
+                  </div>
+                )) : (lossyFidelity != null && (
                   <div style={{ fontSize:'0.55em', color:'#777', marginTop:3 }}>
                     ≈{(lossyFidelity * 100).toFixed(1)}% of pixels differ from the original
                     (many are invisible dither shifts — trust the preview).
                   </div>
-                )}
+                ))}
               </div>
             )}
             {statsStale && (
@@ -924,7 +992,7 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
                 <button onClick={requestCompute}
                   style={{ fontSize:'0.62em', padding:'7px 14px', borderRadius:4, cursor:'pointer',
                     background:'#2b6cb0', color:'#fff', border:'1px solid #3a7bc0', fontWeight:600, width:'100%' }}>
-                  ↻ Recompute at {lossyOn ? `quality ${lossyQuality}` : 'lossless'}
+                  ↻ Recompute at {srgb || lossyOn ? `quality ${lossyQuality}` : 'lossless'}
                 </button>
                 <div style={{ fontSize:'0.52em', color:'#888', marginTop:3, textAlign:'center' }}>
                   Sizes below reflect your previous setting until you recompute.
@@ -1161,21 +1229,28 @@ export function ExportPage({ comp, onBack, uiFontSize = 19 }: ExportPageProps) {
               <div style={{ fontSize:'0.72em', color:'#dfe8ff', fontWeight:600, marginBottom:6 }}>
                 Large animation — {maxF.toLocaleString()} frames
               </div>
-              <div style={{ fontSize:'0.6em', color:'#9aa', lineHeight:1.5, marginBottom:10 }}>
-                Encoding this many frames takes a while, so pick a mode first rather than waiting on
-                one you may not want:
-                <ul style={{ margin:'6px 0 0', paddingLeft:16 }}>
-                  <li><b>Lossless</b> (leave the toggle off): art is byte-exact, but the payload can be
-                    large — more tiles to place. Slower to encode.</li>
-                  <li><b>Lossy</b> (toggle top-left): a close approximation, typically far smaller —
-                    fewer tiles. Adjust the quality slider to taste.</li>
-                </ul>
-              </div>
+              {srgb ? (
+                <div style={{ fontSize:'0.6em', color:'#9aa', lineHeight:1.5, marginBottom:10 }}>
+                  Encoding this many frames takes a while. Full-colour art always encodes as an
+                  AV1 colour stream — set the quality slider (top-left) to taste before computing.
+                </div>
+              ) : (
+                <div style={{ fontSize:'0.6em', color:'#9aa', lineHeight:1.5, marginBottom:10 }}>
+                  Encoding this many frames takes a while, so pick a mode first rather than waiting on
+                  one you may not want:
+                  <ul style={{ margin:'6px 0 0', paddingLeft:16 }}>
+                    <li><b>Lossless</b> (leave the toggle off): art is byte-exact, but the payload can be
+                      large — more tiles to place. Slower to encode.</li>
+                    <li><b>Lossy</b> (toggle top-left): a close approximation, typically far smaller —
+                      fewer tiles. Adjust the quality slider to taste.</li>
+                  </ul>
+                </div>
+              )}
               <button
                 onClick={requestCompute}
                 style={{ fontSize:'0.62em', padding:'7px 14px', borderRadius:4, cursor:'pointer',
                   background:'#2b6cb0', color:'#fff', border:'1px solid #3a7bc0', fontWeight:600 }}>
-                Compute sizes {lossyOn ? '(lossy)' : '(lossless)'}
+                Compute sizes {srgb ? `(sRGB, quality ${lossyQuality})` : lossyOn ? '(lossy)' : '(lossless)'}
               </button>
             </div>
           )}

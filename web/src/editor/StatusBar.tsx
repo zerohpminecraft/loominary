@@ -10,7 +10,7 @@ interface StatusBarProps {
   comp:           CompositionState;
   cursorGx:       number;
   cursorGy:       number;
-  hoverColor:     number;  // map byte under cursor
+  hoverColor:     number;  // map byte under cursor (packed 0xRRGGBB in sRGB mode)
   activeColor:    number;
   activeTool:     string;
   scale:          number;
@@ -21,11 +21,19 @@ interface StatusBarProps {
   distinctCount:  number;
   inPreview:      boolean;
   mergeQueueSize: number;
+  /** True when the comp is in sRGB mode — colour values are packed 0xRRGGBB. */
+  srgb?:          boolean;
+}
+
+/** Packed 0xRRGGBB → "#RRGGBB". */
+function hex6(rgb: number): string {
+  return '#' + rgb.toString(16).padStart(6, '0').toUpperCase();
 }
 
 export function StatusBar({
   comp, cursorGx, cursorGy, hoverColor, activeColor, activeTool, scale,
   canUndo, canRedo, maxFrames, frameDelay, distinctCount, inPreview, mergeQueueSize,
+  srgb = false,
 }: StatusBarProps) {
   const inBounds = cursorGx >= 0 && cursorGy >= 0
     && cursorGx < comp.gridCols * 128
@@ -36,12 +44,13 @@ export function StatusBar({
   const lx      = inBounds ? cursorGx % 128 : -1;
   const ly      = inBounds ? cursorGy % 128 : -1;
 
-  const hoverRgb = MC_PALETTE[hoverColor] ?? 0;
+  // In sRGB mode the colour values ARE the packed RGB; otherwise look up the palette.
+  const hoverRgb = srgb ? hoverColor : MC_PALETTE[hoverColor] ?? 0;
   const hr = (hoverRgb >> 16) & 0xff;
   const hg = (hoverRgb >>  8) & 0xff;
   const hb =  hoverRgb        & 0xff;
 
-  const activeRgb = MC_PALETTE[activeColor] ?? 0;
+  const activeRgb = srgb ? activeColor : MC_PALETTE[activeColor] ?? 0;
   const ar = (activeRgb >> 16) & 0xff;
   const ag = (activeRgb >>  8) & 0xff;
   const ab =  activeRgb        & 0xff;
@@ -71,15 +80,15 @@ export function StatusBar({
       <Sep />
 
       {/* Hover colour */}
-      {inBounds && hoverColor > 0 && (
+      {inBounds && (srgb || hoverColor > 0) && (
         <>
-          <ColorChip r={hr} g={hg} b={hb} label={`byte ${hoverColor}`} />
+          <ColorChip r={hr} g={hg} b={hb} label={srgb ? hex6(hoverColor) : `byte ${hoverColor}`} />
           <Sep />
         </>
       )}
 
       {/* Active colour */}
-      <ColorChip r={ar} g={ag} b={ab} label={`fg ${activeColor}`} />
+      <ColorChip r={ar} g={ag} b={ab} label={srgb ? `fg ${hex6(activeColor)}` : `fg ${activeColor}`} />
       <Sep />
 
       {/* Distinct color count */}

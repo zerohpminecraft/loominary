@@ -14,16 +14,18 @@
 import { compress }    from './compression.js';
 import { buildChunks } from './cjk-codec.js';
 import {
-  toBytesV2, toBytesAnimated, crc32,
-  FLAG_ALL_SHADES, FLAG_ANIMATED, FLAG_AV1, FLAG_AV1_LOSSY, FLAG_AV1_COMPOSITE,
+  toBytesV2, toBytesAnimated, toBytesV7, crc32,
+  FLAG_ALL_SHADES, FLAG_ANIMATED, FLAG_AV1, FLAG_AV1_LOSSY, FLAG_AV1_COMPOSITE, FLAG2_SRGB,
 } from './manifest.js';
-import { encodeLosslessMono, encodeLossyColor, decodeLossyColor } from './av1/codec.js';
+import { encodeLosslessMono, encodeLossyColor, decodeLossyColor, encodeLossyRgb, decodeLossyRgb } from './av1/codec.js';
 import {
-  emptyTileData, emptyPayloadState,
+  emptyTileData, emptyPayloadState, isSrgb,
   type TileData, type PayloadState,
 } from './payload-state.js';
 import type { CodecMode } from './codec-mode.js';
 import type { CompositionState } from './payload-state.js';
+
+const RGB_TILE_BYTES = 128 * 128 * 3; // 49 152
 
 const MAP_BYTES = 128 * 128; // 16 384
 
@@ -57,6 +59,8 @@ export interface TilePayload {
   /** The raw lossy AV1 temporal-unit stream (when lossy chosen) — mux it to MP4 for a
    *  zero-re-encode preview / exported video. */
   lossyStream?:  Uint8Array;
+  /** sRGB tiles: the decoded true-colour frames (packed RGB) matching {@link lossyFrames}. */
+  lossyRgbFrames?: Uint8Array[];
 }
 
 /** Normalize per-frame delays to exactly `frameCount` entries (single [100] for static). */
@@ -207,6 +211,53 @@ export async function encodeTilePayload(
   return { compressed, manifestBytes, av1, lossyFrames, lossyStream: lossyStreamOut };
 }
 
+// ─── sRGB (full-colour) tile encoder ────────────────────────────────────────────
+
+/**
+ * Encode one sRGB tile: true-colour frames as a lossy AV1 colour stream under a v7 manifest
+ * (FLAG2_SRGB).  There is NO raw floor — raw map bytes cannot represent sRGB art, so the AV1
+ * stream ships unconditionally.  `previewFrames` are the nearest-palette twins (used only for
+ * the informational manifest CRC).
+ */
+export async function encodeSrgbTilePayload(
+  rgbFrames:     Uint8Array[],   // [frameIdx] = packed RGB, 49152 bytes
+  previewFrames: Uint8Array[],   // [frameIdx] = quantized twins, 16384 bytes
+  frameDelays:   number[],
+  tileCol:       number,
+  tileRow:       number,
+  gridCols:      number,
+  gridRows:      number,
+  opts: {
+    author: string | null; title: string | null; nonce: number;
+    lossyQuality: number;
+    captureLossyFrames?: boolean;
+    onProgress?: (phase: string, done: number, total: number) => void;
+  },
+): Promise<TilePayload> {
+  const frameCount = Math.max(1, rgbFrames.length);
+  const delays = normalizeDelays(frameCount, frameDelays);
+
+  let flags = FLAG_AV1 | FLAG_AV1_LOSSY;
+  if (frameCount > 1) flags |= FLAG_ANIMATED;
+  const colorCrc32 = crc32(previewFrames[0] ?? new Uint8Array(MAP_BYTES));
+
+  const manifest = toBytesV7(flags, FLAG2_SRGB, gridCols, gridRows, tileCol, tileRow,
+    colorCrc32, opts.author, opts.title, opts.nonce, frameCount, 0);
+  const stream = await encodeLossyRgb(rgbFrames, opts.lossyQuality,
+    (d, t) => opts.onProgress?.('lossy', d, t));
+  const compressed = await compress(combineAv1Payload(manifest, delays, frameCount, stream));
+
+  let lossyFrames: Uint8Array[] | undefined;
+  let lossyRgbFrames: Uint8Array[] | undefined;
+  if (opts.captureLossyFrames) {
+    const dec = await decodeLossyRgb(stream, 0, frameCount, (d, t) => opts.onProgress?.('decode', d, t));
+    lossyFrames = dec.idx;
+    lossyRgbFrames = dec.rgb;
+  }
+  return { compressed, manifestBytes: manifest, av1: true,
+           lossyFrames, lossyRgbFrames, lossyStream: stream };
+}
+
 // ─── Composition-wide lossy encoder (seamless multi-tile) ──────────────────────
 
 /**
@@ -217,6 +268,18 @@ export function compositeEligible(tileFrames: (Uint8Array[] | undefined)[], tile
   if (tilesTotal < 2) return false;
   const fc = tileFrames[0]?.length ?? 1;
   if (fc < 2) return false;
+  for (let ti = 1; ti < tilesTotal; ti++)
+    if ((tileFrames[ti]?.length ?? 1) !== fc) return false;
+  return true;
+}
+
+/**
+ * sRGB variant: static grids qualify too (frameCount 1 is fine — a seam-free single-frame
+ * stream is exactly what a static multi-tile photo wants).  Frame counts must still match.
+ */
+export function compositeEligibleSrgb(tileFrames: (Uint8Array[] | undefined)[], tilesTotal: number): boolean {
+  if (tilesTotal < 2) return false;
+  const fc = tileFrames[0]?.length ?? 1;
   for (let ti = 1; ti < tilesTotal; ti++)
     if ((tileFrames[ti]?.length ?? 1) !== fc) return false;
   return true;
@@ -248,14 +311,123 @@ export function cropTile(frame: Uint8Array, tileCol: number, tileRow: number, gr
   return out;
 }
 
+/** 3-bytes-per-pixel twin of {@link stitchTiles} for packed-RGB tile frames. */
+export function stitchTilesRgb(
+  tileFrames: (Uint8Array[] | undefined)[], f: number, gridCols: number, gridRows: number,
+): Uint8Array {
+  const W = gridCols * 128;
+  const out = new Uint8Array(W * gridRows * 128 * 3);
+  for (let ti = 0; ti < gridCols * gridRows; ti++) {
+    const frame = tileFrames[ti]?.[f];
+    if (!frame) continue;
+    const x0 = (ti % gridCols) * 128, y0 = Math.floor(ti / gridCols) * 128;
+    for (let y = 0; y < 128; y++)
+      out.set(frame.subarray(y * 128 * 3, (y + 1) * 128 * 3), ((y0 + y) * W + x0) * 3);
+  }
+  return out;
+}
+
+/** 3-bytes-per-pixel twin of {@link cropTile}. */
+export function cropTileRgb(frame: Uint8Array, tileCol: number, tileRow: number, gridCols: number): Uint8Array {
+  const W = gridCols * 128;
+  const out = new Uint8Array(RGB_TILE_BYTES);
+  const x0 = tileCol * 128, y0 = tileRow * 128;
+  for (let y = 0; y < 128; y++)
+    out.set(frame.subarray(((y0 + y) * W + x0) * 3, ((y0 + y) * W + x0 + 128) * 3), y * 128 * 3);
+  return out;
+}
+
 export interface CompositionLossyResult {
   tiles: TilePayload[];
   /** True when the composite stream beat the raw floor (tiles carry stream segments). */
   composite: boolean;
   /** Decoded truth per tile ([tile][frame]) — only when captureLossyFrames and composite. */
   lossyTileFrames?: Uint8Array[][];
+  /** sRGB: the decoded true-colour twins of {@link lossyTileFrames} (packed RGB per tile frame). */
+  lossyTileRgb?: Uint8Array[][];
   /** The whole-composition AV1 stream — mux to MP4 for a zero-re-encode preview. */
   stream?: Uint8Array;
+}
+
+/**
+ * Composition-wide sRGB encode: like {@link encodeCompositionLossy} but the source frames are
+ * true-colour and there is no raw floor — if the composite stream can't be built, each tile
+ * falls back to its own per-tile sRGB stream ({@link encodeSrgbTilePayload}), never raw bytes.
+ * Static grids (frameCount 1) are eligible: one seam-free stream is the whole point.
+ */
+export async function encodeCompositionSrgb(
+  rgbTileFrames:     Uint8Array[][],  // [tile][frame], each 49152 bytes
+  previewTileFrames: Uint8Array[][],  // [tile][frame], quantized twins (16384 bytes)
+  tileDelays:        number[][],
+  gridCols:          number,
+  gridRows:          number,
+  opts: {
+    author: string | null; title: string | null; nonce: number;
+    lossyQuality: number;
+    captureLossyFrames?: boolean;
+    onProgress?: (phase: string, done: number, total: number) => void;
+  },
+): Promise<CompositionLossyResult> {
+  const tilesTotal = gridCols * gridRows;
+  const frameCount = Math.max(1, rgbTileFrames[0]?.length ?? 1);
+
+  const perTileFallback = async (): Promise<CompositionLossyResult> => {
+    const tiles: TilePayload[] = [];
+    for (let ti = 0; ti < tilesTotal; ti++) {
+      tiles.push(await encodeSrgbTilePayload(
+        rgbTileFrames[ti] ?? [new Uint8Array(RGB_TILE_BYTES)],
+        previewTileFrames[ti] ?? [new Uint8Array(MAP_BYTES)],
+        tileDelays[ti] ?? [100],
+        ti % gridCols, Math.floor(ti / gridCols), gridCols, gridRows, opts));
+    }
+    return { tiles, composite: false };
+  };
+
+  try {
+    const stitched: Uint8Array[] = [];
+    for (let f = 0; f < frameCount; f++) stitched.push(stitchTilesRgb(rgbTileFrames, f, gridCols, gridRows));
+    const dims = { width: gridCols * 128, height: gridRows * 128 };
+    const stream = await encodeLossyRgb(stitched, opts.lossyQuality,
+      (d, t) => opts.onProgress?.('lossy', d, t), dims);
+
+    // Even split in tile-index order; the decoder reassembles by concatenation.
+    const base = Math.floor(stream.length / tilesTotal);
+    const rem  = stream.length % tilesTotal;
+    let flagsBase = FLAG_AV1 | FLAG_AV1_LOSSY | FLAG_AV1_COMPOSITE;
+    if (frameCount > 1) flagsBase |= FLAG_ANIMATED;
+
+    const tiles: TilePayload[] = [];
+    let off = 0;
+    for (let ti = 0; ti < tilesTotal; ti++) {
+      const segLen  = base + (ti < rem ? 1 : 0);
+      const segment = stream.subarray(off, off + segLen);
+      off += segLen;
+      const tileCol = ti % gridCols, tileRow = Math.floor(ti / gridCols);
+      const delays  = normalizeDelays(frameCount, tileDelays[ti] ?? [100]);
+      const colorCrc32 = crc32(previewTileFrames[ti]?.[0] ?? new Uint8Array(MAP_BYTES));
+      const manifest = toBytesV7(flagsBase, FLAG2_SRGB, gridCols, gridRows, tileCol, tileRow,
+        colorCrc32, opts.author, opts.title, opts.nonce, frameCount, 0);
+      const compressed = await compress(combineAv1Payload(manifest, delays, frameCount, segment));
+      tiles.push({ compressed, manifestBytes: manifest, av1: true });
+    }
+    console.info(`[av1] srgb composite ${gridCols}x${gridRows} ${frameCount}f q${opts.lossyQuality}`
+      + ` stream=${stream.length}B → ${tiles.reduce((s, t) => s + t.compressed.length, 0)}B compressed`);
+
+    let lossyTileFrames: Uint8Array[][] | undefined;
+    let lossyTileRgb:    Uint8Array[][] | undefined;
+    if (opts.captureLossyFrames) {
+      const dec = await decodeLossyRgb(stream, 0, frameCount,
+        (d, t) => opts.onProgress?.('decode', d, t), dims);
+      lossyTileFrames = Array.from({ length: tilesTotal }, (_, ti) =>
+        dec.idx.map(fr => cropTile(fr, ti % gridCols, Math.floor(ti / gridCols), gridCols)));
+      lossyTileRgb = Array.from({ length: tilesTotal }, (_, ti) =>
+        dec.rgb.map(fr => cropTileRgb(fr, ti % gridCols, Math.floor(ti / gridCols), gridCols)));
+    }
+    return { tiles, composite: true, lossyTileFrames, lossyTileRgb, stream };
+  } catch (e) {
+    console.warn('[av1] srgb composite encode FAILED — falling back to per-tile sRGB streams', e);
+    return perTileFallback();
+  }
 }
 
 /**
@@ -418,6 +590,32 @@ export async function encodeComposition(
   const { gridCols, gridRows, allShades } = comp;
   const codecMode = opts.codecMode ?? comp.codecMode;
   const tilesTotal = gridCols * gridRows;
+
+  // sRGB compositions: AV1 colour streams only (no raw floor, hooks not consulted — the
+  // encode is stream-per-composition or stream-per-tile either way).
+  if (isSrgb(comp)) {
+    const quality = opts.lossyQuality ?? 30;
+    const rgbTiles = Array.from({ length: tilesTotal }, (_, ti) => comp.rgbFrames![ti] ?? [new Uint8Array(RGB_TILE_BYTES)]);
+    const pvTiles  = Array.from({ length: tilesTotal }, (_, ti) => comp.frames[ti] ?? [new Uint8Array(MAP_BYTES)]);
+    const tileDelays = Array.from({ length: tilesTotal }, (_, ti) =>
+      comp.frameDelays[ti] ?? new Array(rgbTiles[ti].length).fill(100));
+    const srgbOpts = {
+      author: opts.author, title: opts.title, nonce: opts.nonce, lossyQuality: quality,
+      onProgress: (phase: string, done: number, total: number) =>
+        hooks?.onProgress?.({ tilesDone: 0, tilesTotal: 1, phase, frameDone: done, frameTotal: total }),
+    };
+    let payloads: { compressed: Uint8Array }[];
+    if (compositeEligibleSrgb(comp.rgbFrames!, tilesTotal)) {
+      payloads = (await encodeCompositionSrgb(rgbTiles, pvTiles, tileDelays, gridCols, gridRows, srgbOpts)).tiles;
+    } else {
+      payloads = [];
+      for (let ti = 0; ti < tilesTotal; ti++) {
+        payloads.push(await encodeSrgbTilePayload(rgbTiles[ti], pvTiles[ti], tileDelays[ti],
+          ti % gridCols, Math.floor(ti / gridCols), gridCols, gridRows, srgbOpts));
+      }
+    }
+    return assemblePayloadState(comp, opts, payloads);
+  }
 
   // Composition-wide lossy: one stream, no per-tile seams, all-or-nothing decode.
   if (opts.lossyQuality != null && compositeEligible(comp.frames, tilesTotal)) {

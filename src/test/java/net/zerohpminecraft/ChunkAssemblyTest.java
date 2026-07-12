@@ -102,12 +102,14 @@ class ChunkAssemblyTest {
     }
 
     @Test
-    void decompressedSmallerThanMapBytes_throws() {
-        // Compress a tiny payload so decompressed size < 16384
+    void tinyCorruptPayload_throws() {
+        // Payloads below 16,384 bytes are legal since v7 (AV1 streams decompress well under one
+        // frame), so the old MAP_BYTES size floor is gone — but a payload this small that isn't
+        // a valid manifest must still be rejected, now by the manifest parse / frame-size checks.
         byte[] tiny = {1, 2, 3, 4};
         List<String> chunks = makeChunks(tiny);
 
-        assertThrows(IllegalStateException.class,
+        assertThrows(RuntimeException.class,
                 () -> MapBannerDecoder.reassemblePayload(new ArrayList<>(chunks)));
     }
 

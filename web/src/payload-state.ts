@@ -63,7 +63,11 @@ export interface PayloadState {
 export interface CompositionState {
   gridCols: number;
   gridRows: number;
-  /** [tileIdx][frameIdx] = Uint8Array of 16384 map-colour bytes. */
+  /**
+   * [tileIdx][frameIdx] = Uint8Array of 16384 map-colour bytes.
+   * In sRGB mode this is the nearest-palette preview twin of {@link rgbFrames} — every
+   * write to rgbFrames must re-quantise the touched pixels here (see tools/Tool.ts).
+   */
   frames: Uint8Array[][];
   /** [tileIdx][frameIdx] = delay in ms. */
   frameDelays: number[][];
@@ -74,6 +78,17 @@ export interface CompositionState {
   author: string | null;
   allShades: boolean;
   codecMode: CodecMode;
+  /**
+   * 'srgb': the art is true 24-bit colour, stored in {@link rgbFrames} and exported as a
+   * lossy AV1 colour stream (manifest v7 / FLAG2_SRGB).  Absent/'palette': classic map bytes.
+   */
+  colorSpace?: 'palette' | 'srgb';
+  /** [tileIdx][frameIdx] = packed RGB, 128·128·3 bytes.  Present iff colorSpace === 'srgb'. */
+  rgbFrames?: Uint8Array[][];
+}
+
+export function isSrgb(comp: CompositionState): boolean {
+  return comp.colorSpace === 'srgb' && !!comp.rgbFrames;
 }
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────

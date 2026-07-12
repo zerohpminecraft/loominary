@@ -16,6 +16,7 @@ import { useEffect, useRef, useState, useCallback } from 'preact/hooks';
 import { MapCanvas }    from './Canvas.js';
 import { EditHistory }  from './history.js';
 import { PalettePanel } from './PalettePanel.js';
+import { ColorPanel }   from './ColorPanel.js';
 import { StatusBar }    from './StatusBar.js';
 import { OriginalPreviewPanel } from '../OriginalPreview.js';
 import {
@@ -32,8 +33,9 @@ import {
 } from '../quantize.js';
 import { MC_PALETTE }  from '../palette.js';
 import type { CompositionState } from '../payload-state.js';
-import { emptyPayloadState, compositionFromState } from '../payload-state.js';
-import { FilterType } from '../filters.js';
+import { emptyPayloadState, compositionFromState, isSrgb } from '../payload-state.js';
+import { RGB_TILE_BYTES, quantizeRgbPixel, quantizeRgbTile, rgbFramesToImageData, splitIntoTilesRgb } from '../srgb.js';
+import { FilterType, applyFilter } from '../filters.js';
 import { type PreprocessParams, DEFAULT_PREPROCESS, prepareSourceImage, applyPreprocess } from '../preprocess.js';
 import {
   PALETTE_CHOICES, buildPaletteFlag, type PaletteRestriction,
@@ -362,7 +364,12 @@ export function Editor({
   }, []);
 
   useEffect(() => {
-    if (initialComp) syncComp(initialComp);
+    if (initialComp) {
+      syncComp(initialComp);
+      // Mode switch: activeColor is a packed 0xRRGGBB in sRGB mode, a map byte otherwise.
+      if (isSrgb(initialComp)) { if (activeColorRef.current <= 0xFF) setActiveColor(0xFFFFFF); }
+      else if (activeColorRef.current > 0xFF) setActiveColor(60);
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialComp]);
 
@@ -375,8 +382,9 @@ export function Editor({
     _setActiveToolId(id);
   }
 
-  const [activeColor, _setActiveColor] = useState<number>(60);
-  const activeColorRef = useRef<number>(60);
+  // Palette mode: map byte (default 60).  sRGB mode: packed 0xRRGGBB (default white).
+  const [activeColor, _setActiveColor] = useState<number>(() => initialComp && isSrgb(initialComp) ? 0xFFFFFF : 60);
+  const activeColorRef = useRef<number>(initialComp && isSrgb(initialComp) ? 0xFFFFFF : 60);
   function setActiveColor(c: number) {
     activeColorRef.current = c;
     _setActiveColor(c);
@@ -386,6 +394,12 @@ export function Editor({
       if (canvasRef.current.fillPreview) canvasRef.current.markDirty();
     }
   }
+
+  // Recently committed sRGB colours (most recent first, deduped) for the ColorPanel.
+  const [recentColors, setRecentColors] = useState<number[]>([]);
+  const pushRecentColor = useCallback((packed: number) => {
+    setRecentColors(prev => [packed, ...prev.filter(c => c !== packed)].slice(0, 16));
+  }, []);
 
   // Keyboard modifier state (updated in keydown/keyup so tools can read it via context)
   const ctrlHeldRef  = useRef(false);
@@ -549,7 +563,8 @@ export function Editor({
   // ── Clipboard / paste mode ──────────────────────────────────────────────────
   const clipWRef   = useRef(0);
   const clipHRef   = useRef(0);
-  const clipPixRef = useRef<Uint8Array | null>(null);
+  // Uint32 so packed 0xRRGGBB values fit in sRGB mode (map bytes fit too).
+  const clipPixRef = useRef<Uint32Array | null>(null);
   const clipMskRef = useRef<Uint8Array | null>(null);
 
   const [inPasteMode, _setInPasteMode] = useState(false);
@@ -771,7 +786,11 @@ export function Editor({
     wandTolerance: wandTolRef.current,
     ctrlHeld:      ctrlHeldRef.current,
     shiftHeld:     shiftHeldRef.current,
-    setColor:      (b: number) => setActiveColor(b),
+    setColor:      (b: number) => {
+      setActiveColor(b);
+      // sRGB mode: an eyedropper pick counts as a committed colour for the recent row.
+      if (isSrgb(compRef.current)) pushRecentColor(b);
+    },
     setSelMask,
     getSelMask:    () => selMaskRef.current,
   })).current;
@@ -801,7 +820,7 @@ export function Editor({
         }
     if (x1 < 0) { setStatusMsg('Selection is empty'); return false; }
     const cw = x1-x0+1, ch = y1-y0+1;
-    const pix  = new Uint8Array(cw * ch);
+    const pix  = new Uint32Array(cw * ch);
     const mask = new Uint8Array(cw * ch);
     for (let gy = y0; gy <= y1; gy++)
       for (let gx = x0; gx <= x1; gx++) {
@@ -819,7 +838,7 @@ export function Editor({
     const c   = compRef.current;
     const sel = selMaskRef.current!;
     const gw  = c.gridCols * MAP_SIZE, gh = c.gridRows * MAP_SIZE;
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
     for (let gy = 0; gy < gh; gy++)
       for (let gx = 0; gx < gw; gx++)
         if (sel[gy*gw+gx]) writePixel(c, gx, gy, 0, null);
@@ -849,7 +868,7 @@ export function Editor({
     const cw = clipWRef.current, ch = clipHRef.current;
     const ox = gx - Math.floor(cw / 2);
     const oy = gy - Math.floor(ch / 2);
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
     const newSel = new Uint8Array(c.gridCols * MAP_SIZE * c.gridRows * MAP_SIZE);
     let placed = 0;
     for (let py = 0; py < ch; py++) {
@@ -872,6 +891,7 @@ export function Editor({
 
   // ── Merge helpers ───────────────────────────────────────────────────────────
   function toggleMergeColor(color: number): void {
+    if (isSrgb(compRef.current)) { setStatusMsg('Not available in full-color mode'); return; }
     if (color === 0) return;
     const q = mergeQueueRef.current;
     if (q.has(color)) q.delete(color); else q.add(color);
@@ -881,6 +901,7 @@ export function Editor({
   }
 
   function commitMerge(): void {
+    if (isSrgb(compRef.current)) { setStatusMsg('Not available in full-color mode'); return; }
     const q = mergeQueueRef.current;
     if (q.size === 0) { setStatusMsg('Queue empty — Ctrl+click swatches or canvas pixels to add'); return; }
     const target  = activeColorRef.current;
@@ -889,7 +910,7 @@ export function Editor({
     const c   = compRef.current;
     const sel = selMaskRef.current;
     const gw  = c.gridCols * MAP_SIZE;
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
     let replaced = 0;
     for (let ti = 0; ti < c.frames.length; ti++) {
       const tileCol = ti % c.gridCols;
@@ -924,6 +945,7 @@ export function Editor({
 
   // ── Reduce ──────────────────────────────────────────────────────────────────
   function applyReduction(): void {
+    if (isSrgb(compRef.current)) { setStatusMsg('Not available in full-color mode'); return; }
     const c    = compRef.current;
     const sel  = selMaskRef.current;
     const gw   = c.gridCols * MAP_SIZE;
@@ -953,7 +975,7 @@ export function Editor({
     const [victim, survivor] = findReductionTarget(freq, OKLAB, reductionStrategyRef.current);
     if (victim === -1) { setStatusMsg('Already at minimum (1 color or less)'); return; }
 
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
 
     let pixelsChanged = 0;
     for (let ti = 0; ti < c.frames.length; ti++) {
@@ -987,6 +1009,41 @@ export function Editor({
     const maxF = Math.max(...c.frames.map(t => t.length), 1);
     const frameIdxs = allF ? Array.from({ length: maxF }, (_, i) => i) : [c.activeFrame];
     const total = frameIdxs.length;
+
+    // sRGB mode: filter the true-colour pixels directly — no worker / requantize pass —
+    // then re-derive each touched tile's nearest-palette preview twin.
+    if (isSrgb(c)) {
+      const sel    = selMaskRef.current;
+      const totalW = c.gridCols * MAP_SIZE;
+      const totalH = c.gridRows * MAP_SIZE;
+      historyRef.current.snapshot(c.frames, c.rgbFrames);
+      const newFrames    = c.frames.map(tf => [...tf]);
+      const newRgbFrames = c.rgbFrames!.map(tf => [...tf]);
+      for (const fi of frameIdxs) {
+        const img      = rgbFramesToImageData(c.rgbFrames!, fi, c.gridCols, c.gridRows);
+        const original = new Uint8ClampedArray(img.data); // keep pre-filter pixels for the selection merge
+        const filtered = applyFilter(img, { type: filterTypeRef.current, strength: filterStrengthRef.current });
+        // Selection-aware merge: keep the original RGB where the mask excludes the pixel.
+        const full = new Uint8Array(totalW * totalH * 3);
+        for (let p = 0; p < totalW * totalH; p++) {
+          const src = (sel && !sel[p]) ? original : filtered.data;
+          full[p * 3]     = src[p * 4];
+          full[p * 3 + 1] = src[p * 4 + 1];
+          full[p * 3 + 2] = src[p * 4 + 2];
+        }
+        const tiles = splitIntoTilesRgb(full, totalW, c.gridCols, c.gridRows);
+        for (let ti = 0; ti < newRgbFrames.length; ti++) {
+          if (!tiles[ti]) continue;
+          newRgbFrames[ti][fi] = tiles[ti];
+          newFrames[ti][fi]    = quantizeRgbTile(tiles[ti]);
+        }
+      }
+      syncComp({ ...c, frames: newFrames, rgbFrames: newRgbFrames });
+      setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
+      setStatusMsg(`Filter: ${filterTypeRef.current} applied${allF ? ` (${total} frames)` : ''}`);
+      return;
+    }
+
     setStatusMsg(`Applying ${filterTypeRef.current}… (0/${total})`);
     try {
       const { customPalette: filterCp, tilePalette: filterTp } = buildReqPalette();
@@ -1000,7 +1057,7 @@ export function Editor({
       const selMask = selMaskRef.current;
       const tileCount = c.frames.length;
 
-      historyRef.current.snapshot(c.frames);
+      historyRef.current.snapshot(c.frames, c.rgbFrames);
 
       // Results indexed by position in frameIdxs (not by fi directly).
       const ordered = new Array<Uint8Array[]>(total);
@@ -1047,13 +1104,22 @@ export function Editor({
   }
 
   // ── Frame management ────────────────────────────────────────────────────────
+  // Apply the same structural frame-array transform to c.frames and, in sRGB mode,
+  // to c.rgbFrames — the preview twin must stay index-aligned (see payload-state.ts).
+  function mapFramesBoth(
+    c: CompositionState,
+    fn: (tf: Uint8Array[]) => Uint8Array[],
+  ): { frames: Uint8Array[][]; rgbFrames: Uint8Array[][] | undefined } {
+    return { frames: c.frames.map(fn), rgbFrames: c.rgbFrames ? c.rgbFrames.map(fn) : c.rgbFrames };
+  }
+
   function dropCurrentFrame(): void {
     const c = compRef.current;
     const maxF = Math.max(...c.frames.map(t => t.length), 1);
     if (maxF <= 1) { setStatusMsg('Only 1 frame — cannot drop'); return; }
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
     const fi = c.activeFrame;
-    const newFrames = c.frames.map(tf => {
+    const { frames: newFrames, rgbFrames: newRgbFrames } = mapFramesBoth(c, tf => {
       if (tf.length <= 1) return tf;
       const next = [...tf]; next.splice(fi, 1); return next;
     });
@@ -1062,18 +1128,19 @@ export function Editor({
       const next = [...dd]; next.splice(fi, 1); return next;
     });
     const newActive = Math.min(fi, maxF - 2);
-    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: newActive });
+    syncComp({ ...c, frames: newFrames, rgbFrames: newRgbFrames, frameDelays: newDelays, activeFrame: newActive });
     setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
     setStatusMsg(`Dropped frame ${fi + 1}`);
   }
 
   function cloneCurrentFrame(): void {
     const c = compRef.current;
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
     const fi = c.activeFrame;
-    const newFrames = c.frames.map(tf => {
+    const { frames: newFrames, rgbFrames: newRgbFrames } = mapFramesBoth(c, tf => {
       const next  = [...tf];
-      const clone = (tf[fi] ?? new Uint8Array(MAP_SIZE * MAP_SIZE)).slice() as Uint8Array;
+      // Fallback length matches the array being cloned (16384 preview / 49152 rgb).
+      const clone = (tf[fi] ?? new Uint8Array(tf[0]?.length ?? MAP_SIZE * MAP_SIZE)).slice() as Uint8Array;
       next.splice(fi + 1, 0, clone);
       return next;
     });
@@ -1082,18 +1149,28 @@ export function Editor({
       next.splice(fi + 1, 0, dd[fi] ?? 100);
       return next;
     });
-    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: fi + 1 });
+    syncComp({ ...c, frames: newFrames, rgbFrames: newRgbFrames, frameDelays: newDelays, activeFrame: fi + 1 });
     setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
     setStatusMsg(`Cloned frame ${fi + 1} → frame ${fi + 2}`);
   }
 
   function addBlankFrame(): void {
     const c = compRef.current;
-    historyRef.current.snapshot(c.frames);
-    const fi = c.activeFrame;
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
+    const fi   = c.activeFrame;
+    const srgb = isSrgb(c);
     const newFrames = c.frames.map(tf => {
       const next = [...tf];
-      next.splice(fi + 1, 0, new Uint8Array(MAP_SIZE * MAP_SIZE));
+      // sRGB mode: a blank rgb frame is black, so its preview twin is the palette
+      // black — not transparent byte 0.
+      next.splice(fi + 1, 0, srgb
+        ? new Uint8Array(MAP_SIZE * MAP_SIZE).fill(quantizeRgbPixel(0, 0, 0))
+        : new Uint8Array(MAP_SIZE * MAP_SIZE));
+      return next;
+    });
+    const newRgbFrames = c.rgbFrames?.map(tf => {
+      const next = [...tf];
+      next.splice(fi + 1, 0, new Uint8Array(RGB_TILE_BYTES));
       return next;
     });
     const newDelays = c.frameDelays.map(dd => {
@@ -1101,7 +1178,7 @@ export function Editor({
       next.splice(fi + 1, 0, 100);
       return next;
     });
-    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: fi + 1 });
+    syncComp({ ...c, frames: newFrames, rgbFrames: newRgbFrames, frameDelays: newDelays, activeFrame: fi + 1 });
     setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
     setStatusMsg(`Added blank frame ${fi + 2}`);
   }
@@ -1144,9 +1221,9 @@ export function Editor({
     const c    = compRef.current;
     const maxF = Math.max(...c.frames.map(t => t.length), 1);
     if (maxF <= 1) { setStatusMsg('Only 1 frame — nothing to stride'); return; }
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
 
-    const newFrames = c.frames.map(tf => {
+    const { frames: newFrames, rgbFrames: newRgbFrames } = mapFramesBoth(c, tf => {
       if (tf.length <= 1) return tf;
       const kept: Uint8Array[] = [];
       const keptCount = Math.ceil(tf.length / n);
@@ -1169,7 +1246,7 @@ export function Editor({
 
     const newCount  = Math.ceil(maxF / n);
     const newActive = Math.min(c.activeFrame, newCount - 1);
-    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: newActive });
+    syncComp({ ...c, frames: newFrames, rgbFrames: newRgbFrames, frameDelays: newDelays, activeFrame: newActive });
     setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
     setStatusMsg(`Stride ${n}: ${maxF} → ${newCount} frames`);
   }
@@ -1179,9 +1256,9 @@ export function Editor({
     const c    = compRef.current;
     const maxF = Math.max(...c.frames.map(t => t.length), 1);
     if (maxF <= 1) { setStatusMsg('Only 1 frame — nothing to skip'); return; }
-    historyRef.current.snapshot(c.frames);
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
 
-    const newFrames = c.frames.map(tf => {
+    const { frames: newFrames, rgbFrames: newRgbFrames } = mapFramesBoth(c, tf => {
       if (tf.length <= 1) return tf;
       const kept: Uint8Array[] = [];
       for (let j = 0; j < tf.length; j++) if ((j + 1) % n !== 0) kept.push(tf[j]);
@@ -1208,7 +1285,7 @@ export function Editor({
 
     const newCount  = Math.max(...newFrames.map(tf => tf.length), 1);
     const newActive = Math.min(c.activeFrame, newCount - 1);
-    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: newActive });
+    syncComp({ ...c, frames: newFrames, rgbFrames: newRgbFrames, frameDelays: newDelays, activeFrame: newActive });
     setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
     setStatusMsg(`Skip ${n}: ${maxF} → ${newCount} frames`);
   }
@@ -1219,8 +1296,8 @@ export function Editor({
     const maxF = Math.max(...c.frames.map(t => t.length), 1);
     const fi2 = fi + dir;
     if (fi2 < 0 || fi2 >= maxF) return;
-    historyRef.current.snapshot(c.frames);
-    const newFrames = c.frames.map(tf => {
+    historyRef.current.snapshot(c.frames, c.rgbFrames);
+    const { frames: newFrames, rgbFrames: newRgbFrames } = mapFramesBoth(c, tf => {
       const next = [...tf];
       [next[fi], next[fi2]] = [next[fi2], next[fi]];
       return next;
@@ -1230,7 +1307,7 @@ export function Editor({
       [next[fi], next[fi2]] = [next[fi2], next[fi]];
       return next;
     });
-    syncComp({ ...c, frames: newFrames, frameDelays: newDelays, activeFrame: fi2 });
+    syncComp({ ...c, frames: newFrames, rgbFrames: newRgbFrames, frameDelays: newDelays, activeFrame: fi2 });
     setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
   }
 
@@ -1254,6 +1331,7 @@ export function Editor({
 
   const doRequantize = useCallback(async () => {
     if (reqRunning) return;
+    if (isSrgb(compRef.current)) { setStatusMsg('Not available in full-color mode'); return; }
     // Clear any existing preview
     if (previewCompRef.current) { setPreviewComp(null); }
     setReqRunning(true);
@@ -1478,12 +1556,8 @@ export function Editor({
       },
       onPointerHover: (gx, gy) => {
         setCursorGx(gx); setCursorGy(gy);
-        const c  = compRef.current;
-        const tx = (gx / MAP_SIZE) | 0;
-        const ty = (gy / MAP_SIZE) | 0;
-        const ti = ty * c.gridCols + tx;
-        const frame = c.frames[ti]?.[c.activeFrame];
-        setHoverColor(frame ? frame[(gx % MAP_SIZE) + (gy % MAP_SIZE) * MAP_SIZE] : 0);
+        // readPixel: map byte in palette mode, packed 0xRRGGBB in sRGB mode.
+        setHoverColor(readPixel(compRef.current, gx, gy));
         setScale(canvas.scale);
         const toolId = activeToolIdRef.current;
         if (toolId === 'wand') {
@@ -1588,9 +1662,11 @@ export function Editor({
       if (ctrl && !shift && e.key === 'z') {
         e.preventDefault();
         const h = historyRef.current;
-        const res = h.undo(compRef.current.frames);
+        const cc = compRef.current;
+        const res = h.undo(cc.frames, cc.rgbFrames);
         if (res) {
-          syncComp({ ...compRef.current, frames: res });
+          // Only restore rgbFrames when the snapshot carries them (sRGB-mode comps).
+          syncComp({ ...cc, frames: res.frames, rgbFrames: res.rgbFrames ?? cc.rgbFrames });
           setUndoState({ canUndo: h.canUndo, canRedo: h.canRedo });
           setPreviewComp(null); setReqStatus(null);
         }
@@ -1599,8 +1675,12 @@ export function Editor({
       if (ctrl && shift && (e.key === 'z' || e.key === 'Z')) {
         e.preventDefault();
         const h = historyRef.current;
-        const res = h.redo(compRef.current.frames);
-        if (res) { syncComp({ ...compRef.current, frames: res }); setUndoState({ canUndo: h.canUndo, canRedo: h.canRedo }); }
+        const cc = compRef.current;
+        const res = h.redo(cc.frames, cc.rgbFrames);
+        if (res) {
+          syncComp({ ...cc, frames: res.frames, rgbFrames: res.rgbFrames ?? cc.rgbFrames });
+          setUndoState({ canUndo: h.canUndo, canRedo: h.canRedo });
+        }
         return;
       }
       if (ctrl && e.key === 'a') {
@@ -1639,6 +1719,9 @@ export function Editor({
       const gw = c.gridCols * MAP_SIZE;
       const gh = c.gridRows * MAP_SIZE;
       const maxFrames = Math.max(...c.frames.map(t => t.length), 1);
+      // Palette-only shortcuts (requantize, heatmap, merge, reduce, …) are
+      // unavailable in sRGB mode.
+      const srgbMode = isSrgb(c);
 
       switch (e.key) {
 
@@ -1661,7 +1744,7 @@ export function Editor({
         case 'Enter': {
           e.preventDefault();
           if (previewCompRef.current) {
-            historyRef.current.snapshot(compRef.current.frames);
+            historyRef.current.snapshot(compRef.current.frames, compRef.current.rgbFrames);
             syncComp(previewCompRef.current);
             setPreviewComp(null);
             setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
@@ -1676,7 +1759,7 @@ export function Editor({
 
         case 'y': case 'Y':
           if (!ctrl && previewCompRef.current) {
-            historyRef.current.snapshot(compRef.current.frames);
+            historyRef.current.snapshot(compRef.current.frames, compRef.current.rgbFrames);
             syncComp(previewCompRef.current);
             setPreviewComp(null);
             setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
@@ -1753,7 +1836,7 @@ export function Editor({
         case 'Delete': case 'Backspace': {
           if (selMaskRef.current) {
             e.preventDefault();
-            historyRef.current.snapshot(c.frames);
+            historyRef.current.snapshot(c.frames, c.rgbFrames);
             let cleared = 0;
             const sel = selMaskRef.current!;
             for (let gy = 0; gy < gh; gy++)
@@ -1800,11 +1883,13 @@ export function Editor({
         // ─ Requantize ─────────────────────────────────────────────────────
         case 'r': case 'R':
           e.preventDefault();
+          if (srgbMode) { setStatusMsg('Not available in full-color mode'); break; }
           void doRequantizeRef.current();
           break;
 
         // ─ Cycle dither algo (D) ──────────────────────────────────────────
         case 'd': case 'D':
+          if (srgbMode) break;
           setReqAlgo(a => {
             const next = DITHER_CYCLE[(DITHER_CYCLE.indexOf(a) + 1) % DITHER_CYCLE.length];
             setStatusMsg(`Dither: ${DITHER_LABEL[next]}`);
@@ -1814,6 +1899,7 @@ export function Editor({
 
         // ─ Cycle match metric (Q) ─────────────────────────────────────────
         case 'q': case 'Q':
+          if (srgbMode) break;
           setReqMetric(m => {
             const next = METRIC_CYCLE[(METRIC_CYCLE.indexOf(m) + 1) % METRIC_CYCLE.length];
             setStatusMsg(`Metric: ${METRIC_LABEL[next]}`);
@@ -1823,6 +1909,7 @@ export function Editor({
 
         // ─ Chroma boost (N = +0.25, Shift+N = -0.25) ─────────────────────
         case 'n': case 'N': {
+          if (srgbMode) break;
           const chromaStep = 0.25;
           setReqChroma(v => {
             const next = Math.round(
@@ -1836,6 +1923,7 @@ export function Editor({
 
         // ─ Toggle heatmap (H) ─────────────────────────────────────────────
         case 'h': case 'H':
+          if (srgbMode) { setStatusMsg('Not available in full-color mode'); break; }
           setHeatmapOn(on => {
             const next = !on;
             setStatusMsg(next ? 'Heatmap: red=rarest, blue=most common' : 'Heatmap off');
@@ -1856,6 +1944,7 @@ export function Editor({
 
         // ─ Toggle dither mask overlay (M) ─────────────────────────────────
         case 'm': case 'M':
+          if (srgbMode) break;
           if (canvasRef.current) {
             canvasRef.current.showDitherMask = !canvasRef.current.showDitherMask;
             canvasRef.current.markDirty();
@@ -1864,12 +1953,14 @@ export function Editor({
 
         // ─ Color merge (C = commit, V = cycle scope) ──────────────────────
         case 'c': case 'C':
+          if (srgbMode) break;
           if (!ctrl) {
             if (mergeQueueRef.current.size > 0) commitMerge();
             else setStatusMsg('Queue empty — Ctrl+click swatches or canvas pixels');
           }
           break;
         case 'v': case 'V':
+          if (srgbMode) break;
           if (!ctrl) {
             setMergeScope(mergeScopeRef.current === 'frame' ? 'all' : 'frame');
             setStatusMsg(`Merge scope: ${mergeScopeRef.current === 'frame' ? 'frame → all frames' : 'all frames → frame'}`);
@@ -1889,6 +1980,7 @@ export function Editor({
 
         // ─ Color reduce (K), cycle strategy (Shift+K) ────────────────────
         case 'k': case 'K':
+          if (srgbMode) { setStatusMsg('Not available in full-color mode'); break; }
           if (shift) {
             const nextStrat = STRATEGY_CYCLE[(STRATEGY_CYCLE.indexOf(reductionStrategyRef.current) + 1) % STRATEGY_CYCLE.length];
             setReductionStrategy(nextStrat);
@@ -1928,6 +2020,7 @@ export function Editor({
   ] as const;
 
   const activeTool   = TOOL_MAP.get(activeToolId) ?? brushTool;
+  const srgb         = isSrgb(comp);
   const maxFrames    = Math.max(...comp.frames.map(t => t.length), 1);
   const frameDelay   = comp.frameDelays[0]?.[comp.activeFrame] ?? 100;
   // Distinct color count across all tiles for the active frame.
@@ -2031,9 +2124,10 @@ export function Editor({
           <button style={SEL_BTN} onClick={startPaste}>⎘ Paste (Ctrl+V)</button>
         )}
 
+        {/* ── Requantize section (palette mode only) ──────────────────────── */}
+        {!srgb && <>
         <div style={DIVIDER} />
 
-        {/* ── Requantize section ──────────────────────────────────────────── */}
         <div style={SECTION_LABEL}>Requantize (R)</div>
 
         <div style={MICRO_LABEL}>Dither  (D to cycle)</div>
@@ -2234,7 +2328,7 @@ export function Editor({
           <div style={{ marginTop:4, display:'flex', gap:3 }}>
             <button style={{ ...SEL_BTN, flex:1, textAlign:'center', color:'#7f7', borderColor:'#3a6' }}
               onClick={() => {
-                historyRef.current.snapshot(compRef.current.frames);
+                historyRef.current.snapshot(compRef.current.frames, compRef.current.rgbFrames);
                 syncComp(previewComp);
                 setPreviewComp(null);
                 setUndoState({ canUndo: historyRef.current.canUndo, canRedo: historyRef.current.canRedo });
@@ -2289,6 +2383,8 @@ export function Editor({
           </div>
         )}
 
+        </>}
+
         <div style={DIVIDER} />
 
         {/* ── Filter section ──────────────────────────────────────────────── */}
@@ -2324,9 +2420,10 @@ export function Editor({
         </button>
         <div style={{ fontSize:'0.71em', color:'#555', marginTop:1 }}>Shift+P: cycle type</div>
 
+        {/* ── Color reduce + merge sections (palette mode only) ───────────── */}
+        {!srgb && <>
         <div style={DIVIDER} />
 
-        {/* ── Color reduce section ────────────────────────────────────────── */}
         <div style={SECTION_LABEL}>Reduce (K)</div>
         <div style={CHIP_ROW}>
           {STRATEGY_CYCLE.map(s => (
@@ -2382,15 +2479,19 @@ export function Editor({
           </>
         )}
 
+        </>}
+
         <div style={DIVIDER} />
 
-        {/* ── Heatmap / overlays ───────────────────────────────────────────── */}
+        {/* ── Heatmap / overlays (heatmap is palette mode only) ───────────── */}
+        {!srgb && <>
         <label style={TOGGLE_ROW}>
           <input type="checkbox" checked={heatmapOn}
             onChange={e => setHeatmapOn((e.target as HTMLInputElement).checked)} />
           <span style={{ fontSize:'0.79em' }}>Heatmap (H)</span>
         </label>
         <div style={{ fontSize:'0.71em', color:'#555' }}>red=rarest · blue=common</div>
+        </>}
 
         {/* Detail map overlay */}
         <label style={{ ...TOGGLE_ROW, marginTop:6 }}>
@@ -2571,7 +2672,16 @@ export function Editor({
 
       <ResizeHandle onDrag={dx => setRightW(w => Math.max(80, Math.min(500, w - dx)))} />
 
-      {/* Palette */}
+      {/* Palette / colour picker */}
+      {srgb ? (
+      <ColorPanel
+        color={activeColor}
+        onChange={setActiveColor}
+        onCommit={pushRecentColor}
+        recent={recentColors}
+        panelWidth={rightW}
+      />
+      ) : (
       <PalettePanel
         comp={comp}
         activeColor={activeColor}
@@ -2608,6 +2718,7 @@ export function Editor({
         }}
         panelWidth={rightW}
       />
+      )}
 
       </div>{/* end main row */}
 
@@ -2659,6 +2770,7 @@ export function Editor({
         distinctCount={distinctCount}
         inPreview={!!previewComp}
         mergeQueueSize={mergeQueueSnapshot.size}
+        srgb={srgb}
       />
     </div>
   );

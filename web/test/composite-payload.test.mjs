@@ -15,13 +15,16 @@ import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 
 const entrySrc = `
-export { encodeCompositionLossy, compositeEligible, cropTile } from './src/encode.ts';
-export { _setCodecFactory, decodeLossyColor } from './src/av1/codec.ts';
-export { fromBytes, av1Composite, av1StreamOffset, FLAG_ANIMATED, FLAG_AV1, FLAG_AV1_LOSSY } from './src/manifest.ts';
+export { encodeCompositionLossy, compositeEligible, cropTile,
+         encodeCompositionSrgb, compositeEligibleSrgb, cropTileRgb } from './src/encode.ts';
+export { _setCodecFactory, decodeLossyColor, decodeLossyRgb } from './src/av1/codec.ts';
+export { fromBytes, av1Composite, av1StreamOffset, srgb,
+         FLAG_ANIMATED, FLAG_AV1, FLAG_AV1_LOSSY } from './src/manifest.ts';
 export { decompress } from './src/compression.ts';
 export { IS_VALID } from './src/palette.ts';
 export { computeMuxAllocation, applyCarpetMux, budgetStatus } from './src/mux.ts';
 export { emptyTileData } from './src/payload-state.ts';
+export { quantizeRgbTile } from './src/srgb.ts';
 `;
 const entry = join(process.cwd(), `.composite-test-entry-${process.pid}.ts`);
 await writeFile(entry, entrySrc);
@@ -188,4 +191,64 @@ console.log(`composite-payload: ${COLS}x${ROWS} ×${N} frames OK — stream ${r.
     assert.equal(mod.av1Composite(mod.fromBytes(raw)), true, `receiver ${role.ti} decompresses to a composite manifest`);
   }
   console.log(`composite-payload: mux round-trip OK — ${alloc.roles.filter(x => x.role === 'receiver').length} receivers via ${donors} blank donors (${CODEC})`);
+}
+
+// ── sRGB composite (v7 / FLAG2_SRGB) wire format ──────────────────────────────
+// Same reassembly contract as the palette-lossy composite, but with true-colour source frames,
+// v7 manifests, and BOTH decoded views.  Also exercises the STATIC (frameCount 1) grid, which
+// only sRGB mode allows.
+for (const SN of [3, 1]) {
+  const rgbTileFrames = Array.from({ length: TILES }, (_, ti) =>
+    Array.from({ length: SN }, (_, f) => {
+      const a = new Uint8Array(MAP * 3);
+      const x0 = (ti % COLS) * 128, y0 = Math.floor(ti / COLS) * 128;
+      const t = SN > 1 ? f / (SN - 1) : 0;
+      for (let y = 0; y < 128; y++)
+        for (let x = 0; x < 128; x++) {
+          const i = (y * 128 + x) * 3;
+          const v = noiseAt(x0 + x, y0 + y, t);
+          a[i] = Math.floor(v * 255); a[i + 1] = (x0 + x) & 0xff; a[i + 2] = (y0 + y) & 0xff;
+        }
+      return a;
+    }));
+  const pvTileFrames = rgbTileFrames.map(tf => tf.map(f => mod.quantizeRgbTile(f)));
+  const sDelays = Array.from({ length: TILES }, () => new Array(SN).fill(120));
+
+  assert.equal(mod.compositeEligibleSrgb(rgbTileFrames, TILES), true, `srgb eligibility (${SN}f)`);
+
+  const sr = await mod.encodeCompositionSrgb(rgbTileFrames, pvTileFrames, sDelays, COLS, ROWS, {
+    author: 'Tester', title: 'FullColour', nonce: 9, lossyQuality: 40, captureLossyFrames: true,
+  });
+  assert.equal(sr.composite, true, `srgb composite built (${SN}f)`);
+  assert.equal(sr.tiles.length, TILES);
+  assert.ok(sr.lossyTileRgb?.length === TILES, 'decoded RGB truth per tile');
+
+  const segs = new Array(TILES);
+  for (let ti = 0; ti < TILES; ti++) {
+    const raw = await mod.decompress(sr.tiles[ti].compressed);
+    const mf  = mod.fromBytes(raw);
+    assert.equal(mf.manifestVersion, 7, `tile ${ti} v7 (${SN}f)`);
+    assert.equal(mod.srgb(mf), true, `tile ${ti} FLAG2_SRGB`);
+    assert.equal(mod.av1Composite(mf), true, `tile ${ti} composite flag`);
+    assert.equal((mf.flags & mod.FLAG_ANIMATED) !== 0, SN > 1, `tile ${ti} animated flag (${SN}f)`);
+    assert.equal(mf.frameCount, SN);
+    assert.equal(mf.nonce, 9);
+    // Static tiles collapse to the [100] placeholder (normalizeDelays) — delay is meaningless at fc=1.
+    assert.deepEqual(mf.frameDelays, SN > 1 ? new Array(SN).fill(120) : [100],
+      `tile ${ti} delays from v7 prefix`);
+    // v7 stream offset = headerSize + frameCount*2, exactly the mod's handleCompositeTile math.
+    assert.equal(mod.av1StreamOffset(mf), mf.headerSize + SN * 2, `tile ${ti} stream offset`);
+    segs[mf.tileRow * COLS + mf.tileCol] = raw.subarray(mod.av1StreamOffset(mf));
+  }
+  const sStream = new Uint8Array(segs.reduce((n, s) => n + s.length, 0));
+  { let off = 0; for (const s of segs) { sStream.set(s, off); off += s.length; } }
+  assert.deepEqual(sStream, sr.stream, `srgb segments rebuild the stream (${SN}f)`);
+
+  const dec = await mod.decodeLossyRgb(sStream, 0, SN, undefined, { width: W, height: H });
+  for (let ti = 0; ti < TILES; ti++)
+    for (let f = 0; f < SN; f++) {
+      const crop = mod.cropTileRgb(dec.rgb[f], ti % COLS, Math.floor(ti / COLS), COLS);
+      assert.deepEqual(crop, sr.lossyTileRgb[ti][f], `srgb tile ${ti} frame ${f} RGB crop exact`);
+    }
+  console.log(`composite-payload: srgb ${COLS}x${ROWS} ×${SN} frame${SN > 1 ? 's' : ''} OK — v7 stream ${sr.stream.length} B, reassembly + RGB crop exact`);
 }

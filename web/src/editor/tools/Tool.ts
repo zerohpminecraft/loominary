@@ -8,7 +8,10 @@
 import type { MapCanvas } from '../Canvas.js';
 import type { EditHistory } from '../history.js';
 import type { CompositionState } from '../../payload-state.js';
+import { isSrgb } from '../../payload-state.js';
 import type { OklabLookup } from '../../quantize.js';
+import { quantizeRgbPixel } from '../../srgb.js';
+import { rgbToOklab } from '../../oklab.js';
 
 // ─── Tool context ─────────────────────────────────────────────────────────────
 
@@ -19,7 +22,8 @@ export interface ToolContext {
   oklabLookup:   OklabLookup;
 
   // Tool parameters (read-only from tool's perspective)
-  activeColor:   number;   // foreground map byte (0–255)
+  /** Palette mode: foreground map byte (0–255).  sRGB mode: packed 0xRRGGBB. */
+  activeColor:   number;
   brushRadius:   number;   // pixels
   brushShape:    'circle' | 'square';
   fillTolerance: number;   // OKLab distance (0–1)
@@ -78,17 +82,38 @@ export function globalToTile(
 
 /**
  * Read a single pixel from global coordinates.
+ * Palette mode: the map byte.  sRGB mode: packed 0xRRGGBB.
  * Returns 0 if out of bounds.
  */
 export function readPixel(comp: CompositionState, gx: number, gy: number): number {
   const t = globalToTile(gx, gy, comp);
   if (!t) return 0;
+  if (isSrgb(comp)) {
+    const rgb = comp.rgbFrames![t.ti]?.[comp.activeFrame];
+    if (!rgb) return 0;
+    const i = (t.lx + t.ly * MAP_SIZE) * 3;
+    return (rgb[i] << 16) | (rgb[i + 1] << 8) | rgb[i + 2];
+  }
   const frame = comp.frames[t.ti]?.[comp.activeFrame];
   return frame ? frame[t.lx + t.ly * MAP_SIZE] : 0;
 }
 
 /**
+ * OKLab coordinates of a colour as returned by {@link readPixel} — a map byte in palette
+ * mode, packed 0xRRGGBB in sRGB mode.  Used by the tolerance tools (Fill, Magic Wand).
+ */
+export function colorOklab(ctx: ToolContext, color: number): [number, number, number] | null {
+  if (isSrgb(ctx.comp)) {
+    return rgbToOklab((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
+  }
+  return ctx.oklabLookup[color] ?? null;
+}
+
+/**
  * Write a single pixel at global coordinates.
+ * Palette mode writes the map byte.  sRGB mode writes the packed 0xRRGGBB into rgbFrames
+ * AND its nearest-palette twin into frames — the preview invariant every consumer of
+ * `frames` relies on.
  * Respects the selection mask if provided (only writes if pixel is selected).
  * Returns true if a write occurred.
  */
@@ -109,7 +134,16 @@ export function writePixel(
   if (!t) return false;
   const frame = comp.frames[t.ti]?.[comp.activeFrame];
   if (!frame) return false;
-  frame[t.lx + t.ly * MAP_SIZE] = color;
+  const p = t.lx + t.ly * MAP_SIZE;
+  if (isSrgb(comp)) {
+    const rgb = comp.rgbFrames![t.ti]?.[comp.activeFrame];
+    if (!rgb) return false;
+    const r = (color >> 16) & 0xff, g = (color >> 8) & 0xff, b = color & 0xff;
+    rgb[p * 3] = r; rgb[p * 3 + 1] = g; rgb[p * 3 + 2] = b;
+    frame[p] = quantizeRgbPixel(r, g, b);
+    return true;
+  }
+  frame[p] = color;
   return true;
 }
 

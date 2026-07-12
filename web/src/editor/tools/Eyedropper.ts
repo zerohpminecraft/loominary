@@ -7,6 +7,7 @@
 
 import type { Tool, ToolContext } from './Tool.js';
 import { readPixel } from './Tool.js';
+import { isSrgb } from '../../payload-state.js';
 
 export class EyedropperTool implements Tool {
   readonly id     = 'eyedropper';
@@ -20,7 +21,9 @@ export class EyedropperTool implements Tool {
     if (button !== 0 && button !== 2) return;
 
     const picked = readPixel(ctx.comp, gx, gy);
-    if (picked !== 0) {
+    // Map byte 0 is the transparent sentinel in palette mode; in sRGB mode 0 is a real
+    // colour (pure black) and must be pickable.
+    if (picked !== 0 || isSrgb(ctx.comp)) {
       ctx.setColor(picked);
     }
   }

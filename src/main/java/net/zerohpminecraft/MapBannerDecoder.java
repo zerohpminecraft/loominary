@@ -85,6 +85,24 @@ public class MapBannerDecoder {
     private static final Map<Integer, byte[]> rawColors     = new HashMap<>();
     private static final Map<Integer, byte[]> decodedColors = new HashMap<>();
 
+    /**
+     * Current true-colour frame (packed RGB, 128·128·3 bytes) per RGB-claimed map — tiles decoded
+     * from a FLAG2_SRGB payload.  {@code MapState.colors} holds only the nearest-palette twin for
+     * these; the display mixins ({@code MapTextureMixin}, {@code IfMapAtlasFillMixin}) read this
+     * registry to paint the real colours.  Entries are replaced by {@link #paintMapRgb} and
+     * cleared whenever a non-RGB paint takes the tile over (placeholders, revert, toggle-off is
+     * gated below).
+     */
+    private static final Map<Integer, byte[]> rgbCurrent = new HashMap<>();
+
+    /**
+     * The true-colour frame the display mixins should paint for {@code mapId}, or null to use
+     * the vanilla palette path.  Render-thread callers only.
+     */
+    public static byte[] currentRgbFrame(int mapId) {
+        return decodingEnabled ? rgbCurrent.get(mapId) : null;
+    }
+
     // ── Per-map metadata (title / author from the manifest) ───────────
     // encrypted=true while the tile has metadata from the plaintext envelope header
     // but has not yet been decrypted; set to false once processDecompressedPayload runs.
@@ -123,6 +141,7 @@ public class MapBannerDecoder {
         final int cols, rows, frameCount, loopCount;
         final int[] frameDelays;
         final String username, title;
+        final boolean srgb;           // FLAG2_SRGB — decode keeps the true-colour planes
         final byte[][] segments;      // [tileIndex] = this tile's slice of the AV1 stream
         final CompositeTile[] tiles;  // [tileIndex] = where to paint once decoded
         int received;                 // distinct tiles seen
@@ -134,6 +153,7 @@ public class MapBannerDecoder {
             this.loopCount = m.loopCount;
             this.frameDelays = m.frameDelays;
             this.username = m.username; this.title = m.title;
+            this.srgb = m.srgb();
             this.segments = new byte[cols * rows][];
             this.tiles = new CompositeTile[cols * rows];
         }
@@ -155,6 +175,8 @@ public class MapBannerDecoder {
     private static final class AnimatedMapState {
         final MapIdComponent mapId;
         final byte[][] frames;
+        /** True-colour twins of {@link #frames} (packed RGB); null for palette tiles. */
+        final byte[][] rgbFrames;
         /** Length 1 = global delay; length N = per-frame delay table. */
         final int[] delaysMs;
         final int loopCount;
@@ -171,8 +193,17 @@ public class MapBannerDecoder {
         AnimatedMapState(MapIdComponent mapId, byte[][] frames, int[] delaysMs, int loopCount,
                          BlockPos framePos, int manifestCols, int manifestRows,
                          String syncUsername, String syncTitle) {
+            this(mapId, frames, null, delaysMs, loopCount, framePos, manifestCols, manifestRows,
+                    syncUsername, syncTitle);
+        }
+
+        AnimatedMapState(MapIdComponent mapId, byte[][] frames, byte[][] rgbFrames,
+                         int[] delaysMs, int loopCount,
+                         BlockPos framePos, int manifestCols, int manifestRows,
+                         String syncUsername, String syncTitle) {
             this.mapId = mapId;
             this.frames = frames;
+            this.rgbFrames = rgbFrames;
             this.delaysMs = delaysMs;
             this.loopCount = loopCount;
             this.framePos = framePos;
@@ -254,7 +285,7 @@ public class MapBannerDecoder {
                 decorations.clear();
             byte[] expected = anim != null ? anim.frames[anim.currentFrame] : decodedColors.get(mapId.id());
             if (expected != null && !Arrays.equals(mapState.colors, expected))
-                paintMap(client, mapId, mapState, expected);
+                repaintClaimed(client, mapId, mapState, anim, expected);
             return;
         }
 
@@ -308,6 +339,20 @@ public class MapBannerDecoder {
         }
     }
 
+    /**
+     * Re-paints a claimed tile after a server overwrite, preserving its sRGB claim: animated
+     * sRGB tiles repaint from the animation's RGB twin, static sRGB tiles from the registry
+     * entry, palette tiles via the plain path.
+     */
+    private static void repaintClaimed(MinecraftClient client, MapIdComponent mapId,
+            MapState mapState, AnimatedMapState anim, byte[] expected) {
+        byte[] rgb = anim != null && anim.rgbFrames != null
+                ? anim.rgbFrames[anim.currentFrame]
+                : rgbCurrent.get(mapId.id());
+        if (rgb != null) paintMapRgb(client, mapId, mapState, expected, rgb);
+        else paintMap(client, mapId, mapState, expected);
+    }
+
     private static void processFrame(MinecraftClient client, ItemFrameEntity frame) {
         ItemStack stack = frame.getHeldItemStack();
         if (!(stack.getItem() instanceof FilledMapItem))
@@ -348,7 +393,7 @@ public class MapBannerDecoder {
             if (expected != null && !Arrays.equals(mapState.colors, expected)) {
                 System.out.println(TAG + " server overwrite detected mapId=" + mapId.id()
                         + " — re-painting cached decode");
-                paintMap(client, mapId, mapState, expected);
+                repaintClaimed(client, mapId, mapState, anim, expected);
             }
             return;
         }
@@ -1160,13 +1205,16 @@ public class MapBannerDecoder {
             return;
         }
 
+        if (manifest.av1()) {
+            // AV1 decode is heavy — off the game thread; covers animated AND static streams
+            // (static sRGB tiles are a single-frame stream, not a raw colour array). With no
+            // item frame the animation simply doesn't register and frame 0 paints statically.
+            decodeAv1Async(client, mapId, mapState, manifest, full,
+                    frameEntity != null ? frameEntity.getBlockPos() : null);
+            return;
+        }
+
         if (manifest.animated() && manifest.frameCount > 1 && frameEntity != null) {
-            if (manifest.av1()) {
-                // AV1 decode is heavy — off the game thread. Raw/delta/sparse extraction below
-                // is just array copying and stays synchronous.
-                decodeAv1Async(client, mapId, mapState, manifest, full, frameEntity.getBlockPos());
-                return;
-            }
             byte[][] frames = extractFrames(full, manifest);
             if (frames.length < 2) {
                 paintMap(client, mapId, mapState, frames[0]);
@@ -1179,10 +1227,6 @@ public class MapBannerDecoder {
             animatedMaps.put(mapId.id(), animState);
             markSyncGroupsDirty();
             paintMap(client, mapId, mapState, frames[0]);
-        } else if (manifest.av1() && manifest.frameCount > 1) {
-            // Held AV1 map (no item frame to animate in): the payload has no raw frame 0 —
-            // decode the stream off-thread and paint the first frame statically.
-            decodeAv1Async(client, mapId, mapState, manifest, full, null);
         } else {
             paintMap(client, mapId, mapState,
                     Arrays.copyOfRange(full, offset, offset + MAP_BYTES));
@@ -1222,21 +1266,41 @@ public class MapBannerDecoder {
                     client.execute(() ->
                             paintMap(client, mapId, mapState, PlaceholderArt.decoding(done, totalFrames)));
                 };
-                byte[][] frames = extractFrames(full, manifest, progress);
+                final byte[][] frames;
+                final byte[][] rgbFrames;
+                if (manifest.srgb()) {
+                    // sRGB tiles keep both views: nearest-palette bytes for colors[] and the
+                    // reconstructed RGB for the display mixins.
+                    int av1Offset = manifest.headerSize
+                            + (manifest.manifestVersion >= 5 ? totalFrames * 2 : 0);
+                    Av1FrameDecoder.Decoded dec = Av1FrameDecoder.decodeWithRgb(
+                            full, av1Offset, totalFrames, 128, 128, progress);
+                    frames = dec.idxFrames();
+                    rgbFrames = dec.rgbFrames();
+                } else {
+                    frames = extractFrames(full, manifest, progress);
+                    rgbFrames = null;
+                }
                 long decodeMs = (System.nanoTime() - t0) / 1_000_000;
                 client.execute(() -> {
                     pendingAv1Decodes.remove(mapId.id());
                     if (frames.length > 1 && framePos != null) {
                         AnimatedMapState animState = new AnimatedMapState(
-                                mapId, frames, manifest.frameDelays, manifest.loopCount,
+                                mapId, frames, rgbFrames, manifest.frameDelays, manifest.loopCount,
                                 framePos, manifest.cols, manifest.rows,
                                 manifest.username, manifest.title);
                         animatedMaps.put(mapId.id(), animState);
                         markSyncGroupsDirty();
                     }
-                    if (mapState != null) paintMap(client, mapId, mapState, frames[0]);
+                    if (mapState != null) {
+                        if (rgbFrames != null)
+                            paintMapRgb(client, mapId, mapState, frames[0], rgbFrames[0]);
+                        else
+                            paintMap(client, mapId, mapState, frames[0]);
+                    }
                     System.out.println(TAG + " AV1 map " + mapId.id() + " decoded ("
-                            + frames.length + " frames, " + decodeMs + " ms)");
+                            + frames.length + " frames" + (rgbFrames != null ? ", sRGB" : "")
+                            + ", " + decodeMs + " ms)");
                 });
             } catch (Throwable e) {
                 System.err.println(TAG + " AV1 decode failed for map " + mapId.id() + ": " + e);
@@ -1254,7 +1318,8 @@ public class MapBannerDecoder {
     private static String compositeKey(PayloadManifest m) {
         return m.cols + "x" + m.rows + ":" + m.frameCount + ":" + m.nonce
                 + ":" + (m.username == null ? "" : m.username)
-                + ":" + (m.title    == null ? "" : m.title);
+                + ":" + (m.title    == null ? "" : m.title)
+                + (m.srgb() ? ":srgb" : "");
     }
 
     /** Crop one tile's 128×128 window out of a (cols·128)-wide composition frame. */
@@ -1268,6 +1333,17 @@ public class MapBannerDecoder {
         return out;
     }
 
+    /** RGB variant of {@link #cropCompositeTile} — 3 bytes per pixel. */
+    private static byte[][] cropCompositeTileRgb(byte[][] frames, int tileCol, int tileRow, int cols) {
+        int w = cols * 128;
+        byte[][] out = new byte[frames.length][MAP_BYTES * 3];
+        for (int f = 0; f < frames.length; f++)
+            for (int y = 0; y < 128; y++)
+                System.arraycopy(frames[f], ((tileRow * 128 + y) * w + tileCol * 128) * 3,
+                        out[f], y * 128 * 3, 128 * 3);
+        return out;
+    }
+
     /**
      * Stores one composite tile's stream segment and paints the tile transparent while its
      * siblings are still missing.  When all {@code cols×rows} segments have been seen, the full
@@ -1278,8 +1354,10 @@ public class MapBannerDecoder {
             MapIdComponent mapId, MapState mapState,
             ItemFrameEntity frameEntity, PayloadManifest manifest, byte[] full) {
         int cols = manifest.cols, rows = manifest.rows;
+        // frameCount 1 is legal for sRGB: a static grid still benefits from one seam-free stream.
+        int minFrames = manifest.srgb() ? 1 : 2;
         if (cols < 1 || rows < 1 || manifest.tileCol >= cols || manifest.tileRow >= rows
-                || manifest.frameCount < 2) {
+                || manifest.frameCount < minFrames) {
             throw new IllegalStateException("Bad composite manifest: grid=" + cols + "x" + rows
                     + " tile=(" + manifest.tileCol + "," + manifest.tileRow + ")"
                     + " frames=" + manifest.frameCount);
@@ -1344,8 +1422,18 @@ public class MapBannerDecoder {
                     byte[] art = PlaceholderArt.decoding(done, buf.frameCount);
                     client.execute(() -> paintAllCompositeTiles(client, buf, art));
                 };
-                byte[][] frames = Av1FrameDecoder.decode(stream, 0, buf.frameCount, true, w, h,
-                        progress);
+                final byte[][] frames;
+                final byte[][] rgbFrames;
+                if (buf.srgb) {
+                    Av1FrameDecoder.Decoded dec = Av1FrameDecoder.decodeWithRgb(
+                            stream, 0, buf.frameCount, w, h, progress);
+                    frames = dec.idxFrames();
+                    rgbFrames = dec.rgbFrames();
+                } else {
+                    frames = Av1FrameDecoder.decode(stream, 0, buf.frameCount, true, w, h,
+                            progress);
+                    rgbFrames = null;
+                }
                 long decodeMs = (System.nanoTime() - t0) / 1_000_000;
                 client.execute(() -> {
                     compositeBuffers.remove(key);
@@ -1353,13 +1441,21 @@ public class MapBannerDecoder {
                         CompositeTile tile = buf.tiles[i];
                         if (tile == null) continue;
                         byte[][] tileFrames = cropCompositeTile(frames, i % cols, i / cols, cols);
+                        byte[][] tileRgb = rgbFrames != null
+                                ? cropCompositeTileRgb(rgbFrames, i % cols, i / cols, cols)
+                                : null;
                         if (tileFrames.length > 1 && tile.framePos() != null) {
                             AnimatedMapState animState = new AnimatedMapState(
-                                    tile.mapId(), tileFrames, buf.frameDelays, buf.loopCount,
-                                    tile.framePos(), cols, rows, buf.username, buf.title);
+                                    tile.mapId(), tileFrames, tileRgb, buf.frameDelays,
+                                    buf.loopCount, tile.framePos(), cols, rows,
+                                    buf.username, buf.title);
                             animatedMaps.put(tile.mapId().id(), animState);
                         }
-                        paintMap(client, tile.mapId(), tile.mapState(), tileFrames[0]);
+                        if (tileRgb != null)
+                            paintMapRgb(client, tile.mapId(), tile.mapState(),
+                                    tileFrames[0], tileRgb[0]);
+                        else
+                            paintMap(client, tile.mapId(), tile.mapState(), tileFrames[0]);
                     }
                     markSyncGroupsDirty();
                     System.out.println(TAG + " Composite \"" + key + "\" decoded and painted ("
@@ -1446,7 +1542,12 @@ public class MapBannerDecoder {
 
                 if (!isInRange(playerPos, s)) continue;
                 MapState mapState = FilledMapItem.getMapState(s.mapId, client.world);
-                if (mapState != null) paintMap(client, s.mapId, mapState, s.frames[s.currentFrame]);
+                if (mapState == null) continue;
+                if (s.rgbFrames != null)
+                    paintMapRgb(client, s.mapId, mapState, s.frames[s.currentFrame],
+                            s.rgbFrames[s.currentFrame]);
+                else
+                    paintMap(client, s.mapId, mapState, s.frames[s.currentFrame]);
             }
         }
     }
@@ -1505,9 +1606,12 @@ public class MapBannerDecoder {
         long originalSize = Zstd.getFrameContentSize(compressed);
         if (originalSize < 0)
             throw new IllegalStateException("Missing zstd frame content size — corrupt payload?");
-        if (originalSize < MAP_BYTES)
+        // AV1 payloads (lossy / sRGB v7) are manifest + compressed stream and legitimately
+        // decompress to well under one 16,384-byte frame — the old MAP_BYTES floor only ever
+        // applied to raw payloads, which processDecompressedPayload still size-checks itself.
+        if (originalSize < 2)
             throw new IllegalStateException("Decompressed size " + originalSize
-                    + " is smaller than MAP_BYTES — corrupt payload?");
+                    + " is too small for any payload — corrupt?");
         return Zstd.decompress(compressed, (int) originalSize);
     }
 
@@ -1578,6 +1682,10 @@ public class MapBannerDecoder {
             byte[] mapColors) {
         rawColors.computeIfAbsent(mapId.id(), k -> mapState.colors.clone());
         decodedColors.put(mapId.id(), mapColors.clone());
+        // A plain paint takes the tile over from any earlier sRGB claim (placeholder art,
+        // revert, a re-decode); paintMapRgb re-registers right after this call when the new
+        // content is true-colour.
+        rgbCurrent.remove(mapId.id());
         if (!decodingEnabled) return;
         // Unlock before setNeedsUpdate so MapMipMapMod doesn't see a locked map at
         // dirty-mark time and freeze the texture; MapRendererMixin handles re-unlock
@@ -1594,6 +1702,19 @@ public class MapBannerDecoder {
                     + " checksum=" + Integer.toHexString(colorsChecksum(mapColors))
                     + " mapStateChecksum=" + Integer.toHexString(colorsChecksum(mapState.colors)));
         }
+    }
+
+    /**
+     * Paints an sRGB tile: {@code quantized} (the nearest-palette twin) goes into
+     * {@code MapState.colors} via {@link #paintMap}, and {@code rgb} (packed 128·128·3) is
+     * registered for the display mixins so the rendered texture shows true colour.
+     */
+    public static void paintMapRgb(MinecraftClient client,
+            MapIdComponent mapId,
+            MapState mapState,
+            byte[] quantized, byte[] rgb) {
+        paintMap(client, mapId, mapState, quantized);
+        if (rgb != null) rgbCurrent.put(mapId.id(), rgb);
     }
 
     /** Cheap rolling hash over map colors; only used for diagnostic logs. */
@@ -1746,8 +1867,9 @@ public class MapBannerDecoder {
                     + " tiles of the composition are required");
         }
 
-        if (manifest.av1() && fc > 1) {
-            // v5 stores a frameCount×u16 per-frame delay table as a prefix before the AV1 stream.
+        if (manifest.av1()) {
+            // Any frame count — a static (fc=1) AV1 payload is still a stream, never raw bytes.
+            // v5+ stores a frameCount×u16 per-frame delay table as a prefix before the stream.
             int av1Offset = offset + (manifest.manifestVersion >= 5 ? fc * 2 : 0);
             return Av1FrameDecoder.decode(full, av1Offset, fc, manifest.av1Lossy(),
                     128, 128, onFrameDecoded);
@@ -1932,6 +2054,7 @@ public class MapBannerDecoder {
         encryptedNoPass.clear();
         rawColors.clear();
         decodedColors.clear();
+        rgbCurrent.clear();
         renderUpdateSeen.clear();
         scanSeen.clear();
         paintLogCount.clear();

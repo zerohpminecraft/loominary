@@ -21,6 +21,7 @@
 
 import { MC_PALETTE } from '../palette.js';
 import type { CompositionState } from '../payload-state.js';
+import { isSrgb } from '../payload-state.js';
 
 export const MAP_SIZE = 128;
 
@@ -82,7 +83,8 @@ export class MapCanvas {
   previewComp: CompositionState | null = null;
 
   // Paste ghost — clipboard pixels rendered semi-transparently at cursor.
-  pasteGhost: { pixels: Uint8Array; mask: Uint8Array; w: number; h: number } | null = null;
+  // pixels: map bytes in palette mode, packed 0xRRGGBB in sRGB mode.
+  pasteGhost: { pixels: Uint32Array; mask: Uint8Array; w: number; h: number } | null = null;
 
   // Fill hover preview — flood region shown with the fill colour.
   fillPreview:      Uint8Array | null = null;
@@ -288,6 +290,7 @@ export class MapCanvas {
       this.imgData = new ImageData(gridW, gridH);
     }
 
+    const srgb = isSrgb(comp);
     const d = this.imgData.data;
     for (let tileRow = 0; tileRow < comp.gridRows; tileRow++) {
       for (let tileCol = 0; tileCol < comp.gridCols; tileCol++) {
@@ -295,11 +298,26 @@ export class MapCanvas {
         const frame = comp.frames[ti]?.[comp.activeFrame];
         if (!frame) continue;
 
+        // sRGB mode: render the true-colour bytes directly (no transparency,
+        // heatmap/dither overlays don't apply).  Falls back to the palette
+        // preview twin if this tile's rgb frame is missing.
+        const rgbFrame = srgb ? comp.rgbFrames![ti]?.[comp.activeFrame] ?? null : null;
+
         for (let ly = 0; ly < MAP_SIZE; ly++) {
           for (let lx = 0; lx < MAP_SIZE; lx++) {
             const gx = tileCol * MAP_SIZE + lx;
             const gy = tileRow * MAP_SIZE + ly;
             const di = (gy * gridW + gx) * 4;
+
+            if (rgbFrame) {
+              const si = (lx + ly * MAP_SIZE) * 3;
+              d[di    ] = rgbFrame[si];
+              d[di + 1] = rgbFrame[si + 1];
+              d[di + 2] = rgbFrame[si + 2];
+              d[di + 3] = 255;
+              continue;
+            }
+
             const mapByte = frame[lx + ly * MAP_SIZE];
 
             if (mapByte === 0) {
@@ -503,7 +521,11 @@ export class MapCanvas {
     const [gxMin, gyMin] = this.screenToGlobal(0, 0);
     const [gxMax, gyMax] = this.screenToGlobal(this.el.width, this.el.height);
 
-    const rgb = MC_PALETTE[this.fillPreviewColor] ?? 0;
+    // fillPreviewColor is a map byte in palette mode, a packed 0xRRGGBB in sRGB mode.
+    const comp = this.previewComp ?? this._comp;
+    const rgb = comp && isSrgb(comp)
+      ? this.fillPreviewColor
+      : MC_PALETTE[this.fillPreviewColor] ?? 0;
     const r = (rgb >> 16) & 0xff;
     const g = (rgb >>  8) & 0xff;
     const b = rgb & 0xff;
@@ -524,11 +546,14 @@ export class MapCanvas {
     const ox = brushX - Math.floor(w / 2);
     const oy = brushY - Math.floor(h / 2);
 
+    // Clipboard values are map bytes in palette mode, packed 0xRRGGBB in sRGB mode.
+    const comp = this.previewComp ?? this._comp;
+    const srgb = !!comp && isSrgb(comp);
     for (let py = 0; py < h; py++) {
       for (let px = 0; px < w; px++) {
         const ci = py * w + px;
         if (!mask[ci]) continue;
-        const rgb = MC_PALETTE[pixels[ci]] ?? 0;
+        const rgb = srgb ? pixels[ci] : MC_PALETTE[pixels[ci]] ?? 0;
         const r = (rgb >> 16) & 0xff;
         const g = (rgb >>  8) & 0xff;
         const b =  rgb        & 0xff;

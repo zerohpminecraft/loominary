@@ -9,7 +9,7 @@
  */
 
 import type { Tool, ToolContext } from './Tool.js';
-import { readPixel, MAP_SIZE } from './Tool.js';
+import { readPixel, colorOklab, MAP_SIZE } from './Tool.js';
 import { oklabDistSq } from '../../oklab.js';
 
 export class MagicWandTool implements Tool {
@@ -128,14 +128,14 @@ export class MagicWandTool implements Tool {
   }
 
   private flood(gx: number, gy: number, ctx: ToolContext): Uint8Array | null {
-    const { comp, oklabLookup, wandTolerance } = ctx;
+    const { comp, wandTolerance } = ctx;
     const gridW = comp.gridCols * MAP_SIZE;
     const gridH = comp.gridRows * MAP_SIZE;
 
     if (gx < 0 || gy < 0 || gx >= gridW || gy >= gridH) return null;
 
     const startColor = readPixel(comp, gx, gy);
-    const startEntry = oklabLookup[startColor];
+    const startEntry = colorOklab(ctx, startColor);
     const tolSq      = wandTolerance * wandTolerance;
 
     const result  = new Uint8Array(gridW * gridH);
@@ -149,8 +149,8 @@ export class MagicWandTool implements Tool {
       const cx = cur % gridW;
       const curColor = readPixel(comp, cx, cy);
 
-      if (startEntry && oklabLookup[curColor]) {
-        const e = oklabLookup[curColor]!;
+      const e = startEntry ? colorOklab(ctx, curColor) : null;
+      if (startEntry && e) {
         if (oklabDistSq(startEntry[0], startEntry[1], startEntry[2], e[0], e[1], e[2]) > tolSq) continue;
       } else if (curColor !== startColor) {
         continue;

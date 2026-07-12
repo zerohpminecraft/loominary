@@ -255,27 +255,35 @@ static uint8_t nearest_map_byte(int r, int g, int b) {
     return (uint8_t) best;
 }
 
-/* Decode one temporal unit and write a 128×128 map-byte plane into `out`.
- *   - monochrome stream (lossless): the Y plane already holds (permuted) map indices —
- *     copied through verbatim; the caller applies INV_PERM.
- *   - colour stream (lossy): YUV420 → RGB (BT.601) → nearest palette map byte, per pixel.
- * Returns bytes written (w*h) or negative on error. */
-int dec_tu(const uint8_t *obu, int len, uint8_t *out, int out_cap) {
+/* Decode one temporal unit, writing up to two views of the frame:
+ *   - `out_idx` (may be NULL): map-byte plane, w*h bytes.
+ *       monochrome stream (lossless): the Y plane already holds (permuted) map
+ *       indices — copied through verbatim; the caller applies INV_PERM.
+ *       colour stream (lossy): nearest palette map byte per pixel (needs
+ *       dec_set_palette).
+ *   - `out_rgb` (may be NULL): packed RGB, w*h*3 bytes.  Colour streams only —
+ *       the reconstructed BT.601 RGB before any palette quantisation (sRGB mode);
+ *       ignored for monochrome streams.
+ * Returns w*h or negative on error. */
+int dec_tu_full(const uint8_t *obu, int len, uint8_t *out_idx, int idx_cap,
+                uint8_t *out_rgb, int rgb_cap) {
     if (!g_dec_ready) return -1;
     if (aom_codec_decode(&g_dec, obu, (size_t) len, NULL) != AOM_CODEC_OK) return -2;
     aom_codec_iter_t iter = NULL;
     aom_image_t *img = aom_codec_get_frame(&g_dec, &iter);
     if (!img) return -3;
     int w = img->d_w, h = img->d_h;
-    if (w * h > out_cap) return -4;
+    if (out_idx && w * h > idx_cap) return -4;
+    if (out_rgb && w * h * 3 > rgb_cap) return -5;
 
     if (img->monochrome) {
-        for (int y = 0; y < h; y++)
-            memcpy(out + y * w, img->planes[0] + y * img->stride[0], w);
+        if (out_idx)
+            for (int y = 0; y < h; y++)
+                memcpy(out_idx + y * w, img->planes[0] + y * img->stride[0], w);
         return w * h;
     }
 
-    /* Colour: limited-range BT.601 YUV420 → RGB → nearest palette entry. */
+    /* Colour: limited-range BT.601 YUV420 → RGB → palette byte and/or raw RGB. */
     for (int y = 0; y < h; y++) {
         const uint8_t *Y = img->planes[0] + y * img->stride[0];
         const uint8_t *U = img->planes[1] + (y >> 1) * img->stride[1];
@@ -288,10 +296,21 @@ int dec_tu(const uint8_t *obu, int len, uint8_t *out, int out_cap) {
             r = r < 0 ? 0 : r > 255 ? 255 : r;
             g = g < 0 ? 0 : g > 255 ? 255 : g;
             b = b < 0 ? 0 : b > 255 ? 255 : b;
-            out[y * w + x] = nearest_map_byte(r, g, b);
+            if (out_idx) out_idx[y * w + x] = nearest_map_byte(r, g, b);
+            if (out_rgb) {
+                uint8_t *px = out_rgb + (y * w + x) * 3;
+                px[0] = (uint8_t) r; px[1] = (uint8_t) g; px[2] = (uint8_t) b;
+            }
         }
     }
     return w * h;
+}
+
+/* Legacy single-output entry point — identical behaviour to dec_tu_full with no
+ * RGB buffer.  Kept as its own export so existing callers (and fixtures) are
+ * untouched. */
+int dec_tu(const uint8_t *obu, int len, uint8_t *out, int out_cap) {
+    return dec_tu_full(obu, len, out, out_cap, NULL, 0);
 }
 
 void dec_close(void) {

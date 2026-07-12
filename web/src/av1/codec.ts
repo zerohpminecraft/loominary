@@ -28,6 +28,7 @@ interface CodecExports {
   dec_open(): number;
   dec_set_palette(entries: number, count: number): void;
   dec_tu(obu: number, len: number, out: number, outCap: number): number;
+  dec_tu_full(obu: number, len: number, outIdx: number, idxCap: number, outRgb: number, rgbCap: number): number;
   dec_close(): void;
   _initialize?(): void;
 }
@@ -247,6 +248,86 @@ export async function decodeLossyColor(
     ex.shim_free(palPtr);
     ex.shim_free(obuPtr);
     ex.shim_free(outPtr);
+  }
+}
+
+/**
+ * Encode packed-RGB frames (`width*height*3` bytes each) as a LOSSY colour AV1 stream —
+ * the sRGB-mode twin of {@link encodeLossyColor}, minus the palette rasterise step (the
+ * frames are already true colour and never came from palette indices).
+ */
+export async function encodeLossyRgb(
+  rgbFrames: Uint8Array[], quality: number, onProgress?: ProgressFn, dims: Dims = TILE_DIMS,
+): Promise<Uint8Array> {
+  const { width, height } = dims;
+  const planeBytes = width * height;
+  const ex = await encoder();
+  if (ex.enc_init(width, height, rgbFrames.length, MODE_COLOR_CQ, quality) !== 0) throw new Error('enc_init(rgb) failed');
+  const inPtr = ex.shim_malloc(planeBytes * 3);
+  try {
+    for (let f = 0; f < rgbFrames.length; f++) {
+      const rgb = rgbFrames[f];
+      if (rgb.length !== planeBytes * 3) throw new Error(`rgb frame ${f} is ${rgb.length} bytes, want ${planeBytes * 3}`);
+      writeMem(ex, inPtr, rgb);
+      if (ex.enc_frame(inPtr, rgb.length) !== 0) throw new Error('enc_frame(rgb) failed');
+      onProgress?.(f + 1, rgbFrames.length);
+    }
+    const total = ex.enc_finish();
+    if (total <= 0) throw new Error(`enc_finish(rgb)=${total}`);
+    return readMem(ex, ex.enc_data(), total);
+  } finally {
+    ex.shim_free(inPtr);
+    ex.enc_reset();
+  }
+}
+
+/** Both views of a decoded lossy colour stream (sRGB mode): nearest-palette map bytes and raw RGB. */
+export interface DecodedRgb { idx: Uint8Array[]; rgb: Uint8Array[] }
+
+/**
+ * Decode a lossy colour AV1 stream keeping BOTH the nearest-palette map bytes (`idx`, the
+ * quantised preview twin) and the reconstructed packed RGB (`rgb`, `width*height*3` per frame).
+ * Byte-for-byte the same maths the mod runs via Chicory (`Av1FrameDecoder.decodeWithRgb`).
+ */
+export async function decodeLossyRgb(
+  full: Uint8Array, offset: number, frameCount: number, onProgress?: ProgressFn, dims: Dims = TILE_DIMS,
+): Promise<DecodedRgb> {
+  const { width, height } = dims;
+  const planeBytes = width * height;
+  const ex = await decoder();
+  if (ex.dec_open() !== 0) throw new Error('dec_open failed');
+  const entries = palEntries();
+  const palPtr = ex.shim_malloc(entries.length);
+  const obuPtr = ex.shim_malloc(Math.max(1 << 20, maxTuLength(full, offset)));
+  const outPtr = ex.shim_malloc(planeBytes);
+  const rgbPtr = ex.shim_malloc(planeBytes * 3);
+  try {
+    writeMem(ex, palPtr, entries);
+    ex.dec_set_palette(palPtr, entries.length / 4);
+    const idx: Uint8Array[] = [];
+    const rgb: Uint8Array[] = [];
+    let off = offset;
+    for (let f = 0; f < frameCount; f++) {
+      if (off + 4 > full.length) break;
+      const len = full[off] | (full[off+1] << 8) | (full[off+2] << 16) | (full[off+3] << 24);
+      off += 4;
+      if (len <= 0 || off + len > full.length) break;
+      writeMem(ex, obuPtr, full.subarray(off, off + len));
+      off += len;
+      const wrote = ex.dec_tu_full(obuPtr, len, outPtr, planeBytes, rgbPtr, planeBytes * 3);
+      if (wrote !== planeBytes) throw new Error(`dec_tu_full frame ${f} = ${wrote}`);
+      idx.push(readMem(ex, outPtr, planeBytes));
+      rgb.push(readMem(ex, rgbPtr, planeBytes * 3));
+      onProgress?.(f + 1, frameCount);
+    }
+    if (idx.length === 0) throw new Error('AV1 sRGB decode produced no frames');
+    return { idx, rgb };
+  } finally {
+    ex.dec_close();
+    ex.shim_free(palPtr);
+    ex.shim_free(obuPtr);
+    ex.shim_free(outPtr);
+    ex.shim_free(rgbPtr);
   }
 }
 

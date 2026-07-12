@@ -416,4 +416,107 @@ class PayloadManifestTest {
         assertEquals("Player", m.username);
         assertEquals("Mux Test", m.title);
     }
+
+    // ── v7 (flags2 / sRGB) ───────────────────────────────────────────────
+
+    @Test
+    void roundtrip_v7_srgbAnimated() {
+        int flags = PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1
+                | PayloadManifest.FLAG_AV1_LOSSY;
+        int[] delays = {40, 60, 80, 100};
+        byte[] header = PayloadManifest.toBytesV7(
+                flags, PayloadManifest.FLAG2_SRGB, 2, 2, 1, 0,
+                0xABCDL, "Artist", "Full Colour", 0x11223344, 4, 2);
+        assertEquals(7, header[0] & 0xFF);
+        assertEquals(header.length, header[1] & 0xFF, "headerSize must equal header length");
+
+        // Combined = header ++ prefix delay table ++ (stand-in AV1 stream bytes).
+        byte[] prefix = PayloadManifest.delayPrefixBytes(4, delays);
+        byte[] combined = new byte[header.length + prefix.length + 32];
+        System.arraycopy(header, 0, combined, 0, header.length);
+        System.arraycopy(prefix, 0, combined, header.length, prefix.length);
+
+        PayloadManifest m = PayloadManifest.fromBytes(combined);
+        assertEquals(7, m.manifestVersion);
+        assertTrue(m.srgb(), "FLAG2_SRGB must survive roundtrip");
+        assertTrue(m.animated());
+        assertTrue(m.av1());
+        assertTrue(m.av1Lossy());
+        assertEquals(4, m.frameCount);
+        assertEquals(2, m.loopCount);
+        assertEquals(0x11223344, m.nonce);
+        assertEquals("Artist", m.username);
+        assertEquals("Full Colour", m.title);
+        assertArrayEquals(delays, m.frameDelays, "v7 per-frame delays must parse from the prefix");
+        // The v5+ AV1 stream-offset rule: header + frameCount×u16 prefix.
+        assertEquals(m.headerSize + 4 * 2, header.length + prefix.length);
+    }
+
+    @Test
+    void roundtrip_v7_srgbStatic_frameCount1() {
+        // Static sRGB: frameCount=1, FLAG_ANIMATED unset, but the 2-byte delay prefix is still
+        // written so the stream offset rule stays uniform.
+        int flags = PayloadManifest.FLAG_AV1 | PayloadManifest.FLAG_AV1_LOSSY;
+        byte[] header = PayloadManifest.toBytesV7(
+                flags, PayloadManifest.FLAG2_SRGB, 1, 1, 0, 0,
+                0L, null, null, 0, 1, 0);
+        byte[] prefix = PayloadManifest.delayPrefixBytes(1, new int[]{100});
+        assertEquals(2, prefix.length);
+        byte[] combined = new byte[header.length + prefix.length + 16];
+        System.arraycopy(header, 0, combined, 0, header.length);
+        System.arraycopy(prefix, 0, combined, header.length, prefix.length);
+
+        PayloadManifest m = PayloadManifest.fromBytes(combined);
+        assertEquals(7, m.manifestVersion);
+        assertTrue(m.srgb());
+        assertFalse(m.animated());
+        assertEquals(1, m.frameCount);
+    }
+
+    @Test
+    void v7_headerSize_staysU8_withMaxStrings() {
+        byte[] header = PayloadManifest.toBytesV7(
+                PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1 | PayloadManifest.FLAG_AV1_LOSSY,
+                PayloadManifest.FLAG2_SRGB, 8, 8, 7, 7,
+                0xFFFFFFFFL, "A".repeat(16), "B".repeat(64), -1, 65535, 65535);
+        assertTrue(header.length <= 255, "v7 header must fit the u8 header_size");
+        assertEquals(header.length, header[1] & 0xFF);
+    }
+
+    @Test
+    void flags2_defaultsZero_forOlderVersions() {
+        PayloadManifest v4 = PayloadManifest.fromBytes(PayloadManifest.toBytes(
+                PayloadManifest.FLAG_ANIMATED, 1, 1, 0, 0, 0L, null, null, 0, 2, 0, new int[]{100}));
+        assertEquals(0, v4.flags2);
+        assertFalse(v4.srgb());
+
+        PayloadManifest v2 = PayloadManifest.fromBytes(PayloadManifest.toBytes(
+                0, 1, 1, 0, 0, 0L, "u", "t", 7));
+        assertEquals(0, v2.flags2);
+        assertFalse(v2.srgb());
+    }
+
+    @Test
+    void v7_matchesWebCanonicalBytes() {
+        // Byte-parity anchor shared with web/test/manifest-v7.test.mjs — both writers must
+        // produce these exact bytes for the same inputs.
+        String canonicalHex =
+                "072962020201000000abcd064172746973740b46756c6c20436f6c6f75721122334400040002010001";
+        byte[] header = PayloadManifest.toBytesV7(
+                PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1 | PayloadManifest.FLAG_AV1_LOSSY,
+                PayloadManifest.FLAG2_SRGB, 2, 2, 1, 0,
+                0xABCDL, "Artist", "Full Colour", 0x11223344, 4, 2);
+        StringBuilder hex = new StringBuilder();
+        for (byte b : header) hex.append(String.format("%02x", b));
+        assertEquals(canonicalHex, hex.toString(), "v7 writer must match the web writer byte-for-byte");
+    }
+
+    @Test
+    void v7_trailingDelayBytes_isEmpty() {
+        // v7 uses the PREFIX table; the v5 trailing-table helper must not fire on it.
+        byte[] header = PayloadManifest.toBytesV7(
+                PayloadManifest.FLAG_ANIMATED | PayloadManifest.FLAG_AV1 | PayloadManifest.FLAG_AV1_LOSSY,
+                PayloadManifest.FLAG2_SRGB, 1, 1, 0, 0, 0L, null, null, 0, 3, 0);
+        assertEquals(0, PayloadManifest.trailingDelayBytes(header, new int[]{40, 60, 80}).length);
+    }
 }

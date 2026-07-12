@@ -73,6 +73,31 @@ public final class Av1FrameDecoder {
     public static byte[][] decode(byte[] full, int offset, int frameCount, boolean lossy,
                                   int width, int height,
                                   java.util.function.IntConsumer onFrameDecoded) {
+        return decodeImpl(full, offset, frameCount, lossy, width, height, onFrameDecoded, false).idxFrames();
+    }
+
+    /**
+     * Both views of a decoded lossy-colour stream: {@code idxFrames} are nearest-palette map
+     * bytes (what {@code MapState.colors} holds — the quantised twin), {@code rgbFrames} are the
+     * reconstructed packed-RGB planes ({@code byte[width*height*3]}) before quantisation — the
+     * true-colour art shown by the sRGB display path.
+     */
+    public record Decoded(byte[][] idxFrames, byte[][] rgbFrames) {}
+
+    /**
+     * Decodes a lossy-colour stream (FLAG2_SRGB payloads) keeping BOTH the nearest-palette map
+     * bytes and the raw RGB per frame.  Lossy-only: sRGB art is always carried as an AV1 colour
+     * stream.  Same framing/state rules as {@link #decode(byte[], int, int, boolean, int, int)}.
+     */
+    public static Decoded decodeWithRgb(byte[] full, int offset, int frameCount,
+                                        int width, int height,
+                                        java.util.function.IntConsumer onFrameDecoded) {
+        return decodeImpl(full, offset, frameCount, true, width, height, onFrameDecoded, true);
+    }
+
+    private static Decoded decodeImpl(byte[] full, int offset, int frameCount, boolean lossy,
+                                      int width, int height,
+                                      java.util.function.IntConsumer onFrameDecoded, boolean wantRgb) {
         final int planeBytes = width * height;
         WasiOptions wasiOpts = WasiOptions.builder().build();
         try (WasiPreview1 wasi = WasiPreview1.builder().withOptions(wasiOpts).build()) {
@@ -104,9 +129,11 @@ public final class Av1FrameDecoder {
             int obuCap = Math.max(1 << 20, maxTuLength(full, offset));
             int obuPtr = (int) inst.export("shim_malloc").apply(obuCap)[0];
             int outPtr = (int) inst.export("shim_malloc").apply(planeBytes)[0];
+            int rgbPtr = wantRgb ? (int) inst.export("shim_malloc").apply(planeBytes * 3)[0] : 0;
             byte[] invPerm = PalettePermutation.INV_PERM;
 
             byte[][] frames = new byte[frameCount][];
+            byte[][] rgbFrames = wantRgb ? new byte[frameCount][] : null;
             int off = offset;
             int f = 0;
             for (; f < frameCount; f++) {
@@ -119,7 +146,10 @@ public final class Av1FrameDecoder {
                 mem.write(obuPtr, java.util.Arrays.copyOfRange(full, off, off + len));
                 off += len;
 
-                long wrote = inst.export("dec_tu").apply(obuPtr, len, outPtr, planeBytes)[0];
+                long wrote = wantRgb
+                        ? inst.export("dec_tu_full").apply(obuPtr, len, outPtr, planeBytes,
+                                                           rgbPtr, planeBytes * 3)[0]
+                        : inst.export("dec_tu").apply(obuPtr, len, outPtr, planeBytes)[0];
                 if (wrote != planeBytes) {
                     System.err.println(TAG + " dec_tu frame " + f + " returned " + wrote);
                     break;
@@ -133,6 +163,7 @@ public final class Av1FrameDecoder {
                     for (int p = 0; p < planeBytes; p++) frame[p] = invPerm[plane[p] & 0xFF];
                 }
                 frames[f] = frame;
+                if (wantRgb) rgbFrames[f] = mem.readBytes(rgbPtr, planeBytes * 3);
                 if (onFrameDecoded != null) onFrameDecoded.accept(f + 1);
             }
             inst.export("dec_close").apply();
@@ -141,9 +172,14 @@ public final class Av1FrameDecoder {
             if (f < frameCount) {
                 byte[][] trimmed = new byte[f][];
                 System.arraycopy(frames, 0, trimmed, 0, f);
-                return trimmed;
+                byte[][] trimmedRgb = null;
+                if (wantRgb) {
+                    trimmedRgb = new byte[f][];
+                    System.arraycopy(rgbFrames, 0, trimmedRgb, 0, f);
+                }
+                return new Decoded(trimmed, trimmedRgb);
             }
-            return frames;
+            return new Decoded(frames, rgbFrames);
         }
     }
 }

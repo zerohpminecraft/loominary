@@ -2,12 +2,15 @@
   "required": true,
   "package": "net.zerohpminecraft.mixin",
   "compatibilityLevel": "JAVA_21",
+  "plugin": "net.zerohpminecraft.mixin.LoominaryMixinPlugin",
   "client": [
     "AnvilScreenAccessor",
     "AnvilScreenHandlerAccessor",
     "KeyboardInputMixin",
     "MapRendererMixin",
-    "MapStateAccessor"
+    "MapStateAccessor",
+    "MapTextureMixin",
+    "immediatelyfast.IfMapAtlasFillMixin"
   ],
   "injectors": {
     "defaultRequire": 1

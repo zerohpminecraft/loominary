@@ -76,3 +76,44 @@ console.log(`av1-codec: lossless roundtrip OK (${N} frames -> ${stream.length} B
   }
   console.log(`av1-codec: composite lossy dims OK (${W}x${H}, ${NC} frames -> ${cs.length} B)`);
 }
+
+// sRGB path: encodeLossyRgb → decodeLossyRgb keeps both views. The idx view must equal the
+// palette-only decodeLossyColor of the same stream (same wasm math), the rgb view must be
+// deterministic full-range RGB, and both must match the committed mod fixtures byte-for-byte.
+{
+  const W = 128, H = 128, PLANE = W * H, NS = 3, dims = { width: W, height: H };
+  const rgbFrames = [];
+  for (let f = 0; f < NS; f++) {
+    const a = new Uint8Array(PLANE * 3);
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 3;
+        a[i] = (x * 2 + f * 31) & 0xff; a[i + 1] = (y * 2 + f * 17) & 0xff; a[i + 2] = ((x ^ y) + f * 53) & 0xff;
+      }
+    rgbFrames.push(a);
+  }
+  const ss = await codec.encodeLossyRgb(rgbFrames, 30, undefined, dims);
+  const dec = await codec.decodeLossyRgb(ss, 0, NS, undefined, dims);
+  const idxOnly = await codec.decodeLossyColor(ss, 0, NS, undefined, dims);
+  assert.equal(dec.idx.length, NS, 'srgb idx frame count');
+  assert.equal(dec.rgb.length, NS, 'srgb rgb frame count');
+  for (let f = 0; f < NS; f++) {
+    assert.equal(dec.rgb[f].length, PLANE * 3, `srgb rgb frame ${f} size`);
+    for (let i = 0; i < PLANE; i++) {
+      if (dec.idx[f][i] !== idxOnly[f][i]) assert.fail(`idx view diverges from decodeLossyColor at frame ${f} px ${i}`);
+      if (!IS_VALID[dec.idx[f][i]]) assert.fail(`invalid palette byte in idx view at frame ${f} px ${i}`);
+    }
+  }
+  // Parity with the committed mod fixtures (same generator inputs → identical stream + outputs).
+  const fixStream = new Uint8Array(await readFile('../src/test/resources/av1/av1_srgb_stream.bin'));
+  const fixIdx    = new Uint8Array(await readFile('../src/test/resources/av1/frames_srgb_idx_expected.bin'));
+  const fixRgb    = new Uint8Array(await readFile('../src/test/resources/av1/frames_srgb_rgb_expected.bin'));
+  assert.deepEqual(ss, fixStream, 'stream must match the committed fixture (regenerate gen-av1-fixtures.mjs?)');
+  for (let f = 0; f < NS; f++) {
+    for (let i = 0; i < PLANE; i++)
+      if (dec.idx[f][i] !== fixIdx[f * PLANE + i]) assert.fail(`idx fixture mismatch at frame ${f} px ${i}`);
+    for (let i = 0; i < PLANE * 3; i++)
+      if (dec.rgb[f][i] !== fixRgb[f * PLANE * 3 + i]) assert.fail(`rgb fixture mismatch at frame ${f} byte ${i}`);
+  }
+  console.log(`av1-codec: srgb dual-view roundtrip + fixture parity OK (${NS} frames -> ${ss.length} B)`);
+}

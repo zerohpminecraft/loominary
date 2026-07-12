@@ -64,8 +64,15 @@ public class PayloadManifest {
      * with sparse per-frame changes (typical Minecraft map art) this typically reduces the
      * compressed payload by 5–20×.  Old decoders (≤v5) seeing a v6 tile return a stub and
      * render frame 0 as a static image.
+     *
+     * <p>v7 adds a second flag word: the v5 layout plus a trailing u16 BE {@code flags2} as the
+     * LAST 2 bytes of the header (any future header fields must be inserted before it).  v7 is
+     * written only for sRGB tiles ({@link #FLAG2_SRGB}); every other mode keeps writing v1–v5.
+     * v7 always uses {@code delay_mode=1} with no inline delays — the full
+     * {@code frameCount × u16} delay table sits between the header and the AV1 stream (the v5
+     * AV1 prefix rule), even for static {@code frameCount=1} tiles.
      */
-    public static final int CURRENT_VERSION = 6;
+    public static final int CURRENT_VERSION = 7;
 
     public static final int FLAG_ALL_SHADES  = 0x01;
     /** Set when the payload contains multiple animation frames. */
@@ -121,6 +128,14 @@ public class PayloadManifest {
      */
     public static final int FLAG_AV1_COMPOSITE = 0x80;
 
+    /**
+     * flags2 bit (v7+): the art is full 24-bit sRGB, carried exclusively as a lossy AV1 colour
+     * stream.  The decoder keeps the reconstructed RGB ({@link Av1FrameDecoder#decodeWithRgb})
+     * for display and writes the nearest-palette twin into {@code MapState.colors}.  Implies
+     * {@link #FLAG_AV1} | {@link #FLAG_AV1_LOSSY}.
+     */
+    public static final int FLAG2_SRGB = 0x0001;
+
     public final int manifestVersion;
     /** Total bytes consumed by this header; map colors begin at this offset. */
     public final int headerSize;
@@ -148,11 +163,13 @@ public class PayloadManifest {
      * Length frameCount = per-frame delay table.
      */
     public final int[] frameDelays;
+    /** v7+: second flag word (u16); 0 for older versions. */
+    public final int flags2;
 
     private PayloadManifest(int manifestVersion, int headerSize, int flags,
                              int cols, int rows, int tileCol, int tileRow,
                              long colorCrc32, String username, String title, int nonce,
-                             int frameCount, int loopCount, int[] frameDelays) {
+                             int frameCount, int loopCount, int[] frameDelays, int flags2) {
         this.manifestVersion = manifestVersion;
         this.headerSize = headerSize;
         this.flags = flags;
@@ -167,6 +184,7 @@ public class PayloadManifest {
         this.frameCount = frameCount;
         this.loopCount = loopCount;
         this.frameDelays = frameDelays;
+        this.flags2 = flags2;
     }
 
     public boolean allShades() {
@@ -199,6 +217,10 @@ public class PayloadManifest {
 
     public boolean av1Composite() {
         return (flags & FLAG_AV1_COMPOSITE) != 0;
+    }
+
+    public boolean srgb() {
+        return (flags2 & FLAG2_SRGB) != 0;
     }
 
     // ── CRC helper ───────────────────────────────────────────────────────
@@ -380,13 +402,82 @@ public class PayloadManifest {
     }
 
     /**
+     * Produces a v7 manifest (sRGB tiles only — everything else keeps writing v1–v5).
+     *
+     * <p>v7 = the v5 layout + a trailing u16 BE {@code flags2} as the last 2 bytes of the
+     * header.  {@code delay_mode} is always 1 with no inline delay bytes: the caller must place
+     * the full {@code frameCount × u16} table ({@link #delayPrefixBytes}) between the header and
+     * the AV1 stream, even for static {@code frameCount=1} tiles.
+     */
+    public static byte[] toBytesV7(int flags, int flags2, int cols, int rows,
+                                    int tileCol, int tileRow,
+                                    long colorCrc32, String username, String title, int nonce,
+                                    int frameCount, int loopCount) {
+        if (frameCount < 1 || frameCount > 65535) {
+            throw new IllegalArgumentException("frameCount must be 1–65535, got " + frameCount);
+        }
+        byte[] usernameBytes = encodeString(username, 16);
+        byte[] titleBytes    = encodeString(title, 64);
+        int totalSize = 24 + usernameBytes.length + titleBytes.length; // v5 fixed 22 + u16 flags2
+
+        byte[] out = new byte[totalSize];
+        int i = 0;
+        out[i++] = 7;
+        out[i++] = (byte) totalSize;
+        out[i++] = (byte) flags;
+        out[i++] = (byte) cols;
+        out[i++] = (byte) rows;
+        out[i++] = (byte) tileCol;
+        out[i++] = (byte) tileRow;
+        out[i++] = (byte) ((colorCrc32 >> 24) & 0xFF);
+        out[i++] = (byte) ((colorCrc32 >> 16) & 0xFF);
+        out[i++] = (byte) ((colorCrc32 >>  8) & 0xFF);
+        out[i++] = (byte) ( colorCrc32        & 0xFF);
+        out[i++] = (byte) usernameBytes.length;
+        System.arraycopy(usernameBytes, 0, out, i, usernameBytes.length);
+        i += usernameBytes.length;
+        out[i++] = (byte) titleBytes.length;
+        System.arraycopy(titleBytes, 0, out, i, titleBytes.length);
+        i += titleBytes.length;
+        out[i++] = (byte) ((nonce >> 24) & 0xFF);
+        out[i++] = (byte) ((nonce >> 16) & 0xFF);
+        out[i++] = (byte) ((nonce >>  8) & 0xFF);
+        out[i++] = (byte) ( nonce        & 0xFF);
+        out[i++] = (byte) (frameCount >>> 8);
+        out[i++] = (byte)  frameCount;
+        out[i++] = (byte) ((loopCount >> 8) & 0xFF);
+        out[i++] = (byte)  (loopCount       & 0xFF);
+        out[i++] = 1; // delay_mode: always prefix table, never inline
+        out[i++] = (byte) ((flags2 >> 8) & 0xFF);
+        out[i  ] = (byte)  (flags2       & 0xFF);
+        return out;
+    }
+
+    /**
+     * The full {@code frameCount × u16} delay table a v7 manifest requires as a stream PREFIX
+     * (inserted between the header and the AV1 stream).  Missing entries pad with the last
+     * delay (or 100 ms).
+     */
+    public static byte[] delayPrefixBytes(int frameCount, int[] frameDelays) {
+        byte[] out = new byte[frameCount * 2];
+        for (int f = 0; f < frameCount; f++) {
+            int d = f < frameDelays.length ? frameDelays[f]
+                  : frameDelays.length > 0 ? frameDelays[frameDelays.length - 1] : 100;
+            out[f * 2]     = (byte) ((d >> 8) & 0xFF);
+            out[f * 2 + 1] = (byte)  (d       & 0xFF);
+        }
+        return out;
+    }
+
+    /**
      * Returns the per-frame delay table that must be appended <em>after all frame data</em>
      * when the manifest produced by {@link #toBytes} is a v5 manifest (byte 0 == 5).
      * Returns an empty array for v4 manifests (table is already inline) and for
      * global-delay manifests (no table needed).
      */
     public static byte[] trailingDelayBytes(byte[] manifest, int[] frameDelays) {
-        if (manifest.length < 1 || (manifest[0] & 0xFF) < 5) return new byte[0];
+        // Exactly v5: v4 stores delays inline; v7 (AV1-only) uses the PREFIX table instead.
+        if (manifest.length < 1 || (manifest[0] & 0xFF) != 5) return new byte[0];
         if (frameDelays.length <= 1) return new byte[0];
         byte[] out = new byte[frameDelays.length * 2];
         for (int f = 0; f < frameDelays.length; f++) {
@@ -429,7 +520,7 @@ public class PayloadManifest {
         if (ver > CURRENT_VERSION) {
             // Unknown version — return stub so the caller can still skip to map colors.
             return new PayloadManifest(ver, headerSize, 0, 0, 0, 0, 0, -1L, null, null,
-                    0, 1, 0, new int[]{100});
+                    0, 1, 0, new int[]{100}, 0);
         }
 
         // Parse v1/v2 manifest — minimum 13 bytes (11 fixed + 2 length fields)
@@ -525,8 +616,14 @@ public class PayloadManifest {
             }
         }
 
+        // v7+: flags2 is the LAST u16 of the header (future fields insert before it).
+        int flags2 = 0;
+        if (ver >= 7 && headerSize >= 4 && headerSize <= data.length) {
+            flags2 = ((data[headerSize - 2] & 0xFF) << 8) | (data[headerSize - 1] & 0xFF);
+        }
+
         return new PayloadManifest(ver, headerSize, flags, cols, rows, tileCol, tileRow,
-                colorCrc32, username, title, nonce, frameCount, loopCount, frameDelays);
+                colorCrc32, username, title, nonce, frameCount, loopCount, frameDelays, flags2);
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────

@@ -63,8 +63,8 @@ LINK_LIBS=(-lsetjmp)
 
 exports() { local s=""; for f in "$@"; do s="$s -Wl,--export=$f"; done; echo "$s"; }
 
-DEC_EXPORTS=(shim_malloc shim_free dec_open dec_set_palette dec_tu dec_close)
-ENC_EXPORTS=(shim_malloc shim_free enc_init enc_frame enc_finish enc_data enc_reset dec_open dec_set_palette dec_tu dec_close)
+DEC_EXPORTS=(shim_malloc shim_free dec_open dec_set_palette dec_tu dec_tu_full dec_close)
+ENC_EXPORTS=(shim_malloc shim_free enc_init enc_frame enc_finish enc_data enc_reset dec_open dec_set_palette dec_tu dec_tu_full dec_close)
 
 # ── 3. Link the two reactor modules ──────────────────────────────────────────
 "$CLANG" "${COMMON_CFLAGS[@]}" "${LINK_COMMON[@]}" $(exports "${DEC_EXPORTS[@]}") \

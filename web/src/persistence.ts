@@ -15,11 +15,18 @@
 import type { CompositionState } from './payload-state.js';
 import type { RequantizeParams }  from './quantize.js';
 import type { PreprocessParams }  from './preprocess.js';
+import { RGB_TILE_BYTES }         from './srgb.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface SavedSession {
-  formatVersion: 3;
+  // Record format history:
+  //   v2 — 'sessions' store (source image stored inline)
+  //   v3 — source image split into 'session_images'
+  //   v4 — optional sRGB colour mode: colorSpace + rgbPixelData (packed like
+  //        pixelData but 49 152 bytes per frame).  v2/v3 records load
+  //        unchanged and restore as palette mode with the rgb fields absent.
+  formatVersion: 2 | 3 | 4;
   id:             string;
   savedAt:        number;
 
@@ -34,6 +41,11 @@ export interface SavedSession {
   codecMode:      string;
   frameCounts:    number[];
   pixelData:      ArrayBuffer;
+  // v4+: present iff the composition is in sRGB mode.  rgbPixelData packs
+  // rgbFrames with the same frameCounts as pixelData (model invariant:
+  // rgbFrames and frames always have identical shape).
+  colorSpace?:    'palette' | 'srgb';
+  rgbPixelData?:  ArrayBuffer | null;
   cropMode:       'scale' | 'center';
   pre:            PreprocessParams;
   reqParams:      RequantizeParams | null;
@@ -202,30 +214,31 @@ function mergeRow(row: SessionRow, img: ImageRow | null): SavedSession {
 
 const FRAME_BYTES = 128 * 128; // 16 384
 
-function packFrames(frames: Uint8Array[][]): { pixelData: ArrayBuffer; frameCounts: number[] } {
+// frameBytes: FRAME_BYTES for palette frames, RGB_TILE_BYTES for rgbFrames.
+function packFrames(frames: Uint8Array[][], frameBytes = FRAME_BYTES): { pixelData: ArrayBuffer; frameCounts: number[] } {
   const frameCounts  = frames.map(tf => tf.length);
   const totalFrames  = frameCounts.reduce((s, c) => s + c, 0);
-  const buf          = new ArrayBuffer(totalFrames * FRAME_BYTES);
+  const buf          = new ArrayBuffer(totalFrames * frameBytes);
   const dest         = new Uint8Array(buf);
   let   offset       = 0;
   for (const tileFrames of frames) {
     for (const frame of tileFrames) {
-      dest.set(frame.length === FRAME_BYTES ? frame : frame.subarray(0, FRAME_BYTES), offset);
-      offset += FRAME_BYTES;
+      dest.set(frame.length === frameBytes ? frame : frame.subarray(0, frameBytes), offset);
+      offset += frameBytes;
     }
   }
   return { pixelData: buf, frameCounts };
 }
 
-function unpackFrames(pixelData: ArrayBuffer, frameCounts: number[]): Uint8Array[][] {
+function unpackFrames(pixelData: ArrayBuffer, frameCounts: number[], frameBytes = FRAME_BYTES): Uint8Array[][] {
   const src    = new Uint8Array(pixelData);
   const frames: Uint8Array[][] = [];
   let   offset = 0;
   for (const count of frameCounts) {
     const tileFrames: Uint8Array[] = [];
     for (let f = 0; f < count; f++) {
-      tileFrames.push(src.slice(offset, offset + FRAME_BYTES) as Uint8Array);
-      offset += FRAME_BYTES;
+      tileFrames.push(src.slice(offset, offset + frameBytes) as Uint8Array);
+      offset += frameBytes;
     }
     frames.push(tileFrames);
   }
@@ -247,8 +260,10 @@ function buildRow(
 ): SessionRow {
   const { pixelData, frameCounts } = packFrames(comp.frames);
   const rawThumb = comp.frames[0]?.[0];
+  // sRGB mode: persist the true-colour frames alongside the palette preview.
+  const rgb = comp.colorSpace === 'srgb' && comp.rgbFrames ? comp.rgbFrames : null;
   return {
-    formatVersion: 3,
+    formatVersion: 4,
     id,
     savedAt:        Date.now(),
     gridCols:       comp.gridCols,
@@ -262,6 +277,8 @@ function buildRow(
     codecMode:      comp.codecMode,
     frameCounts,
     pixelData,
+    colorSpace:   rgb ? 'srgb' as const : undefined,
+    rgbPixelData: rgb ? packFrames(rgb, RGB_TILE_BYTES).pixelData : undefined,
     cropMode,
     pre,
     reqParams,
@@ -331,7 +348,7 @@ export async function loadSessionById(id: string): Promise<SavedSession | null> 
   try {
     const db  = await openDb();
     const row = await getOne(db, id);
-    if (!row || (row.formatVersion !== 3 && row.formatVersion !== 2)) return null;
+    if (!row || row.formatVersion < 2 || row.formatVersion > 4) return null;
     const img = await getImage(db, id);
     return mergeRow(row, img);
   } catch { return null; }
@@ -345,7 +362,7 @@ export async function loadMostRecentSession(): Promise<SavedSession | null> {
   try {
     const db   = await openDb();
     const all  = await getAllMeta(db);
-    const valid = all.filter(s => s.formatVersion === 3 || s.formatVersion === 2);
+    const valid = all.filter(s => s.formatVersion >= 2 && s.formatVersion <= 4);
     if (!valid.length) return null;
     const row = valid.sort((a, b) => b.savedAt - a.savedAt)[0];
     const img = await getImage(db, row.id);
@@ -362,7 +379,7 @@ export async function loadSessionMetas(): Promise<SessionMeta[]> {
   try {
     const db    = await openDb();
     const all   = await getAllMeta(db);
-    const valid = all.filter(s => s.formatVersion === 3 || s.formatVersion === 2);
+    const valid = all.filter(s => s.formatVersion >= 2 && s.formatVersion <= 4);
     return valid
       .sort((a, b) => b.savedAt - a.savedAt)
       .map(s => ({
@@ -392,7 +409,7 @@ export async function clearAllSessions(): Promise<void> {
 // ─── Deserialization ──────────────────────────────────────────────────────────
 
 export function sessionToComposition(s: SavedSession): CompositionState {
-  return {
+  const comp: CompositionState = {
     gridCols:       s.gridCols,
     gridRows:       s.gridRows,
     frames:         unpackFrames(s.pixelData, s.frameCounts),
@@ -404,6 +421,12 @@ export function sessionToComposition(s: SavedSession): CompositionState {
     allShades:      s.allShades,
     codecMode:      s.codecMode as import('./payload-state.js').CompositionState['codecMode'],
   };
+  // v4 sRGB sessions carry the true-colour frames alongside the palette preview.
+  if (s.colorSpace === 'srgb' && s.rgbPixelData) {
+    comp.colorSpace = 'srgb';
+    comp.rgbFrames  = unpackFrames(s.rgbPixelData, s.frameCounts, RGB_TILE_BYTES);
+  }
+  return comp;
 }
 
 export function savedAgoLabel(savedAt: number): string {

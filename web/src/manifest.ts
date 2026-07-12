@@ -5,7 +5,7 @@
  * zstd frame.  Carries grid position, author, title, and animation parameters.
  */
 
-export const CURRENT_VERSION = 6;
+export const CURRENT_VERSION = 7;
 
 export const FLAG_ALL_SHADES   = 0x01;
 export const FLAG_ANIMATED     = 0x02;
@@ -32,6 +32,17 @@ export const FLAG_AV1_LOSSY    = 0x40;
  * composition must be decoded before any of them can display.
  */
 export const FLAG_AV1_COMPOSITE = 0x80;
+
+/**
+ * flags2 (v7+, u16 BE, the LAST 2 bytes inside headerSize — any future header fields must be
+ * inserted BEFORE it so it stays last): the art is full 24-bit sRGB, carried exclusively as a
+ * lossy AV1 colour stream.  Decoders keep the reconstructed RGB (dec_tu_full) instead of
+ * quantising to the map palette; MapState.colors still receives the nearest-palette twin.
+ * Implies FLAG_AV1 | FLAG_AV1_LOSSY.  v7 always writes delay_mode=1 with the frameCount×u16
+ * delay table as a stream PREFIX (like v5 AV1), even for static frameCount=1 tiles, so
+ * av1StreamOffset() needs no version-specific rule.
+ */
+export const FLAG2_SRGB = 0x0001;
 
 const MAP_BYTES = 128 * 128; // 16384
 
@@ -60,6 +71,8 @@ export interface Manifest {
   loopCount: number;
   /** v3+: delay(s) in ms. Length 1 = global; length frameCount = per-frame. */
   frameDelays: number[];
+  /** v7+: second flag word (u16); 0 for older versions. */
+  flags2: number;
 }
 
 export function allShades(m: Manifest): boolean  { return (m.flags & FLAG_ALL_SHADES) !== 0; }
@@ -70,6 +83,7 @@ export function sparseFrames(m: Manifest): boolean { return (m.flags & FLAG_SPAR
 export function av1(m: Manifest): boolean         { return (m.flags & FLAG_AV1)          !== 0; }
 export function av1Lossy(m: Manifest): boolean    { return (m.flags & FLAG_AV1_LOSSY)    !== 0; }
 export function av1Composite(m: Manifest): boolean { return (m.flags & FLAG_AV1_COMPOSITE) !== 0; }
+export function srgb(m: Manifest): boolean          { return (m.flags2 & FLAG2_SRGB)        !== 0; }
 
 /**
  * Byte offset where an AV1 stream begins.  For v5 (per-frame delays that overflow the header)
@@ -190,11 +204,61 @@ export function toBytesAnimated(
 }
 
 /**
+ * Produce a v7 manifest (sRGB tiles only — everything else keeps writing v1/v2/v4/v5).
+ *
+ * v7 = the v5 layout + a trailing u16 BE `flags2` as the last 2 bytes of the header.
+ * delay_mode is ALWAYS 1 with no inline delay bytes: the caller must place the full
+ * `frameCount × u16` delay table (see {@link delayPrefixBytes}) between the header and the
+ * AV1 stream, even for static frameCount=1 tiles — that keeps {@link av1StreamOffset}'s
+ * existing v5+ rule correct and makes the flags2 position deterministic.
+ */
+export function toBytesV7(
+  flags: number, flags2: number, cols: number, rows: number, tileCol: number, tileRow: number,
+  colorCrc32: number, username: string | null, title: string | null, nonce: number,
+  frameCount: number, loopCount: number,
+): Uint8Array {
+  if (frameCount < 1 || frameCount > 65535) throw new Error(`frameCount must be 1–65535, got ${frameCount}`);
+
+  const userBytes  = encodeStr(username, 16);
+  const titleBytes = encodeStr(title, 64);
+  const totalSize  = 24 + userBytes.length + titleBytes.length; // v5 fixed 22 + u16 flags2
+
+  const out = new Uint8Array(totalSize);
+  let i = 0;
+  out[i++] = 7; out[i++] = totalSize;
+  out[i++] = flags; out[i++] = cols; out[i++] = rows; out[i++] = tileCol; out[i++] = tileRow;
+  writeU32BE(out, i, colorCrc32); i += 4;
+  out[i++] = userBytes.length; out.set(userBytes, i); i += userBytes.length;
+  out[i++] = titleBytes.length; out.set(titleBytes, i); i += titleBytes.length;
+  writeU32BE(out, i, nonce); i += 4;
+  out[i++] = (frameCount >>> 8) & 0xff; out[i++] = frameCount & 0xff;
+  out[i++] = (loopCount >>> 8) & 0xff;  out[i++] = loopCount  & 0xff;
+  out[i++] = 1; // delay_mode: always prefix table, never inline
+  out[i++] = (flags2 >>> 8) & 0xff; out[i++] = flags2 & 0xff;
+  return out;
+}
+
+/**
+ * The full `frameCount × u16` delay table a v7 manifest requires as a stream PREFIX
+ * (inserted between the header and the AV1 stream).  Missing entries pad with the last
+ * delay (or 100 ms).
+ */
+export function delayPrefixBytes(frameCount: number, frameDelays: number[]): Uint8Array {
+  const out = new Uint8Array(frameCount * 2);
+  for (let f = 0; f < frameCount; f++) {
+    const d = frameDelays[f] ?? frameDelays[frameDelays.length - 1] ?? 100;
+    out[f * 2] = (d >>> 8) & 0xff; out[f * 2 + 1] = d & 0xff;
+  }
+  return out;
+}
+
+/**
  * Returns the trailing delay table that must be appended after all frame data
  * for v5 manifests.  Returns empty Uint8Array for v4 or global-delay cases.
  */
 export function trailingDelayBytes(manifest: Uint8Array, frameDelays: number[]): Uint8Array {
-  if (manifest.length < 1 || (manifest[0] & 0xff) < 5) return new Uint8Array(0);
+  // Exactly v5: v4 stores delays inline; v7 (AV1-only) uses the PREFIX table instead.
+  if (manifest.length < 1 || (manifest[0] & 0xff) !== 5) return new Uint8Array(0);
   if (frameDelays.length <= 1) return new Uint8Array(0);
   const out = new Uint8Array(frameDelays.length * 2);
   for (let f = 0; f < frameDelays.length; f++) {
@@ -218,7 +282,7 @@ export function fromBytes(data: Uint8Array): Manifest {
     // Unknown version — stub so caller can still skip to map colours.
     return { manifestVersion: ver, headerSize, flags: 0, cols: 0, rows: 0,
              tileCol: 0, tileRow: 0, colorCrc32: -1, username: null, title: null,
-             nonce: 0, frameCount: 1, loopCount: 0, frameDelays: [100] };
+             nonce: 0, frameCount: 1, loopCount: 0, frameDelays: [100], flags2: 0 };
   }
 
   if (data.length < 13) throw new Error(`v1 manifest too short: ${data.length} bytes`);
@@ -276,8 +340,14 @@ export function fromBytes(data: Uint8Array): Manifest {
     }
   }
 
+  // v7+: flags2 is the LAST u16 of the header (future fields insert before it).
+  let flags2 = 0;
+  if (ver >= 7 && headerSize >= 4 && headerSize <= data.length) {
+    flags2 = (data[headerSize - 2] << 8) | data[headerSize - 1];
+  }
+
   return { manifestVersion: ver, headerSize, flags, cols, rows, tileCol, tileRow,
-           colorCrc32, username, title, nonce, frameCount, loopCount, frameDelays };
+           colorCrc32, username, title, nonce, frameCount, loopCount, frameDelays, flags2 };
 }
 
 // ─── Frame extraction ─────────────────────────────────────────────────────────

@@ -29,6 +29,7 @@ import {
   prepareSourceImage,
 } from '../preprocess.js';
 import { rgbToOklab } from '../oklab.js';
+import { rasterizeGridRgb, quantizeRgbTile, rgbFramesToImageData } from '../srgb.js';
 import { MC_PALETTE }  from '../palette.js';
 import { updateCarpetTables } from '../carpet.js';
 import { decodeGifFrames } from '../gif-decode.js';
@@ -180,14 +181,32 @@ async function decodeStateToComposition(
   onProgress?: (done: number, total: number) => void,
 ): Promise<CompositionState> {
   const { decompress }     = await import('../compression.js');
-  const { fromBytes: parseMf, extractFrames, av1, av1Lossy, av1Composite, av1StreamOffset } = await import('../manifest.js');
-  const { decodeLosslessMono, decodeLossyColor } = await import('../av1/codec.js');
-  const { cropTile }       = await import('../encode.js');
+  const { fromBytes: parseMf, extractFrames, av1, av1Lossy, av1Composite, av1StreamOffset, srgb } = await import('../manifest.js');
+  const { decodeLosslessMono, decodeLossyColor, decodeLossyRgb } = await import('../av1/codec.js');
+  const { cropTile, cropTileRgb } = await import('../encode.js');
   const { assembleChunks } = await import('../cjk-codec.js');
 
   const artCount = ps.columns * ps.rows;
   const pixelData: Uint8Array[][] = [];
+  // sRGB (v7 / FLAG2_SRGB) payloads restore true-colour frames alongside the quantized twins.
+  const rgbData: Uint8Array[][] = [];
+  let anySrgb = false;
   const BLANK = () => [new Uint8Array(128 * 128)];
+  const BLANK_RGB = () => [new Uint8Array(128 * 128 * 3)];
+
+  const finish = (): CompositionState => {
+    const comp = compositionFromState(ps, pixelData);
+    if (anySrgb) {
+      // Pad any non-sRGB tiles so the twin arrays stay shape-identical.
+      while (rgbData.length < pixelData.length) rgbData.push(BLANK_RGB());
+      comp.colorSpace = 'srgb';
+      comp.rgbFrames = pixelData.map((tf, ti) => {
+        const rgb = rgbData[ti] ?? [];
+        return tf.map((_, f) => rgb[f] ?? new Uint8Array(128 * 128 * 3));
+      });
+    }
+    return comp;
+  };
 
   // First pass: decompress every tile and parse its manifest.
   const parsed: ({ raw: Uint8Array; mf: import('../manifest.js').Manifest } | null)[] = [];
@@ -225,8 +244,19 @@ async function decodeStateToComposition(
         const stream = new Uint8Array(segs.reduce((n, s) => n + s!.length, 0));
         let off = 0;
         for (const s of segs) { stream.set(s!, off); off += s!.length; }
-        const frames = await decodeLossyColor(stream, 0, parsed[0]!.mf.frameCount,
-          undefined, { width: ps.columns * 128, height: ps.rows * 128 });
+        const dims = { width: ps.columns * 128, height: ps.rows * 128 };
+        if (srgb(parsed[0]!.mf)) {
+          anySrgb = true;
+          const dec = await decodeLossyRgb(stream, 0, parsed[0]!.mf.frameCount, undefined, dims);
+          for (let ti = 0; ti < artCount; ti++) {
+            const tc = ti % ps.columns, tr = Math.floor(ti / ps.columns);
+            pixelData.push(dec.idx.map(fr => cropTile(fr, tc, tr, ps.columns)));
+            rgbData.push(dec.rgb.map(fr => cropTileRgb(fr, tc, tr, ps.columns)));
+            onProgress?.(ti + 1, artCount);
+          }
+          return finish();
+        }
+        const frames = await decodeLossyColor(stream, 0, parsed[0]!.mf.frameCount, undefined, dims);
         for (let ti = 0; ti < artCount; ti++) {
           pixelData.push(frames.map(fr => cropTile(fr, ti % ps.columns, Math.floor(ti / ps.columns), ps.columns)));
           onProgress?.(ti + 1, artCount);
@@ -238,9 +268,17 @@ async function decodeStateToComposition(
 
   for (let ti = 0; ti < artCount; ti++) {
     const p = parsed[ti];
-    if (!p) { pixelData.push(BLANK()); onProgress?.(ti + 1, artCount); continue; }
+    if (!p) { pixelData.push(BLANK()); rgbData.push(BLANK_RGB()); onProgress?.(ti + 1, artCount); continue; }
     try {
       const { raw, mf } = p;
+      if (!av1Composite(mf) && srgb(mf)) {
+        anySrgb = true;
+        const dec = await decodeLossyRgb(raw, av1StreamOffset(mf), mf.frameCount);
+        pixelData.push(dec.idx.length > 0 ? dec.idx : BLANK());
+        rgbData.push(dec.rgb.length > 0 ? dec.rgb : BLANK_RGB());
+        onProgress?.(ti + 1, artCount);
+        continue;
+      }
       const frames = av1Composite(mf)
         ? BLANK() // a lone composite segment can't be decoded without its siblings
         : av1Lossy(mf)
@@ -249,14 +287,16 @@ async function decodeStateToComposition(
         ? await decodeLosslessMono(raw, av1StreamOffset(mf), mf.frameCount)
         : extractFrames(raw, mf);
       pixelData.push(frames.length > 0 ? frames : BLANK());
+      rgbData.push(BLANK_RGB());
     } catch {
       pixelData.push(BLANK());
+      rgbData.push(BLANK_RGB());
     }
 
     onProgress?.(ti + 1, artCount);
   }
 
-  return compositionFromState(ps, pixelData);
+  return finish();
 }
 
 // ─── Props ────────────────────────────────────────────────────────────────────
@@ -436,6 +476,11 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
 
   // ── Image adjustments ──────────────────────────────────────────────────────
   const [pre, setPre] = useState<PreprocessParams>(DEFAULT_PREPROCESS);
+
+  // ── Color mode ─────────────────────────────────────────────────────────────
+  // 'palette' = classic pipeline (quantize to map colours, editable, dithering).
+  // 'srgb'    = keep true 24-bit colour; exported as a lossy AV1 colour stream.
+  const [colorMode, setColorMode] = useState<'palette' | 'srgb'>('palette');
 
   // ── Palette ────────────────────────────────────────────────────────────────
   const [palRestriction, setPalRestriction] = useState<PaletteRestriction>('legal');
@@ -691,10 +736,21 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       setComputing(true);
       setPreviewStatus('computing');
       try {
-        const reqP = buildReqParams();
-        const { tiles, quality } = await computePreview(bmp, effectiveCols, effectiveRows, cropMode, pre, palRestriction, reqP, greyThreshold);
-        setMatchQuality(quality);
-        const imgData = mapBytesToImageData(tiles.map(t => [t]), 0, effectiveCols, effectiveRows);
+        let imgData: ImageData;
+        if (colorMode === 'srgb') {
+          // True-colour preview: preprocess only, no palette quantization.
+          // Round-trip through the packed-RGB tiles so the preview matches the
+          // stored data exactly (alpha composited over black).
+          const img      = await prepareSourceImage(bmp, effectiveCols * 128, effectiveRows * 128, cropMode, pre);
+          const rgbTiles = rasterizeGridRgb(img, effectiveCols, effectiveRows);
+          imgData = rgbFramesToImageData(rgbTiles.map(t => [t]), 0, effectiveCols, effectiveRows);
+          setMatchQuality(null);
+        } else {
+          const reqP = buildReqParams();
+          const { tiles, quality } = await computePreview(bmp, effectiveCols, effectiveRows, cropMode, pre, palRestriction, reqP, greyThreshold);
+          setMatchQuality(quality);
+          imgData = mapBytesToImageData(tiles.map(t => [t]), 0, effectiveCols, effectiveRows);
+        }
 
         const osc  = new OffscreenCanvas(imgData.width, imgData.height);
         const octx = osc.getContext('2d')!;
@@ -718,7 +774,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
     }, 600);
     return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sourceBitmap, effectiveCols, effectiveRows, cropMode, pre, palRestriction, greyThreshold, dither, metric, chromaBoost,
+  }, [sourceBitmap, effectiveCols, effectiveRows, cropMode, pre, colorMode, palRestriction, greyThreshold, dither, metric, chromaBoost,
       fsStrength, atkStrength, sierraStr, sierra2Str, sierraLiteStr, shiauFanStr, jjnStr, stuckiStr,
       serpentine, bayerScale, bayerSize, tilePalette]);
 
@@ -750,10 +806,50 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       }
 
       const ps     = emptyPayloadState(eCols, eRows);
-      ps.allShades = paletteMeansAllShades(palRestriction);
+      // sRGB mode: the preview twin is quantized against the full all-shades
+      // palette (see srgb.ts), so allShades is always true there.
+      ps.allShades = colorMode === 'srgb' ? true : paletteMeansAllShades(palRestriction);
       ps.sourceFilename = filename;
 
-      if (gifFrames) {
+      if (colorMode === 'srgb') {
+        // Full-colour pipeline: preprocess → per-tile packed RGB + a
+        // nearest-palette preview twin per frame.  Rasterizing is cheap, so a
+        // plain per-frame loop replaces the quantize worker pool.
+        const srcBitmaps = gifFrames ? gifFrames.map(f => f.bitmap) : [bmp];
+        const total      = srcBitmaps.length;
+        if (gifFrames) setProceedTotal(total);
+        setPreviewStatus(total > 1 ? `Preparing ${total} frames…` : 'Computing…');
+        const preparedImages = await Promise.all(
+          srcBitmaps.map(fb => prepareSourceImage(fb, eCols * 128, eRows * 128, cropMode, pre))
+        );
+
+        const tileCount = eCols * eRows;
+        const rgbByTile:     Uint8Array[][] = Array.from({ length: tileCount }, () => []);
+        const previewByTile: Uint8Array[][] = Array.from({ length: tileCount }, () => []);
+        for (let f = 0; f < total; f++) {
+          const rgbTiles = rasterizeGridRgb(preparedImages[f], eCols, eRows);
+          for (let ti = 0; ti < tileCount; ti++) {
+            rgbByTile[ti].push(rgbTiles[ti]);
+            previewByTile[ti].push(quantizeRgbTile(rgbTiles[ti]));
+          }
+          if (gifFrames) {
+            setProceedProgress(f + 1);
+            setPreviewStatus(`Converting ${f + 1} of ${total}…`);
+            await new Promise(r => setTimeout(r)); // let the progress bar paint
+          }
+        }
+
+        const delays      = gifFrames ? gifFrames.map(f => f.delayMs) : [100];
+        const frameDelays = Array.from({ length: tileCount }, () => [...delays]);
+        const comp: CompositionState = {
+          ...compositionFromState(ps, previewByTile),
+          frameDelays,
+          colorSpace: 'srgb',
+          rgbFrames:  rgbByTile,
+        };
+        onProceed(comp, srcBitmaps[0], reqP, cropMode, pre,
+            gifFrames ? srcBitmaps : null, latestFileRef.current, null);
+      } else if (gifFrames) {
         const total = gifFrames.length;
         setProceedTotal(total);
 
@@ -804,7 +900,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       setProceedProgress(0);
       setProceedTotal(0);
     }
-  }, [buildReqParams, colsManual, rowsManual, autoGrid, cropMode, pre, palRestriction, greyThreshold, onProceed]);
+  }, [buildReqParams, colsManual, rowsManual, autoGrid, cropMode, pre, colorMode, palRestriction, greyThreshold, onProceed]);
 
   // ── Status display ─────────────────────────────────────────────────────────
 
@@ -999,7 +1095,28 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
           </div>
         ))}
 
-        <Step n={4} title="Palette"
+        <Step n={4} title="Color mode"
+          hint="Map palette quantizes every pixel to Minecraft's map colours — fully editable in the editor, with dithering. Full color keeps true 24-bit sRGB and exports as a lossy AV1 colour stream instead." />
+        {([
+          { id: 'palette', label: 'Map palette',
+            desc: 'Editable pixels quantized to Minecraft map colours. Dithering available.' },
+          { id: 'srgb', label: 'Full color (sRGB)',
+            desc: 'Keeps true 24-bit colour; exported as a lossy AV1 stream. Requires the next Loominary release (or newer) to view in-game.' },
+        ] as const).map(choice => (
+          <label key={choice.id} style={{ display: 'flex', gap: 6, marginBottom: 5, cursor: 'pointer', alignItems: 'flex-start' }}>
+            <input type="radio" name="colorMode" value={choice.id}
+              checked={colorMode === choice.id}
+              onChange={() => setColorMode(choice.id)}
+              style={{ marginTop: 2, flexShrink: 0 }} />
+            <div>
+              <div style={{ color: '#ccc', fontSize: '0.58em' }}>{choice.label}</div>
+              <div style={{ color: '#666', fontSize: '0.53em', lineHeight: 1.3 }}>{choice.desc}</div>
+            </div>
+          </label>
+        ))}
+
+        {colorMode === 'palette' && <>
+        <Step n={5} title="Palette"
           hint="Restricts which Minecraft map colours are available. Legal = normally-placeable blocks (~186 colours). All Shades adds mod-exclusive shades for a larger palette. Carpet-only is required by carpet-channel codecs on the export screen." />
         {PALETTE_CHOICES.map(choice => (
           <label key={choice.id} style={{ display: 'flex', gap: 6, marginBottom: 5, cursor: 'pointer', alignItems: 'flex-start' }}>
@@ -1052,7 +1169,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
           </div>
         )}
 
-        <Step n={5} title="Quantization"
+        <Step n={6} title="Quantization"
           hint="Controls how pixels are colour-matched to the palette. Dithering spreads matching error across neighbouring pixels to reduce banding — Floyd–Steinberg (FS) is a solid starting point. Chroma boost pre-amplifies saturation before matching." />
         <div style={{ fontSize: '0.53em', color: '#666', marginBottom: 3 }}>Dither</div>
         <div style={{ display: 'flex', gap: 2, marginBottom: 6, flexWrap: 'wrap' }}>
@@ -1101,11 +1218,12 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
             onChange={e => setTilePalette((e.target as HTMLInputElement).checked)} />
           <span style={{ fontSize: '0.58em' }}>Tile palette</span>
         </label>
+        </>}
 
         {/* Carpet table override + Proceed */}
         <div style={{ flex: 1 }} />
         <CarpetDumpInput />
-        <Step n={6} title="Proceed to Editor"
+        <Step n={colorMode === 'palette' ? 7 : 5} title="Proceed to Editor"
           hint="When the preview looks good, continue to the editor for per-tile fine-tuning and additional adjustments before export." />
         <button
           onClick={() => void handleProceed()}
@@ -1120,7 +1238,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
           }}
         >
           {computing && proceedTotal > 0
-            ? `Quantizing frame ${proceedProgress} of ${proceedTotal}…`
+            ? `${colorMode === 'srgb' ? 'Converting' : 'Quantizing'} frame ${proceedProgress} of ${proceedTotal}…`
             : computing ? 'Computing…' : 'Proceed to Editor →'}
         </button>
 

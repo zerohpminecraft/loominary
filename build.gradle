@@ -12,11 +12,8 @@ sourceSets {
 }
 
 repositories {
-	// Add repositories to retrieve artifacts from in here.
-	// You should only use this when depending on other mods because
-	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
-	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
-	// for more information about repositories.
+	// MixinSquared (IF/MapMipMapMod sRGB compat mixin)
+	maven { url = "https://maven.bawnorton.com/releases" }
 }
 
 dependencies {
@@ -45,6 +42,11 @@ dependencies {
     include        "com.dylibso.chicory:log:1.7.5"
 
     chicoryGenImplementation "com.dylibso.chicory:build-time-compiler:1.7.5"
+
+    // MixinSquared lets IfMapAtlasFillMixin target ImmediatelyFast's own mixin handler (the
+    // atlas fill) so sRGB tiles stay true-colour under IF + MapMipMapMod. Soft dep — the
+    // mixin package is gated by LoominaryMixinPlugin on isModLoaded("immediatelyfast").
+    include(implementation(annotationProcessor("com.github.bawnorton.mixinsquared:mixinsquared-fabric:0.3.3")))
 
     testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
     testRuntimeOnly   'org.junit.platform:junit-platform-launcher'

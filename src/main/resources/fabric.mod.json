@@ -3,13 +3,13 @@
 	"id": "loominary",
 	"version": "${version}",
 	"name": "Loominary",
-	"description": "Create sharable mapart using only banner NBT data!",
+	"description": "Create shareable map art from images — encode, place, and decode it client-side.",
 	"authors": [
 		"ZeroHPMinecraft"
 	],
 	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
+		"homepage": "https://zerohpminecraft.github.io/loominary/",
+		"sources": "https://github.com/zerohpminecraft/loominary"
 	},
 	"license": "MIT",
 	"icon": "assets/loominary/icon.png",

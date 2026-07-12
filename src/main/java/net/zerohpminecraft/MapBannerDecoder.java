@@ -33,7 +33,7 @@ import java.util.concurrent.Executors;
 
 public class MapBannerDecoder {
 
-    private static final String TAG = "[BannerMod]";
+    private static final String TAG = "[Loominary]";
     private static final int SCAN_INTERVAL_TICKS = 20;
     private static final double SCAN_RADIUS = 32.0;
     private static final int MAP_BYTES = 128 * 128;

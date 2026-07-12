@@ -65,7 +65,7 @@ Static fields hold the active batch. A batch is an N×M grid of tiles, where eac
 
 ### Commands (`command/LoominaryCommand`)
 
-All `/loominary` subcommands live here. Commands that need the crosshair-targeted map call `resolveCrosshairMap()`, which casts `client.crosshairTarget` to `EntityHitResult` and pulls the `MapState`. Preview and reduce-undo state are stored in command-local `Map<Integer, byte[]>` caches keyed by map ID or tile index.
+All `/loominary` subcommands live here. Commands that need the crosshair-targeted map call `resolveCrosshairMap()`, which casts `client.crosshairTarget` to `EntityHitResult` and pulls the `MapState`. Preview state is stored in a command-local `Map<Integer, byte[]>` cache keyed by map ID. Image editing (edit/reduce/dither/filter/requantize/palette/sparse/stride/skip/resalt) was removed in v2.0.0 in favor of the web editor; the old literals are stubs via `removedCommand()` that print a pointer.
 
 ### Mixins
 

@@ -21,7 +21,10 @@ jobs:
 
       - name: Push docs/wiki → wiki repo
         run: |
-          git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" /tmp/wiki
+          if ! git clone --depth 1 "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" /tmp/wiki 2>/dev/null; then
+            echo "::error title=Wiki not initialized::GitHub only creates the wiki git repo after the first page is saved in the web UI. Open https://github.com/${{ github.repository }}/wiki, click 'Create the first page', save anything, then re-run this workflow — the sync will overwrite it with docs/wiki/."
+            exit 1
+          fi
           rsync -a --delete --exclude .git docs/wiki/ /tmp/wiki/
           cd /tmp/wiki
           git config user.name "github-actions"

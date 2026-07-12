@@ -133,7 +133,7 @@ class ChunkAssemblyTest {
             System.arraycopy(rawFrames[f], 0, flat, f * MAP_BYTES, MAP_BYTES);
 
         // Apply delta encoding.
-        byte[] deltaFlat = net.zerohpminecraft.command.LoominaryCommand.toDeltaFrames(flat, frameCount);
+        byte[] deltaFlat = toDeltaFrames(flat, frameCount);
 
         // Frame 0 must be unchanged.
         for (int p = 0; p < MAP_BYTES; p++)
@@ -169,7 +169,7 @@ class ChunkAssemblyTest {
                 if (rng.nextInt(50) == 0) flat[f * MAP_BYTES + p] ^= 119;
         }
 
-        byte[] deltaFlat = net.zerohpminecraft.command.LoominaryCommand.toDeltaFrames(flat, frameCount);
+        byte[] deltaFlat = toDeltaFrames(flat, frameCount);
         // Reconstruct and verify round-trip is exact (the core correctness guarantee).
         byte[][] frames = new byte[frameCount][MAP_BYTES];
         for (int f = 0; f < frameCount; f++)
@@ -193,4 +193,22 @@ class ChunkAssemblyTest {
         System.out.println("[delta test] raw=" + rawSize + " delta=" + deltaSize
                 + " (smaller is better; raw wins for correlated animation at level 3)");
     }
+
+    /**
+     * XOR-delta encoder (frame 0 raw, frame n = frame[n] ^ frame[n-1]) — the wire
+     * format behind FLAG_DELTA_FRAMES. The production encoder lives in the web
+     * editor (encode.ts); this local copy exists to exercise the mod's decoder.
+     */
+    private static byte[] toDeltaFrames(byte[] rawFrames, int frameCount) {
+        if (frameCount <= 1) return rawFrames;
+        byte[] out = new byte[rawFrames.length];
+        System.arraycopy(rawFrames, 0, out, 0, MAP_BYTES); // frame 0 is raw
+        for (int f = 1; f < frameCount; f++) {
+            int off = f * MAP_BYTES;
+            for (int p = 0; p < MAP_BYTES; p++)
+                out[off + p] = (byte)(rawFrames[off + p] ^ rawFrames[off - MAP_BYTES + p]);
+        }
+        return out;
+    }
+
 }

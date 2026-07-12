@@ -102,17 +102,10 @@ public class PngToMapColors {
     public static byte[][] convertTwoPassGrid(BufferedImage fullImage, boolean legalOnly,
                                                int targetColors, boolean dither,
                                                int cols, int rows) {
-        return convertTwoPassGrid(fullImage, legalOnly, targetColors, dither, cols, rows, null);
-    }
-
-    public static byte[][] convertTwoPassGrid(BufferedImage fullImage, boolean legalOnly,
-                                               int targetColors, boolean dither,
-                                               int cols, int rows, FilterParams filter) {
         int totalW = cols * MAP_SIZE;
         int totalH = rows * MAP_SIZE;
 
         BufferedImage scaled = scale(fullImage, totalW, totalH);
-        if (filter != null) scaled = applyFilter(scaled, filter);
         float[][] oklabLookup = buildOklabLookup();
 
         // Pass 1: nearest-neighbor quantization of the entire grid.
@@ -169,188 +162,6 @@ public class PngToMapColors {
      * </ul>
      */
     public enum Strategy { RAREST, CLOSEST, WEIGHTED }
-
-    public enum DitherAlgo { NONE, FLOYD_STEINBERG, ATKINSON, BAYER_4X4 }
-
-    /**
-     * Distance metric used by nearest-color matching during requantize.
-     * OKLAB   — standard perceptual Euclidean (default)
-     * CHROMA_FIRST — 4× weight on a,b chroma components (saturates palette use)
-     * LUMA_FIRST   — 4× weight on L luma (preserves luminosity over hue)
-     * HUE_ONLY     — angular hue distance in OKLab a-b plane; achromatic inputs fall back to OKLab
-     * RGB          — sRGB Euclidean (matches what most color pickers display)
-     */
-    public enum MatchMetric { OKLAB, CHROMA_FIRST, LUMA_FIRST, HUE_ONLY, RGB }
-
-    // Squared OKLab chroma threshold below which a color is considered achromatic
-    private static final float ACHROMATIC_SQ = 0.04f * 0.04f;
-
-    // ── Image filters ────────────────────────────────────────────────────
-
-    /**
-     * Pre-quantization spatial filter applied to the scaled source image.
-     * {@code strength} interpretation depends on type:
-     * SMOOTH = Gaussian radius (px), MEDIAN = box radius (px),
-     * SHARPEN = unsharp amount (0–3), POSTERIZE = tone levels (2–16).
-     */
-    public record FilterParams(FilterType type, float strength) {
-        public enum FilterType { SMOOTH, MEDIAN, SHARPEN, POSTERIZE }
-        public static FilterParams smooth(float radius)  { return new FilterParams(FilterType.SMOOTH,    radius); }
-        public static FilterParams median(int radius)    { return new FilterParams(FilterType.MEDIAN,    radius); }
-        public static FilterParams sharpen(float amount) { return new FilterParams(FilterType.SHARPEN,   amount); }
-        public static FilterParams posterize(int levels) { return new FilterParams(FilterType.POSTERIZE, levels); }
-    }
-
-    /** Applies a pre-quantization filter to {@code img}. Returns a new BufferedImage. */
-    public static BufferedImage applyFilter(BufferedImage img, FilterParams params) {
-        BufferedImage src = ensureArgb(img);
-        return switch (params.type()) {
-            case SMOOTH    -> gaussianBlur(src, params.strength());
-            case MEDIAN    -> medianFilter(src, Math.max(1, (int) params.strength()));
-            case SHARPEN   -> sharpenUnsharpMask(src, params.strength());
-            case POSTERIZE -> posterize(src, Math.max(2, (int) params.strength()));
-        };
-    }
-
-    /**
-     * Applies a filter to each frame in-place. Each frame is reconstructed as a
-     * BufferedImage via the color lookup, filtered, then re-quantized to the union
-     * palette of all frames (no new colors are added).
-     */
-    public static void applyFilterToFrames(byte[][] frames, FilterParams filter) {
-        applyFilterToFrames(frames, filter, buildOklabLookup());
-    }
-
-    public static void applyFilterToFrames(byte[][] frames, FilterParams filter,
-                                            float[][] oklabLookup) {
-        boolean[] palette = new boolean[256];
-        for (byte[] f : frames) for (byte b : f) palette[b & 0xFF] = true;
-        palette[0] = false;
-        int[] colorLookup = buildColorLookup();
-        for (byte[] frame : frames) {
-            BufferedImage img = new BufferedImage(MAP_SIZE, MAP_SIZE, BufferedImage.TYPE_INT_ARGB);
-            for (int y = 0; y < MAP_SIZE; y++)
-                for (int x = 0; x < MAP_SIZE; x++) {
-                    int cb = frame[x + y * MAP_SIZE] & 0xFF;
-                    img.setRGB(x, y, cb == 0 ? 0 : 0xFF000000 | colorLookup[cb]);
-                }
-            BufferedImage filtered = applyFilter(img, filter);
-            for (int y = 0; y < MAP_SIZE; y++) {
-                for (int x = 0; x < MAP_SIZE; x++) {
-                    int idx = x + y * MAP_SIZE;
-                    if (frame[idx] == 0) continue;
-                    int argb = filtered.getRGB(x, y);
-                    if (((argb >>> 24) & 0xFF) < 128) { frame[idx] = 0; continue; }
-                    float[] ok = rgbToOklab(argb);
-                    float bestDist = Float.MAX_VALUE;
-                    int best = frame[idx] & 0xFF;
-                    for (int c = 1; c < 256; c++) {
-                        if (!palette[c] || oklabLookup[c] == null) continue;
-                        float dL = ok[0]-oklabLookup[c][0], da = ok[1]-oklabLookup[c][1],
-                              db = ok[2]-oklabLookup[c][2];
-                        float d = dL*dL + da*da + db*db;
-                        if (d < bestDist) { bestDist = d; best = c; }
-                    }
-                    frame[idx] = (byte) best;
-                }
-            }
-        }
-    }
-
-    private static BufferedImage ensureArgb(BufferedImage img) {
-        if (img.getType() == BufferedImage.TYPE_INT_ARGB) return img;
-        BufferedImage out = new BufferedImage(img.getWidth(), img.getHeight(),
-                BufferedImage.TYPE_INT_ARGB);
-        Graphics2D g = out.createGraphics();
-        g.drawImage(img, 0, 0, null);
-        g.dispose();
-        return out;
-    }
-
-    private static BufferedImage gaussianBlur(BufferedImage img, float radius) {
-        int size  = Math.max(3, ((int)(radius * 2 + 1)) | 1);
-        float sigma = Math.max(0.01f, radius * 0.5f);
-        int half = size / 2;
-        float[] data = new float[size * size];
-        float sum = 0;
-        for (int y = -half; y <= half; y++) {
-            for (int x = -half; x <= half; x++) {
-                float v = (float) Math.exp(-(x * x + y * y) / (2 * sigma * sigma));
-                data[(y + half) * size + (x + half)] = v;
-                sum += v;
-            }
-        }
-        for (int i = 0; i < data.length; i++) data[i] /= sum;
-        ConvolveOp op = new ConvolveOp(new Kernel(size, size, data), ConvolveOp.EDGE_NO_OP, null);
-        // ConvolveOp needs a destination image of the same type
-        BufferedImage dst = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_ARGB);
-        return op.filter(img, dst);
-    }
-
-    private static BufferedImage medianFilter(BufferedImage img, int radius) {
-        int w = img.getWidth(), h = img.getHeight();
-        int n = (2 * radius + 1) * (2 * radius + 1);
-        int[] rs = new int[n], gs = new int[n], bs = new int[n];
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int k = 0;
-                for (int dy = -radius; dy <= radius; dy++) {
-                    for (int dx = -radius; dx <= radius; dx++) {
-                        int px = Math.max(0, Math.min(w - 1, x + dx));
-                        int py = Math.max(0, Math.min(h - 1, y + dy));
-                        int rgb = img.getRGB(px, py);
-                        rs[k] = (rgb >> 16) & 0xFF;
-                        gs[k] = (rgb >>  8) & 0xFF;
-                        bs[k] =  rgb        & 0xFF;
-                        k++;
-                    }
-                }
-                Arrays.sort(rs, 0, n);
-                Arrays.sort(gs, 0, n);
-                Arrays.sort(bs, 0, n);
-                int alpha = (img.getRGB(x, y) >> 24) & 0xFF;
-                out.setRGB(x, y, (alpha << 24) | (rs[n/2] << 16) | (gs[n/2] << 8) | bs[n/2]);
-            }
-        }
-        return out;
-    }
-
-    private static BufferedImage sharpenUnsharpMask(BufferedImage img, float amount) {
-        BufferedImage blurred = gaussianBlur(img, 1.0f);
-        int w = img.getWidth(), h = img.getHeight();
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int o = img.getRGB(x, y), b = blurred.getRGB(x, y);
-                int a  = (o >> 24) & 0xFF;
-                int r  = clampByte(((o>>16)&0xFF) + (int)(amount * (((o>>16)&0xFF) - ((b>>16)&0xFF))));
-                int g  = clampByte(((o>> 8)&0xFF) + (int)(amount * (((o>> 8)&0xFF) - ((b>> 8)&0xFF))));
-                int bv = clampByte(( o     &0xFF) + (int)(amount * (( o     &0xFF) - ( b     &0xFF))));
-                out.setRGB(x, y, (a << 24) | (r << 16) | (g << 8) | bv);
-            }
-        }
-        return out;
-    }
-
-    private static BufferedImage posterize(BufferedImage img, int levels) {
-        float step = 255.0f / (levels - 1);
-        int w = img.getWidth(), h = img.getHeight();
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int rgb = img.getRGB(x, y);
-                int a = (rgb >> 24) & 0xFF;
-                int r = Math.round(Math.round(((rgb >> 16) & 0xFF) / step) * step);
-                int g = Math.round(Math.round(((rgb >>  8) & 0xFF) / step) * step);
-                int b = Math.round(Math.round(( rgb        & 0xFF) / step) * step);
-                out.setRGB(x, y, (a << 24) | (clampByte(r) << 16) | (clampByte(g) << 8) | clampByte(b));
-            }
-        }
-        return out;
-    }
-
-    private static int clampByte(int v) { return Math.max(0, Math.min(255, v)); }
 
     // ── FitResult ────────────────────────────────────────────────────────
 
@@ -553,32 +364,6 @@ public class PngToMapColors {
         int distinctAfter = 0;
         for (int c = 1; c < 256; c++) if (freqAfter[c] > 0) distinctAfter++;
         return new int[]{distinctBefore, distinctAfter, victimFreq};
-    }
-
-    // ── Reduction: color-count target ────────────────────────────────────
-
-    public static FitResult reduceToColorCount(byte[] mapColors, byte[] prefix,
-                                               int chunkSize, int targetColors) {
-        return reduceToColorCount(mapColors, prefix, chunkSize, targetColors, Strategy.RAREST);
-    }
-
-    public static FitResult reduceToColorCount(byte[] mapColors, int chunkSize, int targetColors) {
-        return reduceToColorCount(mapColors, new byte[0], chunkSize, targetColors, Strategy.RAREST);
-    }
-
-    public static FitResult reduceToColorCount(byte[] mapColors, byte[] prefix,
-                                               int chunkSize, int targetColors, Strategy strategy) {
-        return reduceToColorCount(mapColors, prefix, chunkSize, targetColors, strategy, null);
-    }
-
-    public static FitResult reduceToColorCount(byte[] mapColors, byte[] prefix,
-                                               int chunkSize, int targetColors, Strategy strategy,
-                                               int[] normFreq) {
-        float[][] oklabLookup = buildOklabLookup();
-        int originalDistinct = countDistinct(mapColors);
-        int[] stats = reduceColorsInPlace(mapColors, targetColors, oklabLookup, strategy, normFreq);
-        byte[] compressed = compressCombined(prefix, mapColors);
-        return new FitResult(mapColors, compressed, stats[0], originalDistinct, stats[1]);
     }
 
     // ── Shared core: in-place palette reduction ───────────────────────────
@@ -848,201 +633,6 @@ public class PngToMapColors {
         return out;
     }
 
-    public static byte[] renderDithered(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, float[] ditherStrength,
-                                          int width, int height, float diffuseAmount,
-                                          MatchMetric metric, float[][] rgbLookup) {
-        if (metric == MatchMetric.OKLAB)
-            return renderDithered(scaled, palette, oklabLookup, ditherStrength, width, height, diffuseAmount);
-        float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
-        byte[] out = new byte[width * height];
-        float[] errCur = new float[width * 3];
-        float[] errNxt = new float[width * 3];
-        for (int y = 0; y < height; y++) {
-            float[] tmp = errCur; errCur = errNxt; errNxt = tmp;
-            java.util.Arrays.fill(errNxt, 0f);
-            for (int x = 0; x < width; x++) {
-                int argb = scaled.getRGB(x, y);
-                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
-                float[] src = rgbToOklab(argb);
-                int ei = x * 3;
-                float L = src[0] + errCur[ei    ];
-                float a = src[1] + errCur[ei + 1];
-                float b = src[2] + errCur[ei + 2];
-                byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup, metric, rgbLookup, palHues);
-                out[x + y * width] = chosen;
-                float[] cl = oklabLookup[chosen & 0xFF];
-                float eL = L - cl[0], ea = a - cl[1], eb = b - cl[2];
-                float errMagSq = eL * eL + ea * ea + eb * eb;
-                float s = (errMagSq > ERROR_FLOOR_SQ) ? ditherStrength[x + y * width] * diffuseAmount : 0f;
-                if (s > 0f) {
-                    float seL = eL * s, sea = ea * s, seb = eb * s;
-                    if (x + 1 < width)  { int ri=(x+1)*3; errCur[ri]+=seL*(7f/16f); errCur[ri+1]+=sea*(7f/16f); errCur[ri+2]+=seb*(7f/16f); }
-                    if (x - 1 >= 0)     { int li=(x-1)*3; errNxt[li]+=seL*(3f/16f); errNxt[li+1]+=sea*(3f/16f); errNxt[li+2]+=seb*(3f/16f); }
-                    errNxt[ei]+=seL*(5f/16f); errNxt[ei+1]+=sea*(5f/16f); errNxt[ei+2]+=seb*(5f/16f);
-                    if (x + 1 < width)  { int ri=(x+1)*3; errNxt[ri]+=seL*(1f/16f); errNxt[ri+1]+=sea*(1f/16f); errNxt[ri+2]+=seb*(1f/16f); }
-                }
-            }
-        }
-        return out;
-    }
-
-    /**
-     * Atkinson dithering: diffuses 6/8 of the error across 6 neighbors (right×2, below-left,
-     * below, below-right, two-below). The discarded 2/8 preserves highlights better than FS.
-     * {@code diffuseAmount} scales total error spread (1.0 = classic Atkinson, 0.1 = near-none).
-     */
-    static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height,
-                                          float diffuseAmount) {
-        byte[] out     = new byte[width * height];
-        float[] errCur  = new float[width * 3];
-        float[] errNxt  = new float[width * 3];
-        float[] errNxt2 = new float[width * 3];
-
-        for (int y = 0; y < height; y++) {
-            float[] tmp = errCur; errCur = errNxt; errNxt = errNxt2; errNxt2 = tmp;
-            Arrays.fill(errNxt2, 0f);
-
-            for (int x = 0; x < width; x++) {
-                int argb = scaled.getRGB(x, y);
-                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
-
-                float[] src = rgbToOklab(argb);
-                int ei = x * 3;
-                float L = src[0] + errCur[ei    ];
-                float a = src[1] + errCur[ei + 1];
-                float b = src[2] + errCur[ei + 2];
-
-                byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup);
-                out[x + y * width] = chosen;
-
-                float[] cl = oklabLookup[chosen & 0xFF];
-                float scale = diffuseAmount / 8f;
-                float seL = (L - cl[0]) * scale, sea = (a - cl[1]) * scale, seb = (b - cl[2]) * scale;
-
-                if (x + 1 < width) { int ri=(x+1)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
-                if (x + 2 < width) { int ri=(x+2)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
-                if (x - 1 >= 0)    { int li=(x-1)*3; errNxt[li]+=seL; errNxt[li+1]+=sea; errNxt[li+2]+=seb; }
-                errNxt[ei]+=seL; errNxt[ei+1]+=sea; errNxt[ei+2]+=seb;
-                if (x + 1 < width) { int ri=(x+1)*3; errNxt[ri]+=seL; errNxt[ri+1]+=sea; errNxt[ri+2]+=seb; }
-                errNxt2[ei]+=seL; errNxt2[ei+1]+=sea; errNxt2[ei+2]+=seb;
-            }
-        }
-        return out;
-    }
-
-    static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height) {
-        return renderAtkinson(scaled, palette, oklabLookup, width, height, 1.0f);
-    }
-
-    public static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height,
-                                          MatchMetric metric, float[][] rgbLookup,
-                                          float diffuseAmount) {
-        if (metric == MatchMetric.OKLAB) return renderAtkinson(scaled, palette, oklabLookup, width, height, diffuseAmount);
-        float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
-        byte[] out     = new byte[width * height];
-        float[] errCur  = new float[width * 3];
-        float[] errNxt  = new float[width * 3];
-        float[] errNxt2 = new float[width * 3];
-        for (int y = 0; y < height; y++) {
-            float[] tmp = errCur; errCur = errNxt; errNxt = errNxt2; errNxt2 = tmp;
-            Arrays.fill(errNxt2, 0f);
-            for (int x = 0; x < width; x++) {
-                int argb = scaled.getRGB(x, y);
-                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
-                float[] src = rgbToOklab(argb);
-                int ei = x * 3;
-                float L = src[0] + errCur[ei    ];
-                float a = src[1] + errCur[ei + 1];
-                float b = src[2] + errCur[ei + 2];
-                byte chosen = findClosestInPalette(L, a, b, palette, oklabLookup, metric, rgbLookup, palHues);
-                out[x + y * width] = chosen;
-                float[] cl = oklabLookup[chosen & 0xFF];
-                float sc = diffuseAmount / 8f;
-                float seL = (L - cl[0]) * sc, sea = (a - cl[1]) * sc, seb = (b - cl[2]) * sc;
-                if (x + 1 < width) { int ri=(x+1)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
-                if (x + 2 < width) { int ri=(x+2)*3; errCur[ri]+=seL; errCur[ri+1]+=sea; errCur[ri+2]+=seb; }
-                if (x - 1 >= 0)    { int li=(x-1)*3; errNxt[li]+=seL; errNxt[li+1]+=sea; errNxt[li+2]+=seb; }
-                errNxt[ei]+=seL; errNxt[ei+1]+=sea; errNxt[ei+2]+=seb;
-                if (x + 1 < width) { int ri=(x+1)*3; errNxt[ri]+=seL; errNxt[ri+1]+=sea; errNxt[ri+2]+=seb; }
-                errNxt2[ei]+=seL; errNxt2[ei+1]+=sea; errNxt2[ei+2]+=seb;
-            }
-        }
-        return out;
-    }
-
-    public static byte[] renderAtkinson(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height,
-                                          MatchMetric metric, float[][] rgbLookup) {
-        return renderAtkinson(scaled, palette, oklabLookup, width, height, metric, rgbLookup, 1.0f);
-    }
-
-    private static final int[][] BAYER_MATRIX_4X4 = {
-        { 0,  8,  2, 10},
-        {12,  4, 14,  6},
-        { 3, 11,  1,  9},
-        {15,  7, 13,  5}
-    };
-    // OKLab offset scale: max threshold = ±½ × BAYER_SCALE per component
-    private static final float BAYER_SCALE = 0.08f;
-
-    /** Bayer 4×4 ordered dithering: deterministic, no error propagation.
-     * {@code bayerScale} sets the OKLab threshold amplitude (default {@link #BAYER_SCALE}). */
-    static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height,
-                                          float bayerScale) {
-        byte[] out = new byte[width * height];
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int argb = scaled.getRGB(x, y);
-                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
-
-                float[] src = rgbToOklab(argb);
-                float t = (BAYER_MATRIX_4X4[y & 3][x & 3] + 0.5f) / 16.0f - 0.5f;
-                float offset = t * bayerScale;
-                out[x + y * width] = findClosestInPalette(
-                        src[0] + offset, src[1] + offset, src[2] + offset, palette, oklabLookup);
-            }
-        }
-        return out;
-    }
-
-    static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height) {
-        return renderBayer4x4(scaled, palette, oklabLookup, width, height, BAYER_SCALE);
-    }
-
-    public static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height,
-                                          MatchMetric metric, float[][] rgbLookup,
-                                          float bayerScale) {
-        if (metric == MatchMetric.OKLAB) return renderBayer4x4(scaled, palette, oklabLookup, width, height, bayerScale);
-        float[] palHues = (metric == MatchMetric.HUE_ONLY) ? buildPaletteHues(palette, oklabLookup) : null;
-        byte[] out = new byte[width * height];
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int argb = scaled.getRGB(x, y);
-                if (((argb >>> 24) & 0xFF) < 128) { out[x + y * width] = 0; continue; }
-                float[] src = rgbToOklab(argb);
-                float t = (BAYER_MATRIX_4X4[y & 3][x & 3] + 0.5f) / 16.0f - 0.5f;
-                float offset = t * bayerScale;
-                out[x + y * width] = findClosestInPalette(
-                        src[0] + offset, src[1] + offset, src[2] + offset,
-                        palette, oklabLookup, metric, rgbLookup, palHues);
-            }
-        }
-        return out;
-    }
-
-    public static byte[] renderBayer4x4(BufferedImage scaled, boolean[] palette,
-                                          float[][] oklabLookup, int width, int height,
-                                          MatchMetric metric, float[][] rgbLookup) {
-        return renderBayer4x4(scaled, palette, oklabLookup, width, height, metric, rgbLookup, BAYER_SCALE);
-    }
-
     // ── Tile splitting ────────────────────────────────────────────────────
 
     /**
@@ -1103,52 +693,6 @@ public class PngToMapColors {
         return bestByte;
     }
 
-    public static byte findClosestInPalette(float L, float a, float b,
-                                              boolean[] palette, float[][] oklabLookup,
-                                              MatchMetric metric, float[][] rgbLookup, float[] palHues) {
-        if (metric == MatchMetric.OKLAB) return findClosestInPalette(L, a, b, palette, oklabLookup);
-        float bestDist = Float.MAX_VALUE;
-        byte bestByte  = 0;
-        float inputChromaSq = a * a + b * b;
-        float inputHue = (metric == MatchMetric.HUE_ONLY) ? (float) Math.atan2(b, a) : 0f;
-        float[] inputRgb = (metric == MatchMetric.RGB) ? oklabToLinearRgb(L, a, b) : null;
-        for (int c = 1; c < 256; c++) {
-            if (!palette[c] || oklabLookup[c] == null) continue;
-            float dL = L - oklabLookup[c][0], da = a - oklabLookup[c][1], db = b - oklabLookup[c][2];
-            float dist = switch (metric) {
-                case OKLAB -> dL * dL + da * da + db * db; // unreachable but exhaustive
-                case CHROMA_FIRST -> dL * dL + 4f * da * da + 4f * db * db;
-                case LUMA_FIRST   -> 4f * dL * dL + da * da + db * db;
-                case HUE_ONLY -> {
-                    float ca = oklabLookup[c][1], cb = oklabLookup[c][2];
-                    float palChromaSq = ca * ca + cb * cb;
-                    if (inputChromaSq < ACHROMATIC_SQ) {
-                        yield dL * dL + da * da + db * db;
-                    } else if (palChromaSq < ACHROMATIC_SQ) {
-                        yield 2.01f;
-                    } else {
-                        float ph = (palHues != null) ? palHues[c] : (float) Math.atan2(cb, ca);
-                        float hDiff = inputHue - ph;
-                        if (hDiff >  (float) Math.PI) hDiff -= (float) (2 * Math.PI);
-                        if (hDiff < -(float) Math.PI) hDiff += (float) (2 * Math.PI);
-                        yield 1.0f - (float) Math.cos(hDiff);
-                    }
-                }
-                case RGB -> {
-                    if (rgbLookup == null || rgbLookup[c] == null || inputRgb == null) {
-                        yield dL * dL + da * da + db * db;
-                    }
-                    float dr = inputRgb[0] - rgbLookup[c][0];
-                    float dg = inputRgb[1] - rgbLookup[c][1];
-                    float db2 = inputRgb[2] - rgbLookup[c][2];
-                    yield dr * dr + dg * dg + db2 * db2;
-                }
-            };
-            if (dist < bestDist) { bestDist = dist; bestByte = (byte) c; }
-        }
-        return bestByte;
-    }
-
     // ── Compression helpers ───────────────────────────────────────────────
 
     private static byte[] compressCombined(byte[] prefix, byte[] data) {
@@ -1162,11 +706,6 @@ public class PngToMapColors {
         System.arraycopy(prefix, 0, combined, 0, prefix.length);
         System.arraycopy(data,   0, combined, prefix.length, data.length);
         return Zstd.compress(combined, level);
-    }
-
-    /** Fast size-only estimate for palette analysis (level 3, not for encoding). */
-    public static int estimateCompressedSize(byte[] data) {
-        return Zstd.compress(data, 3).length;
     }
 
     // ── Color-space helpers ───────────────────────────────────────────────
@@ -1199,30 +738,6 @@ public class PngToMapColors {
         return oklab;
     }
 
-    public static float[][] buildLinearRgbLookup() {
-        float[][] out = new float[256][];
-        int[] srgb = buildColorLookup();
-        for (int b = 1; b < 256; b++) {
-            if (srgb[b] == 0) continue;
-            int rgb = srgb[b];
-            out[b] = new float[]{
-                srgbToLinear(((rgb >> 16) & 0xFF) / 255f),
-                srgbToLinear(((rgb >>  8) & 0xFF) / 255f),
-                srgbToLinear(( rgb        & 0xFF) / 255f)
-            };
-        }
-        return out;
-    }
-
-    public static float[] buildPaletteHues(boolean[] palette, float[][] oklabLookup) {
-        float[] hues = new float[256];
-        for (int c = 1; c < 256; c++) {
-            if (!palette[c] || oklabLookup[c] == null) continue;
-            hues[c] = (float) Math.atan2(oklabLookup[c][2], oklabLookup[c][1]);
-        }
-        return hues;
-    }
-
     public static float[] rgbToOklab(int rgb) {
         float r  = srgbToLinear(((rgb >> 16) & 0xFF) / 255f);
         float g  = srgbToLinear(((rgb >>  8) & 0xFF) / 255f);
@@ -1251,34 +766,6 @@ public class PngToMapColors {
         if (c <= 0f) return 0f;
         if (c >= 1f) return 1f;
         return c <= 0.0031308f ? c * 12.92f : 1.055f * (float) Math.pow(c, 1.0 / 2.4) - 0.055f;
-    }
-
-    /**
-     * Returns a new image with each pixel's OKLab a,b (chroma) components scaled by {@code boost}.
-     * Values {@literal >}1.0 saturate; values {@literal <}1.0 desaturate. Out-of-gamut results are
-     * clamped per channel (hue may shift slightly at high boost values near the gamut boundary).
-     */
-    public static BufferedImage boostChroma(BufferedImage img, float boost) {
-        if (boost == 1.0f) return img;
-        BufferedImage src = ensureArgb(img);
-        int w = src.getWidth(), h = src.getHeight();
-        BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int argb = src.getRGB(x, y);
-                int alpha = (argb >>> 24) & 0xFF;
-                if (alpha == 0) { out.setRGB(x, y, 0); continue; }
-                float[] lab = rgbToOklab(argb);
-                lab[1] *= boost;
-                lab[2] *= boost;
-                float[] rgb = oklabToLinearRgb(lab[0], lab[1], lab[2]);
-                int r = clampByte(Math.round(linearToSrgb(rgb[0]) * 255f));
-                int g = clampByte(Math.round(linearToSrgb(rgb[1]) * 255f));
-                int b = clampByte(Math.round(linearToSrgb(rgb[2]) * 255f));
-                out.setRGB(x, y, (alpha << 24) | (r << 16) | (g << 8) | b);
-            }
-        }
-        return out;
     }
 
     static float[] oklabToLinearRgb(float L, float a, float b) {
@@ -1367,7 +854,17 @@ public class PngToMapColors {
      */
     public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
                                         boolean dither, int cols, int rows) throws IOException {
-        return convertGif(gifPath, legalOnly, targetColors, dither, cols, rows, null);
+        try (ImageInputStream iis = ImageIO.createImageInputStream(Files.newInputStream(gifPath))) {
+            Iterator<ImageReader> readers = ImageIO.getImageReadersByMIMEType("image/gif");
+            if (!readers.hasNext()) throw new IOException("No GIF image reader available");
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(iis, false);
+                return readGif(reader, legalOnly, targetColors, dither, cols, rows);
+            } finally {
+                reader.dispose();
+            }
+        }
     }
 
     /**
@@ -1427,30 +924,8 @@ public class PngToMapColors {
         }
     }
 
-    public static GifResult convertGif(Path gifPath, boolean legalOnly, int targetColors,
-                                        boolean dither, int cols, int rows,
-                                        FilterParams filter) throws IOException {
-        try (ImageInputStream iis = ImageIO.createImageInputStream(Files.newInputStream(gifPath))) {
-            Iterator<ImageReader> readers = ImageIO.getImageReadersByMIMEType("image/gif");
-            if (!readers.hasNext()) throw new IOException("No GIF image reader available");
-            ImageReader reader = readers.next();
-            try {
-                reader.setInput(iis, false);
-                return readGif(reader, legalOnly, targetColors, dither, cols, rows, filter);
-            } finally {
-                reader.dispose();
-            }
-        }
-    }
-
     private static GifResult readGif(ImageReader reader, boolean legalOnly, int targetColors,
                                       boolean dither, int cols, int rows) throws IOException {
-        return readGif(reader, legalOnly, targetColors, dither, cols, rows, null);
-    }
-
-    private static GifResult readGif(ImageReader reader, boolean legalOnly, int targetColors,
-                                      boolean dither, int cols, int rows,
-                                      FilterParams filter) throws IOException {
         // Screen dimensions from stream metadata (reliable; Java's GIF reader always provides it).
         int screenW = 0, screenH = 0;
         IIOMetadata streamMeta = reader.getStreamMetadata();
@@ -1507,7 +982,6 @@ public class PngToMapColors {
         BufferedImage[] scaled = new BufferedImage[numFrames];
         for (int f = 0; f < numFrames; f++) {
             scaled[f] = scale(coalesced[f], totalW, totalH);
-            if (filter != null) scaled[f] = applyFilter(scaled[f], filter);
         }
 
         // Shared palette: pass 1 on the union of all frames.

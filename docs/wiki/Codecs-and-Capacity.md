@@ -16,14 +16,14 @@ Every 128×128 map tile carries its art as compressed bytes smuggled through van
 
 | Codec | Channels (fill order) | Budget | Needs platform? |
 |---|---|---|---|
-| `carpet+banners+shade` **(default)** | carpet → banners → shade | **15,482 B** | yes |
+| `carpet+banners+shade` | carpet → banners → shade | **15,482 B** | yes |
 | `carpet+shade+banners` (web only) | carpet → shade → banners | 15,482 B | yes |
 | `carpet+banners` | carpet → banners | 13,466 B | yes |
 | `carpet+shade` | carpet → shade | 10,192 B | yes (staircase) |
-| `carpet` | carpet only | 8,176 B | yes |
+| `carpet` **(web default)** | carpet only | 8,176 B | yes |
 | `banners` | banners only | 5,290 B | **no** ([legacy mode](Banner-Mode-Legacy)) |
 
-The default fills banners before shade because a few overflow banners are usually less work than building a staircase; the web-only `carpet+shade+banners` variant flips that preference. In-game: `/loominary codec <mode>` re-encodes the loaded batch.
+The web editor defaults to plain `carpet` — most images fit its 8 KB after compression, and it needs no banners and no staircase. Step up a codec when the stats table says so. Of the two full-capacity variants, `carpet+banners+shade` fills banners before shade (a few overflow banners are usually less work than building a staircase); the web-only `carpet+shade+banners` flips that. In-game, `/loominary codec <mode>` re-encodes the loaded batch (the in-game *import* default remains `carpet+banners+shade`).
 
 ![Codec selection on the export page](assets/web/export-codec-banner.png)
 

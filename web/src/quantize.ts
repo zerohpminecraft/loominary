@@ -359,7 +359,7 @@ export interface RequantizeParams {
 
 export const DEFAULT_REQ_PARAMS: RequantizeParams = {
   legalOnly:         true,
-  dither:            'FS',
+  dither:            'NONE',
   metric:            'OKLAB',
   fsStrength:        1.0,
   atkStrength:       1.0,

@@ -18,7 +18,7 @@ export const CodecMode = {
 } as const;
 export type CodecMode = typeof CodecMode[keyof typeof CodecMode];
 
-export const DEFAULT_CODEC: CodecMode = 'CARPET_BANNERS_SHADE';
+export const DEFAULT_CODEC: CodecMode = 'CARPET';
 
 /**
  * Maximum compressed payload bytes per tile for each codec.
@@ -46,11 +46,11 @@ export const CODEC_LABEL: Record<CodecMode, string> = {
 
 export const CODEC_HINT: Record<CodecMode, string> = {
   BANNER:               'CJK banner chunks only — no carpet platform required',
-  CARPET:               'LOOM carpet channel only — 8 176 B max',
+  CARPET:               'LOOM carpet channel only — 8 176 B max (default)',
   CARPET_SHADE:         'Carpet + shade height channel — 10 192 B max',
   CARPET_BANNERS:       'Carpet + CJK overflow banners — 13 466 B max',
   CARPET_SHADE_BANNERS: 'Carpet + shade + banners — shade fills first, then overflow — 15 482 B max',
-  CARPET_BANNERS_SHADE: 'Carpet + banners + shade — banners fill first, then shade — 15 482 B max (default)',
+  CARPET_BANNERS_SHADE: 'Carpet + banners + shade — banners fill first, then shade — 15 482 B max',
 };
 
 export const NEEDS_CARPET = new Set<CodecMode>([

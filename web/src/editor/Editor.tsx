@@ -315,6 +315,12 @@ export interface EditorProps {
   onCompChange?:       (comp: CompositionState) => void;
   /** Called when the user wants to re-link a source image (e.g. after session restore). */
   onRelinkSource?:     () => void;
+  /**
+   * Post-quantization palette-match stats from import (measured against the
+   * actual quantized output across ALL animation frames, computed for free
+   * inside the quantize workers). Null when entering from a state JSON.
+   */
+  importQuality?:      { accuratePct: number; avgDelta: number; frames: number } | null;
 }
 
 // ─── Editor ───────────────────────────────────────────────────────────────────
@@ -329,6 +335,7 @@ export function Editor({
   initialReqParams,
   onCompChange,
   onRelinkSource,
+  importQuality = null,
 }: EditorProps) {
   const canvasElRef = useRef<HTMLCanvasElement>(null);
   const canvasRef   = useRef<MapCanvas | null>(null);
@@ -2489,6 +2496,20 @@ export function Editor({
 
           {/* Content */}
           <div style={{ flex: 1, overflowY: 'auto', padding: '4px 6px' }}>
+            {importQuality && (
+              <div style={{
+                fontSize: '0.68em', marginBottom: 6, paddingBottom: 5,
+                borderBottom: '1px solid #2a2a2a',
+                color: importQuality.accuratePct >= 75 ? '#7f7'
+                     : importQuality.accuratePct >= 50 ? '#fc6' : '#f77',
+              }}>
+                Palette match {importQuality.accuratePct.toFixed(0)}%
+                <div style={{ color: '#555', marginTop: 1 }}>
+                  avg ΔE {importQuality.avgDelta.toFixed(3)}
+                  {importQuality.frames > 1 ? ` · all ${importQuality.frames} frames` : ''}
+                </div>
+              </div>
+            )}
             {dataStats ? (() => {
               const { tiles, totalBytes } = dataStats;
               return (

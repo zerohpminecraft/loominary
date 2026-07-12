@@ -171,6 +171,7 @@ function StepBar({
 export function App() {
   const [step,            setStep]            = useState<Step>('import');
   const [composition,     setComposition]     = useState<CompositionState | null>(null);
+  const [importQuality,   setImportQuality]   = useState<{ accuratePct: number; avgDelta: number; frames: number } | null>(null);
   const [sourceBitmap,    setSourceBitmap]    = useState<ImageBitmap | null>(null);
   const [importReqParams, setImportReqParams] = useState<RequantizeParams | null>(null);
   const [importCropMode,  setImportCropMode]  = useState<'scale' | 'center'>('center');
@@ -312,7 +313,9 @@ export function App() {
     pre:          PreprocessParams,
     gifFrames?:   ImageBitmap[] | null,
     sourceFile?:  File | null,
+    quality?:     { accuratePct: number; avgDelta: number; frames: number } | null,
   ) {
+    setImportQuality(quality ?? null);
     // Null out the active session ID immediately so scheduleSave skips any
     // auto-save fired between now and when saveNewSession resolves.  Without
     // this, the Editor's initialComp effect fires onCompChange on mount and
@@ -351,6 +354,7 @@ export function App() {
 
   // ── Proceed from state JSON import (no source bitmap) ────────────────────
   function handleProceedFromState(comp: CompositionState) {
+    setImportQuality(null);
     activeSessionIdRef.current  = null;
     sourceImageSavedRef.current = true; // no source image; nothing to save
     setActiveSessionId(null);
@@ -487,6 +491,7 @@ export function App() {
             uiFontSize={uiFontSize}
             initialReqParams={importReqParams ?? undefined}
             sourceFrames={sourceFrames}
+            importQuality={importQuality}
             onCompChange={c => {
               latestCompRef.current = c;
               scheduleSave(c, importCropMode, importPre, importReqParams);

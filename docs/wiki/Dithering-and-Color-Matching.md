@@ -20,7 +20,7 @@ Dithering scatters two palette colors in a pattern your eye blends into an in-be
 
 | Chip | Algorithm | Character |
 |---|---|---|
-| `FS` | Floyd–Steinberg | The classic. Tight 4-neighbor spread; balanced default |
+| `FS` | Floyd–Steinberg | The classic. Tight 4-neighbor spread; the first one to try |
 | `Atk` | Atkinson | Only diffuses 6/8 of the error — softer, brighter, preserves highlights; the retro Mac look |
 | `Sierra` | Sierra (3-row) | Wide, smooth spread; very even gradients |
 | `Sierra2` | Sierra Two-Row | Slightly cheaper/sharper Sierra |
@@ -33,7 +33,7 @@ Every error-diffusion algorithm gets a **strength slider (0.1–1.0)** — lower
 
 **Ordered:** `Bayer` uses a fixed threshold matrix instead of error diffusion — a regular crosshatch pattern that compresses well and reads as deliberate texture. Options: **Bayer scale** (0.02–0.20, pattern contrast) and **matrix size** (2×2 / 4×4 / 8×8 / 16×16 — smaller = coarser pattern).
 
-**`None`** disables dithering: every pixel snaps to its single nearest palette color. Best for logos, flat-color art, and [animations](Animated-Art) (dither noise is what video codecs hate most).
+**`None`** — the **default** — disables dithering: every pixel snaps to its single nearest palette color. It's the right call for logos, flat-color art, and [animations](Animated-Art) (dither noise is what video codecs hate most); switch to an error-diffusion algorithm when gradients start banding.
 
 ### Adaptive strength
 
@@ -80,8 +80,8 @@ Above the preview, **"Palette coverage: N%"** reports the fraction of pixels who
 
 ## A tuning recipe
 
-1. Start with defaults (Staircase fullblock, OKLab, FS at 1.0).
+1. Start with defaults (Staircase fullblock, OKLab, dithering off).
 2. Nudge **saturation** up ~1.1–1.3 in Adjustments; watch the coverage score.
-3. Banding in gradients? Raise dither strength or switch FS → JJN. Noise in flats? Lower strength, or try Atkinson.
+3. Banding in gradients? Turn dithering on (`FS`); still banding, try JJN. Noise in flats? Lower the strength, or try Atkinson.
 4. Colors feel muddy? Chroma boost 1.25, or metric `Chr+`.
 5. Making an animation? Dither `None`, fewer colors, let [lossy AV1](Animated-Art) handle the gradients.

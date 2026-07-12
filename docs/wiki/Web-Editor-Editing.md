@@ -12,6 +12,7 @@ This page is the tour; the complete tool-by-tool and key-by-key reference lives 
 - **Left panels** — the heavy machinery: **Requantize (R)** re-runs the entire [quantization pipeline](Dithering-and-Color-Matching) on the current pixels *or* the original source image, with preview-then-commit; **Filter (P)** offers smooth/median/sharpen/posterize; **Reduce (K)** strips one color at a time by strategy; **Color Merge** commits the palette panel's merge queue.
 - **Right palette panel** — every color with live pixel counts across four tabs (all / frame / selection / total), sortable by hue, lightness, chroma, or frequency. **Ctrl+click swatches to queue merges** — the fastest way to clean up a noisy palette before [budget](Codecs-and-Capacity) trouble starts.
 - **Status bar** — cursor position (grid + tile-local), hovered color, distinct-color count (turns amber past 120, red past 180 — a compression early-warning), zoom, and frame position.
+- **Stats panel** (right edge) — per-tile byte usage, and for imported art a **Palette match** score measured against the actual quantized output across *all* animation frames (computed inside the quantize workers at import, so it's free).
 
 ## Three overlays worth knowing
 

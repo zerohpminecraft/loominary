@@ -262,7 +262,7 @@ async function decodeStateToComposition(
 // ─── Props ────────────────────────────────────────────────────────────────────
 
 export interface ImportPageProps {
-  onProceed: (comp: CompositionState, bitmap: ImageBitmap, reqParams: RequantizeParams, cropMode: 'scale' | 'center', pre: PreprocessParams, sourceFrames?: ImageBitmap[] | null, sourceFile?: File | null) => void;
+  onProceed: (comp: CompositionState, bitmap: ImageBitmap, reqParams: RequantizeParams, cropMode: 'scale' | 'center', pre: PreprocessParams, sourceFrames?: ImageBitmap[] | null, sourceFile?: File | null, quality?: { accuratePct: number; avgDelta: number; frames: number } | null) => void;
   /** Called when the user imports a state JSON directly — no source bitmap available. */
   onProceedFromState?: (comp: CompositionState) => void;
   onLoadSession?: (id: string) => void;
@@ -316,7 +316,7 @@ function Step({ n, title, hint }: { n: number; title: string; hint: string }) {
 //   main → worker: imageData.data.buffer (transferred; original ImageData neutered)
 //   worker → main: tile ArrayBuffer[]    (transferred; worker is done with them)
 
-interface QuantizeWorkerResult { frameIndex: number; tileBuffers: ArrayBuffer[] }
+interface QuantizeWorkerResult { frameIndex: number; tileBuffers: ArrayBuffer[]; stats?: { good: number; total: number; sumDelta: number } }
 
 async function runQuantizePool(
   preparedImages: ImageData[],
@@ -324,9 +324,10 @@ async function runQuantizePool(
   gridRows:       number,
   reqParams:      RequantizeParams,
   onProgress:     (done: number) => void,
-): Promise<Uint8Array[][]> {
+): Promise<{ frames: Uint8Array[][]; quality: MatchQuality }> {
   const total = preparedImages.length;
-  if (total === 0) return [];
+  if (total === 0) return { frames: [], quality: { accuratePct: 0, avgDelta: 0 } };
+  let statGood = 0, statTotal = 0, statDelta = 0;
 
   const concurrency = Math.min(total, navigator.hardwareConcurrency || 4);
   const ordered     = new Array<Uint8Array[]>(total);
@@ -357,11 +358,18 @@ async function runQuantizePool(
         { type: 'module' },
       );
       w.onmessage = ({ data }: MessageEvent<QuantizeWorkerResult>) => {
-        const { frameIndex, tileBuffers } = data;
+        const { frameIndex, tileBuffers, stats } = data;
         ordered[frameIndex] = tileBuffers.map(b => new Uint8Array(b));
+        if (stats) { statGood += stats.good; statTotal += stats.total; statDelta += stats.sumDelta; }
         finished++;
         onProgress(finished);
-        if (finished === total) { terminateAll(); resolve(ordered); }
+        if (finished === total) {
+          terminateAll();
+          resolve({ frames: ordered, quality: {
+            accuratePct: statTotal > 0 ? (statGood / statTotal) * 100 : 0,
+            avgDelta:    statTotal > 0 ? statDelta / statTotal        : 0,
+          } });
+        }
         else dispatch(w);
       };
       w.onerror = (e) => { terminateAll(); reject(new Error(e.message ?? 'Worker error')); };
@@ -410,6 +418,8 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
 
   // ── Image state ────────────────────────────────────────────────────────────
   const [sourceBitmap, setSourceBitmap] = useState<ImageBitmap | null>(null);
+  // Decoded GIF frames, cached at load so Proceed doesn't decode twice.
+  const gifFramesRef = useRef<import('../gif-decode.js').GifFrame[] | null>(null);
   const [filename,     setFilename]     = useState<string | null>(null);
   const [imgDims,      setImgDims]      = useState<[number, number] | null>(null);
   const [dragging,     setDragging]     = useState(false);
@@ -617,6 +627,14 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       setAutoGrid(bestGridSize(bmp.width, bmp.height));
       setCropMode(bmp.width !== bmp.height ? 'center' : 'scale');
       setIsGif(file.type === 'image/gif');
+      gifFramesRef.current = null;
+      if (file.type === 'image/gif') {
+        decodeGifFrames(file).then(decoded => {
+          // Ignore if another file was loaded while decoding.
+          if (latestFileRef.current !== file || decoded.length <= 1) return;
+          gifFramesRef.current = decoded;
+        }).catch(() => { /* single-frame fallback */ });
+      }
     } catch (err) {
       setPreviewStatus(`Error loading image: ${err}`);
     }
@@ -723,8 +741,8 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       const eRows = rowsManual ?? autoGrid?.[1] ?? 1;
 
       // Try to decode all GIF frames if the source is an animated GIF.
-      let gifFrames: import('../gif-decode.js').GifFrame[] | null = null;
-      if (file && file.type === 'image/gif') {
+      let gifFrames: import('../gif-decode.js').GifFrame[] | null = gifFramesRef.current;
+      if (!gifFrames && file && file.type === 'image/gif') {
         try {
           const decoded = await decodeGifFrames(file);
           if (decoded.length > 1) gifFrames = decoded;
@@ -753,7 +771,7 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
         // Each ImageData buffer is transferred zero-copy to its worker.
         setPreviewStatus(`Quantizing 0 of ${total}…`);
         setProceedProgress(0);
-        const perFrameTiles = await runQuantizePool(
+        const { frames: perFrameTiles, quality: poolQuality } = await runQuantizePool(
           preparedImages, eCols, eRows,
           { ...reqP, customPalette: paletteFlag },
           (done) => {
@@ -772,10 +790,12 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
         const frameDelays = Array.from({ length: eCols * eRows }, () => [...delays]);
         const comp        = { ...compositionFromState(ps, framesByTile), frameDelays };
         const sourceBitmaps = gifFrames.map(f => f.bitmap);
-        onProceed(comp, sourceBitmaps[0], reqP, cropMode, pre, sourceBitmaps, latestFileRef.current);
+        onProceed(comp, sourceBitmaps[0], reqP, cropMode, pre, sourceBitmaps, latestFileRef.current,
+            { ...poolQuality, frames: gifFrames.length });
       } else {
         const { tiles } = await computePreview(bmp, eCols, eRows, cropMode, pre, palRestriction, reqP, greyThreshold);
-        onProceed(compositionFromState(ps, tiles.map(t => [t])), bmp, reqP, cropMode, pre, null, latestFileRef.current);
+        onProceed(compositionFromState(ps, tiles.map(t => [t])), bmp, reqP, cropMode, pre, null, latestFileRef.current,
+            matchQuality ? { ...matchQuality, frames: 1 } : null);
       }
     } catch (err) {
       setPreviewStatus(`Error: ${err}`);

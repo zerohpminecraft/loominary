@@ -9,7 +9,7 @@ This walkthrough takes one image from your disk to a framed map in-game. Budget 
 
    ![Import step with a live quantized preview](assets/web/import-preview.png)
 
-3. The right side shows a live preview of how the image maps onto Minecraft's palette, with a match-quality score. The defaults (OKLab matching + adaptive dithering) are good — tweak later, not now.
+3. The right side shows a live preview of how the image maps onto Minecraft's palette, with a match-quality score. Dithering is **off by default** — for photos and gradients, switching it to `FS` in the Quantization step is the first knob worth turning; pixel art and logos are usually best left undithered.
 4. Click **Proceed to Editor →**. You can paint, fill, and fix pixels here ([full tour](Web-Editor-Editing)), or go straight on.
 5. Click **③ Export** in the step bar, then **⬇ Export ZIP**.
 

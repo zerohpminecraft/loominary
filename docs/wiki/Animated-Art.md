@@ -35,7 +35,7 @@ A raw frame is 16,384 bytes; a tile's whole [budget](Codecs-and-Capacity) is ~15
 ## Making animations fit
 
 1. **Fewer distinct colors** is the biggest lever — restrict the palette at import.
-2. **Skip import dithering** (`None`): dither noise varies frame to frame, and temporal noise is what video codecs handle worst. Let lossy mode render gradients instead.
+2. **Keep import dithering off** (the default): dither noise varies frame to frame, and temporal noise is what video codecs handle worst. Let lossy mode render gradients instead.
 3. **Thin frames** with stride/skip before dropping quality — 15 fps reads as smooth on a map.
 4. Then the lossy toggle, walking quality down from 60 until it fits.
 

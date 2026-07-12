@@ -10,11 +10,11 @@ Which vanilla data channels carry the payload — and therefore each tile's byte
 
 | Label | Budget/tile | Notes |
 |---|---|---|
-| `carpet+banners+shade` (default) | 15,482 B | banners fill before shade |
+| `carpet+banners+shade` | 15,482 B | banners fill before shade — the maximum-capacity pick |
 | `carpet+shade+banners` | 15,482 B | shade fills before banners (fewer banners, staircase sooner) |
 | `carpet+banners` | 13,466 B | never a staircase |
 | `carpet+shade` | 10,192 B | zero banners |
-| `carpet` | 8,176 B | pure platform |
+| `carpet` (default) | 8,176 B | pure platform — no banners, no staircase; most images fit here after compression |
 | `banners` | 5,290 B | no platform at all — [legacy mode](Banner-Mode-Legacy) |
 
 Each radio shows a live fit line ("✓ all N fit" / "⚠ M/N tiles over budget"), and the stats table breaks every tile into carpet / shade / banner bytes with a percentage bar. Full channel mechanics: [Codecs & Capacity](Codecs-and-Capacity).

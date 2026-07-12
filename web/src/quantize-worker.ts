@@ -20,6 +20,8 @@
 
 import { requantizeGrid } from './quantize.js';
 import type { RequantizeParams } from './quantize.js';
+import { rgbToOklab } from './oklab.js';
+import { MC_PALETTE } from './palette.js';
 
 interface WorkerTask {
   frameIndex:       number;
@@ -52,7 +54,31 @@ addEventListener('message', ({ data }: MessageEvent<WorkerTask>) => {
   const gridShape = { gridCols, gridRows, frames, activeFrame: 0 };
 
   const tiles       = requantizeGrid(imageData, gridShape, selMask, reqParams);
-  const tileBuffers = tiles.map(t => t.buffer as ArrayBuffer);
 
-  self.postMessage({ frameIndex, tileBuffers }, { transfer: tileBuffers });
+  // Fidelity stats: perceptual distance between each source pixel and the
+  // palette colour it actually received. One OKLab distance per pixel —
+  // negligible next to the quantization itself. Aggregated across all frames
+  // by the caller and surfaced in the editor's stats panel.
+  const GOOD_SQ = 0.05 * 0.05;
+  let good = 0, total = 0, sumDelta = 0;
+  for (let gy = 0; gy < height; gy++) {
+    for (let gx = 0; gx < width; gx++) {
+      const si = (gy * width + gx) * 4;
+      if (imageData.data[si + 3] < 128) continue;
+      const tile = (gy >> 7) * gridCols + (gx >> 7);
+      const b    = tiles[tile][((gy & 127) << 7) | (gx & 127)] & 0xff;
+      if (b === 0) continue; // transparent output
+      const rgb = MC_PALETTE[b];
+      const [sL, sa, sb] = rgbToOklab(imageData.data[si], imageData.data[si + 1], imageData.data[si + 2]);
+      const [qL, qa, qb] = rgbToOklab((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+      const dSq = (sL - qL) ** 2 + (sa - qa) ** 2 + (sb - qb) ** 2;
+      sumDelta += Math.sqrt(dSq);
+      total++;
+      if (dSq <= GOOD_SQ) good++;
+    }
+  }
+
+  const tileBuffers = tiles.map(t => t.buffer as ArrayBuffer);
+  self.postMessage({ frameIndex, tileBuffers, stats: { good, total, sumDelta } },
+      { transfer: tileBuffers });
 });

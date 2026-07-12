@@ -13,7 +13,8 @@ env:
   MODRINTH_PROJECT: loominary
 
 jobs:
-  sync-readme:    runs-on: ubuntu-latest
+  sync-readme:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

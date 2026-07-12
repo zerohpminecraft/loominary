@@ -1,0 +1,57 @@
+# Mirrors README.md to the Modrinth project description on every README change,
+# rewriting relative image/link paths to absolute GitHub URLs.
+# Requires the MODRINTH_KEY repo secret.
+name: modrinth-readme
+
+on:
+  push:
+    branches: [master]
+    paths: ['README.md', '.github/workflows/modrinth-readme.yml']
+  workflow_dispatch:
+
+env:
+  MODRINTH_PROJECT: loominary
+
+jobs:
+  sync-readme:    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Modrinth body from README
+        run: |
+          # Relative image/link paths only resolve on GitHub — point them at the
+          # raw file / blob URLs so they render on Modrinth too.
+          RAW="https://raw.githubusercontent.com/${{ github.repository }}/master"
+          BLOB="https://github.com/${{ github.repository }}/blob/master"
+          python3 - "$RAW" "$BLOB" <<'EOF'
+          import re, sys
+          raw, blob = sys.argv[1], sys.argv[2]
+          body = open('README.md').read()
+          # <img src="relative"> → raw URL
+          body = re.sub(r'(<img[^>]+src=")(?!https?://)([^"]+)', lambda m: m.group(1) + f'{raw}/' + m.group(2), body)
+          # ![alt](relative) → raw URL
+          body = re.sub(r'(!\[[^\]]*\]\()(?!https?://)([^)]+)', lambda m: m.group(1) + f'{raw}/' + m.group(2), body)
+          # [text](relative-file-or-dir) → blob URL (skip anchors and absolute)
+          body = re.sub(r'(?<!!)(\[[^\]]+\]\()(?!https?://|#|mailto:)([^)]+)', lambda m: m.group(1) + f'{blob}/' + m.group(2), body)
+          open('/tmp/body.md', 'w').write(body)
+          EOF
+
+      - name: PATCH project description
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          body = open('/tmp/body.md').read()
+          req = urllib.request.Request(
+              f"https://api.modrinth.com/v2/project/{os.environ['MODRINTH_PROJECT']}",
+              data=json.dumps({'body': body}).encode(),
+              headers={
+                  'Authorization': os.environ['MODRINTH_KEY'],
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'zerohpminecraft/loominary readme-sync',
+              },
+              method='PATCH')
+          with urllib.request.urlopen(req) as resp:
+              print('Modrinth responded', resp.status)
+          EOF
+        env:
+          MODRINTH_KEY: ${{ secrets.MODRINTH_KEY }}

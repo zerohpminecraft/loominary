@@ -90,18 +90,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  * /loominary tile pos <col> <row> — switch to tile at grid position
  * /loominary preview — paint active tile onto crosshair map
  * /loominary revert — restore a previewed map to its original
- * /loominary edit — open the map editor for the active tile
- * /loominary dither [all] [colors <n>] — re-encode from source with Floyd-Steinberg dithering
- * /loominary filter smooth [all] [radius <r>]   — Gaussian blur applied in-place (default r=1.5)
- * /loominary filter median [all] [radius <r>]   — edge-preserving median in-place (default r=1)
- * /loominary filter sharpen [all] [amount <a>]  — unsharp mask in-place (default a=0.8)
- * /loominary filter posterize [all] <levels>    — posterize tones in-place (2–16)
- * /loominary palette [all] — color stats + rarity histogram for active tile (or all tiles)
- * /loominary reduce [all] [<n>] — reduce tile(s) to n banners (default 255)
- * /loominary reduce [all] colors <n> — reduce tile(s) to n distinct colors
- * /loominary reduce strategy <rarest|closest|weighted> — set reduction algorithm
- * /loominary reduce undo — restore active tile to pre-reduction state
- * /loominary reduce undo all — restore all tiles to pre-reduction state
  * /loominary click — toggle auto-right-click of banners while holding map
  * /loominary click stop — stop auto-clicking
  * /loominary whitelist — show how many named banners are whitelisted for reuse
@@ -111,6 +99,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  * /loominary mux undo — remove all donor tiles and reset mux state (may leave batch over-budget)
  * /loominary export [name] — write a Litematica .litematic for active tile
  * /loominary clear [memory|disk] — clear state
+ *
+ * Image editing (edit/reduce/dither/filter/requantize/palette/sparse/stride/skip/resalt)
+ * was removed in v2.0.0 — it lives in the web editor now. Those literals remain as
+ * stubs that print a pointer (see {@link #removedCommand}).
  */
 public class LoominaryCommand {
 
@@ -1451,43 +1443,17 @@ public class LoominaryCommand {
                                     .then(ClientCommandManager.literal("all")
                                             .executes(ctx -> revertAll(ctx.getSource()))))
 
-                            // ── palette / reduce ───────────────────────────────
-                            .then(ClientCommandManager.literal("palette")
-                                    .executes(ctx -> palette(ctx.getSource(), false))
-                                    .then(ClientCommandManager.literal("all")
-                                            .executes(ctx -> palette(ctx.getSource(), true))))
-                            .then(ClientCommandManager.literal("reduce")
-                                    .executes(ctx -> reduceOne(ctx.getSource(), 255))
-                                    .then(ClientCommandManager.literal("undo")
-                                            .executes(ctx -> reduceUndo(ctx.getSource()))
-                                            .then(ClientCommandManager.literal("all")
-                                                    .executes(ctx -> reduceUndoAll(ctx.getSource()))))
-                                    .then(ClientCommandManager.literal("strategy")
-                                            .then(ClientCommandManager.literal("rarest")
-                                                    .executes(ctx -> setReduceStrategy(ctx.getSource(),
-                                                            PngToMapColors.Strategy.RAREST)))
-                                            .then(ClientCommandManager.literal("closest")
-                                                    .executes(ctx -> setReduceStrategy(ctx.getSource(),
-                                                            PngToMapColors.Strategy.CLOSEST)))
-                                            .then(ClientCommandManager.literal("weighted")
-                                                    .executes(ctx -> setReduceStrategy(ctx.getSource(),
-                                                            PngToMapColors.Strategy.WEIGHTED))))
-                                    .then(ClientCommandManager.literal("all")
-                                            .executes(ctx -> reduceAll(ctx.getSource(), 255))
-                                            .then(ClientCommandManager.literal("colors")
-                                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
-                                                            .executes(ctx -> reduceAllColors(ctx.getSource(),
-                                                                    IntegerArgumentType.getInteger(ctx, "n")))))
-                                            .then(ClientCommandManager.argument("target", IntegerArgumentType.integer(1, 255))
-                                                    .executes(ctx -> reduceAll(ctx.getSource(),
-                                                            IntegerArgumentType.getInteger(ctx, "target")))))
-                                    .then(ClientCommandManager.literal("colors")
-                                            .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
-                                                    .executes(ctx -> reduceOneColors(ctx.getSource(),
-                                                            IntegerArgumentType.getInteger(ctx, "n")))))
-                                    .then(ClientCommandManager.argument("target", IntegerArgumentType.integer(1, 255))
-                                            .executes(ctx -> reduceOne(ctx.getSource(),
-                                                    IntegerArgumentType.getInteger(ctx, "target")))))
+                            // ── removed in v2.0.0 — editing moved to the web editor ──
+                            .then(removedCommand("edit"))
+                            .then(removedCommand("palette"))
+                            .then(removedCommand("reduce"))
+                            .then(removedCommand("dither"))
+                            .then(removedCommand("filter"))
+                            .then(removedCommand("requantize"))
+                            .then(removedCommand("sparse"))
+                            .then(removedCommand("stride"))
+                            .then(removedCommand("skip"))
+                            .then(removedCommand("resalt"))
 
                             // ── click ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("click")
@@ -1562,18 +1528,6 @@ public class LoominaryCommand {
                                             .executes(ctx -> authorSet(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
 
-                            // ── stride ─────────────────────────────────────────
-                            .then(ClientCommandManager.literal("stride")
-                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(2, 100))
-                                            .executes(ctx -> applyStrideTile(ctx.getSource(),
-                                                    IntegerArgumentType.getInteger(ctx, "n")))))
-
-                            // ── skip ───────────────────────────────────────────
-                            .then(ClientCommandManager.literal("skip")
-                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(2, 100))
-                                            .executes(ctx -> applySkipTile(ctx.getSource(),
-                                                    IntegerArgumentType.getInteger(ctx, "n")))))
-
                             // ── save ───────────────────────────────────────────
                             .then(ClientCommandManager.literal("save")
                                     .executes(ctx -> saveState(ctx.getSource(), null))
@@ -1597,103 +1551,6 @@ public class LoominaryCommand {
                                             .executes(ctx -> exportSchematic(ctx.getSource(),
                                                     StringArgumentType.getString(ctx, "name")))))
 
-                            // ── dither ─────────────────────────────────────────
-                            .then(ClientCommandManager.literal("dither")
-                                    .executes(ctx -> dither(ctx.getSource(), false, 0))
-                                    .then(ClientCommandManager.literal("all")
-                                            .executes(ctx -> dither(ctx.getSource(), true, 0))
-                                            .then(ClientCommandManager.literal("colors")
-                                                    .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
-                                                            .executes(ctx -> dither(ctx.getSource(), true,
-                                                                    IntegerArgumentType.getInteger(ctx, "n"))))))
-                                    .then(ClientCommandManager.literal("colors")
-                                            .then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 248))
-                                                    .executes(ctx -> dither(ctx.getSource(), false,
-                                                            IntegerArgumentType.getInteger(ctx, "n"))))))
-
-                            // ── filter ─────────────────────────────────────────
-                            .then(ClientCommandManager.literal("filter")
-                                    .then(ClientCommandManager.literal("smooth")
-                                            .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                    PngToMapColors.FilterParams.smooth(1.5f), false))
-                                            .then(ClientCommandManager.literal("all")
-                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                            PngToMapColors.FilterParams.smooth(1.5f), true))
-                                                    .then(ClientCommandManager.literal("radius")
-                                                            .then(ClientCommandManager.argument("r", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.5f, 5f))
-                                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                                            PngToMapColors.FilterParams.smooth(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "r")), true)))))
-                                            .then(ClientCommandManager.literal("radius")
-                                                    .then(ClientCommandManager.argument("r", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.5f, 5f))
-                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                                    PngToMapColors.FilterParams.smooth(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "r")), false)))))
-                                    .then(ClientCommandManager.literal("median")
-                                            .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                    PngToMapColors.FilterParams.median(1), false))
-                                            .then(ClientCommandManager.literal("all")
-                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                            PngToMapColors.FilterParams.median(1), true))
-                                                    .then(ClientCommandManager.literal("radius")
-                                                            .then(ClientCommandManager.argument("r", IntegerArgumentType.integer(1, 3))
-                                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                                            PngToMapColors.FilterParams.median(IntegerArgumentType.getInteger(ctx, "r")), true)))))
-                                            .then(ClientCommandManager.literal("radius")
-                                                    .then(ClientCommandManager.argument("r", IntegerArgumentType.integer(1, 3))
-                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                                    PngToMapColors.FilterParams.median(IntegerArgumentType.getInteger(ctx, "r")), false)))))
-                                    .then(ClientCommandManager.literal("sharpen")
-                                            .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                    PngToMapColors.FilterParams.sharpen(0.8f), false))
-                                            .then(ClientCommandManager.literal("all")
-                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                            PngToMapColors.FilterParams.sharpen(0.8f), true))
-                                                    .then(ClientCommandManager.literal("amount")
-                                                            .then(ClientCommandManager.argument("a", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.1f, 3f))
-                                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                                            PngToMapColors.FilterParams.sharpen(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "a")), true)))))
-                                            .then(ClientCommandManager.literal("amount")
-                                                    .then(ClientCommandManager.argument("a", com.mojang.brigadier.arguments.FloatArgumentType.floatArg(0.1f, 3f))
-                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                                    PngToMapColors.FilterParams.sharpen(com.mojang.brigadier.arguments.FloatArgumentType.getFloat(ctx, "a")), false)))))
-                                    .then(ClientCommandManager.literal("posterize")
-                                            .then(ClientCommandManager.literal("all")
-                                                    .then(ClientCommandManager.argument("levels", IntegerArgumentType.integer(2, 16))
-                                                            .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                                    PngToMapColors.FilterParams.posterize(IntegerArgumentType.getInteger(ctx, "levels")), true))))
-                                            .then(ClientCommandManager.argument("levels", IntegerArgumentType.integer(2, 16))
-                                                    .executes(ctx -> filterInPlace(ctx.getSource(),
-                                                            PngToMapColors.FilterParams.posterize(IntegerArgumentType.getInteger(ctx, "levels")), false)))))
-
-                            // ── resalt ─────────────────────────────────────────
-                            .then(ClientCommandManager.literal("resalt")
-                                    .executes(ctx -> resalt(ctx.getSource())))
-
-                            // ── requantize ─────────────────────────────────────
-                            .then(ClientCommandManager.literal("requantize")
-                                    .executes(ctx -> requantizeAll(ctx.getSource(), false))
-                                    .then(ClientCommandManager.literal("preserve-transparent")
-                                            .executes(ctx -> requantizeAll(ctx.getSource(), true)))
-                                    .then(ClientCommandManager.literal("metric")
-                                            .then(ClientCommandManager.literal("oklab")
-                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.OKLAB)))
-                                            .then(ClientCommandManager.literal("chroma")
-                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.CHROMA_FIRST)))
-                                            .then(ClientCommandManager.literal("luma")
-                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.LUMA_FIRST)))
-                                            .then(ClientCommandManager.literal("hue")
-                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.HUE_ONLY)))
-                                            .then(ClientCommandManager.literal("rgb")
-                                                    .executes(ctx -> setRequantizeMetric(ctx.getSource(), PngToMapColors.MatchMetric.RGB))))
-                                    .then(ClientCommandManager.literal("dither")
-                                            .then(ClientCommandManager.literal("none")
-                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.NONE)))
-                                            .then(ClientCommandManager.literal("fs")
-                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.FLOYD_STEINBERG)))
-                                            .then(ClientCommandManager.literal("atkinson")
-                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.ATKINSON)))
-                                            .then(ClientCommandManager.literal("bayer")
-                                                    .executes(ctx -> setRequantizeDither(ctx.getSource(), PngToMapColors.DitherAlgo.BAYER_4X4)))))
-
                             // ── codec ──────────────────────────────────────────
                             .then(ClientCommandManager.literal("codec")
                                     .executes(ctx -> showCodec(ctx.getSource()))
@@ -1713,12 +1570,6 @@ public class LoominaryCommand {
                                     .executes(ctx -> applyMux(ctx.getSource()))
                                     .then(ClientCommandManager.literal("undo")
                                             .executes(ctx -> unmuxTiles(ctx.getSource()))))
-
-                            // ── sparse ──────────────────────────────────────────
-                            .then(ClientCommandManager.literal("sparse")
-                                    .executes(ctx -> applySparse(ctx.getSource(), false))
-                                    .then(ClientCommandManager.literal("all")
-                                            .executes(ctx -> applySparse(ctx.getSource(), true))))
 
                             // ── password ────────────────────────────────────────
                             .then(ClientCommandManager.literal("password")
@@ -1759,6 +1610,26 @@ public class LoominaryCommand {
                             .then(ClientCommandManager.literal("dumpcarpet")
                                     .executes(ctx -> dumpCarpet(ctx.getSource()))));
         });
+    }
+
+    /**
+     * Stub for a command removed in v2.0.0 (image editing moved to the web editor).
+     * The greedy tail swallows any old argument form, so muscle-memory invocations
+     * like {@code /loominary reduce all colors 32} get the pointer instead of a
+     * Brigadier parse error.
+     */
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<FabricClientCommandSource>
+            removedCommand(String name) {
+        com.mojang.brigadier.Command<FabricClientCommandSource> exec = ctx -> {
+            ctx.getSource().sendError(Text.literal(
+                    "§c/loominary " + name + " was removed in v2.0.0 — image editing now lives in "
+                    + "the web editor: §fhttps://zerohpminecraft.github.io/loominary/"));
+            return 0;
+        };
+        return ClientCommandManager.literal(name)
+                .executes(exec)
+                .then(ClientCommandManager.argument("rest", StringArgumentType.greedyString())
+                        .executes(exec));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -2166,14 +2037,19 @@ public class LoominaryCommand {
                 client.execute(() -> {
                     try {
                         if (client.player == null) return;
+                        // v2: no in-game reduce — an import that can't fit is aborted.
                         if (finalAnyOverflow) {
-                            source.sendFeedback(Text.literal(String.format(
-                                    "§e⚠ GIF over budget on some tiles (%d frame%s). Imported anyway — use /loominary reduce or /loominary edit.",
+                            source.sendError(Text.literal(String.format(
+                                    "§cImport aborted — GIF is over budget on some tiles (%d frame%s).",
                                     finalFrameCount, finalFrameCount == 1 ? "" : "s")));
                             for (int i = 0; i < finalTileCount; i++) {
                                 if (finalNotes.get(i) != null)
-                                    source.sendFeedback(Text.literal("§e  " + PayloadState.tileLabel(i) + ": " + finalNotes.get(i)));
+                                    source.sendError(Text.literal("§c  tile " + i + ": " + finalNotes.get(i)));
                             }
+                            source.sendError(Text.literal(
+                                    "§cUse the web editor — its AV1 animation modes fit far more frames: "
+                                    + "§fhttps://zerohpminecraft.github.io/loominary/"));
+                            return;
                         }
                         PayloadState.tiles.clear();
                         PayloadState.tiles.addAll(finalTiles);
@@ -2473,13 +2349,15 @@ public class LoominaryCommand {
                             note = String.format("reduced %d→%d colors to fit",
                                     fit.originalDistinctColors, fit.originalDistinctColors - fit.colorsRemoved);
                         } catch (Exception overflow2) {
-                            // Still over budget — import anyway, user can reduce manually.
+                            // Still over budget even after auto-reduce. Encode it anyway so the
+                            // mux post-pass can try to redistribute; if that fails too, the
+                            // import is aborted below.
                             byte[] combined = new byte[manifestBytes.length + mapColors.length];
                             System.arraycopy(manifestBytes, 0, combined, 0,                   manifestBytes.length);
                             System.arraycopy(mapColors,     0, combined, manifestBytes.length, mapColors.length);
                             byte[] compressed = compress(combined);
                             enc = encodeLoomFromCompressed(compressed, col, row, PayloadState.codecMode);
-                            note = "over budget — use /loominary reduce";
+                            note = "over budget";
                         }
                     }
                     PayloadState.TileData tile = new PayloadState.TileData();
@@ -2499,6 +2377,28 @@ public class LoominaryCommand {
                 if (mux && anyOverBudgetStatic) {
                     muxApplied = true;
                     muxSuccess = poolMuxTiles(newTiles, columns, rows) == 0;
+                }
+
+                // v2: no in-game reduce — an import that can't fit is aborted, not
+                // committed over budget.
+                boolean stillOverBudget = newTiles.stream().anyMatch(
+                        tile2 -> carpetCompressedBytes(tile2) > maxBytesForTile(tile2));
+                if (stillOverBudget) {
+                    final boolean triedMux = mux;
+                    client.execute(() -> {
+                        try {
+                            source.sendError(Text.literal(
+                                    "§cImport aborted — the image doesn't fit the tile budget"
+                                    + (triedMux ? " even after mux pooling."
+                                                : " (adding §fmux§c may help on multi-tile grids).")));
+                            source.sendError(Text.literal(
+                                    "§cUse the web editor to shrink it (palette reduction, dithering, mux): "
+                                    + "§fhttps://zerohpminecraft.github.io/loominary/"));
+                        } finally {
+                            importInProgress = false;
+                        }
+                    });
+                    return;
                 }
 
                 final List<PayloadState.TileData> finalTiles = newTiles;
@@ -2653,7 +2553,7 @@ public class LoominaryCommand {
                     System.arraycopy(payloadBytes,  0, combined, manifestBytes.length, payloadBytes.length);
                     byte[] compressed = compress(combined);
                     enc = encodeLoomFromCompressed(compressed, col, row, PayloadState.codecMode);
-                    tileNote = "over budget — use /loominary reduce";
+                    tileNote = "over budget";
                 }
                 int encCap = maxBytesForMode(PayloadState.codecMode);
                 if (enc.compressed().length > encCap) {
@@ -2699,6 +2599,17 @@ public class LoominaryCommand {
             client.execute(() -> {
                 try {
                     if (client.player == null) return;
+                    // v2: no in-game reduce — an import that can't fit is aborted.
+                    if (finalAnyOverflow) {
+                        source.sendError(Text.literal(String.format(
+                                "§cImport aborted — GIF is over budget on some tiles (%d frame%s)"
+                                + "%s.", finalFrameCount, finalFrameCount == 1 ? "" : "s",
+                                finalMuxApplied ? " even after mux pooling" : "")));
+                        source.sendError(Text.literal(
+                                "§cUse the web editor — its AV1 animation modes fit far more frames: "
+                                + "§fhttps://zerohpminecraft.github.io/loominary/"));
+                        return;
+                    }
                     PayloadState.tiles.clear();
                     PayloadState.tiles.addAll(finalTiles);
                     PayloadState.currentSourceFilename = filename;
@@ -2741,22 +2652,13 @@ public class LoominaryCommand {
                             : "variable (" + finalRawDelays[0] + "–"
                                     + java.util.Arrays.stream(finalRawDelays).max().getAsInt() + "ms)";
                     source.sendFeedback(Text.literal("§7Delay: " + delayDesc));
-                    if (finalMuxApplied && !finalMuxSuccess) {
-                        source.sendFeedback(Text.literal(
-                                "§c⚠ Mux pooling could not fit all overflow — some tiles still over budget."));
-                    }
-                    if (finalAnyOverflow) {
-                        source.sendFeedback(Text.literal(
-                                "§e⚠ Some tiles are over budget — use §f/loominary reduce§e or §f/loominary edit§e before placing."));
-                    } else {
-                        int maxOvf = finalTiles.stream().mapToInt(ti -> overflowBannerCount(ti, ti.chunks)).max().orElse(0);
-                        if (maxOvf > 0)
-                            source.sendFeedback(Text.literal(String.format(
-                                    "§e⚠ %d overflow banner%s needed — rename at anvil and click with map.",
-                                    maxOvf, maxOvf == 1 ? "" : "s")));
-                        else
-                            source.sendFeedback(Text.literal("§aNo overflow banners needed — just place the carpet schematic and scan with your map!"));
-                    }
+                    int maxOvf = finalTiles.stream().mapToInt(ti -> overflowBannerCount(ti, ti.chunks)).max().orElse(0);
+                    if (maxOvf > 0)
+                        source.sendFeedback(Text.literal(String.format(
+                                "§e⚠ %d overflow banner%s needed — rename at anvil and click with map.",
+                                maxOvf, maxOvf == 1 ? "" : "s")));
+                    else
+                        source.sendFeedback(Text.literal("§aNo overflow banners needed — just place the carpet schematic and scan with your map!"));
                     source.sendFeedback(Text.literal("§7Run §f/loominary export§7 when ready to generate the schematic."));
                 } finally {
                     importInProgress = false;
@@ -3035,7 +2937,7 @@ public class LoominaryCommand {
         // Summary line.
         boolean anyCarpet  = PayloadState.tiles.stream().anyMatch(t -> t.carpetEncoded);
         boolean anyBanners = PayloadState.tiles.stream().anyMatch(t -> !t.carpetEncoded);
-        String budgetWarn = anyOverBudget ? " §c[some tiles over budget — /loominary reduce]" : "";
+        String budgetWarn = anyOverBudget ? " §c[some tiles over budget — re-export from the web editor]" : "";
         if (anyCarpet && !anyBanners) {
             source.sendFeedback(Text.literal(String.format(
                     "§7%d carpet tile%s  §8[codec: %s]%s",
@@ -5003,7 +4905,7 @@ public class LoominaryCommand {
             if (t.carpetEncoded && carpetCompressedBytes(t) > maxBytesForTile(t)) {
                 source.sendError(Text.literal(
                         "§cCan't export: one or more tiles are over budget. "
-                        + "Use §f/loominary reduce§c or §f/loominary mux§c first."));
+                        + "Use §f/loominary mux§c or re-export from the web editor."));
                 PayloadState.syncFromActiveTile();
                 return 0;
             }
@@ -5493,7 +5395,7 @@ public class LoominaryCommand {
                 PayloadState.syncFromActiveTile();
                 PayloadState.save();
                 String msg = String.format("§aRe-encoded %d tile(s) as %s.", ok, newMode.label());
-                if (over > 0) msg += String.format(" §e(%d tile%s over budget — use /loominary reduce.)",
+                if (over > 0) msg += String.format(" §e(%d tile%s over budget — re-export from the web editor.)",
                         over, over == 1 ? "" : "s");
                 if (mc.player != null) mc.player.sendMessage(Text.literal(msg), false);
             });
@@ -5815,7 +5717,7 @@ public class LoominaryCommand {
 
         if (unresolved > 0) {
             source.sendFeedback(Text.literal(String.format(
-                    "§c%d tile%s could not be resolved — try /loominary reduce first.",
+                    "§c%d tile%s could not be resolved — shrink the image in the web editor first.",
                     unresolved, unresolved == 1 ? "" : "s")));
         } else {
             source.sendFeedback(Text.literal(
@@ -6233,6 +6135,7 @@ public class LoominaryCommand {
         try {
             String summary = PayloadState.loadFromFile(path);
             PayloadState.save();
+            AnvilAutoFillHandler.clearHalt();
             source.sendFeedback(Text.literal("§aLoaded: §f" + summary));
             source.sendFeedback(Text.literal("§7Active: " + PayloadState.tileLabel(PayloadState.activeTileIndex)));
             return 1;
@@ -6506,6 +6409,7 @@ public class LoominaryCommand {
 
     private static int clearAll(FabricClientCommandSource source) {
         PayloadState.clear();
+        AnvilAutoFillHandler.clearHalt();
         originalColors.clear();
         preReductionChunks.clear();
         preReductionCarpetB64.clear();
@@ -6518,6 +6422,7 @@ public class LoominaryCommand {
 
     private static int clearMemory(FabricClientCommandSource source) {
         PayloadState.clearMemory();
+        AnvilAutoFillHandler.clearHalt();
         originalColors.clear();
         preReductionChunks.clear();
         preReductionCarpetB64.clear();

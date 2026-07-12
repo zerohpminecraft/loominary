@@ -63,7 +63,7 @@ public class AnvilAutoFillHandler {
     private static boolean bannerPausedLogged = false;
     private static boolean batchDoneLogged    = false;
 
-    /** Called by /loominary resalt after re-encoding the stuck tile. */
+    /** Called when the active state is replaced (load / clear) so a halt never outlives the batch that caused it. */
     public static void clearHalt() {
         haltedForResalt    = false;
         renameAttemptCount = 0;
@@ -90,7 +90,7 @@ public class AnvilAutoFillHandler {
             bannerPausedLogged = false;
             batchDoneLogged    = false;
             // haltedForResalt is intentionally preserved across screen opens;
-            // only /loominary resalt clears it.
+            // only loading fresh state (or /loominary clear) clears it.
 
             // If encryption is configured, apply it now to the active tile's
             // plain chunks and load the result into ACTIVE_CHUNKS.
@@ -111,7 +111,7 @@ public class AnvilAutoFillHandler {
             // ── Halt: server has permanently rejected this chunk name ───────
             if (haltedForResalt) {
                 client.inGameHud.setOverlayMessage(
-                        Text.literal("§c" + TAG + " Stuck — run /loominary resalt"), false);
+                        Text.literal("§c" + TAG + " Stuck — re-export from the web editor (fresh salt), then /loominary load"), false);
                 cooldown = 20;
                 return;
             }
@@ -420,7 +420,7 @@ public class AnvilAutoFillHandler {
                         if (renameAttemptCount >= MAX_RENAME_ATTEMPTS) {
                             System.out.println(TAG + " Chunk " + pendingIndex
                                     + " failed " + MAX_RENAME_ATTEMPTS
-                                    + " times — halting. Run /loominary resalt.");
+                                    + " times — halting. Re-export from the web editor (fresh salt), then /loominary load.");
                             haltedForResalt = true;
                             pendingName  = null;
                             pendingIndex = -1;
@@ -508,7 +508,7 @@ public class AnvilAutoFillHandler {
         // Current chunk's target name; used to short-circuit when a whitelisted
         // banner already happens to carry the exact name we'd rename it to.
         // Vanilla anvil treats same-name as a no-op (empty output), which would
-        // stall PRIORITY 2 and eventually trip the resalt halt.
+        // stall PRIORITY 2 and eventually trip the rename halt.
         String target = PayloadState.ACTIVE_CHUNKS.get(PayloadState.activeChunkIndex);
 
         // Pass 1: prefer an unnamed banner stack (existing behavior).

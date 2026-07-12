@@ -29,5 +29,12 @@ public class ClientModInit implements ClientModInitializer {
         AutoWalkHandler.register();
         WaypointMover.register();
         AutoPrintHandler.register();
+
+        // Docs screenshot harness — dev-only. The class is excluded from the release
+        // jar (build.gradle), and lazy class loading means this reference is safe:
+        // the branch never executes without -Dloominary.docs=true.
+        if (Boolean.getBoolean("loominary.docs")) {
+            net.zerohpminecraft.docs.DocsDriver.init();
+        }
     }
 }

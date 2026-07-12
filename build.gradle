@@ -126,6 +126,34 @@ jar {
 	from("LICENSE") {
 		rename { "${it}_${project.name}"}
 	}
+
+	// The docs screenshot harness (DocsDriver) is dev-only: ClientModInit only
+	// loads it behind -Dloominary.docs=true, and it never ships.
+	exclude "net/zerohpminecraft/docs/**"
+}
+
+// Headless docs-screenshot run: creates/joins a superflat "docs-world" and executes
+// docs/tools/game-shots.json (see DocsDriver). Wrapper: scripts/game-shots.sh
+loom {
+	runs {
+		docsShots {
+			client()
+			ideConfigGenerated = false
+			runDir "run"
+			vmArg "-Dloominary.docs=true"
+			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/game-shots.json"
+		}
+	}
+}
+
+// Renders map-byte frames (status screens etc.) to PNG/GIF docs assets without
+// launching the game. See src/test/java/net/zerohpminecraft/tools/MapRender.java
+tasks.register("renderMapPreviews", JavaExec) {
+	group = "documentation"
+	description = "Render map-byte previews (status screens) into docs/wiki/assets/game/"
+	classpath = sourceSets.test.runtimeClasspath
+	mainClass = "net.zerohpminecraft.tools.MapRender"
+	args "docs/wiki/assets/game", "3"
 }
 
 // configure the maven publication

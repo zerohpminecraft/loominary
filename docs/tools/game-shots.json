@@ -1,0 +1,131 @@
+[
+  {
+    "cmd": "gamerule doDaylightCycle false"
+  },
+  {
+    "cmd": "gamerule doWeatherCycle false"
+  },
+  {
+    "cmd": "time set noon"
+  },
+  {
+    "cmd": "weather clear"
+  },
+  {
+    "cmd": "fill -4 -60 -6 4 -54 -6 minecraft:smooth_stone"
+  },
+  {
+    "cmd": "fill -4 -60 -7 4 -54 -7 minecraft:stone_bricks"
+  },
+  {
+    "cmd": "clear"
+  },
+  {
+    "cmd": "give @s minecraft:item_frame"
+  },
+  {
+    "cmd": "give @s minecraft:map"
+  },
+  {
+    "waitTicks": 10
+  },
+  {
+    "tp": [
+      0.5,
+      -60,
+      -3.0,
+      180,
+      3
+    ]
+  },
+  {
+    "waitTicks": 20
+  },
+  {
+    "select": "minecraft:item_frame"
+  },
+  {
+    "useBlock": true
+  },
+  {
+    "waitTicks": 20
+  },
+  {
+    "select": "minecraft:map"
+  },
+  {
+    "useItem": true
+  },
+  {
+    "waitTicks": 40
+  },
+  {
+    "select": "minecraft:filled_map"
+  },
+  {
+    "waitTicks": 10
+  },
+  {
+    "useEntity": true
+  },
+  {
+    "waitTicks": 40
+  },
+  {
+    "cmd": "loominary import sample.png"
+  },
+  {
+    "waitTicks": 120
+  },
+  {
+    "screenshot": "import-chat"
+  },
+  {
+    "tp": [
+      0.5,
+      -60,
+      -3.0,
+      180,
+      3
+    ]
+  },
+  {
+    "waitTicks": 10
+  },
+  {
+    "cmd": "loominary preview"
+  },
+  {
+    "waitTicks": 60
+  },
+  {
+    "screenshot": "preview-chat"
+  },
+  {
+    "hud": false
+  },
+  {
+    "hotbar": 8
+  },
+  {
+    "tp": [
+      0.5,
+      -60,
+      0.5,
+      180,
+      1.5
+    ]
+  },
+  {
+    "waitTicks": 30
+  },
+  {
+    "screenshot": "preview-map"
+  },
+  {
+    "hud": true
+  },
+  {
+    "exit": true
+  }
+]

@@ -1,0 +1,1 @@
+[Web editor](https://zerohpminecraft.github.io/loominary/) · [Releases](https://github.com/zerohpminecraft/loominary/releases) · [Report an issue](https://github.com/zerohpminecraft/loominary/issues) — This wiki is generated from [`docs/wiki/`](https://github.com/zerohpminecraft/loominary/tree/master/docs/wiki); edit there, not here.

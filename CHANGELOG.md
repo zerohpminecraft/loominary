@@ -4,6 +4,19 @@
 
 ---
 
+## v2.1.0
+
+### Full color (sRGB) mode
+
+Until now, every pixel of map art had to be one of Minecraft's ~248 map colors, and dithering existed to hide the gaps. This release adds a second color mode that skips the palette entirely. Choose **Full color (sRGB)** when you import and the art stays true 24-bit color from the editor to the map on your wall. This works because the lossy AV1 stream Loominary already used for animations has carried full color all along; the decoder simply snapped every pixel back to the nearest palette entry at the last step. It now keeps the real colors and paints them directly into the map texture. Everything around the pixels is unchanged, so byte budgets, mux pooling, carpet platforms, and schematics work as before, and `MapState.colors` still holds a nearest-palette copy so minimaps, server-overwrite detection, and `/loominary toggle` and `revert` behave normally. Static images, animations, and multi-tile murals are all supported, and a mural is encoded as one seam-free stream even when it is static. Older mod versions show sRGB tiles as undecoded rather than garbage.
+
+- **Editor**: every tool works in full color. Brush, fill, magic wand, eyedropper, selections, copy/paste, frame operations, and filters all operate on real RGB, and a hue/hex color picker with recent swatches replaces the palette panel. Palette-only features (dithering, requantize, reduce/merge, restrictions) hide, since there is no palette to manage. Sessions save the RGB frames (format v4); older sessions load unchanged.
+- **Export**: sRGB art always ships as an AV1 color stream (raw RGB is 48 KB per tile and fits no channel), with the usual 1–100 quality slider now available for static art too. The fidelity readout shows average color error (OKLab ΔE) and PSNR instead of percent of pixels changed, and the static preview shows the decoded result rather than the source.
+- **Wire format**: manifest v7 adds a second flag word (`FLAG2_SRGB`) as the last two bytes of the header. Only sRGB tiles write v7; every existing mode still writes v1 through v5 unchanged. The decoder wasm gained a `dec_tu_full` export that returns both the nearest-palette bytes and the raw RGB plane, and all existing fixtures decode identically.
+- **ImmediatelyFast and MapMipMapMod compatibility**: ImmediatelyFast's map atlas replaces the vanilla map texture path, so Loominary hooks IF's own atlas fill (via MixinSquared, the same mechanism MapMipMapMod uses) and substitutes the true colors per map. MapMipMapMod then builds its mipmaps from the sRGB pixels, so full-color art looks right at every distance. The hook applies only when ImmediatelyFast is installed; `mixinsquared` is bundled in the jar alongside zstd and Chicory.
+- **Fixed along the way**: static single-frame AV1 payloads used to fall into a raw-copy branch and paint garbage, and now decode properly. The banner decode path no longer rejects payloads that decompress below 16,384 bytes, which small AV1 streams legitimately do.
+- New tests lock the web and mod decoders together byte for byte: `Av1SrgbRoundtripTest` covers both decoded views for single tiles and murals, manifest v7 has a shared byte anchor in both test suites, and `web/test/composite-payload.test.mjs` round-trips the sRGB mural wire format, animated and static.
+
 ## v2.0.1
 
 ### Docs: wiki depth pass — 4 new deep-dive pages, 20+ new screenshots

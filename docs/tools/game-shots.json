@@ -75,6 +75,42 @@
     "waitTicks": 40
   },
   {
+    "hud": false
+  },
+  {
+    "hotbar": 8
+  },
+  {
+    "tp": [
+      0.5,
+      -60,
+      0.5,
+      180,
+      1.5
+    ]
+  },
+  {
+    "waitTicks": 25
+  },
+  {
+    "screenshot": "preview-demo-blank"
+  },
+  {
+    "hud": true
+  },
+  {
+    "tp": [
+      0.5,
+      -60,
+      -3.0,
+      180,
+      3
+    ]
+  },
+  {
+    "waitTicks": 15
+  },
+  {
     "cmd": "loominary import sample.png"
   },
   {

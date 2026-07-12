@@ -74,9 +74,10 @@ function drawScene(w, h) {
         const t = y / horizon;
         set(x, y, Math.floor(40 + 215 * t * t), Math.floor(30 + 110 * t), Math.floor(90 + 30 * (1 - t)));
       } else {
-        // Lake: mirrored, darkened sky
+        // Lake: mirrored, darkened sky with a gentle swell (kept smooth — busy
+        // ripples quantize into noise that reads as data pixels in screenshots)
         const t = (2 * horizon - y) / horizon;
-        const ripple = Math.sin(y * 0.7 + x * 0.05) * 8;
+        const ripple = Math.sin(y * 0.18 + x * 0.01) * 3;
         set(x, y, Math.floor((40 + 215 * t * t) * 0.55 + ripple),
                    Math.floor((30 + 110 * t) * 0.55 + ripple),
                    Math.floor((90 + 30 * (1 - t)) * 0.6 + ripple));

@@ -1,0 +1,116 @@
+# Keeps the Modrinth project in step with GitHub:
+#  - publish: on every v* tag, builds the jar and uploads it as a new Modrinth
+#    version (changelog = that version's section of CHANGELOG.md)
+#  - sync-readme: on README.md changes (and after each publish), replaces the
+#    Modrinth project description with the GitHub README, rewriting relative
+#    image/link paths to absolute raw.githubusercontent.com URLs
+#
+# Requires the MODRINTH_KEY repo secret (a Modrinth PAT with project-write and
+# version-create scopes). MODRINTH_PROJECT below is the project slug or ID.
+name: modrinth
+
+on:
+  push:
+    tags: ['v*']
+    branches: [master]
+    paths: ['README.md', '.github/workflows/modrinth.yml']
+  workflow_dispatch:
+
+env:
+  MODRINTH_PROJECT: loominary
+
+jobs:
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: ./gradlew build
+
+      - name: Gather version info
+        id: info
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "MC_VERSION=$(grep -oP '^minecraft_version=\K.*' gradle.properties)" >> "$GITHUB_OUTPUT"
+          # Extract this version's section from CHANGELOG.md (from its "## v<ver>"
+          # heading up to the next "## " heading).
+          awk -v ver="${GITHUB_REF_NAME#v}" '
+            $0 == "## v" ver { grab = 1; next }
+            grab && /^## /   { exit }
+            grab             { print }
+          ' CHANGELOG.md > build/changelog.md
+          if [ ! -s build/changelog.md ]; then
+            echo "See CHANGELOG.md for details." > build/changelog.md
+          fi
+
+      - name: Publish to Modrinth
+        uses: Kir-Antipov/mc-publish@v3.3
+        with:
+          modrinth-id: ${{ env.MODRINTH_PROJECT }}
+          modrinth-token: ${{ secrets.MODRINTH_KEY }}
+          files: build/libs/loominary-${{ steps.info.outputs.VERSION }}.jar
+          name: v${{ steps.info.outputs.VERSION }}
+          version: ${{ steps.info.outputs.VERSION }}
+          version-type: release
+          changelog-file: build/changelog.md
+          loaders: fabric
+          game-versions: ${{ steps.info.outputs.MC_VERSION }}
+          dependencies: |
+            fabric-api(required)
+            litematica(optional)
+
+  sync-readme:
+    # Runs on README pushes, after a tag publish, and on manual dispatch.
+    if: always()
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Modrinth body from README
+        run: |
+          # Relative image/link paths only resolve on GitHub — point them at the
+          # raw file / blob URLs so they render on Modrinth too.
+          RAW="https://raw.githubusercontent.com/${{ github.repository }}/master"
+          BLOB="https://github.com/${{ github.repository }}/blob/master"
+          python3 - "$RAW" "$BLOB" <<'EOF'
+          import re, sys
+          raw, blob = sys.argv[1], sys.argv[2]
+          body = open('README.md').read()
+          # <img src="relative"> → raw URL
+          body = re.sub(r'(<img[^>]+src=")(?!https?://)([^"]+)', lambda m: m.group(1) + f'{raw}/' + m.group(2), body)
+          # ![alt](relative) → raw URL
+          body = re.sub(r'(!\[[^\]]*\]\()(?!https?://)([^)]+)', lambda m: m.group(1) + f'{raw}/' + m.group(2), body)
+          # [text](relative-file-or-dir) → blob URL (skip anchors and absolute)
+          body = re.sub(r'(?<!!)(\[[^\]]+\]\()(?!https?://|#|mailto:)([^)]+)', lambda m: m.group(1) + f'{blob}/' + m.group(2), body)
+          open('/tmp/body.md', 'w').write(body)
+          EOF
+
+      - name: PATCH project description
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          body = open('/tmp/body.md').read()
+          req = urllib.request.Request(
+              f"https://api.modrinth.com/v2/project/{os.environ['MODRINTH_PROJECT']}",
+              data=json.dumps({'body': body}).encode(),
+              headers={
+                  'Authorization': os.environ['MODRINTH_KEY'],
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'zerohpminecraft/loominary readme-sync',
+              },
+              method='PATCH')
+          with urllib.request.urlopen(req) as resp:
+              print('Modrinth responded', resp.status)
+          EOF
+        env:
+          MODRINTH_KEY: ${{ secrets.MODRINTH_KEY }}

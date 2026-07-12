@@ -36,7 +36,9 @@ You now have a ZIP containing:
 ## Step 3 — Place the carpet platform
 
 1. Open Litematica's menu (**M** by default), load your schematic, and position it flat on the ground where you want the art to live. Any open 128×128 area works.
-2. Place the carpets — by hand from the ghost preview, or hands-free with [`/loominary walk print`](Autonomous-Printing) if you have a printer installed.
+2. Place the carpets — by hand from the ghost preview, or hands-free with [`/loominary walk print`](Autonomous-Printing) if you have a printer installed. The finished platform is only as deep as your data:
+
+   ![A placed carpet platform](assets/game/carpet-platform.png)
 3. If the export mentioned **overflow banners**, head to an anvil with unnamed banners, empty bundles, and some XP — the mod renames them automatically. Place them anywhere inside the map's area and run `/loominary click` while holding the map. Small images usually need none.
 
 ## Step 4 — Scan and frame

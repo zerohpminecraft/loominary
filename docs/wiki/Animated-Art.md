@@ -1,33 +1,42 @@
 # Animated map art
 
-Drop an animated GIF into the web editor and the whole pipeline stays the same — import, edit, export, place — except the map now *plays* the animation in-game, frames advancing on a wall-clock timer, synced across every viewer and every tile of a mural.
+Drop an animated GIF into the web editor and the pipeline stays the same — import, edit, export, place — except the framed map now *plays* the animation, frames advancing on a wall-clock timer, synchronized for every viewer and across every tile of a mural.
 
 ![Importing an animated GIF](assets/web/import-gif.png)
 
-## How animations are encoded
+## Importing animation
 
-Map bytes are precious: a single frame is 16 KB raw, and a tile's budget is ~15 KB *total* (compressed). Animations only work because consecutive frames are massively redundant, and Loominary exploits that with a real video codec:
+GIF frames are fully composited on import (disposal methods handled), with each frame's own delay preserved (clamped to ≥10 ms; frames without timing default to 100 ms). The import preview shows frame 1; **Proceed** then quantizes every frame in a parallel worker pool with a per-frame progress bar. Decoding uses the browser's `ImageDecoder` (Chrome/Edge 94+ — other browsers import the first frame only).
 
-- **Lossless AV1** (default): frames are encoded as an AV1 stream over the palette indices — pixel-exact playback, typically far smaller than storing frames raw. The exporter automatically picks whichever is smaller per tile (AV1 vs raw+zstd).
-- **Lossy AV1** (opt-in toggle on the export page): for heavily dithered or noisy animations that refuse to compress, frames are encoded as actual lossy video and re-quantized to the palette on decode. The export preview runs the *identical* decode the mod will run, so what you see is byte-for-byte what players get.
-- **Multi-tile animations are seamless**: a lossy animated mural is encoded as **one AV1 stream covering the whole composition**, then split across the tiles' payloads — no per-tile encode boundaries, so no visible seams. The trade-off: every tile of the mural must be scanned at least once before any of them can play (until then, tiles show a WAITING screen counting scanned tiles).
+## Editing frames
 
-The same AV1 decoder binary runs in your browser (WebAssembly) and inside the mod's JVM — that's how the preview can promise exactness.
+The [editor's frame strip](Editor-Tools#animation-frames) gives you playback, scrubbing, per-frame delays (**,** / **.** nudge ±10 ms; an "all" button syncs every frame), clone/blank/delete/reorder, and **stride/skip thinning** — keep or drop every *n*-th frame with delays merged so overall timing is preserved. Every tool and overlay works per frame; requantize, filters, and palette merges optionally apply across **all frames**.
 
-## Working with frames in the editor
+![The frame strip](assets/web/editor-frames.png)
 
-The [editor](Web-Editor-Editing)'s frame strip gives you per-frame editing, cloning, blank frames, reordering, per-frame delays, and **stride/skip thinning** (keep every Nth frame / drop every Nth frame) when a GIF has more frames than budget.
+## How animations fit in the budget
+
+A raw frame is 16,384 bytes; a tile's whole [budget](Codecs-and-Capacity) is ~15 KB *compressed*. Animation only works because consecutive frames are hugely redundant, and Loominary attacks that with an actual video codec:
+
+- **Lossless AV1** (automatic): frames are encoded as an AV1 stream over the palette indices — pixel-exact, and the exporter uses it whenever it beats raw-frames-plus-zstd for the tile.
+- **Lossy AV1** (the "⚡ Lossy animation" toggle, quality 1–100, default 60): real lossy video, re-quantized to the palette on decode. For dithered or noisy animations that refuse lossless compression, it's transformative — and honest: the export preview runs the *same decoder binary* the mod ships (compiled to WebAssembly in the browser, to JVM bytecode in the mod), so the preview is byte-for-byte what players will see. The panel reports the measured pixel-difference percentage at your chosen quality.
+- **Multi-tile animations are seamless**: a lossy animated mural encodes as **one AV1 stream across the whole composition**, split byte-wise over the tiles — no per-tile encode boundaries, no seams. The trade-off is all-or-nothing decoding: every tile must be scanned once before any of them plays; waiting tiles show a WAITING screen counting scanned siblings.
+
+## In-game playback
+
+- **Decode**: heavy animations take a few seconds off-thread; the map shows a live **DECODING** progress bar, then starts playing.
+
+  ![decode progress](assets/game/status-decoding-anim.gif)
+
+- **Timing**: frames advance on wall-clock time using the GIF's own per-frame delays (loop counts honored).
+- **Sync**: maps are grouped by author + title + grid — an entire mural advances as one unit, so the wall never shows mixed frames, and two players standing together see the same frame.
+- **Culling**: tiles farther than 32 blocks pause; they rejoin the sync group, on the correct frame, as you approach.
+
+## Making animations fit
+
+1. **Fewer distinct colors** is the biggest lever — restrict the palette at import.
+2. **Skip import dithering** (`None`): dither noise varies frame to frame, and temporal noise is what video codecs handle worst. Let lossy mode render gradients instead.
+3. **Thin frames** with stride/skip before dropping quality — 15 fps reads as smooth on a map.
+4. Then the lossy toggle, walking quality down from 60 until it fits.
 
 ![An animated composition on the export page](assets/web/export-animated.png)
-
-## In-game behavior
-
-- Playback starts as soon as the tile decodes. Heavy animations show a **DECODING** progress bar on the map while the codec runs (a few seconds for long animations), then start playing.
-- Frames advance on wall-clock time with the GIF's original delays; distant tiles cull playback for performance.
-- Multi-tile murals frame-sync: the grid never shows mixed frames.
-
-## Budget tips
-
-- Fewer distinct colors compress dramatically better — try a palette restriction at import.
-- Dithering fights video compression; for animations, consider dithering OFF at import and let lossy mode handle gradients instead.
-- Long GIFs: thin with stride/skip before reaching for lossy.

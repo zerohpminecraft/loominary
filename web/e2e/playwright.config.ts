@@ -33,7 +33,7 @@ export default defineConfig({
     reducedMotion: 'reduce',
   },
   projects: [
-    { name: 'shots', testMatch: /docs-shots\.spec\.ts/ },
+    { name: 'shots', testMatch: /docs-shots.*\.spec\.ts/ },
     {
       name: 'broll',
       testMatch: /broll\.spec\.ts/,

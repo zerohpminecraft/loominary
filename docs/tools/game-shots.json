@@ -12,6 +12,9 @@
     "cmd": "weather clear"
   },
   {
+    "cmd": "recipe give @s *"
+  },
+  {
     "cmd": "fill -4 -60 -6 4 -54 -6 minecraft:smooth_stone"
   },
   {
@@ -123,7 +126,206 @@
     "screenshot": "preview-map"
   },
   {
+    "placeCarpets": [
+      -64,
+      -60,
+      20
+    ]
+  },
+  {
+    "tp": [
+      0.5,
+      -38,
+      54,
+      180,
+      46
+    ]
+  },
+  {
+    "waitTicks": 40
+  },
+  {
+    "screenshot": "carpet-platform"
+  },
+  {
+    "tp": [
+      0.5,
+      -55,
+      42,
+      180,
+      20
+    ]
+  },
+  {
+    "waitTicks": 30
+  },
+  {
+    "screenshot": "carpet-platform-close"
+  },
+  {
     "hud": true
+  },
+  {
+    "cmd": "give @s minecraft:item_frame"
+  },
+  {
+    "cmd": "give @s minecraft:map"
+  },
+  {
+    "waitTicks": 10
+  },
+  {
+    "tp": [
+      1.5,
+      -60,
+      -3.0,
+      180,
+      3
+    ]
+  },
+  {
+    "waitTicks": 20
+  },
+  {
+    "select": "minecraft:item_frame"
+  },
+  {
+    "useBlock": true
+  },
+  {
+    "waitTicks": 20
+  },
+  {
+    "select": "minecraft:map"
+  },
+  {
+    "useItem": true
+  },
+  {
+    "waitTicks": 40
+  },
+  {
+    "select": "minecraft:filled_map"
+  },
+  {
+    "waitTicks": 10
+  },
+  {
+    "useEntity": true
+  },
+  {
+    "waitTicks": 40
+  },
+  {
+    "cmd": "loominary import sample-wide.png 2 1"
+  },
+  {
+    "waitTicks": 160
+  },
+  {
+    "tp": [
+      1.0,
+      -60,
+      -3.0,
+      180,
+      3
+    ]
+  },
+  {
+    "waitTicks": 10
+  },
+  {
+    "cmd": "loominary preview"
+  },
+  {
+    "waitTicks": 80
+  },
+  {
+    "hud": false
+  },
+  {
+    "hotbar": 8
+  },
+  {
+    "tp": [
+      1.0,
+      -60,
+      1.5,
+      180,
+      2
+    ]
+  },
+  {
+    "waitTicks": 30
+  },
+  {
+    "screenshot": "preview-wall"
+  },
+  {
+    "hud": true
+  },
+  {
+    "cmd": "loominary import sample.png banners"
+  },
+  {
+    "waitTicks": 140
+  },
+  {
+    "screenshot": "import-banners-chat"
+  },
+  {
+    "cmd": "setblock 3 -60 -3 minecraft:anvil[facing=west]"
+  },
+  {
+    "cmd": "give @s white_banner 64"
+  },
+  {
+    "cmd": "give @s minecraft:bundle 16"
+  },
+  {
+    "cmd": "xp add @s 64 levels"
+  },
+  {
+    "waitTicks": 20
+  },
+  {
+    "tp": [
+      3.5,
+      -60,
+      -1.2,
+      180,
+      30
+    ]
+  },
+  {
+    "waitTicks": 20
+  },
+  {
+    "hotbar": 8
+  },
+  {
+    "useBlock": true
+  },
+  {
+    "waitTicks": 8
+  },
+  {
+    "cursor": [
+      0.05,
+      0.9
+    ]
+  },
+  {
+    "screenshot": "anvil-renaming"
+  },
+  {
+    "waitTicks": 60
+  },
+  {
+    "screenshot": "anvil-progress"
+  },
+  {
+    "closeScreen": true
   },
   {
     "exit": true

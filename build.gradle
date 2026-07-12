@@ -142,6 +142,7 @@ loom {
 			runDir "run"
 			vmArg "-Dloominary.docs=true"
 			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/game-shots.json"
+			programArgs "--width", "1600", "--height", "900"
 		}
 	}
 }

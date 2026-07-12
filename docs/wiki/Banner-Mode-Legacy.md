@@ -21,7 +21,9 @@ That original mode still works, and it's still the right tool in one situation: 
 
 **In-game:** add `banners` to imports — `/loominary import <file> banners` or `/loominary import steal banners`.
 
-Then the placement flow ([full guide](In-Game-Placement)) is just the anvil half:
+![A banner-mode import: the whole image in 13 banner names](assets/game/import-banners-chat.png)
+
+Then the placement flow is just the anvil half — covered in depth on [Anvil & Banners](Anvil-and-Banners):
 
 1. Open an anvil with unnamed banners, empty bundles, and XP. The mod renames one banner per tick with the payload chunks (each name: a 2-char index + 48 CJK characters ≈ 84 bytes) and bundles them up.
 2. Place the banners anywhere inside the 128×128 area the map covers.

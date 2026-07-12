@@ -1,48 +1,64 @@
 # Web editor · Step 3: Export
 
-The export step encodes your composition into the actual bytes the mod will decode, shows you exactly what fits where, and packages everything for the game.
+Export encodes your composition into the exact bytes the mod will decode, shows the accounting per tile, and packages everything for the game. Four numbered steps: **Codec · Identify · Encrypt · Export**.
 
-![The export page: codec, metadata, and per-tile stats](assets/web/export-overview.png)
+![The export page](assets/web/export-overview.png)
 
-## Codec: how the data travels
+## ① Codec
 
-Each 128×128 map tile has a byte budget determined by the **codec** — which vanilla data channels carry the payload:
+Which vanilla data channels carry the payload — and therefore each tile's byte budget:
 
-| Channel | Capacity | How |
+| Label | Budget/tile | Notes |
 |---|---|---|
-| **Carpet** | 8,192 B | 16 carpet colors = 4-bit nibbles read back through the map's own colors |
-| **Shade** | +2,016 B | carpet *height* variation (staircase schematic instead of flat) |
-| **Banners** | +~5,200 B | up to 62 named banners, 84 bytes each (14-bit CJK alphabet) |
+| `carpet+banners+shade` (default) | 15,482 B | banners fill before shade |
+| `carpet+shade+banners` | 15,482 B | shade fills before banners (fewer banners, staircase sooner) |
+| `carpet+banners` | 13,466 B | never a staircase |
+| `carpet+shade` | 10,192 B | zero banners |
+| `carpet` | 8,176 B | pure platform |
+| `banners` | 5,290 B | no platform at all — [legacy mode](Banner-Mode-Legacy) |
 
-The default codec (carpet + banners + shade) gives **~15,400 compressed bytes per tile** — most images fit comfortably after zstd compression. The codec picker shows each mode's budget and what your composition needs; the per-tile stats show carpet rows, overflow banner count, and bytes with an over-budget warning if you exceed it. A banner-only codec also exists for the no-building workflow — see [Banner-Only Mode](Banner-Mode-Legacy).
+Each radio shows a live fit line ("✓ all N fit" / "⚠ M/N tiles over budget"), and the stats table breaks every tile into carpet / shade / banner bytes with a percentage bar. Full channel mechanics: [Codecs & Capacity](Codecs-and-Capacity).
 
-## Metadata
+![Banner-only codec selected — note the changed stats columns](assets/web/export-codec-banner.png)
 
-- **Title** — embedded in the payload, shown to whoever decodes it (defaults to the filename).
-- **Author** — your name, also embedded.
-- Every payload carries a CRC32 integrity check and a random salt, so re-exports are always distinguishable.
+## Lossy AV1 (animations only)
 
-## Password protection
+Animated compositions get a prominent **"⚡ Lossy animation — much smaller"** toggle with a **quality slider (1–100, default 60)**. Lossless AV1 is always tried first and is usually enough; lossy is for dithered/noisy animations that refuse to compress. The panel reports the measured "% of pixels differing from the original", and since the preview runs the *identical* decoder the mod ships, what you see is exactly what players get. Heavy compositions (60+ frames) compute sizes on demand — the **Recompute** button appears whenever a setting has made the stats stale, and nothing recomputes behind your back.
 
-Add one or more passwords to encrypt the payload (AES-256-GCM, PBKDF2-derived keys — each password is an independent "key slot"). Only players who've run `/loominary password add <pw>` see the art; everyone else's mod shows a lock icon. Details: [Encryption & Sharing](Encryption-and-Sharing).
+![Animated export](assets/web/export-animated.png)
 
-## Mux: balancing multi-tile budgets
+## ② Identify
 
-On multi-tile grids, busy tiles can blow their budget while plain tiles have room to spare. **Mux** redistributes the overflow into donor tiles automatically. The export page shows the allocation; the mod reassembles it transparently. Details: [Multi-Tile & Mux](Multi-Tile-and-Mux).
+- **Title** (≤64 chars) and **Author** (≤16) — embedded in the payload, shown to whoever decodes it. Both required; the author persists in your browser.
+- **Resalt (nonce)** — randomizes the compressed bytes without changing the image. Every export gets a random nonce regardless; this checkbox forces fresh bytes on demand (the fix for [stuck anvil renames](Anvil-and-Banners#the-anvil-auto-renamer)).
 
-## Animations
+## ③ Encrypt
 
-Animated compositions are encoded with a **lossless AV1** codec (or optional **lossy** mode for dithered content that won't compress — the preview shows the exact decoded result before you commit). Multi-tile animations encode as one seamless stream. Details: [Animated Art](Animated-Art).
+Optional AES-256-GCM payload encryption with one key slot per password — any single password decodes. Costs ≈290 B + 76 B per password, per tile (the stats table accounts for it automatically, and encrypted tiles show a 🔒). Full guide: [Encryption & Sharing](Encryption-and-Sharing).
 
-![Export of an animated composition](assets/web/export-animated.png)
+![Two password slots added](assets/web/export-password.png)
 
-## The ZIP
+## Mux (multi-tile)
 
-**⬇ Export ZIP** produces:
+When some tiles bust their budget and siblings have room, the mux allocator routes the overflow: the panel lists every tile's **role** (normal / receiver / donor), its own vs guest bytes, and the donor↔receiver routing. Blank auto-donor tiles are added if the art tiles alone can't absorb everything. Full guide: [Multi-Tile & Mux](Multi-Tile-and-Mux).
 
-- `loominary_state.json` → your game's `config/` folder — this is the payload
-- `loominary_carpet_r<row>_c<col>.litematic` → your `schematics/` folder, one per tile (carpet codecs only)
-- `preview.png` / `preview.mp4` — the exact decoded result
-- `README.txt` — offline install instructions
+## The 3D schematic viewer
+
+Every carpet-codec tile gets a **physical preview** of its schematic — the actual carpet blocks, flat or staircase (drag = orbit, shift+drag = pan, scroll = zoom, plus a 2D mode). This is the "what am I actually building" view:
+
+![The 3D schematic preview](assets/web/export-schematic-3d.png)
+
+## ④ Export
+
+**⬇ Export ZIP** (suffixed "(encrypted)" / "(mux)" when active) produces:
+
+| File | Destination |
+|---|---|
+| `loominary_state.json` | `<game dir>/config/` — the payload itself |
+| `loominary_carpet_r<row>_c<col>.litematic` | your `schematics/` folder, one per tile (carpet codecs only) |
+| `preview.png` / `preview.mp4` | the exact decoded result (MP4 for animations) |
+| `README.txt` | offline install instructions |
+
+If any tile is still over budget, the export interrupts with an explicit warning — the art won't decode in-game until it fits — and offers the fixes (mux, higher-capacity codec, fewer colors/frames) before letting you "Export anyway".
 
 Then head in-game: **[Placing your art](In-Game-Placement)**.

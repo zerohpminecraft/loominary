@@ -7,9 +7,12 @@
 * [1 · Import](Web-Editor-Import)
 * [2 · Edit](Web-Editor-Editing)
 * [3 · Export](Web-Editor-Export)
+* [Dithering & color matching](Dithering-and-Color-Matching)
+* [Editor tools & shortcuts](Editor-Tools)
 
 **In the game**
 * [Placing your art](In-Game-Placement)
+* [Anvil & banners](Anvil-and-Banners)
 * [Autonomous printing](Autonomous-Printing)
 
 **Features**
@@ -19,6 +22,7 @@
 * [Archiving map art](Stealing-Map-Art)
 
 **Reference**
+* [Codecs & capacity](Codecs-and-Capacity)
 * [Command reference](Command-Reference)
 * [Hotkeys](Hotkeys)
 * [Troubleshooting & FAQ](Troubleshooting-and-FAQ)

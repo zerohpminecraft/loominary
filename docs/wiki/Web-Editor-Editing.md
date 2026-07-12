@@ -1,42 +1,38 @@
 # Web editor · Step 2: Edit
 
-The editor is a full pixel editor working directly in map-color space — every color you can paint is a color a map can actually display.
+A full pixel editor operating directly in map-color space — every color you can pick is a color a map can display, so nothing here can break in-game.
 
 ![The editor with canvas, toolbar, and palette panel](assets/web/editor-overview.png)
 
-## Tools
+This page is the tour; the complete tool-by-tool and key-by-key reference lives at **[Editor Tools & Shortcuts](Editor-Tools)**.
 
-| Tool | What it does |
-|---|---|
-| **Brush** | Paint with the selected palette color; adjustable radius |
-| **Dither brush** | Paint a two-color dither pattern — great for manual gradient touch-ups |
-| **Fill** | Flood-fill contiguous color |
-| **Rect select / Lasso** | Select regions to constrain painting, or cut/copy/paste them |
-| **Magic wand** | Select all contiguous pixels of a color |
-| **Eyedropper** | Pick a color from the canvas (or hold a modifier while painting) |
+## The layout
 
-Undo/redo is full-history (Ctrl+Z / Ctrl+Y). Zoom with the scroll wheel, pan by dragging with the appropriate tool or modifier.
+- **Left toolbar** — the five tools: **B**rush, **F**ill, rect **S**elect, **L**asso, magic **W**and, plus tool options (brush radius/shape, OKLab tolerance for fill/wand) and the selection operations (grow/shrink/invert, copy/cut/paste).
+- **Left panels** — the heavy machinery: **Requantize (R)** re-runs the entire [quantization pipeline](Dithering-and-Color-Matching) on the current pixels *or* the original source image, with preview-then-commit; **Filter (P)** offers smooth/median/sharpen/posterize; **Reduce (K)** strips one color at a time by strategy; **Color Merge** commits the palette panel's merge queue.
+- **Right palette panel** — every color with live pixel counts across four tabs (all / frame / selection / total), sortable by hue, lightness, chroma, or frequency. **Ctrl+click swatches to queue merges** — the fastest way to clean up a noisy palette before [budget](Codecs-and-Capacity) trouble starts.
+- **Status bar** — cursor position (grid + tile-local), hovered color, distinct-color count (turns amber past 120, red past 180 — a compression early-warning), zoom, and frame position.
 
-## The palette panel
+## Three overlays worth knowing
 
-The side panel lists every palette color used in the image with its pixel count. Use it to:
+- **H** — rarity heatmap: red pixels use rare colors (cheap to merge away).
+- **Z** — compression detail map: bright regions are where your bytes go.
+- **M** — the adaptive dither-strength mask from import, viewable and paintable.
 
-- **Spot budget problems** — rare colors cost compression space far out of proportion to their pixel count. A color used 4 times is usually noise worth merging away.
-- **Select by color** — highlight everywhere a color occurs.
-- **Merge / requantize** — collapse colors into their nearest neighbors to shrink the payload, with live preview.
+## Working across tiles
 
-## Animation frames
-
-Animated compositions get a frame strip: step through frames, **clone** or **add blank** frames, delete, reorder, and set per-frame delays (or apply one delay to all). **Stride/Skip** thinning drops every Nth frame when a GIF is too heavy. See [Animated Art](Animated-Art) for how frames are encoded.
-
-## Multi-tile canvas
-
-For grid compositions, the **⊞ Grid** toggle in the step bar switches between editing one tile and the whole composition as a single canvas — selections, fills, and brushes work seamlessly across tile boundaries.
+The **⊞ Grid** toggle (step bar) switches between single-tile editing and the whole composition as one canvas — brush strokes, fills, and selections run straight across tile boundaries.
 
 ![Editing a 2×1 composition as one canvas](assets/web/editor-multitile.png)
 
-## Sessions
+## Animation
 
-Your work auto-saves to the browser (IndexedDB), including the source image — closing the tab loses nothing. The import page lists saved sessions for one-click resume.
+Animated compositions get the frame strip: scrubbing, playback (**Space**), per-frame delays (10–10,000 ms), clone/blank/delete/reorder, and stride/skip thinning. Details in [Editor Tools](Editor-Tools#animation-frames) and the [animation guide](Animated-Art).
+
+![The frame strip](assets/web/editor-frames.png)
+
+## Undo and persistence
+
+Full-history undo (**Ctrl+Z**, 20 levels of complete frame snapshots), and the whole session — source image included — auto-saves to the browser continuously. Close the tab mid-edit; the import page's session history brings it all back.
 
 → **[Step 3: Export](Web-Editor-Export)**

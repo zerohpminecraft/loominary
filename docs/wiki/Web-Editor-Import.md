@@ -1,32 +1,47 @@
 # Web editor · Step 1: Import
 
-The import step turns your source image into map-palette pixels. Everything happens locally in your browser — the image never leaves your machine.
+The import page turns your source image into map-palette pixels. Everything runs locally in your browser — nothing is uploaded anywhere. The page is a numbered wizard down the left side; the right side is a live preview of the final result.
 
 ![The import page before loading an image](assets/web/import-dropzone.png)
 
-## Loading an image
+## ① Image
 
-Drop a file onto the dropzone or click to browse. Supported: **PNG, JPEG, WebP, BMP, and animated GIF** (GIFs bring all their frames — see [Animated Art](Animated-Art)). You can also **import a state JSON** you exported earlier to resume editing without the source image, and previous sessions are auto-saved in the browser for one-click resume.
+Drop a file or **Choose File…** — PNG, JPEG, WebP, BMP, or **animated GIF** (all frames come along; see [Animated Art](Animated-Art)). Two other entry points live here too:
+
+- **Import state JSON…** — load a previously exported `loominary_state.json` to resume editing without the source image (works for every codec, including muxed exports). This is also how you [edit captured art](Stealing-Map-Art).
+- **Session history** — the editor auto-saves complete sessions (source image included) to your browser; load or delete them here.
+
+## ② Grid & Crop
+
+One map tile is 128×128 pixels; a composition is a **Cols × Rows** grid of them (each 1–128). Loominary suggests a grid from your image's aspect ratio — type to override, or hit **auto** to re-derive. Then choose how the image meets the grid:
+
+- **Scale to grid** — stretch/squeeze to fill every tile exactly.
+- **Center crop** (default) — preserve aspect ratio, trim the overflow edges.
+
+Multi-tile guidance: [Multi-Tile & Mux](Multi-Tile-and-Mux).
+
+## ③ Adjustments
+
+Brightness, contrast, and saturation (each 0–2, default 1.0), applied at full resolution *before* color matching. The map palette is muted, so a small saturation push (1.1–1.3) is the single most common improvement. Transparent pixels pass through untouched.
+
+## ④ Palette
+
+Which palette entries quantization may use — from all 244 shades down to 16 flat carpet colors, plus a greyscale mode with an adjustable chroma threshold. Full table and guidance: [Dithering & Color Matching](Dithering-and-Color-Matching#palette-restriction).
+
+## ⑤ Quantization
+
+The heart of the pipeline: **ten dither algorithms** (Floyd–Steinberg through Jarvis–Judice–Ninke to ordered Bayer, each with a strength slider and serpentine option), **five match metrics** (perceptual OKLab default), and a **chroma boost** slider. This deserves its own page — [Dithering & Color Matching](Dithering-and-Color-Matching) — with side-by-side comparisons.
 
 ## The preview pane
 
-The right side shows the quantized result — exactly what the map will display. **Scroll to zoom, drag to pan.** Above it, a **match quality** score reports how many pixels landed within a perceptual hair's breadth of the original; use it to compare settings objectively.
-
 ![A loaded image with its quantized preview](assets/web/import-preview.png)
 
-## Settings that matter
+- **Scroll to zoom · drag to pan.** The default 4× zoom shows dither texture honestly.
+- The small **Original** thumbnail keeps the source in view for comparison.
+- **Palette coverage: N%** scores how well the current palette suits this image — % of pixels whose best palette match lands within a perceptual ΔE of 0.05, colored green ≥75% / amber ≥50% / red below, with the average ΔE alongside. Dithering and chroma boost deliberately don't move this number, so it's a clean instrument for comparing palettes and adjustments.
 
-- **Grid** — how many maps the image spans (1×1 for a single map; see [Multi-Tile & Mux](Multi-Tile-and-Mux) for bigger). "Auto" suggests a grid from the aspect ratio.
-- **Scale vs. center-crop** — fit the whole image or fill the frame.
-- **Adjustments** — brightness, contrast, saturation, and friends, applied before quantization. Small saturation boosts often help; the map palette is muted.
-- **Palette restriction** — limit which palette entries are used (e.g. exclude hard-to-obtain colors, or force a mood).
-- **Dithering** — the algorithm and strength used to fake in-between colors. Adaptive Floyd–Steinberg in OKLab space is the default: gradients dither smoothly, hard edges stay crisp. Try Atkinson for a softer retro look, Bayer for patterns.
-- **Match metric** — how "closest color" is judged. OKLab (perceptual) is almost always right; the chroma-boost slider trades luminance accuracy for more saturated palette use.
+## ⑥ Proceed
 
-**Legal palette vs. all shades:** Minecraft's map format has 4 brightness shades per base color, but only 3 occur from real blocks. "All shades" unlocks the fourth for extra fidelity — at the cost that the art can only exist as encoded data, never as an actual block build. Leave it on unless you care about that distinction.
-
-## Moving on
-
-Click **Proceed to Editor →** when the preview looks right. Heavy images take a moment to encode — the button shows progress.
+**Proceed to Editor →** encodes and hands off. Animated GIFs quantize every frame in a worker pool at this point (one worker per CPU core) with a "Quantizing frame X of Y…" progress bar — the import preview itself only shows frame 1.
 
 → **[Step 2: Edit](Web-Editor-Editing)**

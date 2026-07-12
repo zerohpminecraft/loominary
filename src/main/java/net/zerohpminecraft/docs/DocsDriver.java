@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.util.ScreenshotRecorder;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.resource.DataConfiguration;
 import net.minecraft.resource.featuretoggle.FeatureFlags;
@@ -140,6 +141,9 @@ public final class DocsDriver {
                     a.get(0).getAsString(), a.get(1).getAsString(), a.get(2).getAsString(),
                     a.size() > 3 ? a.get(3).getAsString() : "0",
                     a.size() > 4 ? a.get(4).getAsString() : "0"));
+            // Hover in place — otherwise elevated camera positions fall during waits.
+            client.player.getAbilities().flying = true;
+            client.player.sendAbilitiesUpdate();
             waitTicks = 5;
         } else if (step.has("useItem")) {
             var result = client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
@@ -196,6 +200,52 @@ public final class DocsDriver {
                     break;
                 }
             }
+            waitTicks = 5;
+        } else if (step.has("placeCarpets")) {
+            // Places the ACTIVE tile's real carpet platform by decoding its payload
+            // nibbles and writing blocks straight into the integrated server world —
+            // the authentic platform, no Litematica needed. Args: [x0, y0, z0].
+            JsonArray a = step.getAsJsonArray("placeCarpets");
+            int x0 = a.get(0).getAsInt(), y0 = a.get(1).getAsInt(), z0 = a.get(2).getAsInt();
+            var tile = net.zerohpminecraft.PayloadState.tiles.get(
+                    net.zerohpminecraft.PayloadState.activeTileIndex);
+            byte[] compressed = java.util.Base64.getDecoder().decode(tile.carpetCompressedB64);
+            int carpetBytes = Math.min(compressed.length, net.zerohpminecraft.CarpetChannel.MAX_CARPET_BYTES);
+            var world = client.getServer().getOverworld();
+            var colors = net.minecraft.util.DyeColor.values();
+            int placed = 0;
+            for (int i = 0; i < carpetBytes * 2; i++) {
+                int b = compressed[i / 2] & 0xFF;
+                int nib = (i % 2 == 0) ? (b >> 4) & 0xF : b & 0xF;
+                var id = net.minecraft.util.Identifier.of("minecraft", colors[nib].getName() + "_carpet");
+                var block = net.minecraft.registry.Registries.BLOCK.get(id);
+                world.setBlockState(new BlockPos(x0 + (i % 128), y0, z0 + (i / 128)), block.getDefaultState());
+                placed++;
+            }
+            System.out.println(TAG + " placed " + placed + " carpets (" + carpetBytes + " bytes)");
+            waitTicks = 20;
+        } else if (step.has("cursor")) {
+            // Park the mouse pointer (window-relative fractions) so slot tooltips
+            // don't cover container-screen screenshots.
+            JsonArray a = step.getAsJsonArray("cursor");
+            double px = client.getWindow().getWidth() * a.get(0).getAsDouble();
+            double py = client.getWindow().getHeight() * a.get(1).getAsDouble();
+            org.lwjgl.glfw.GLFW.glfwSetCursorPos(client.getWindow().getHandle(), px, py);
+            try {
+                // GLFW setCursorPos doesn't fire the position callback, so update the
+                // fields MC reads for hover/tooltips too. Yarn field names — dev-only.
+                var mouse = client.mouse;
+                var fx = mouse.getClass().getDeclaredField("x");
+                var fy = mouse.getClass().getDeclaredField("y");
+                fx.setAccessible(true); fy.setAccessible(true);
+                fx.setDouble(mouse, px); fy.setDouble(mouse, py);
+            } catch (ReflectiveOperationException e) {
+                System.err.println(TAG + " cursor: mouse field poke failed: " + e);
+            }
+            waitTicks = 2;
+        } else if (step.has("closeScreen")) {
+            if (client.player != null) client.player.closeHandledScreen();
+            client.setScreen(null);
             waitTicks = 5;
         } else if (step.has("hud")) {
             client.options.hudHidden = !step.get("hud").getAsBoolean();

@@ -43,6 +43,8 @@ mkdir -p run
 if [[ ! -f run/options.txt ]] || ! grep -q pauseOnLostFocus run/options.txt; then
     printf 'pauseOnLostFocus:false\nonboardAccessibility:false\ntutorialStep:none\nguiScale:2\n' >> run/options.txt
 fi
+# Keep the harness silent regardless of system volume.
+grep -q 'soundCategory_master' run/options.txt || printf 'soundCategory_master:0.0\n' >> run/options.txt
 
 "${RUNNER[@]}" ./gradlew runDocsShots
 

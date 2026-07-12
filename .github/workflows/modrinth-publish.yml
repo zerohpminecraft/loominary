@@ -8,6 +8,11 @@ name: modrinth-publish
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing v* tag to (re)publish'
+        required: true
 
 env:
   MODRINTH_PROJECT: loominary
@@ -17,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-java@v4
         with:
@@ -31,11 +38,12 @@ jobs:
       - name: Gather version info
         id: info
         run: |
-          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "MC_VERSION=$(grep -oP '^minecraft_version=\K.*' gradle.properties)" >> "$GITHUB_OUTPUT"
           # Extract this version's section from CHANGELOG.md (from its "## v<ver>"
           # heading up to the next "## " heading).
-          awk -v ver="${GITHUB_REF_NAME#v}" '
+          awk -v ver="${TAG#v}" '
             $0 == "## v" ver { grab = 1; next }
             grab && /^## /   { exit }
             grab             { print }

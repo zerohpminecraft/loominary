@@ -4,6 +4,15 @@
 
 ---
 
+## v2.0.1
+
+### Docs: wiki depth pass — 4 new deep-dive pages, 20+ new screenshots
+
+The wiki grows from breadth to depth. Four new pages fork off the overview pages: **Dithering & Color Matching** (all ten dither algorithms with side-by-side comparison crops, the five match metrics, chroma boost, palette restrictions), **Editor Tools & Shortcuts** (every tool, option, and key), **Codecs & Capacity** (the full byte accounting for every channel and codec), and **Anvil & Banners** (the complete banner pipeline: renamer flow, pause/stuck states, whitelist, click markers). Every existing page gained exact option ranges, defaults, message strings, and new screenshots.
+
+- **Screenshot tooling grew to match**: the in-game harness now places a *real carpet platform* from the active tile's payload (direct integrated-server block writes), drives the anvil auto-renamer on camera, shoots a 2×1 preview wall, holds elevated camera positions (fly-on-tp), runs at 1600×900, and is silent (`soundCategory_master:0`). The web rig adds 13 detail shots including per-algorithm dither comparison crops.
+- **Modrinth CI**: releases now publish to Modrinth automatically on every tag (jar + changelog section + dependencies), and the project description syncs from the README with image paths rewritten. Split into two workflows because a `paths:` filter silently excludes tag pushes; `workflow_dispatch` backfill supported.
+
 ## v2.0.0
 
 ### Breaking: in-game image editing removed — the web editor is the editor

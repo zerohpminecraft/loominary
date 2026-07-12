@@ -4,6 +4,25 @@
 
 ---
 
+## v2.0.0
+
+### Breaking: in-game image editing removed — the web editor is the editor
+
+The in-game GUI editor (`/loominary edit`, 4,100 lines) and the CLI image-editing commands are gone: the [web editor](https://zerohpminecraft.github.io/loominary/) does all of it with live preview, undo history, and none of the byte-budget guesswork. The mod now focuses on what only it can do: placing, decoding, and automation.
+
+- **Removed commands**: `edit`, `reduce` (all forms), `dither`, `filter smooth/median/sharpen/posterize`, `requantize` (+ metric/dither), `palette`, `sparse`, `stride`, `skip`, `resalt`. Each literal remains as a stub — old invocations (with any argument form) print a one-line pointer to the web editor instead of a parse error.
+- **Kept**: `preview`/`revert` (placement verification), all import forms (file/steal/header, with the `dither` import flag intact), tile navigation, click, carpets, walk/print, whitelist, title/author, save/load, export, codec, mux, passwords, clear, stop.
+- **Over-budget imports now abort** with a web-editor pointer instead of importing anyway — there is no in-game `reduce` to fix them with. Multi-tile carpet imports still try the `mux` flag's pooling first.
+- **Anvil stuck-recovery changed**: `resalt` is gone; re-export from the web editor (every export carries a fresh salt) and `/loominary load` the new state — `load` and `clear` now reset the halt.
+- Net −7,700 lines; `PngToMapColors` keeps only the import-quantization machinery.
+
+### Rebrand & docs
+
+- The last `[BannerMod]` log tag is now `[Loominary]`; `fabric.mod.json` contact URLs point at the real repo and web editor (they were still the Fabric example mod's).
+- **README is now a landing page**; the full documentation moved to the [GitHub wiki](https://github.com/zerohpminecraft/loominary/wiki), generated from `docs/wiki/` (17 tutorial-style pages with screenshots, synced by `.github/workflows/wiki.yml`). `EDITOR.md` deleted; `PIPELINE.md` → `docs/dev/pipeline.md`.
+- **Screenshot automation**: `web/e2e/` (Playwright) regenerates all web-editor screenshots + records video B-roll headlessly; `scripts/game-shots.sh` runs a real dev client (dev-only `DocsDriver`, excluded from the release jar) that builds a superflat set, runs commands, and screenshots in-game flows; `./gradlew renderMapPreviews` renders map-byte status screens to PNG/GIF without the game.
+- `docs/videos/`: production cards (scripts, shot lists, B-roll manifests) for an 8-episode tutorial series.
+
 ## v1.25.1
 
 ### Feat: status screens on maps (progress, lock, error)

@@ -63,6 +63,16 @@ public final class Av1FrameDecoder {
      */
     public static byte[][] decode(byte[] full, int offset, int frameCount, boolean lossy,
                                   int width, int height) {
+        return decode(full, offset, frameCount, lossy, width, height, null);
+    }
+
+    /**
+     * @param onFrameDecoded optional progress callback, called with the number of frames
+     *                       decoded so far (1..frameCount) on the decoding thread
+     */
+    public static byte[][] decode(byte[] full, int offset, int frameCount, boolean lossy,
+                                  int width, int height,
+                                  java.util.function.IntConsumer onFrameDecoded) {
         final int planeBytes = width * height;
         WasiOptions wasiOpts = WasiOptions.builder().build();
         try (WasiPreview1 wasi = WasiPreview1.builder().withOptions(wasiOpts).build()) {
@@ -123,6 +133,7 @@ public final class Av1FrameDecoder {
                     for (int p = 0; p < planeBytes; p++) frame[p] = invPerm[plane[p] & 0xFF];
                 }
                 frames[f] = frame;
+                if (onFrameDecoded != null) onFrameDecoded.accept(f + 1);
             }
             inst.export("dec_close").apply();
 

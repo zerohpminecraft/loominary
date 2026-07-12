@@ -1094,6 +1094,8 @@ public class MapBannerDecoder {
         } catch (Exception e) {
             System.err.println(TAG + " Mux completion failed for " + key + ": " + e.getMessage());
             e.printStackTrace();
+            if (buf.mapState != null)
+                paintMap(client, buf.mapId, buf.mapState, PlaceholderArt.error());
         }
     }
 
@@ -1204,12 +1206,23 @@ public class MapBannerDecoder {
             MapState mapState, PayloadManifest manifest, byte[] full, BlockPos framePos) {
         if (!pendingAv1Decodes.add(mapId.id())) return; // decode already in flight
         // Hide the raw stream noise until frame 0 is ready (same as composite tiles).
-        if (mapState != null) paintMap(client, mapId, mapState, new byte[MAP_BYTES]);
+        int totalFrames = Math.max(1, manifest.frameCount);
+        if (mapState != null)
+            paintMap(client, mapId, mapState, PlaceholderArt.decoding(0, totalFrames));
         DECODE_EXECUTOR.submit(() -> {
             // Catch Throwable: submit() swallows anything thrown into an unread Future.
             try {
                 long t0 = System.nanoTime();
-                byte[][] frames = extractFrames(full, manifest);
+                // Repaint the progress screen every ~5% (decode-thread callback → client thread).
+                int[] lastStep = { 0 };
+                java.util.function.IntConsumer progress = mapState == null ? null : done -> {
+                    int step = done * 20 / totalFrames;
+                    if (step == lastStep[0] || done == totalFrames) return;
+                    lastStep[0] = step;
+                    client.execute(() ->
+                            paintMap(client, mapId, mapState, PlaceholderArt.decoding(done, totalFrames)));
+                };
+                byte[][] frames = extractFrames(full, manifest, progress);
                 long decodeMs = (System.nanoTime() - t0) / 1_000_000;
                 client.execute(() -> {
                     pendingAv1Decodes.remove(mapId.id());
@@ -1228,7 +1241,10 @@ public class MapBannerDecoder {
             } catch (Throwable e) {
                 System.err.println(TAG + " AV1 decode failed for map " + mapId.id() + ": " + e);
                 e.printStackTrace();
-                client.execute(() -> pendingAv1Decodes.remove(mapId.id()));
+                client.execute(() -> {
+                    pendingAv1Decodes.remove(mapId.id());
+                    if (mapState != null) paintMap(client, mapId, mapState, PlaceholderArt.error());
+                });
             }
         });
     }
@@ -1285,11 +1301,12 @@ public class MapBannerDecoder {
         buf.tiles[idx] = new CompositeTile(mapId, mapState,
                 frameEntity != null ? frameEntity.getBlockPos() : null);
 
-        // Hide the raw carpet/banner noise until the composition is complete.
-        paintMap(client, mapId, mapState, new byte[MAP_BYTES]);
-
         int totalTiles = cols * rows;
         if (buf.received < totalTiles) {
+            // Hide the raw carpet/banner noise and show progress on every tile seen so far.
+            byte[] waitArt = PlaceholderArt.waiting(buf.received, totalTiles);
+            for (CompositeTile t : buf.tiles)
+                if (t != null) paintMap(client, t.mapId(), t.mapState(), waitArt);
             System.out.println(TAG + " Composite tile (" + manifest.tileCol + "," + manifest.tileRow
                     + ") map " + mapId.id() + " stored — " + buf.received + "/" + totalTiles
                     + " tiles seen for \"" + key + "\"");
@@ -1310,12 +1327,25 @@ public class MapBannerDecoder {
         System.out.println(TAG + " Composite \"" + key + "\" complete — decoding "
                 + streamLen + " bytes at " + w + "x" + h + " (" + buf.frameCount + " frames)");
 
+        // All tiles switch from the waiting screen to the decode progress bar.
+        paintAllCompositeTiles(client, buf, PlaceholderArt.decoding(0, buf.frameCount));
+
         DECODE_EXECUTOR.submit(() -> {
             // Catch Throwable, not Exception: submit() swallows anything the task throws into an
             // unread Future, so an Error here would kill the decode with no log line at all.
             try {
                 long t0 = System.nanoTime();
-                byte[][] frames = Av1FrameDecoder.decode(stream, 0, buf.frameCount, true, w, h);
+                // Repaint the progress bar on every tile every ~5% (decode thread → client thread).
+                int[] lastStep = { 0 };
+                java.util.function.IntConsumer progress = done -> {
+                    int step = done * 20 / buf.frameCount;
+                    if (step == lastStep[0] || done == buf.frameCount) return;
+                    lastStep[0] = step;
+                    byte[] art = PlaceholderArt.decoding(done, buf.frameCount);
+                    client.execute(() -> paintAllCompositeTiles(client, buf, art));
+                };
+                byte[][] frames = Av1FrameDecoder.decode(stream, 0, buf.frameCount, true, w, h,
+                        progress);
                 long decodeMs = (System.nanoTime() - t0) / 1_000_000;
                 client.execute(() -> {
                     compositeBuffers.remove(key);
@@ -1339,9 +1369,18 @@ public class MapBannerDecoder {
             } catch (Throwable e) {
                 System.err.println(TAG + " Composite decode failed for \"" + key + "\": " + e);
                 e.printStackTrace();
-                client.execute(() -> buf.decoding = false);
+                client.execute(() -> {
+                    buf.decoding = false;
+                    paintAllCompositeTiles(client, buf, PlaceholderArt.error());
+                });
             }
         });
+    }
+
+    private static void paintAllCompositeTiles(MinecraftClient client, CompositeBuffer buf,
+                                               byte[] art) {
+        for (CompositeTile t : buf.tiles)
+            if (t != null) paintMap(client, t.mapId(), t.mapState(), art);
     }
 
     // ── Animation tick ────────────────────────────────────────────────────
@@ -1688,6 +1727,16 @@ public class MapBannerDecoder {
      * decoded for display, editing, or re-encoding.
      */
     public static byte[][] extractFrames(byte[] full, PayloadManifest manifest) {
+        return extractFrames(full, manifest, null);
+    }
+
+    /**
+     * @param onFrameDecoded optional progress callback for the (slow) AV1 path — frames
+     *                       decoded so far, called on the decoding thread. Ignored for the
+     *                       raw/delta/sparse formats, which extract near-instantly.
+     */
+    public static byte[][] extractFrames(byte[] full, PayloadManifest manifest,
+                                         java.util.function.IntConsumer onFrameDecoded) {
         int fc     = Math.max(1, manifest.frameCount);
         int offset = manifest.headerSize;
 
@@ -1700,7 +1749,8 @@ public class MapBannerDecoder {
         if (manifest.av1() && fc > 1) {
             // v5 stores a frameCount×u16 per-frame delay table as a prefix before the AV1 stream.
             int av1Offset = offset + (manifest.manifestVersion >= 5 ? fc * 2 : 0);
-            return Av1FrameDecoder.decode(full, av1Offset, fc, manifest.av1Lossy());
+            return Av1FrameDecoder.decode(full, av1Offset, fc, manifest.av1Lossy(),
+                    128, 128, onFrameDecoded);
         }
 
         byte[][] frames = new byte[fc][MAP_BYTES];
@@ -1814,9 +1864,11 @@ public class MapBannerDecoder {
         }
 
         if (MapEncryption.passwords.isEmpty()) {
-            if (encryptedNoPass.add(id))
+            if (encryptedNoPass.add(id)) {
                 System.out.println(TAG + " Encrypted map id=" + id
                         + " — add a password with /loominary password add <pw>");
+                if (mapState != null) paintMap(client, mapId, mapState, PlaceholderArt.locked());
+            }
             return;
         }
 
@@ -1833,6 +1885,9 @@ public class MapBannerDecoder {
                     client.execute(() -> {
                         claimedMaps.remove(id);
                         pendingDecrypts.remove(id);
+                        // Paint once per session (rescans retry every 20 ticks).
+                        if (encryptedNoPass.add(id) && mapState != null)
+                            paintMap(client, mapId, mapState, PlaceholderArt.locked());
                     });
                     return;
                 }
@@ -1874,6 +1929,7 @@ public class MapBannerDecoder {
         muxPendingBytes.clear();
         compositeBuffers.clear();
         pendingAv1Decodes.clear();
+        encryptedNoPass.clear();
         rawColors.clear();
         decodedColors.clear();
         renderUpdateSeen.clear();

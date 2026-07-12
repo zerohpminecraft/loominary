@@ -4,6 +4,16 @@
 
 ---
 
+## v1.25.1
+
+### Feat: status screens on maps (progress, lock, error)
+
+Tiles that can't display their art yet no longer sit transparent or noisy — they paint a status screen (procedural map-palette pixel art, `PlaceholderArt`):
+
+- **Decoding** — AV1 tiles (per-tile and composite) show a live progress bar with percentage, repainted every ~5% straight from the decode thread. Composite tiles waiting for their sibling tiles show a "WAITING — TILES n/N — SCAN ALL TILES" screen with one bar segment per tile, updated on every tile scanned.
+- **Password required** — encrypted tiles with no matching password (or an empty password list) show a lock icon; painted once per session, replaced by the art as soon as a working password is added.
+- **Error** — failed decodes (AV1 stream errors, composite decode failures, mux reassembly failures) show a warning triangle with "CHECK LOGS" instead of failing invisibly.
+
 ## v1.25.0
 
 ### Feat: composition-wide lossy encoding (seamless multi-tile animations)

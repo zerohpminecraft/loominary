@@ -29,7 +29,9 @@ Recommended cadence: publish 1 and 2 together (hook + depth), then weekly.
 Episode 1 can be produced end-to-end with no manual filming: `scripts/game-video.sh` records
 the in-game segments (1080p X11 grab, markers at segment boundaries; audio capture works on a
 desktop session but not under Xvfb), and `docs/videos/tools/assemble-ep01.py` cuts, captions
-(burned + `.srt` sidecar), scores (captured audio when present, vanilla sound assets when the
+(burned + `.srt` sidecar), narrates (DECtalk "Perfect Paul" via `DECTALK_DIR` pointing at a
+[dectalk/dectalk](https://github.com/dectalk/dectalk) release dir, falling back to espeak-ng or to
+captions-only), scores (captured audio when present, vanilla sound assets when the
 capture is silent), and encodes the final MP4 (H.264 NVENC by default, `--codec av1` for
 SVT-AV1). Output lands in `docs/videos/out/ep01/` (git-ignored). The in-game decode shot is
 real: the harness places the LOOM carpet platform (header + noobline), scans it with an empty

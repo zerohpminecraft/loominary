@@ -23,3 +23,14 @@ One card per episode. Each contains: title/thumbnail/description (paste into You
 8. [Tips, Troubleshooting & How It Works](ep08-how-it-works.md)
 
 Recommended cadence: publish 1 and 2 together (hook + depth), then weekly.
+
+## Fully generated cut (ep. 01)
+
+Episode 1 can be produced end-to-end with no manual filming: `scripts/game-video.sh` records
+the in-game segments (1080p X11 grab, markers at segment boundaries; audio capture works on a
+desktop session but not under Xvfb), and `docs/videos/tools/assemble-ep01.py` cuts, captions
+(burned + `.srt` sidecar), scores (captured audio when present, vanilla sound assets when the
+capture is silent), and encodes the final MP4 (H.264 NVENC by default, `--codec av1` for
+SVT-AV1). Output lands in `docs/videos/out/ep01/` (git-ignored). The in-game decode shot is
+real: the harness places the LOOM carpet platform (header + noobline), scans it with an empty
+map on camera, and the framed map decodes live.

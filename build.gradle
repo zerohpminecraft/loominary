@@ -146,6 +146,16 @@ loom {
 			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/game-shots.json"
 			programArgs "--width", "1600", "--height", "900"
 		}
+		// Video-series footage run (docs/videos): 1080p, driven by game-video.json,
+		// recorded from outside by scripts/game-video.sh (X11 grab + Pulse null sink).
+		docsVideo {
+			client()
+			ideConfigGenerated = false
+			runDir "run"
+			vmArg "-Dloominary.docs=true"
+			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/game-video.json"
+			programArgs "--width", "1920", "--height", "1080"
+		}
 	}
 }
 

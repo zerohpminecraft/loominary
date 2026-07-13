@@ -202,27 +202,42 @@ public final class DocsDriver {
             }
             waitTicks = 5;
         } else if (step.has("placeCarpets")) {
-            // Places the ACTIVE tile's real carpet platform by decoding its payload
-            // nibbles and writing blocks straight into the integrated server world —
-            // the authentic platform, no Litematica needed. Args: [x0, y0, z0].
+            // Places the ACTIVE tile's real carpet platform by writing blocks straight
+            // into the integrated server world — the authentic LOOM layout (16-byte
+            // header + payload nibbles), scannable and decodable with an in-game map,
+            // no Litematica needed. Args: [x0, y0, z0]; align x0/z0 to a map cell
+            // (≡ −64 mod 128) if the footage should actually decode.
+            //
+            // A noobline row of carpets is placed directly north of the first data row
+            // so row 0 tops out level with its northern neighbor and shades flat
+            // (see the wiki's In-Game-Placement page).
             JsonArray a = step.getAsJsonArray("placeCarpets");
             int x0 = a.get(0).getAsInt(), y0 = a.get(1).getAsInt(), z0 = a.get(2).getAsInt();
             var tile = net.zerohpminecraft.PayloadState.tiles.get(
                     net.zerohpminecraft.PayloadState.activeTileIndex);
             byte[] compressed = java.util.Base64.getDecoder().decode(tile.carpetCompressedB64);
-            int carpetBytes = Math.min(compressed.length, net.zerohpminecraft.CarpetChannel.MAX_CARPET_BYTES);
+            byte[] header = net.zerohpminecraft.CarpetChannel.buildLoomHeader(
+                    0, 0, 0, compressed.length, compressed.length, null);
+            byte[] cargo = new byte[header.length + compressed.length];
+            System.arraycopy(header, 0, cargo, 0, header.length);
+            System.arraycopy(compressed, 0, cargo, header.length, compressed.length);
+            int carpetBytes = Math.min(cargo.length, net.zerohpminecraft.CarpetChannel.MAX_CARPET_BYTES);
             var world = client.getServer().getOverworld();
             var colors = net.minecraft.util.DyeColor.values();
-            int placed = 0;
+            var white = net.minecraft.registry.Registries.BLOCK.get(
+                    net.minecraft.util.Identifier.of("minecraft", "white_carpet")).getDefaultState();
+            for (int x = 0; x < 128; x++) world.setBlockState(new BlockPos(x0 + x, y0, z0 - 1), white);
+            int placed = 128;
             for (int i = 0; i < carpetBytes * 2; i++) {
-                int b = compressed[i / 2] & 0xFF;
+                int b = cargo[i / 2] & 0xFF;
                 int nib = (i % 2 == 0) ? (b >> 4) & 0xF : b & 0xF;
                 var id = net.minecraft.util.Identifier.of("minecraft", colors[nib].getName() + "_carpet");
                 var block = net.minecraft.registry.Registries.BLOCK.get(id);
                 world.setBlockState(new BlockPos(x0 + (i % 128), y0, z0 + (i / 128)), block.getDefaultState());
                 placed++;
             }
-            System.out.println(TAG + " placed " + placed + " carpets (" + carpetBytes + " bytes)");
+            System.out.println(TAG + " placed " + placed + " carpets (LOOM header + "
+                    + compressed.length + " payload bytes, noobline row at z=" + (z0 - 1) + ")");
             waitTicks = 20;
         } else if (step.has("cursor")) {
             // Park the mouse pointer (window-relative fractions) so slot tooltips

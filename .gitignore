@@ -33,3 +33,4 @@ loominary_exports/
 *.log
 hs_err_pid*.log
 web/e2e/media/
+docs/videos/out/

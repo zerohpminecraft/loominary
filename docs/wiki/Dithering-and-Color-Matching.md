@@ -2,6 +2,8 @@
 
 Nothing affects output quality more than how your image's true colors get mapped onto Minecraft's limited map palette. This page covers the whole quantization toolbox: the ten dither algorithms, the five match metrics, chroma boost, and palette restriction. Everything here lives in **Step 5 (Quantization)** and **Step 4 (Palette)** of the [import page](Web-Editor-Import), and identically in the editor's Requantize panel.
 
+> Everything on this page applies to **map palette** mode only. [Full color (sRGB)](Full-Color-sRGB) compositions skip quantization entirely; these steps don't appear for them.
+
 ## Dithering: trading resolution for color
 
 Dithering scatters two palette colors in a pattern your eye blends into an in-between shade, which is how a ~183-color palette approximates thousands. The price is visible texture. Loominary offers ten algorithms; here is the same sunset with a few of them:

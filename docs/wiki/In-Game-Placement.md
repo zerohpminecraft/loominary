@@ -64,7 +64,7 @@ Hang any map in an item frame, look at it, and run `/loominary preview`; the pen
 
 ![Preview paints the framed map; revert restores it](assets/game/preview-revert-demo.gif)
 
-Preview is the fastest way to sanity-check scale, colors, and dithering at actual map size before committing to a build.
+Preview is the fastest way to sanity-check scale, colors, and dithering at actual map size before committing to a build. As of v2.1.1 it decodes AV1 payloads of every kind (lossless, lossy, [full-color sRGB](Full-Color-sRGB), composite) properly; on older versions a static AV1 tile previewed as garbage.
 
 ## Command crib sheet
 

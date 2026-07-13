@@ -40,6 +40,9 @@ The budgets sound small next to a raw frame's 16,384 bytes before compression. B
 | [Encryption](Encryption-and-Sharing) | ≈290 B + 76 B per password slot, per tile |
 | Mux guest descriptor | 10 B per guest carried by a donor |
 | Per-frame delay table (animated, v5+) | 2 B per frame |
+| Trailing flags word (manifest v7, [full color mode](Full-Color-sRGB)) | 2 B |
+
+Manifest **v7** is the v5 layout plus that trailing 16-bit flags word; its `FLAG2_SRGB` bit marks a [full color (sRGB)](Full-Color-sRGB) composition. Full-color payloads ride the same channels with the same budgets: the art travels as a lossy AV1 stream, and a typical single 128×128 full-color image compresses to roughly 1 KB at high quality.
 
 ## When a tile doesn't fit
 

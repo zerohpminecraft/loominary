@@ -1769,6 +1769,19 @@ public class MapBannerDecoder {
     }
 
     /**
+     * Runs the full decode/paint pipeline on an already-decompressed payload — the public
+     * entry {@code /loominary preview} uses for AV1 payloads (lossless, lossy, sRGB, and
+     * composite), whose bytes after the header are a stream rather than raw map colours and
+     * therefore cannot be painted by a plain 16,384-byte copy.
+     *
+     * @param frameEntity may be null (held map); animation then doesn't register
+     */
+    public static void paintFromDecompressed(MinecraftClient client, MapIdComponent mapId,
+            MapState mapState, ItemFrameEntity frameEntity, byte[] full) {
+        processDecompressedPayload(client, mapId, mapState, frameEntity, full);
+    }
+
+    /**
      * Registers animation for a map from an already-decompressed payload.
      * Works for both banner and carpet tiles. Does nothing for static payloads.
      */

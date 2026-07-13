@@ -162,6 +162,51 @@
     "screenshot": "preview-map"
   },
   {
+    "cmd": "loominary load srgb"
+  },
+  {
+    "waitTicks": 20
+  },
+  {
+    "tp": [
+      0.5,
+      -60,
+      -3.0,
+      180,
+      3
+    ]
+  },
+  {
+    "waitTicks": 10
+  },
+  {
+    "cmd": "loominary preview"
+  },
+  {
+    "waitTicks": 120
+  },
+  {
+    "tp": [
+      0.5,
+      -60,
+      0.5,
+      180,
+      1.5
+    ]
+  },
+  {
+    "waitTicks": 30
+  },
+  {
+    "screenshot": "srgb-map"
+  },
+  {
+    "cmd": "loominary import sample.png"
+  },
+  {
+    "waitTicks": 120
+  },
+  {
     "placeCarpets": [
       -64,
       -60,

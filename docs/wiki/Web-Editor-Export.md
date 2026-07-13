@@ -27,6 +27,12 @@ Animated compositions get a prominent **"⚡ Lossy animation — much smaller"**
 
 ![Animated export](assets/web/export-animated.png)
 
+## Full color (sRGB) compositions
+
+Compositions imported in [Full color (sRGB)](Full-Color-sRGB) mode replace the lossy checkbox with an always-on **"Full color (sRGB) — AV1"** panel; the mode has no lossless variant, so the same **quality slider (1–100)** applies to static art as well as animations. The fidelity readout is **"avg color error ΔE ≈ x.xxx · PSNR y.y dB"** (mean OKLab ΔE between original and decoded result, plus RGB peak signal-to-noise ratio) instead of the palette mode's pixel-difference percentage, and the static preview shows the decoded result.
+
+![Full color export panel with the fidelity line](assets/web/export-fullcolor.png)
+
 ## ② Identify
 
 - **Title** (≤64 chars) and **Author** (≤16) are embedded in the payload and shown to whoever decodes it. Both required; the author persists in your browser.

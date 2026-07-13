@@ -4,6 +4,15 @@
 
 ---
 
+## v2.1.1
+
+### Preview decodes AV1 payloads, plus full-color wiki coverage
+
+`/loominary preview` used to copy the first 16,384 bytes after the manifest onto the map, which is only correct for raw payloads; an AV1 tile (lossless, lossy, full-color sRGB, or composite) carries a compressed stream there, so a static AV1 tile previewed as garbage. Preview now routes AV1 payloads through the real decode pipeline, the same one the scanner uses.
+
+- The wiki gained a [Full color (sRGB)](https://github.com/zerohpminecraft/loominary/wiki/Full-Color-sRGB) deep-dive page and full-color sections across the import, editing, export, codec, animation, and FAQ pages, with new screenshots from both rigs, including a palette-versus-full-color comparison of the same art on real in-game maps.
+- The screenshot harnesses grew to match: the web rig shoots the color-mode step, the color panel, and the sRGB export panel; the game rig loads a committed sRGB demo state (`node web/scripts/gen-docs-srgb-state.mjs`) and photographs it decoded in an item frame.
+
 ## v2.1.0
 
 ### Full color (sRGB) mode

@@ -16,6 +16,7 @@ The web editor quantizes your image to Minecraft's map palette, compresses it, a
 
 - **Any image in, map art out.** PNG, JPEG, WebP, GIF, BMP; perceptual OKLab color matching and adaptive dithering get a lot out of the limited palette.
 - **Animated map art**: GIFs become AV1-encoded animations that play back on the map, frame-synced across multi-tile walls.
+- **[Full color (sRGB)](Full-Color-sRGB)**: skip the map palette entirely and keep true 24-bit color, carried as a lossy AV1 stream over the same channels.
 - **Giant murals.** Split one image across an N×M wall of maps, with seamless dithering and automatic byte-budget balancing between tiles (mux).
 - **Fully autonomous building**: `/loominary walk print` walks your player along the platform and places every carpet for you.
 - **Encrypted art.** Lock your art with passwords (AES-256-GCM); other players need both the mod and the password.

@@ -17,6 +17,7 @@
 
 **Features**
 * [Animated art](Animated-Art)
+* [Full color (sRGB)](Full-Color-sRGB)
 * [Multi-tile murals & mux](Multi-Tile-and-Mux)
 * [Encryption & sharing](Encryption-and-Sharing)
 * [Archiving map art](Stealing-Map-Art)

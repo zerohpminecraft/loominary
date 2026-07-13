@@ -24,6 +24,15 @@ Multi-tile guidance: [Multi-Tile & Mux](Multi-Tile-and-Mux).
 
 Brightness, contrast, and saturation (each 0–2, default 1.0), applied at full resolution *before* color matching. The map palette is muted, so a small saturation push (1.1–1.3) is the most common improvement. Transparent pixels pass through untouched.
 
+## Color mode
+
+A composition-wide choice between two ways of carrying color:
+
+- **Map palette** (default): pixels are quantized to Minecraft's map palette, exactly as the steps below describe.
+- **Full color (sRGB)**: the art keeps true 24-bit color and travels as a lossy AV1 stream instead. The Palette and Quantization steps disappear, since nothing gets quantized. Full guide: [Full color (sRGB)](Full-Color-sRGB).
+
+![Import with Full color selected](assets/web/import-fullcolor.png)
+
 ## ④ Palette
 
 Which palette entries quantization may use, from all 244 shades down to 16 flat carpet colors, plus a greyscale mode with an adjustable chroma threshold. Full table and guidance: [Dithering & Color Matching](Dithering-and-Color-Matching#palette-restriction).

@@ -32,6 +32,12 @@ Animated compositions get the frame strip: scrubbing, playback (**Space**), per-
 
 ![The frame strip](assets/web/editor-frames.png)
 
+## Editing in full color (sRGB)
+
+Compositions imported in [Full color (sRGB)](Full-Color-sRGB) mode edit the same way, on real RGB pixels. All five tools plus copy/paste, frame operations, and filters work unchanged, and fill/wand tolerance is still an OKLab distance, computed from the actual colors. A **color panel** (hue slider, saturation/value square, hex and R/G/B inputs, recent colors) replaces the palette panel, and the palette-only features are hidden: dithering, Requantize, Reduce, Color Merge, the dither brush mask, and the rarity heatmap. Sessions save as usual and older saved sessions load unchanged.
+
+![The editor's color panel in full color mode](assets/web/colorpanel.png)
+
 ## Undo and persistence
 
 Full-history undo (**Ctrl+Z**, 20 levels of complete frame snapshots), and the whole session (source image included) auto-saves to the browser continuously. Close the tab mid-edit and the import page's session history brings it all back.

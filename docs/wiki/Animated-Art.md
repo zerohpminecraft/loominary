@@ -21,6 +21,9 @@ A raw frame is 16,384 bytes; a tile's whole [budget](Codecs-and-Capacity) is ~15
 - **Lossless AV1** (automatic): frames are encoded as an AV1 stream over the palette indices. The result is pixel-exact, and the exporter uses it whenever it beats raw-frames-plus-zstd for the tile.
 - **Lossy AV1** (the "⚡ Lossy animation" toggle, quality 1–100, default 60): real lossy video, re-quantized to the palette on decode. It makes a large difference for dithered or noisy animations that compress poorly losslessly. The export preview runs the same decoder binary the mod ships (compiled to WebAssembly in the browser, to JVM bytecode in the mod), so what you preview is byte-for-byte what players will see. The panel reports the measured pixel-difference percentage at your chosen quality.
 - **Multi-tile animations are seamless**: a lossy animated mural encodes as one AV1 stream across the whole composition, split byte-wise over the tiles, so there are no per-tile encode boundaries and no seams. In exchange, decoding is all-or-nothing: every tile must be scanned once before any of them plays, and waiting tiles show a WAITING screen counting scanned siblings.
+- **[Full color (sRGB)](Full-Color-sRGB) animations** work too. In that mode every payload is a lossy AV1 color stream in true 24-bit color, with the same quality slider, and murals share one stream across the grid whether animated or static.
+
+![An animated full-color composition on the export page](assets/web/export-fullcolor-animated.png)
 
 ## In-game playback
 

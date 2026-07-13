@@ -32,6 +32,10 @@ fi
 mkdir -p run/loominary_data run/screenshots
 cp web/e2e/fixtures/sample.png web/e2e/fixtures/sample-wide.png run/loominary_data/
 
+# sRGB demo state for the full-color shot (regenerate: node web/scripts/gen-docs-srgb-state.mjs).
+mkdir -p run/loominary_saves
+cp docs/tools/srgb-state.json run/loominary_saves/srgb.json
+
 # Fresh world each run keeps shots reproducible.
 if [[ "${1:-}" != "--keep-world" ]]; then
     rm -rf run/saves/docs-world

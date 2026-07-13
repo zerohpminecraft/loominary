@@ -37,6 +37,9 @@ Its reach is ~4.5 blocks and it scans ±5 around you, so walk the banner field a
 **Animated tile plays for me, freezes or errors for a friend.**
 Their mod predates the AV1 codec. Art needs the mod version that made it, or newer.
 
+**My [full-color (sRGB)](Full-Color-sRGB) art shows for me, but my friend sees an undecoded tile.**
+They're on an older Loominary version; full color needs **v2.1.0 or newer** to decode. Older versions show the undecoded tile (carpet noise or banner markers) rather than garbage, and vanilla players see an ordinary carpet map as always.
+
 **The animation stutters when I walk away and back.**
 That's the 32-block distance culling. The tile rejoins its sync group on the correct frame, and a brief catch-up is normal.
 
@@ -53,6 +56,9 @@ Yes to both, since the mod is fully client-side.
 
 **What's "legal palette" vs "all shades"?**
 Maps encode 4 brightness shades per base color; only 3 occur from real block placement. "All shades" adds the fourth (244 colors total) for fidelity, at the cost that the art can't exist as a physical build. [Details](Dithering-and-Color-Matching#palette-restriction).
+
+**Does [full color mode](Full-Color-sRGB) work with ImmediatelyFast / MapMipMapMod?**
+Yes, automatically. ImmediatelyFast's map atlas replaces the vanilla map texture, so Loominary hooks IF's atlas fill (the hook ships in the jar and only activates when IF is installed) and writes the true colors there. MapMipMapMod, which requires IF, then generates its mipmaps from those colors, so full-color art looks right at a distance too. No configuration needed for either.
 
 **Why ~15 KB per tile?**
 That's the sum of the vanilla channels: 8,176 B carpet + 2,016 B shade + 5,290 B banners. Compression makes it feel much bigger, and typical images use 1.5–6 KB. The full math is on [Codecs & Capacity](Codecs-and-Capacity).

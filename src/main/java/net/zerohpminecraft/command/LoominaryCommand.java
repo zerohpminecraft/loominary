@@ -2958,18 +2958,28 @@ public class LoominaryCommand {
                 PayloadState.TileData tile = PayloadState.tiles.get(tileIdx);
                 if (!tileHasContent(tile)) continue;
 
-                byte[] mapColors = resolveMapColorsForTile(tile, tile.chunks);
-
                 if (!originalColors.containsKey(cell.mapId().id())) {
                     originalColors.put(cell.mapId().id(), cell.mapState().colors.clone());
                 }
-                MapBannerDecoder.paintMap(fm.client, cell.mapId(), cell.mapState(), mapColors);
-                if (tile.frameCount > 1) {
-                    try {
-                        byte[] full = resolveFullPayloadForTile(tile, tile.chunks);
-                        MapBannerDecoder.registerAnimatedFromDecompressed(
-                                fm.client, cell.mapId(), cell.frame().getBlockPos(), full);
-                    } catch (Exception ignored) {}
+
+                // AV1 payloads (lossless, lossy, sRGB v7, composite) carry a stream after the
+                // header, not raw colours — a plain 16,384-byte copy paints garbage. Route them
+                // through the real decode pipeline; everything else keeps the fast direct paint.
+                byte[] full = resolveFullPayloadForTile(tile, tile.chunks);
+                PayloadManifest previewMf = full.length == MAP_BYTES
+                        ? null : PayloadManifest.fromBytes(full);
+                if (previewMf != null && previewMf.av1()) {
+                    MapBannerDecoder.paintFromDecompressed(
+                            fm.client, cell.mapId(), cell.mapState(), cell.frame(), full);
+                } else {
+                    byte[] mapColors = resolveMapColorsForTile(tile, tile.chunks);
+                    MapBannerDecoder.paintMap(fm.client, cell.mapId(), cell.mapState(), mapColors);
+                    if (tile.frameCount > 1) {
+                        try {
+                            MapBannerDecoder.registerAnimatedFromDecompressed(
+                                    fm.client, cell.mapId(), cell.frame().getBlockPos(), full);
+                        } catch (Exception ignored) {}
+                    }
                 }
                 tileWasPainted[tileIdx] = true;
                 painted++;

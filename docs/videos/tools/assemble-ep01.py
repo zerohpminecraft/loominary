@@ -170,24 +170,40 @@ SCALE = 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-
 clips = []       # (path, has_audio)
 for i, (kind, src, dur, cues) in enumerate(SEGS):
     clip = TMP / f'seg{i:02d}.mp4'
+    # GUARDRAIL: every segment must be long enough to hold ALL of its narration —
+    # a cue that outruns its segment spills the voice into the next segment's
+    # lines. Cards/stills stretch by definition; game/broll clips get their last
+    # frame held (tpad clone) to make up any shortfall.
+    need = sum(cue_slot(i, j, c) for j, c in enumerate(cues)) + 0.8
     if kind in ('card', 'still'):
-        dur = max(dur, sum(cue_slot(i, j, c) for j, c in enumerate(cues)) + 0.8)
+        dur = max(dur, need)
     if kind == 'game':
         start, d = game_window(src)
         speed = dur or 1.0
+        out_d = d / speed
+        pad = max(0.0, need - out_d)
         if speed != 1.0:
             # Timelapse the shot; camera moves are silent, so drop audio (bed covers it).
+            vf = f'{SCALE},setpts=PTS/{speed}'
+            if pad: vf += f',tpad=stop_mode=clone:stop_duration={pad:.3f}'
             run('-ss', f'{start:.3f}', '-t', f'{d:.3f}', '-i', RAW / 'game.mkv',
-                '-vf', f'{SCALE},setpts=PTS/{speed}', *NORM_V, '-an', clip)
+                '-vf', vf, *NORM_V, '-an', clip)
             clips.append((clip, False))
         else:
+            vf = SCALE
+            extra = ([] if not pad else
+                     ['-af', f'apad=pad_dur={pad:.3f}', '-t', f'{out_d + pad:.3f}'])
+            if pad: vf += f',tpad=stop_mode=clone:stop_duration={pad:.3f}'
             run('-ss', f'{start:.3f}', '-t', f'{d:.3f}', '-i', RAW / 'game.mkv',
-                '-vf', SCALE, *NORM_V, '-c:a', 'aac', '-b:a', '192k', clip)
+                '-vf', vf, *extra, *NORM_V, '-c:a', 'aac', '-b:a', '192k', clip)
             clips.append((clip, True))
     elif kind == 'broll':
         path, off, d = src
+        vf = SCALE
+        pad = max(0.0, need - d)
+        if pad: vf += f',tpad=stop_mode=clone:stop_duration={pad:.3f}'
         run('-ss', f'{off:.3f}', '-t', f'{d:.3f}', '-i', path,
-            '-vf', SCALE, *NORM_V, '-an', clip)
+            '-vf', vf, *NORM_V, '-an', clip)
         clips.append((clip, False))
     elif kind == 'still':
         # Ken Burns push-in. Two zoompan traps handled here: (1) `d` means "output
@@ -214,18 +230,32 @@ def fmt_ts(t):
     return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
 
 srt, cue_events, cue_n, t0 = [], [], 1, 0.0
+vo_cursor = 0.0   # GUARDRAIL: narration is strictly sequential — never overlapping
+VO_GAP = 0.35
 for i, ((kind, src, dur, cues), (clip, _a)) in enumerate(zip(SEGS, clips)):
     d_real = probe(clip)
     lead = min(0.4, d_real * 0.05)
     t = t0 + lead
     for j, cue in enumerate(cues):
         cd = cue_slot(i, j, cue)
+        # Never start a cue before the previous voice line has finished.
+        t = max(t, vo_cursor + VO_GAP if vo_cursor else t)
         end = min(t + cd, t0 + d_real - 0.1)
+        if end <= t:   # segment overfull despite the clip guardrail — surface it
+            print(f'WARNING: cue {cue_n} ("{cue[:40]}…") does not fit segment {i}; '
+                  f'voice slides past the segment boundary')
+            end = t + cd
         srt.append(f'{cue_n}\n{fmt_ts(t)} --> {fmt_ts(end)}\n{cue}\n')
         if (i, j) in vo:
             cue_events.append((t + 0.1, vo[(i, j)][0]))
+            vo_cursor = t + 0.1 + vo[(i, j)][1]
         cue_n += 1; t = end
     t0 += d_real
+
+# Hard assertion: no two narration clips may overlap on the final timeline.
+for (a_t, a_w), (b_t, _b_w) in zip(cue_events, cue_events[1:]):
+    a_end = a_t + probe(a_w)
+    assert a_end <= b_t + 0.01, f'narration overlap: clip ending {a_end:.2f}s vs next start {b_t:.2f}s'
 
 srt_path = OUT / 'ep01-first-map-art.srt'
 srt_path.write_text('\n'.join(srt))

@@ -3,7 +3,10 @@
  * docs/videos/out/raw/fm-<scene>.webm at 1080p via Playwright.
  *   cd web && node ../docs/videos/tools/record-fm.mjs
  */
-import { chromium } from '@playwright/test';
+import { createRequire } from 'node:module';
+// Resolve playwright from the CALLER's tree (run from web/), not this file's location.
+const req = createRequire(process.cwd() + '/package.json');
+const { chromium } = req('@playwright/test');
 import { rename } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';

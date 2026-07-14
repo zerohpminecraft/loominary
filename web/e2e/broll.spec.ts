@@ -90,3 +90,33 @@ test('broll: multi-tile flow (ep04)', async ({ page }) => {
   await proceedToExport(page);
   await pause(page, 3000);
 });
+
+test('broll: animated editing + export preview (ep01)', async ({ page }) => {
+  // Timing marks let the assembler slice around the variable quantize/encode waits:
+  // recordVideo starts with the context, so Date.now deltas ≈ video timestamps.
+  const t0 = Date.now();
+  const marks: Record<string, number> = {};
+  await page.goto('/loominary/');
+  await loadFixture(page, 'sample-anim.gif');
+  await pause(page, 1000);
+  await proceedToEditor(page);
+  await pause(page, 800);
+  marks.editorPlay = (Date.now() - t0) / 1000;
+  await page.keyboard.press(' ');       // play the animation on the canvas
+  await pause(page, 4500);
+  await page.keyboard.press(' ');       // pause
+  await pause(page, 400);
+  for (let i = 0; i < 4; i++) { await page.keyboard.press('>'); await pause(page, 450); }
+  await proceedToExport(page);
+  // The encoded MP4 preview appears once the AV1 compute finishes.
+  const video = page.locator('video');
+  await video.waitFor({ state: 'visible', timeout: 300_000 });
+  await page.waitForFunction(() => {
+    const v = document.querySelector('video');
+    return v && v.currentTime > 0.2 && !v.paused;
+  }, { timeout: 60_000 });
+  marks.exportPreview = (Date.now() - t0) / 1000;
+  await pause(page, 5500);
+  const { writeFile } = await import('node:fs/promises');
+  await writeFile(new URL('./media/anim-marks.json', import.meta.url), JSON.stringify(marks));
+});

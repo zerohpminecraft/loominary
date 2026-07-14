@@ -91,6 +91,8 @@ wiz = broll('wizard'); wiz_d = probe(wiz)
 adj = broll('adjustments'); adj_d = probe(adj)
 tools = broll('editor-tools'); tools_d = probe(tools)
 gifroll = broll('animated-GIF'); gif_d = probe(gifroll)
+anim = broll('animated-editing')
+anim_marks = json.load(open(ROOT / 'web/e2e/media/anim-marks.json'))
 
 # Optional 5th field: callout boxes — [(cue_index, x, y, w, h), ...] drawn on the clip
 # (1080p coords) for the duration of that cue, derived from the same slot arithmetic the
@@ -104,18 +106,18 @@ SEGS = [
         "The tool is called Loominary. A client-side mod, plus a web editor. Nothing is uploaded. No server plugins. No permission slips.",
     ]),
     ('fmvideo', RAW / 'fm-install.webm', None, [
-        "Installation is the usual Fabric routine: Loominary, Fabric API, and Litematica, into the mods folder. Three files. You can do this. Links are below.",
+        "Installation is the usual Fabric routine: Loominary, Fabric API, Litematica, and IceTank's printer fork, into the mods folder. Four files. The order does not matter. You will put them in an order anyway.",
     ]),
     ('broll', (wiz, 0.0, min(11.0, wiz_d * 0.4)), None, [
         "Open the web editor and drop in your image. Nothing uploads. Your browser does all the work.",
-        "The preview is not a mockup. It is the exact in-game result, quantized to Minecraft's actual map palette. All 248 colors of it.",
+        "The preview is not a mockup. It is the exact in-game result, quantized to Minecraft's actual map palette. All 248 colors. You were going to count them. I know. I counted too.",
     ], [(0, 12, 256, 336, 132), (1, 776, 84, 948, 916)]),
     ('broll', (adj, 1.0, min(10.0, adj_d - 1)), None, [
-        "The palette is muted, so give the saturation a nudge. There is a match-quality score, if you want to feel scientific.",
+        "The palette is muted, so give the saturation a nudge. There is a match-quality score. You are going to optimize it. This is correct behavior.",
         "The dithering does the heavy lifting on the gradients. It does not complain. Learn from it.",
     ], [(0, 12, 856, 336, 210)]),
     ('broll', (tools, 1.0, min(7.5, tools_d - 1)), None, [
-        "Step two is a full pixel editor. Touch up whatever bothers you. I am a video, not your supervisor.",
+        "Step two is a full pixel editor. Something in there is one pixel off. You already saw it. Go fix it. Neither of us was going to sleep anyway.",
     ]),
     ('broll', (wiz, wiz_d * 0.72, wiz_d * 0.28), None, [
         "Step three: export. This screen shows exactly how your image travels. Carpet colors carry most of the bytes; banners catch the overflow.",
@@ -128,27 +130,30 @@ SEGS = [
         "In game, loominary status confirms the mod loaded your art. It loaded. It always loads.",
     ], [(0, 0, 880, 690, 150)]),
     ('game', 'plat', 4.5, [
-        "Load the schematic with Litematica and place the platform: a 128 by 128 sheet of carpet, with one polite row of blocks up north so the map shades correctly.",
+        "Load the schematic with Litematica and place the platform: a 128 by 128 sheet of carpet, with one polite row of blocks up north so the map shades correctly. The grid alignment must be exact. This will not be a problem for you.",
         "Yes, you can place it by hand from the ghost. Yes, there is a feature that walks out and places every carpet for you. That is another video. Contain yourself.",
     ]),
     ('game', 'scan', None, [
         "Stand on the platform and use an empty map. That snapshot is the entire trick.",
         "Those pixels along the top of the map? The carpet colors just became data.",
     ], [(1, 650, 585, 640, 100)]),
-    ('game', 'dec', None, [
+    ('game', ('dec', 2.5), None, [
         "Lock the map at a cartography table so it never redraws. Frame it.",
         "The mod reads the data off the map and paints the real image. No servers were consulted.",
         "Everyone with Loominary sees art. Everyone else sees modern art.",
     ]),
-    ('broll', (gifroll, 1.0, min(6.0, gif_d - 1)), None, [
-        "It does animated GIFs.",
+    ('broll', (anim, anim_marks['editorPlay'] + 0.1, 5.8), None, [
+        "It does animated GIFs. Press play in the editor. Every frame gets the same obsessive treatment.",
+    ]),
+    ('broll', (anim, anim_marks['exportPreview'] + 0.3, 5.5), None, [
+        "The export preview is the encoded animation, already playing. What ships is what you see. We checked. Twice.",
     ]),
     ('still', SHOTS_WEB / 'export-multitile.png', 4.0, ["Wall-sized murals."]),
     ('still', SHOTS_GAME / 'status-locked.png', 4.5, [
         "And password-locked art, for your secrets. All coming up in this series.",
     ]),
     ('card', CARDS / 'card-end.png', 6.0, [
-        "Editor and wiki are linked below. Go make something. The carpet is waiting.",
+        "Editor and wiki are linked below. This video will not make eye contact with you. Go make something, mapautists. The carpet is waiting.",
     ]),
 ]
 # Normalize: every entry is (kind, src, dur, cues, boxes).
@@ -197,7 +202,10 @@ for i, (kind, src, dur, cues, boxes) in enumerate(SEGS):
     if kind in ('card', 'still'):
         dur = max(dur, need)
     if kind == 'game':
-        start, d = game_window(src)
+        if isinstance(src, tuple):
+            start, d = game_window(src[0], pad_out=0.3 + src[1])
+        else:
+            start, d = game_window(src)
         speed = dur or 1.0
         out_d = d / speed
         pad = max(0.0, need - out_d)
@@ -342,7 +350,7 @@ else:
     mixins.append('[bed]'); idx += 1
     t_cursor, t_dec = 0.0, None
     for (kind, src, _dur, _cues, _b), (clip, _a) in zip(SEGS, clips):
-        if kind == 'game' and src == 'dec':
+        if kind == 'game' and (src == 'dec' or (isinstance(src, tuple) and src[0] == 'dec')):
             t_dec = t_cursor
         t_cursor += probe(clip)
     if t_dec is not None:

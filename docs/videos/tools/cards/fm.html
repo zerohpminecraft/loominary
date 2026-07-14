@@ -46,9 +46,9 @@ const JAR = n => ({ n, i: 'JAR' });
 const SCENES = {
   install: {
     title: 'Downloads', crumb: '~/Downloads',
-    files: [JAR('loominary-2.1.1.jar'), JAR('fabric-api-0.119.4+1.21.4.jar'), JAR('litematica-fabric-1.21.4.jar')],
+    files: [JAR('loominary-2.1.1.jar'), JAR('fabric-api-0.119.4+1.21.4.jar'), JAR('litematica-fabric-1.21.4.jar'), JAR('litematica-printer-1.21.4.jar')],
     side: [['.minecraft', 0], ['mods', 1, 'target'], ['config', 1], ['schematics', 1]],
-    moves: [{ files: [0, 1, 2], target: 'mods' }],
+    moves: [{ files: [0, 1, 2, 3], target: 'mods' }],
   },
   files: {
     title: 'loominary-export.zip', crumb: '~/Downloads/loominary-export',

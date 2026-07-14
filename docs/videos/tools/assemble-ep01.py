@@ -92,6 +92,9 @@ adj = broll('adjustments'); adj_d = probe(adj)
 tools = broll('editor-tools'); tools_d = probe(tools)
 gifroll = broll('animated-GIF'); gif_d = probe(gifroll)
 
+# Optional 5th field: callout boxes — [(cue_index, x, y, w, h), ...] drawn on the clip
+# (1080p coords) for the duration of that cue, derived from the same slot arithmetic the
+# caption layout uses, so boxes always track the narration.
 SEGS = [
     ('game', 'reveal', 4.0, [
         "This is a Minecraft map. Completely vanilla. Completely legal.",
@@ -100,38 +103,40 @@ SEGS = [
     ('card', CARDS / 'card-title.png', 6.5, [
         "The tool is called Loominary. A client-side mod, plus a web editor. Nothing is uploaded. No server plugins. No permission slips.",
     ]),
-    ('card', CARDS / 'card-install.png', 6.0, [
-        "Installation: three jars, one mods folder. This is the hardest step, and it is not hard.",
+    ('fmvideo', RAW / 'fm-install.webm', None, [
+        "Installation is the usual Fabric routine: Loominary, Fabric API, and Litematica, into the mods folder. Three files. You can do this. Links are below.",
     ]),
     ('broll', (wiz, 0.0, min(11.0, wiz_d * 0.4)), None, [
-        "Drop your image into the editor. The preview is the exact in-game result, quantized to Minecraft's map palette. All 248 colors of it.",
-    ]),
+        "Open the web editor and drop in your image. Nothing uploads. Your browser does all the work.",
+        "The preview is not a mockup. It is the exact in-game result, quantized to Minecraft's actual map palette. All 248 colors of it.",
+    ], [(0, 12, 256, 336, 132), (1, 776, 84, 948, 916)]),
     ('broll', (adj, 1.0, min(10.0, adj_d - 1)), None, [
-        "The palette is muted, so boost the saturation a little.",
-        "The dithering is doing the heavy lifting here. It does not complain. Learn from it.",
-    ]),
+        "The palette is muted, so give the saturation a nudge. There is a match-quality score, if you want to feel scientific.",
+        "The dithering does the heavy lifting on the gradients. It does not complain. Learn from it.",
+    ], [(0, 12, 856, 336, 210)]),
     ('broll', (tools, 1.0, min(7.5, tools_d - 1)), None, [
         "Step two is a full pixel editor. Touch up whatever bothers you. I am a video, not your supervisor.",
     ]),
-    ('broll', (wiz, wiz_d * 0.62, min(9.0, wiz_d * 0.38)), None, [
-        "Step three. Export. Carpet colors carry the bytes; banners catch the overflow. Press the button.",
-    ]),
-    ('card', CARDS / 'card-files.png', 7.0, [
-        "Two files. JSON to the config folder. Litematic to the schematics folder. Do not swap them. People swap them.",
+    ('broll', (wiz, wiz_d * 0.72, wiz_d * 0.28), None, [
+        "Step three: export. This screen shows exactly how your image travels. Carpet colors carry most of the bytes; banners catch the overflow.",
+        "Pick a codec. Press Export ZIP. Try to look busy while it encodes.",
+    ], [(0, 12, 230, 344, 560), (0, 392, 640, 1510, 110)]),
+    ('fmvideo', RAW / 'fm-files.webm', None, [
+        "Two files matter. The state JSON goes to your config folder. The litematic goes to your schematics folder. Do not improvise here.",
     ]),
     ('game', 'status', None, [
-        "In game, loominary status confirms the load. It loaded. It always loads.",
-    ]),
+        "In game, loominary status confirms the mod loaded your art. It loaded. It always loads.",
+    ], [(0, 0, 880, 690, 150)]),
     ('game', 'plat', 4.5, [
-        "Now, the platform: a 128-wide sheet of carpet, plus one polite row of blocks up north so the map shades correctly.",
-        "Yes, there is a feature that walks out and places every carpet for you. That's another video. Contain yourself.",
+        "Load the schematic with Litematica and place the platform: a 128 by 128 sheet of carpet, with one polite row of blocks up north so the map shades correctly.",
+        "Yes, you can place it by hand from the ghost. Yes, there is a feature that walks out and places every carpet for you. That is another video. Contain yourself.",
     ]),
     ('game', 'scan', None, [
-        "Stand on the platform. Use an empty map.",
-        "Congratulations: the carpet is now data.",
-    ]),
+        "Stand on the platform and use an empty map. That snapshot is the entire trick.",
+        "Those pixels along the top of the map? The carpet colors just became data.",
+    ], [(1, 650, 585, 640, 100)]),
     ('game', 'dec', None, [
-        "Lock the map. Frame the map.",
+        "Lock the map at a cartography table so it never redraws. Frame it.",
         "The mod reads the data off the map and paints the real image. No servers were consulted.",
         "Everyone with Loominary sees art. Everyone else sees modern art.",
     ]),
@@ -146,13 +151,27 @@ SEGS = [
         "Editor and wiki are linked below. Go make something. The carpet is waiting.",
     ]),
 ]
+# Normalize: every entry is (kind, src, dur, cues, boxes).
+SEGS = [s if len(s) == 5 else (*s, None) for s in SEGS]
+
+def boxes_vf(boxes, i, cues):
+    """drawbox chain for a segment's callouts (accent blue), gated to the bound cue's
+    on-screen window (same slot arithmetic as the caption layout, minus small margins)."""
+    if not boxes: return ''
+    parts = []
+    for (cj, x, y, w, h) in boxes:
+        b0 = 0.4 + sum(cue_slot(i, k, cues[k]) for k in range(cj)) + 0.2
+        b1 = b0 - 0.2 + cue_slot(i, cj, cues[cj]) - 0.4
+        parts.append(f"drawbox=x={x}:y={y}:w={w}:h={h}:color=0x6fb3ff@0.9:t=5"
+                     f":enable='between(t,{b0:.2f},{b1:.2f})'")
+    return ',' + ','.join(parts)
 
 OUT.mkdir(parents=True, exist_ok=True); TMP.mkdir(exist_ok=True)
 
 # Synthesize narration first: card/still durations stretch to fit their lines.
 vo = {}      # (seg_idx, cue_idx) -> (wav_path, duration)
 if VOICE:
-    for i, (_k, _s, _d, cues) in enumerate(SEGS):
+    for i, (_k, _s, _d, cues, _b) in enumerate(SEGS):
         for j, cue in enumerate(cues):
             w = TMP / f'vo{i:02d}_{j}.wav'
             say(cue, w)
@@ -168,7 +187,7 @@ NORM_V = ['-r', '30', '-c:v', 'libx264', '-preset', 'medium', '-crf', '18', '-pi
 SCALE = 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=0x0b1020'
 
 clips = []       # (path, has_audio)
-for i, (kind, src, dur, cues) in enumerate(SEGS):
+for i, (kind, src, dur, cues, boxes) in enumerate(SEGS):
     clip = TMP / f'seg{i:02d}.mp4'
     # GUARDRAIL: every segment must be long enough to hold ALL of its narration —
     # a cue that outruns its segment spills the voice into the next segment's
@@ -184,13 +203,13 @@ for i, (kind, src, dur, cues) in enumerate(SEGS):
         pad = max(0.0, need - out_d)
         if speed != 1.0:
             # Timelapse the shot; camera moves are silent, so drop audio (bed covers it).
-            vf = f'{SCALE},setpts=PTS/{speed}'
+            vf = f'{SCALE},setpts=PTS/{speed}' + boxes_vf(boxes, i, cues)
             if pad: vf += f',tpad=stop_mode=clone:stop_duration={pad:.3f}'
             run('-ss', f'{start:.3f}', '-t', f'{d:.3f}', '-i', RAW / 'game.mkv',
                 '-vf', vf, *NORM_V, '-an', clip)
             clips.append((clip, False))
         else:
-            vf = SCALE
+            vf = SCALE + boxes_vf(boxes, i, cues)
             extra = ([] if not pad else
                      ['-af', f'apad=pad_dur={pad:.3f}', '-t', f'{out_d + pad:.3f}'])
             if pad: vf += f',tpad=stop_mode=clone:stop_duration={pad:.3f}'
@@ -199,11 +218,18 @@ for i, (kind, src, dur, cues) in enumerate(SEGS):
             clips.append((clip, True))
     elif kind == 'broll':
         path, off, d = src
-        vf = SCALE
+        vf = SCALE + boxes_vf(boxes, i, cues)
         pad = max(0.0, need - d)
         if pad: vf += f',tpad=stop_mode=clone:stop_duration={pad:.3f}'
         run('-ss', f'{off:.3f}', '-t', f'{d:.3f}', '-i', path,
             '-vf', vf, *NORM_V, '-an', clip)
+        clips.append((clip, False))
+    elif kind == 'fmvideo':
+        d = probe(src)
+        vf = SCALE + boxes_vf(boxes, i, cues)
+        pad = max(0.0, need - d)
+        if pad: vf += f',tpad=stop_mode=clone:stop_duration={pad:.3f}'
+        run('-i', src, '-vf', vf, *NORM_V, '-an', clip)
         clips.append((clip, False))
     elif kind == 'still':
         # Ken Burns push-in. Two zoompan traps handled here: (1) `d` means "output
@@ -232,7 +258,7 @@ def fmt_ts(t):
 srt, cue_events, cue_n, t0 = [], [], 1, 0.0
 vo_cursor = 0.0   # GUARDRAIL: narration is strictly sequential — never overlapping
 VO_GAP = 0.35
-for i, ((kind, src, dur, cues), (clip, _a)) in enumerate(zip(SEGS, clips)):
+for i, ((kind, src, dur, cues, _b), (clip, _a)) in enumerate(zip(SEGS, clips)):
     d_real = probe(clip)
     lead = min(0.4, d_real * 0.05)
     t = t0 + lead
@@ -297,7 +323,7 @@ if captured_ok:
     inputs += ['-stream_loop', '-1', '-t', f'{total:.3f}', '-i', bed]
     filters.append(f'[{idx}:a]volume={BED_VOL + 0.2}[bed]'); mixins.append('[bed]'); idx += 1
     t_cursor = 0.0
-    for (kind, _src, _dur, _cues), (clip, has_audio) in zip(SEGS, clips):
+    for (kind, _src, _dur, _cues, _b), (clip, has_audio) in zip(SEGS, clips):
         d_real = probe(clip)
         if has_audio:
             inputs += ['-i', clip]
@@ -315,7 +341,7 @@ else:
                    f'apad,atrim=0:{total:.3f},afade=t=out:st={total-2.5:.3f}:d=2.5[bed]')
     mixins.append('[bed]'); idx += 1
     t_cursor, t_dec = 0.0, None
-    for (kind, src, _dur, _cues), (clip, _a) in zip(SEGS, clips):
+    for (kind, src, _dur, _cues, _b), (clip, _a) in zip(SEGS, clips):
         if kind == 'game' and src == 'dec':
             t_dec = t_cursor
         t_cursor += probe(clip)
@@ -335,7 +361,7 @@ for t_at, wav in cue_events:
 filters.append(f"{''.join(mixins)}amix=inputs={len(mixins)}:normalize=0,alimiter=limit=0.92[aout]")
 
 sub_style = ('FontName=Ubuntu,Fontsize=16,PrimaryColour=&H00F4F7FF,OutlineColour=&HA0000000,'
-             'BorderStyle=1,Outline=2,Shadow=0,MarginV=48')
+             'BorderStyle=1,Outline=2,Shadow=0,MarginV=20')
 
 # Final encode. Default is H.264 via NVENC: plays in every browser GitHub serves the
 # wiki to (AV1 playback is still spotty, HEVC-in-MP4 spottier), and this machine's

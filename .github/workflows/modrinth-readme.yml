@@ -1,5 +1,7 @@
 # Mirrors README.md to the Modrinth project description on every README change,
-# rewriting relative image/link paths to absolute GitHub URLs.
+# rewriting relative image/link paths to absolute GitHub URLs. The same PATCH
+# enforces the client-side-only environment metadata (Modrinth rejects the mod
+# in review without it, and nothing in the version-upload path can set it).
 # Requires the MODRINTH_KEY repo secret.
 name: modrinth-readme
 
@@ -37,14 +39,18 @@ jobs:
           open('/tmp/body.md', 'w').write(body)
           EOF
 
-      - name: PATCH project description
+      - name: PATCH project description + environment metadata
         run: |
           python3 - <<'EOF'
           import json, os, urllib.request
           body = open('/tmp/body.md').read()
           req = urllib.request.Request(
               f"https://api.modrinth.com/v2/project/{os.environ['MODRINTH_PROJECT']}",
-              data=json.dumps({'body': body}).encode(),
+              # client_side/server_side: Loominary is a client-side-only mod
+              # ("environment": "client" in fabric.mod.json) — enforce it here.
+              data=json.dumps({'body': body,
+                               'client_side': 'required',
+                               'server_side': 'unsupported'}).encode(),
               headers={
                   'Authorization': os.environ['MODRINTH_KEY'],
                   'Content-Type': 'application/json',

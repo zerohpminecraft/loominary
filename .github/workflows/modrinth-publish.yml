@@ -68,3 +68,27 @@ jobs:
             fabric-api(required)
             litematica(optional)
 
+      # Side metadata is project-level and mc-publish cannot set it; without
+      # client-side-only environment metadata Modrinth rejects the mod in review.
+      # modrinth-readme.yml enforces the same thing on master pushes — this keeps
+      # releases self-healing even if that workflow hasn't run.
+      - name: Enforce client-side-only environment metadata
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          req = urllib.request.Request(
+              f"https://api.modrinth.com/v2/project/{os.environ['MODRINTH_PROJECT']}",
+              data=json.dumps({'client_side': 'required',
+                               'server_side': 'unsupported'}).encode(),
+              headers={
+                  'Authorization': os.environ['MODRINTH_KEY'],
+                  'Content-Type': 'application/json',
+                  'User-Agent': 'zerohpminecraft/loominary publish',
+              },
+              method='PATCH')
+          with urllib.request.urlopen(req) as resp:
+              print('Modrinth responded', resp.status)
+          EOF
+        env:
+          MODRINTH_KEY: ${{ secrets.MODRINTH_KEY }}
+

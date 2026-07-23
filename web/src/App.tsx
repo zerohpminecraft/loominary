@@ -221,13 +221,13 @@ export function App() {
       const bmp  = await createImageBitmap(blob);
       setSourceBitmap(bmp);
       sourceImageRef.current = { buffer, mime };
-      if (mime === 'image/gif') {
-        const file = new File([blob], 'source.gif', { type: mime });
-        const { decodeGifFrames } = await import('./gif-decode.js');
+      const { decodeGifFrames, isMultiFrameType } = await import('./gif-decode.js');
+      if (isMultiFrameType(mime)) {
+        const file = new File([blob], 'source', { type: mime });
         const frames = await decodeGifFrames(file);
         if (frames.length > 1) setSourceFrames(frames.map(f => f.bitmap));
       }
-      // Non-GIF: sourceFrames stays null (cleared above) — correct.
+      // Still image: sourceFrames stays null (cleared above) — correct.
     } catch { /* corrupt bytes — ignore */ }
   }
 

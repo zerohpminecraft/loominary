@@ -32,7 +32,7 @@ import { rgbToOklab } from '../oklab.js';
 import { rasterizeGridRgb, quantizeRgbTile, rgbFramesToImageData } from '../srgb.js';
 import { MC_PALETTE }  from '../palette.js';
 import { updateCarpetTables } from '../carpet.js';
-import { decodeGifFrames } from '../gif-decode.js';
+import { decodeGifFrames, isMultiFrameType } from '../gif-decode.js';
 import {
   PALETTE_CHOICES,
   buildPaletteFlag,
@@ -671,9 +671,9 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       // Update auto-grid from image dims without overriding any manual user choice.
       setAutoGrid(bestGridSize(bmp.width, bmp.height));
       setCropMode(bmp.width !== bmp.height ? 'center' : 'scale');
-      setIsGif(file.type === 'image/gif');
+      setIsGif(isMultiFrameType(file.type));
       gifFramesRef.current = null;
-      if (file.type === 'image/gif') {
+      if (isMultiFrameType(file.type)) {
         decodeGifFrames(file).then(decoded => {
           // Ignore if another file was loaded while decoding.
           if (latestFileRef.current !== file || decoded.length <= 1) return;
@@ -796,9 +796,9 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
       const eCols = colsManual ?? autoGrid?.[0] ?? 1;
       const eRows = rowsManual ?? autoGrid?.[1] ?? 1;
 
-      // Try to decode all GIF frames if the source is an animated GIF.
+      // Try to decode all frames if the source is an animated image (GIF or WebP).
       let gifFrames: import('../gif-decode.js').GifFrame[] | null = gifFramesRef.current;
-      if (!gifFrames && file && file.type === 'image/gif') {
+      if (!gifFrames && file && isMultiFrameType(file.type)) {
         try {
           const decoded = await decodeGifFrames(file);
           if (decoded.length > 1) gifFrames = decoded;
@@ -1022,9 +1022,9 @@ export function ImportPage({ onProceed, onProceedFromState, onLoadSession, uiFon
             marginTop: 5, padding: '4px 7px',
             background: '#1a1a10', border: '1px solid #443', borderRadius: 3,
           }}>
-            ℹ Animated GIFs only preview the first frame here. When you proceed,
-            every frame will be quantized — large GIFs with many frames may take
-            a moment to process.
+            ℹ Animated images (GIF or WebP) only preview the first frame here. When you
+            proceed, every frame will be quantized — clips with many frames may take a
+            moment to process.
           </div>
         )}
 

@@ -1,16 +1,28 @@
 /**
- * Multi-frame GIF decoder using the browser's ImageDecoder API (Chrome/Edge 94+).
- * Falls back to a single-frame result for browsers that don't support it.
+ * Multi-frame decoder for animated images (GIF and animated WebP) using the browser's
+ * ImageDecoder API (Chrome/Edge 94+). Falls back to a single-frame result for browsers
+ * that don't support it (e.g. Safari).
  *
  * ImageDecoder returns composited VideoFrame objects (disposal methods applied),
- * so each frame is the complete rendered image at that animation position.
+ * so each frame is the complete rendered image at that animation position. The codec
+ * is taken from the file's MIME type, so the same path decodes GIF and WebP — the
+ * latter matters for sRGB mode, where a lossless animated WebP carries full 24-bit
+ * colour with no palette or dithering, unlike GIF's 256-colour ceiling.
  *
- * Returns an array of { bitmap, delayMs } — one entry per GIF frame.
+ * Returns an array of { bitmap, delayMs } — one entry per frame.
  */
 
 export interface GifFrame {
   bitmap:  ImageBitmap;
   delayMs: number;
+}
+
+/**
+ * True for image MIME types this module can split into frames via ImageDecoder.
+ * Callers gate the multi-frame path on this instead of hardcoding `'image/gif'`.
+ */
+export function isMultiFrameType(mime: string): boolean {
+  return mime === 'image/gif' || mime === 'image/webp';
 }
 
 export async function decodeGifFrames(file: File): Promise<GifFrame[]> {
@@ -25,7 +37,7 @@ export async function decodeGifFrames(file: File): Promise<GifFrame[]> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const decoder: any = new ImageDecoder({
     data: file.stream(),
-    type: 'image/gif',
+    type: file.type || 'image/gif',   // GIF or animated WebP — same composited-frame path
   });
 
   try {

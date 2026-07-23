@@ -1,0 +1,15 @@
+[
+  {"cmd": "gamerule doDaylightCycle false"},
+  {"cmd": "time set noon"},
+  {"cmd": "weather clear"},
+  {"waitTicks": 20},
+
+  {"cmd": "loominary import sample.png"},
+  {"waitTicks": 120},
+
+  {"assertSourceLoaded": "sample.png"},
+  {"assertTilesAtLeast": 1},
+  {"assertActiveChunksAtLeast": 1},
+
+  {"exit": true}
+]

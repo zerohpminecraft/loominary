@@ -20,6 +20,7 @@ bin/
 # Loom / Fabric
 remappedSrc/
 run/
+run-smoke/
 
 # OS
 .DS_Store

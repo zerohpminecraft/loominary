@@ -48,7 +48,20 @@ import java.util.List;
  *   {"exit": true}                    stop the client
  * </pre>
  *
- * Wrapper: scripts/game-shots.sh (xvfb + gradle runDocsShots + copy to docs).
+ * <h2>Smoke-test steps</h2>
+ * The same engine also backs the live in-game smoke harness (see {@code SMOKE_TESTS.md}).
+ * When {@code -Dloominary.smoke.result=<path>} is set, each assertion below is counted, and
+ * a one-line {@code PASS n/n} or {@code FAIL: …} verdict is written to that path on {@code exit}
+ * (or when the script runs out). {@code scripts/smoke-test.sh} reads it for the process exit code.
+ * Assertions never throw — a failed assertion is recorded and the run continues so every check
+ * reports.
+ * <pre>
+ *   {"assertTilesAtLeast": 1}         PayloadState.tiles.size() &gt;= N
+ *   {"assertActiveChunksAtLeast": 1}  PayloadState.ACTIVE_CHUNKS.size() &gt;= N
+ *   {"assertSourceLoaded": "sample"}  currentSourceFilename contains the substring
+ * </pre>
+ *
+ * Wrappers: scripts/game-shots.sh (docs) and scripts/smoke-test.sh (smoke).
  */
 public final class DocsDriver {
 
@@ -62,6 +75,11 @@ public final class DocsDriver {
     private static int stepIndex = 0;
     private static int waitTicks = 0;
     private static int settleTicks = 0;
+
+    // Smoke-test bookkeeping (inert unless -Dloominary.smoke.result is set).
+    private static int smokeChecks = 0;
+    private static final List<String> smokeFailures = new ArrayList<>();
+    private static boolean smokeResultWritten = false;
 
     private DocsDriver() {}
 
@@ -271,12 +289,57 @@ public final class DocsDriver {
             ScreenshotRecorder.saveScreenshot(client.runDirectory, name,
                     client.getFramebuffer(), text -> {});
             waitTicks = 5;
+        } else if (step.has("assertTilesAtLeast")) {
+            int want = step.get("assertTilesAtLeast").getAsInt();
+            int got = net.zerohpminecraft.PayloadState.tiles.size();
+            smokeCheck(got >= want, "tiles >= " + want + " (got " + got + ")");
+            waitTicks = 2;
+        } else if (step.has("assertActiveChunksAtLeast")) {
+            int want = step.get("assertActiveChunksAtLeast").getAsInt();
+            int got = net.zerohpminecraft.PayloadState.ACTIVE_CHUNKS.size();
+            smokeCheck(got >= want, "active chunks >= " + want + " (got " + got + ")");
+            waitTicks = 2;
+        } else if (step.has("assertSourceLoaded")) {
+            String want = step.get("assertSourceLoaded").getAsString();
+            String got = net.zerohpminecraft.PayloadState.currentSourceFilename;
+            smokeCheck(got != null && got.contains(want),
+                    "source contains '" + want + "' (got " + got + ")");
+            waitTicks = 2;
         } else if (step.has("exit")) {
             System.out.println(TAG + " script complete — stopping client");
+            writeSmokeResult();
             phase = Phase.DONE;
             client.scheduleStop();
         } else {
             System.err.println(TAG + " unknown step: " + step);
+        }
+    }
+
+    /** Record a smoke assertion; never throws so the whole script always runs. */
+    private static void smokeCheck(boolean ok, String desc) {
+        smokeChecks++;
+        if (ok) {
+            System.out.println(TAG + " smoke PASS: " + desc);
+        } else {
+            System.err.println(TAG + " smoke FAIL: " + desc);
+            smokeFailures.add(desc);
+        }
+    }
+
+    /** Write PASS/FAIL verdict to -Dloominary.smoke.result, if set. No-op for docs runs. */
+    private static void writeSmokeResult() {
+        String out = System.getProperty("loominary.smoke.result");
+        if (out == null || smokeResultWritten) return;
+        smokeResultWritten = true;
+        String verdict = smokeFailures.isEmpty()
+                ? "PASS " + smokeChecks + "/" + smokeChecks
+                : "FAIL " + (smokeChecks - smokeFailures.size()) + "/" + smokeChecks
+                        + ": " + String.join("; ", smokeFailures);
+        try {
+            Files.writeString(Path.of(out), verdict + "\n");
+            System.out.println(TAG + " smoke result → " + out + ": " + verdict);
+        } catch (Exception e) {
+            System.err.println(TAG + " could not write smoke result " + out + ": " + e);
         }
     }
 }

@@ -156,6 +156,20 @@ loom {
 			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/game-video.json"
 			programArgs "--width", "1920", "--height", "1080"
 		}
+		// Live in-game SMOKE test: boots a real headless client into a throwaway
+		// superflat integrated-server world (NO network), drives docs/tools/smoke.json
+		// (import + PayloadState assertions), and writes a PASS/FAIL verdict to
+		// run-smoke/smoke-result.txt. Sandboxed in its own runDir so it never touches
+		// the docs run/ or any real Minecraft install. Wrapper: scripts/smoke-test.sh.
+		smokeTest {
+			client()
+			ideConfigGenerated = false
+			runDir "run-smoke"
+			vmArg "-Dloominary.docs=true"
+			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/smoke.json"
+			vmArg "-Dloominary.smoke.result=${rootDir}/run-smoke/smoke-result.txt"
+			programArgs "--width", "640", "--height", "480"
+		}
 	}
 }
 

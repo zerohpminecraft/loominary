@@ -23,3 +23,26 @@ jobs:
         with:
           name: Artifacts
           path: build/libs/
+
+  # Opt-in live in-game smoke test (see SMOKE_TESTS.md, Layer B). It boots a real
+  # headless Minecraft client in a sandboxed game dir and drives /loominary import.
+  # DISABLED by default: the first run downloads ~500 MB of Minecraft assets and
+  # renders under software GL. Enable by removing `if: false` (ideally after adding
+  # a Gradle/Loom asset cache), or gate it on a label / schedule.
+  smoke-test:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+      - name: setup jdk
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - name: setup gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: live in-game smoke test
+        run: scripts/smoke-test.sh

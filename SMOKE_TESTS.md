@@ -86,17 +86,41 @@ for CI. The `docs/videos/out/` tree is git-ignored, so recordings are build arti
 
 ## Release process (produce videos → human approval)
 
-`scripts/smoke-release.sh` is the pre-release gate. It runs **every** scenario in
-`docs/tools/smoke/` with `--video` and writes an approval bundle to `docs/videos/out/smoke/`:
+The gate is two scripts: one produces the evidence, the other enforces the sign-off.
 
-- `docs/videos/out/smoke/<scenario>.mp4` — one recording per behavior.
-- `docs/videos/out/smoke/APPROVAL.md` — a checklist manifest listing each scenario, its
-  PASS/FAIL assertion verdict, and a link to its video, with an unticked box per scenario.
+**`scripts/smoke-release.sh`** runs **every** scenario in `docs/tools/smoke/` with `--video`:
 
-The script exits non-zero if any scenario's assertions fail, but a green run **still requires
-a human** to watch each video and tick the boxes before the release is approved. Wire this
-into the release steps in `CLAUDE.md` (before tagging): run `scripts/smoke-release.sh`, review
-the videos, and confirm `APPROVAL.md` is fully ticked.
+- `docs/videos/out/smoke/<scenario>.mp4` — one recording per behavior (git-ignored artifact).
+- `SMOKE_APPROVAL.md` — the manifest, at the repo root and **committed**, so sign-off is
+  auditable in history rather than living in an ignored directory. One row per scenario with
+  its PASS/FAIL verdict, the revision the footage was made at, a link to its video, and a box.
+
+It exits non-zero if any scenario's assertions fail or its recording is missing. That is only
+half the gate — it cannot prove a human watched anything.
+
+**`scripts/smoke-approve.sh`** is the half a release actually depends on. It exits 0 only when
+every scenario is ticked, still PASSing, and still current, and fails when:
+
+- the manifest is missing (the suite was never run);
+- any row is unticked (nobody reviewed that footage);
+- any row is FAIL (assertions failed, or the recording went missing);
+- any row's rev ≠ the current revision (footage is stale — the code moved on after sign-off);
+- a scenario exists in `docs/tools/smoke/` but has no row (a new scenario can't ship unreviewed).
+
+Ticks are preserved across re-runs at the same revision, so re-recording doesn't wipe review
+work — but any commit or working-tree edit changes the rev (a dirty tree gets a `-dirty`
+suffix) and drops the ticks, forcing re-review of footage that no longer matches the code.
+
+Release sequence, before tagging:
+
+```bash
+./gradlew build && scripts/smoke-release.sh   # produce verdicts + videos
+# watch each video, change its `- [ ]` to `- [x]` in SMOKE_APPROVAL.md
+scripts/smoke-approve.sh && git tag v<version>
+```
+
+Note this is **not yet wired into `CLAUDE.md`'s release steps** — adding it there is still an
+open decision.
 
 ## Sandbox / isolation model
 
@@ -117,7 +141,8 @@ the videos, and confirm `APPROVAL.md` is fully ticked.
 scripts/smoke-test.sh                    # Layer B: default scenario, headless (needs xvfb; downloads MC assets once)
 scripts/smoke-test.sh preview-map        # a specific scenario, headless
 scripts/smoke-test.sh --video preview-map # record docs/videos/out/smoke/preview-map.mp4
-scripts/smoke-release.sh                  # run ALL scenarios with video → approval bundle
+scripts/smoke-release.sh                  # run ALL scenarios with video → SMOKE_APPROVAL.md
+scripts/smoke-approve.sh                  # enforce sign-off; exit 0 only if fully approved
 ```
 
 ## CI
@@ -141,8 +166,8 @@ label) once a cached-assets step is in place.
 - **Enable the CI job.** Flip `if: false` on the `smoke-test` job in
   `.github/workflows/build.yml` and add Minecraft-asset caching so it doesn't re-download
   every run. Optionally upload the recorded `docs/videos/out/smoke/*.mp4` as job artifacts.
-- **Wire the release gate.** Add `scripts/smoke-release.sh` (+ human review of `APPROVAL.md`)
-  to the release steps in `CLAUDE.md`, before `git tag`.
+- **Wire the release gate.** Add `scripts/smoke-release.sh` + `scripts/smoke-approve.sh` to the
+  release steps in `CLAUDE.md`, before `git tag`.
 - **Grow the scenario suite.** Add scenarios mirroring the rest of the video series
   (banner anvil-fill placement, carpet platform via `placeCarpets`, animated/sRGB art) —
   each new `docs/tools/smoke/*.json` is picked up automatically by `smoke-release.sh`.

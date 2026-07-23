@@ -63,27 +63,55 @@ if [[ "$VIDEO" == 1 ]]; then
     # Record the run: dedicated Xvfb display + ffmpeg x11grab, mirroring game-video.sh.
     # Audio (optional) via a private Pulse null sink so nothing plays on your speakers.
     command -v ffmpeg >/dev/null || { echo "--video needs ffmpeg" >&2; exit 1; }
+    command -v ffprobe >/dev/null || { echo "--video needs ffprobe (to validate output)" >&2; exit 1; }
     OUTDIR="docs/videos/out/smoke"; mkdir -p "$OUTDIR"
     OUT="$OUTDIR/${SCENARIO}.mp4"
     W=1280; H=720
     GRADLE_ARGS+=(-PsmokeW="$W" -PsmokeH="$H")
 
-    DISP=:94
+    # Never let a stale recording from an earlier run masquerade as this run's output.
+    rm -f "$OUT"
+
+    # Pick a FREE display number. A hardcoded one collides when scenarios run
+    # back-to-back (smoke-release.sh): the previous Xvfb's lock/socket is not always
+    # released before the next run binds it, so Xvfb fails to start, ffmpeg grabs
+    # nothing, and the recording silently vanishes.
+    DISPNUM=""
+    for n in $(seq 94 120); do
+        [[ -e "/tmp/.X${n}-lock" || -e "/tmp/.X11-unix/X${n}" ]] && continue
+        DISPNUM="$n"; break
+    done
+    [[ -n "$DISPNUM" ]] || { echo "no free X display in :94-:120" >&2; exit 1; }
+    DISP=":${DISPNUM}"
+
     Xvfb "$DISP" -screen 0 "${W}x${H}x24" & XVFB_PID=$!
-    sleep 1
-    AUDIO=(); SINK_ID=""
-    if command -v pactl >/dev/null; then
-        SINK_ID=$(pactl load-module module-null-sink sink_name=loom_smoke \
-            sink_properties=device.description=LoominarySmoke 2>/dev/null || true)
-        [[ -n "$SINK_ID" ]] && AUDIO=(-f pulse -i loom_smoke.monitor -c:a aac -b:a 160k)
-    fi
+    SINK=""; SINK_ID=""
     cleanup() {
         [[ -n "$SINK_ID" ]] && pactl unload-module "$SINK_ID" 2>/dev/null || true
         kill "$XVFB_PID" 2>/dev/null || true
+        wait "$XVFB_PID" 2>/dev/null || true
     }
     trap cleanup EXIT
 
-    echo "== Recording sandboxed smoke run '$SCENARIO' → $OUT ==" >&2
+    # Wait until the display actually accepts connections — a fixed `sleep 1` races
+    # ffmpeg against a display that may not be up yet.
+    for _ in $(seq 1 50); do
+        [[ -e "/tmp/.X11-unix/X${DISPNUM}" ]] && break
+        kill -0 "$XVFB_PID" 2>/dev/null || { echo "Xvfb died starting $DISP" >&2; exit 1; }
+        sleep 0.2
+    done
+    [[ -e "/tmp/.X11-unix/X${DISPNUM}" ]] || { echo "Xvfb never came up on $DISP" >&2; exit 1; }
+
+    AUDIO=()
+    if command -v pactl >/dev/null; then
+        # Per-display sink name so concurrent/consecutive runs can't collide either.
+        SINK="loom_smoke_${DISPNUM}"
+        SINK_ID=$(pactl load-module module-null-sink sink_name="$SINK" \
+            sink_properties=device.description=LoominarySmoke 2>/dev/null || true)
+        [[ -n "$SINK_ID" ]] && AUDIO=(-f pulse -i "${SINK}.monitor" -c:a aac -b:a 160k)
+    fi
+
+    echo "== Recording sandboxed smoke run '$SCENARIO' on $DISP → $OUT ==" >&2
     ffmpeg -hide_banner -loglevel error \
         -f x11grab -framerate 30 -video_size "${W}x${H}" -i "$DISP" \
         "${AUDIO[@]}" \
@@ -91,11 +119,24 @@ if [[ "$VIDEO" == 1 ]]; then
         "$OUT" -y & FFMPEG_PID=$!
 
     set +e
-    DISPLAY="$DISP" ${SINK_ID:+PULSE_SINK=loom_smoke} ./gradlew "${GRADLE_ARGS[@]}"
+    # `env` so the CONDITIONAL PULSE_SINK assignment survives expansion — a bare
+    # `${SINK_ID:+PULSE_SINK=...} ./gradlew` is parsed as a command name, not an env
+    # assignment, and fails with "command not found" (gradle never launches).
+    env ${SINK_ID:+PULSE_SINK=$SINK} DISPLAY="$DISP" ./gradlew "${GRADLE_ARGS[@]}"
     set -e
     kill -INT "$FFMPEG_PID" 2>/dev/null || true
     wait "$FFMPEG_PID" 2>/dev/null || true
-    echo "== Wrote $OUT ==" >&2
+
+    # VERIFY the recording actually exists and is playable. Announcing success
+    # unconditionally lets a failed ffmpeg pass as green — and the release gate then
+    # hands a reviewer an APPROVAL.md linking a video that was never written.
+    [[ -s "$OUT" ]] || { echo "SMOKE FAIL [$SCENARIO]: no video written to $OUT" >&2; exit 1; }
+    VID_DUR="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$OUT" 2>/dev/null || true)"
+    [[ -n "$VID_DUR" ]] || {
+        echo "SMOKE FAIL [$SCENARIO]: $OUT is not a valid video (no moov atom / unreadable)" >&2
+        exit 1
+    }
+    echo "== Wrote $OUT (${VID_DUR}s, $(du -h "$OUT" | cut -f1)) ==" >&2
 else
     echo "== Booting sandboxed headless client for smoke scenario '$SCENARIO' ==" >&2
     xvfb-run -a -s "-screen 0 1280x720x24" ./gradlew "${GRADLE_ARGS[@]}"

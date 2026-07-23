@@ -51,8 +51,16 @@ for path in "${SCENARIOS[@]}"; do
         status="FAIL"
         FAILED=1
     fi
-    printf -- '- [ ] **%s** — %s — assertions: `%s` — video: [%s.mp4](%s.mp4)\n' \
-        "$scenario" "$status" "$verdict" "$scenario" "$scenario" >> "$MANIFEST"
+    # Only link a video that actually exists — a dead link in the approval bundle
+    # means a reviewer ticks a box for footage nobody ever saw.
+    if [[ -s "$OUTDIR/${scenario}.mp4" ]]; then
+        video="[${scenario}.mp4](${scenario}.mp4)"
+    else
+        video='**MISSING — not recorded**'
+        status="FAIL"; FAILED=1
+    fi
+    printf -- '- [ ] **%s** — %s — assertions: `%s` — video: %s\n' \
+        "$scenario" "$status" "$verdict" "$video" >> "$MANIFEST"
 done
 
 echo >> "$MANIFEST"

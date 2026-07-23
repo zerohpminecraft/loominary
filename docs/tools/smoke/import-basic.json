@@ -9,7 +9,7 @@
 
   {"assertSourceLoaded": "sample.png"},
   {"assertTilesAtLeast": 1},
-  {"assertActiveChunksAtLeast": 1},
+  {"assertPayloadPresent": true},
 
   {"exit": true}
 ]

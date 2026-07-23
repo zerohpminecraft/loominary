@@ -57,7 +57,8 @@ import java.util.List;
  * reports.
  * <pre>
  *   {"assertTilesAtLeast": 1}         PayloadState.tiles.size() &gt;= N
- *   {"assertActiveChunksAtLeast": 1}  PayloadState.ACTIVE_CHUNKS.size() &gt;= N
+ *   {"assertPayloadPresent": true}    active tile carried a payload (carpet OR banner chunks)
+ *   {"assertActiveChunksAtLeast": 1}  PayloadState.ACTIVE_CHUNKS.size() &gt;= N (banner-only path)
  *   {"assertSourceLoaded": "sample"}  currentSourceFilename contains the substring
  * </pre>
  *
@@ -298,6 +299,27 @@ public final class DocsDriver {
             int want = step.get("assertActiveChunksAtLeast").getAsInt();
             int got = net.zerohpminecraft.PayloadState.ACTIVE_CHUNKS.size();
             smokeCheck(got >= want, "active chunks >= " + want + " (got " + got + ")");
+            waitTicks = 2;
+        } else if (step.has("assertPayloadPresent")) {
+            // Codec-agnostic: a correct import lands a payload on the active tile. The
+            // DEFAULT carpet codec (CARPET_BANNERS_SHADE) stores it as carpetCompressedB64
+            // with 0 overflow banner chunks, so checking ACTIVE_CHUNKS alone wrongly fails
+            // the common case. Accept either channel: carpet payload OR banner chunks.
+            var tiles = net.zerohpminecraft.PayloadState.tiles;
+            int idx = net.zerohpminecraft.PayloadState.activeTileIndex;
+            boolean ok = false;
+            String detail;
+            if (idx < 0 || idx >= tiles.size()) {
+                detail = "no active tile (index " + idx + ", tiles " + tiles.size() + ")";
+            } else {
+                var tile = tiles.get(idx);
+                String carpet = tile.carpetCompressedB64;
+                int carpetLen = carpet == null ? 0 : carpet.length();
+                int chunks = tile.chunks.size();
+                ok = carpetLen > 0 || chunks > 0;
+                detail = "tile " + idx + " carpetB64=" + carpetLen + "b, chunks=" + chunks;
+            }
+            smokeCheck(ok, "active tile carried a payload (" + detail + ")");
             waitTicks = 2;
         } else if (step.has("assertSourceLoaded")) {
             String want = step.get("assertSourceLoaded").getAsString();

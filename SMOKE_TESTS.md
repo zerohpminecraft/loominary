@@ -147,22 +147,30 @@ scripts/smoke-approve.sh                  # enforce sign-off; exit 0 only if ful
 
 ## CI
 
-`.github/workflows/build.yml` already runs `./gradlew build test`, which includes **Layer
-A**. **Layer B** is heavier (first run downloads ~500 MB of Minecraft assets and renders
-under software GL), so it is provided as an **opt-in** job rather than gating every push —
-see the commented `smoke-test` job stub in the workflow. Enable it (e.g. on a schedule or a
-label) once a cached-assets step is in place.
+`.github/workflows/build.yml` has three jobs:
 
-## TODO for a human to finish the live-boot parts
+- **`build`** — `./gradlew build test`, which includes **Layer A** (the fast, boot-free smoke
+  test) alongside the rest of the suite.
+- **`smoke-test`** — **Layer B**, enabled on every push/PR. Installs `xvfb` and boots a real
+  headless client for every scenario in `docs/tools/smoke/`. The first run downloads ~500 MB
+  of Minecraft assets, so `~/.gradle/caches/fabric-loom` and `modules-2` are cached, keyed on
+  `build.gradle`/`gradle.properties`. On failure it uploads `run-smoke/logs/` as an artifact,
+  which is the fastest way to see what the client actually did. No video here — recording is
+  a release-time concern, so no `ffmpeg` is needed.
+- **`release-gate`** — runs only on `refs/tags/v*`. Executes `scripts/smoke-approve.sh` to
+  refuse a tagged release whose in-game behavior was never signed off. It boots nothing and
+  just parses the committed `SMOKE_APPROVAL.md`, so it costs seconds.
 
-- **Run it end-to-end once.** Boot Layer B locally (`scripts/smoke-test.sh` and
-  `scripts/smoke-test.sh --video preview-map`) on a machine with `xvfb`, `ffmpeg`, and
-  network to seed the Loom asset cache, and confirm the verdicts are `PASS` and the videos
-  show the expected behavior. Tune the `waitTicks` in the `docs/tools/smoke/*.json` scenarios
-  if a step needs longer under software GL (import/preview are slower there).
-- **Validate `preview-map.json`.** Its framed-map + preview steps are copied from the proven
-  `docs/tools/game-shots.json` sequence but have not been booted here; the video-emitting run
-  is exactly how a human confirms it.
+## TODO for a human
+
+- **Review the footage.** `SMOKE_APPROVAL.md` is committed **unticked** — the suite has been
+  booted and both scenarios pass their assertions, but no human has watched the recordings
+  yet, so nothing is signed off. Run `scripts/smoke-release.sh`, watch both videos, and tick
+  the boxes. Until then `scripts/smoke-approve.sh` (and the `release-gate` CI job) will
+  correctly refuse a tagged release.
+- **Confirm the CI job's cost.** The `smoke-test` job now runs on every push/PR; its first
+  run populates the asset cache and will be slow (~500 MB download). If that proves too
+  heavy for routine PRs, narrow it to `push` on `master` plus tags rather than disabling it.
 - **Enable the CI job.** Flip `if: false` on the `smoke-test` job in
   `.github/workflows/build.yml` and add Minecraft-asset caching so it doesn't re-download
   every run. Optionally upload the recorded `docs/videos/out/smoke/*.mp4` as job artifacts.

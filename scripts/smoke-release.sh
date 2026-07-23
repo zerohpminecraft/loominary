@@ -22,8 +22,9 @@
 # what a release should actually depend on.
 #
 # Ticks are PRESERVED across runs, but only while they still mean something: each row
-# records the revision its footage was made at, and a tick is dropped as soon as that
-# revision changes (including a dirty tree). Re-recorded footage must be re-reviewed.
+# records a fingerprint of the behavior-affecting sources its footage was made from, and a
+# tick is dropped as soon as that fingerprint changes. Re-recorded footage must be
+# re-reviewed. See scripts/smoke-fingerprint.sh for what is and isn't covered.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -31,22 +32,22 @@ OUTDIR="docs/videos/out/smoke"
 mkdir -p "$OUTDIR"
 MANIFEST="SMOKE_APPROVAL.md"
 
-# Revision the footage is being made at. A dirty tree gets a -dirty suffix so edits
-# invalidate prior sign-off rather than silently inheriting it.
-REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-    REV="${REV}-dirty"
-fi
+# Fingerprint of everything that can change in-game behavior, read from the WORKING TREE
+# so uncommitted edits count. Deliberately NOT the commit sha: ticking a box and committing
+# the manifest would change the sha and invalidate the very sign-off just recorded, making
+# the gate impossible to pass. SMOKE_APPROVAL.md, CHANGELOG and docs prose are excluded for
+# the same reason — they cannot alter what the client does in-game.
+REV="$(scripts/smoke-fingerprint.sh)"
 
 shopt -s nullglob
 SCENARIOS=(docs/tools/smoke/*.json)
 [[ ${#SCENARIOS[@]} -gt 0 ]] || { echo "no scenarios in docs/tools/smoke/" >&2; exit 1; }
 
-# Remember which scenarios were already signed off, and at which revision.
+# Remember which scenarios were already signed off, and against which fingerprint.
 declare -A PREV_TICK PREV_REV
 if [[ -f "$MANIFEST" ]]; then
     while IFS= read -r line; do
-        if [[ "$line" =~ ^-\ \[([ xX])\]\ \*\*([^*]+)\*\*\ —\ (PASS|FAIL)\ —\ rev\ \`([^\`]+)\` ]]; then
+        if [[ "$line" =~ ^-\ \[([ xX])\]\ \*\*([^*]+)\*\*\ —\ (PASS|FAIL)\ —\ fingerprint\ \`([^\`]+)\` ]]; then
             PREV_TICK["${BASH_REMATCH[2]}"]="${BASH_REMATCH[1]}"
             PREV_REV["${BASH_REMATCH[2]}"]="${BASH_REMATCH[4]}"
         fi
@@ -76,7 +77,7 @@ for path in "${SCENARIOS[@]}"; do
         status="FAIL"; FAILED=1
     fi
 
-    # Carry a tick forward only if it was for THIS revision and the run still passes.
+    # Carry a tick forward only if it was for THIS fingerprint and the run still passes.
     tick=" "
     if [[ "${PREV_TICK[$scenario]:- }" =~ [xX] \
        && "${PREV_REV[$scenario]:-}" == "$REV" \
@@ -84,18 +85,19 @@ for path in "${SCENARIOS[@]}"; do
         tick="x"
     fi
 
-    ROWS+="$(printf -- '- [%s] **%s** — %s — rev `%s` — assertions: `%s` — video: %s' \
+    ROWS+="$(printf -- '- [%s] **%s** — %s — fingerprint `%s` — assertions: `%s` — video: %s' \
         "$tick" "$scenario" "$status" "$REV" "$verdict" "$video")"$'\n'
 done
 
 {
     echo "# Loominary smoke-test release approval"
     echo
-    echo "Last run: $(date -u +%Y-%m-%dT%H:%M:%SZ) at rev \`$REV\`"
+    echo "Last run: $(date -u +%Y-%m-%dT%H:%M:%SZ) — source fingerprint \`$REV\`"
     echo
     echo "Watch each video and confirm the in-game behavior is correct, then change its"
-    echo "\`- [ ]\` to \`- [x]\`. A tick is dropped automatically when the revision changes,"
-    echo "so re-recorded footage must be re-reviewed."
+    echo "\`- [ ]\` to \`- [x]\`. Ticking this file does not invalidate the sign-off, but a tick"
+    echo "is dropped as soon as the mod source, a scenario, or a smoke script changes, so"
+    echo "re-recorded footage must be re-reviewed."
     echo
     printf '%s' "$ROWS"
     echo

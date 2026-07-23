@@ -17,8 +17,23 @@ JUnit tests live under `src/test/java/` and run as part of `./gradlew build` (or
 2. Bump `mod_version` in `gradle.properties` to match the new tag
 3. Run `./gradlew build` — must pass cleanly
 4. Commit both files: `git commit -m "v<version>: <summary>"`
-5. Tag: `git tag v<version>`
-6. Push: `git push origin master && git push origin v<version>`
+5. Run the live in-game smoke suite: `scripts/smoke-release.sh` — must exit 0. It boots a
+   sandboxed headless client per scenario, records a video of each into
+   `docs/videos/out/smoke/`, and refreshes `SMOKE_APPROVAL.md`. Needs `xvfb` + `ffmpeg`
+   (see `SMOKE_TESTS.md`)
+6. **Watch each video** and tick its box (`- [ ]` → `- [x]`) in `SMOKE_APPROVAL.md`. The
+   assertions prove the state; only a human can confirm the on-screen behavior is right
+7. Enforce the sign-off: `scripts/smoke-approve.sh` — must exit 0. It refuses on an unticked
+   or failing scenario, on a scenario that has no row, and on a stale sign-off (ticks are
+   scoped to a fingerprint of the mod sources and scenarios, so a later code change drops
+   them)
+8. Commit the approval: `git commit -m "v<version>: smoke approval" SMOKE_APPROVAL.md`
+9. Tag: `git tag v<version>`
+10. Push: `git push origin master && git push origin v<version>`
+
+Steps 5–8 are the live-gameplay gate, and CI re-checks step 7 on every version tag. Ticking
+`SMOKE_APPROVAL.md` and committing it does **not** invalidate the sign-off, but editing mod
+source, a scenario, or a smoke script does — so run the suite *after* the release commit.
 
 ## Stack
 

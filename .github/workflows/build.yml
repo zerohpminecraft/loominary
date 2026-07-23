@@ -24,13 +24,12 @@ jobs:
           name: Artifacts
           path: build/libs/
 
-  # Opt-in live in-game smoke test (see SMOKE_TESTS.md, Layer B). It boots a real
-  # headless Minecraft client in a sandboxed game dir and drives /loominary import.
-  # DISABLED by default: the first run downloads ~500 MB of Minecraft assets and
-  # renders under software GL. Enable by removing `if: false` (ideally after adding
-  # a Gradle/Loom asset cache), or gate it on a label / schedule.
+  # Live in-game smoke test (see SMOKE_TESTS.md, Layer B). Boots a real headless
+  # Minecraft client in a sandboxed game dir (integrated-server superflat world, no
+  # network) and drives every scenario in docs/tools/smoke/ through real gameplay.
+  # Headless only — no video is recorded here, so ffmpeg isn't needed; recording is a
+  # release-time concern (scripts/smoke-release.sh).
   smoke-test:
-    if: false
     runs-on: ubuntu-latest
     steps:
       - name: checkout repository
@@ -42,7 +41,39 @@ jobs:
           distribution: 'temurin'
       - name: setup gradle
         uses: gradle/actions/setup-gradle@v4
+      # The first run downloads ~500 MB of Minecraft assets and libraries. Cache them so
+      # later runs don't re-fetch; keyed on the Loom/MC coordinates in build.gradle.
+      - name: cache minecraft assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/fabric-loom
+            ~/.gradle/caches/modules-2
+          key: loom-${{ runner.os }}-${{ hashFiles('build.gradle', 'gradle.properties') }}
+          restore-keys: loom-${{ runner.os }}-
       - name: install xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
-      - name: live in-game smoke test
-        run: scripts/smoke-test.sh
+      - name: live in-game smoke test (all scenarios)
+        run: |
+          set -euo pipefail
+          for s in docs/tools/smoke/*.json; do
+            scripts/smoke-test.sh "$(basename "$s" .json)"
+          done
+      - name: capture game logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: run-smoke/logs/
+
+  # Release gate: on a version tag, refuse the release unless the live smoke suite was
+  # signed off by a human against exactly these sources. Cheap — it parses the committed
+  # SMOKE_APPROVAL.md and boots nothing. See the release process in CLAUDE.md.
+  release-gate:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+      - name: verify in-game smoke approval
+        run: scripts/smoke-approve.sh

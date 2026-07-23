@@ -12,8 +12,8 @@
 #   - the manifest is missing (the smoke suite was never run)
 #   - any scenario row is unticked (nobody reviewed that footage)
 #   - any scenario row is FAIL (assertions failed or the recording went missing)
-#   - any row's rev does not match the current revision (footage is stale — the code
-#     moved on after sign-off, so the approval no longer describes what ships)
+#   - any row's fingerprint does not match the current sources (footage is stale — the code
+#     or a scenario changed after sign-off, so the approval no longer describes what ships)
 #
 # Use before tagging:
 #   ./gradlew build && scripts/smoke-release.sh && <watch videos, tick boxes> \
@@ -28,16 +28,16 @@ MANIFEST="SMOKE_APPROVAL.md"
     exit 1
 }
 
-REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-    REV="${REV}-dirty"
-fi
+# Same fingerprint the manifest was stamped with. Ticking SMOKE_APPROVAL.md and committing
+# it does not change this, so a sign-off survives being recorded — but any change to the mod
+# source, a scenario, or a smoke script does invalidate it.
+REV="$(scripts/smoke-fingerprint.sh)"
 
 TOTAL=0; PROBLEMS=0
 while IFS= read -r line; do
-    [[ "$line" =~ ^-\ \[([ xX])\]\ \*\*([^*]+)\*\*\ —\ (PASS|FAIL)\ —\ rev\ \`([^\`]+)\` ]] || continue
+    [[ "$line" =~ ^-\ \[([ xX])\]\ \*\*([^*]+)\*\*\ —\ (PASS|FAIL)\ —\ fingerprint\ \`([^\`]+)\` ]] || continue
     tick="${BASH_REMATCH[1]}"; scenario="${BASH_REMATCH[2]}"
-    status="${BASH_REMATCH[3]}"; rowrev="${BASH_REMATCH[4]}"
+    status="${BASH_REMATCH[3]}"; rowfp="${BASH_REMATCH[4]}"
     TOTAL=$((TOTAL + 1))
 
     if [[ "$status" != "PASS" ]]; then
@@ -46,8 +46,8 @@ while IFS= read -r line; do
     elif [[ ! "$tick" =~ [xX] ]]; then
         echo "APPROVAL FAIL [$scenario]: not signed off — watch the video and tick its box." >&2
         PROBLEMS=$((PROBLEMS + 1))
-    elif [[ "$rowrev" != "$REV" ]]; then
-        echo "APPROVAL FAIL [$scenario]: signed off at rev '$rowrev' but HEAD is '$REV' — re-run the smoke suite and re-review." >&2
+    elif [[ "$rowfp" != "$REV" ]]; then
+        echo "APPROVAL FAIL [$scenario]: signed off against sources '$rowfp' but current sources are '$REV' — code or scenario changed; re-run the smoke suite and re-review." >&2
         PROBLEMS=$((PROBLEMS + 1))
     fi
 done < "$MANIFEST"
@@ -73,4 +73,4 @@ if [[ "$PROBLEMS" -gt 0 ]]; then
     exit 1
 fi
 
-echo "== APPROVED: all $TOTAL scenario(s) pass and are signed off at rev $REV ==" >&2
+echo "== APPROVED: all $TOTAL scenario(s) pass and are signed off against sources $REV ==" >&2

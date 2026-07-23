@@ -48,23 +48,55 @@ boot, no network, milliseconds to run. This is the floor that keeps CI green on 
 
 ### Layer B — live in-game smoke (opt-in Gradle run + wrapper, boots real MC)
 
-Boots a real headless client and drives the mod through actual gameplay:
+Boots a real headless client and drives the mod through actual gameplay. The tested
+behaviors are the same kind demonstrated in the video series (import, framed-map preview,
+banner/carpet placement) — see the scenario scripts.
 
-- **Gradle run** `smokeTest` in `build.gradle` (`./gradlew runSmokeTest`) — mirrors
-  `docsShots` but with its own **`runDir "run-smoke"`** sandbox, points
-  `-Dloominary.docs.script` at `docs/tools/smoke.json`, and sets
-  `-Dloominary.smoke.result=…/run-smoke/smoke-result.txt`.
-- **Script** `docs/tools/smoke.json` — sets deterministic gamerules, runs
-  `/loominary import sample.png`, then asserts:
+- **Scenario scripts** live in `docs/tools/smoke/` (one JSON step script per behavior). They
+  reuse the `DocsDriver` step vocabulary plus the assertion steps:
   - `assertSourceLoaded: "sample.png"` — the import actually loaded the source
   - `assertTilesAtLeast: 1` — `PayloadState.tiles` is populated
   - `assertActiveChunksAtLeast: 1` — the active tile has encoded banner chunks
+
+  Current scenarios:
+  - `import-basic.json` — deterministic gamerules, `/loominary import sample.png`, assert.
+  - `preview-map.json` — builds a wall, places an item frame + empty map, runs
+    `/loominary import` then `/loominary preview`, and views the decoded map on the frame
+    (a full visual behavior worth recording).
+- **Gradle run** `smokeTest` in `build.gradle` (`./gradlew runSmokeTest`) — mirrors
+  `docsShots` but with its own **`runDir "run-smoke"`** sandbox. The scenario, result path,
+  and window size are Gradle properties (`-PsmokeScript`, `-PsmokeResult`, `-PsmokeW`,
+  `-PsmokeH`) so one run config drives the whole suite and both headless and video modes.
 - **Verdict** — on `exit`, `DocsDriver` writes `PASS n/n` or `FAIL …/n: <reasons>` to the
   result file. Assertions never throw, so a run reports every check.
-- **Wrapper** `scripts/smoke-test.sh` — creates the fresh `run-smoke/` sandbox, copies the
-  `web/e2e/fixtures/sample.png` fixture into `run-smoke/loominary_data/`, boots under Xvfb
-  + software GL, then turns the result file into the **process exit code** (missing verdict
-  = failure, so a boot that never reached the assertions also fails CI).
+- **Wrapper** `scripts/smoke-test.sh [--video] [scenario]` — creates the fresh `run-smoke/`
+  sandbox, copies the `web/e2e/fixtures/*.png` fixtures into `run-smoke/loominary_data/`,
+  boots under Xvfb + software GL, then turns the result file into the **process exit code**
+  (missing verdict = failure, so a boot that never reached the assertions also fails CI).
+
+## Video emission (human-visible proof of behavior)
+
+Assertions prove the mod's *state*; a video proves the *on-screen behavior* a human must
+sign off on. `scripts/smoke-test.sh --video <scenario>` records the run to
+`docs/videos/out/smoke/<scenario>.mp4` using the **same pipeline as `scripts/game-video.sh`**:
+a dedicated `Xvfb` display captured by `ffmpeg -f x11grab`, with optional game audio through
+a private Pulse null sink (nothing plays on your speakers). Video runs use a larger window
+(1280×720) and unmute the client; the default (no `--video`) stays fast, silent, and headless
+for CI. The `docs/videos/out/` tree is git-ignored, so recordings are build artifacts.
+
+## Release process (produce videos → human approval)
+
+`scripts/smoke-release.sh` is the pre-release gate. It runs **every** scenario in
+`docs/tools/smoke/` with `--video` and writes an approval bundle to `docs/videos/out/smoke/`:
+
+- `docs/videos/out/smoke/<scenario>.mp4` — one recording per behavior.
+- `docs/videos/out/smoke/APPROVAL.md` — a checklist manifest listing each scenario, its
+  PASS/FAIL assertion verdict, and a link to its video, with an unticked box per scenario.
+
+The script exits non-zero if any scenario's assertions fail, but a green run **still requires
+a human** to watch each video and tick the boxes before the release is approved. Wire this
+into the release steps in `CLAUDE.md` (before tagging): run `scripts/smoke-release.sh`, review
+the videos, and confirm `APPROVAL.md` is fully ticked.
 
 ## Sandbox / isolation model
 
@@ -80,9 +112,12 @@ Boots a real headless client and drives the mod through actual gameplay:
 ## How to run
 
 ```bash
-./gradlew build            # Layer A smoke runs as part of the normal test suite
+./gradlew build                         # Layer A smoke runs as part of the normal test suite
 ./gradlew test --tests '*LiveEncodeDecodeSmokeTest'   # just the fast smoke test
-scripts/smoke-test.sh      # Layer B: live in-game smoke (needs xvfb; downloads MC assets once)
+scripts/smoke-test.sh                    # Layer B: default scenario, headless (needs xvfb; downloads MC assets once)
+scripts/smoke-test.sh preview-map        # a specific scenario, headless
+scripts/smoke-test.sh --video preview-map # record docs/videos/out/smoke/preview-map.mp4
+scripts/smoke-release.sh                  # run ALL scenarios with video → approval bundle
 ```
 
 ## CI
@@ -95,13 +130,23 @@ label) once a cached-assets step is in place.
 
 ## TODO for a human to finish the live-boot parts
 
-- **Run it end-to-end once.** Boot Layer B locally (`scripts/smoke-test.sh`) on a machine
-  with `xvfb` and network to seed the Loom asset cache, and confirm the verdict is `PASS`.
-  Tune the `waitTicks` in `docs/tools/smoke.json` if import needs longer under software GL.
-- **Enable the CI job.** Uncomment the `smoke-test` job in `.github/workflows/build.yml` and
-  add Minecraft-asset caching so it doesn't re-download every run.
-- **Deepen the assertions (optional).** The current live checks stop at "import produced a
-  populated `PayloadState`." A fuller flow could place a framed map, let `MapBannerDecoder`
-  decode it, and assert the rendered `MapState.colors` match the expected pixels (reuse
-  `src/test/java/net/zerohpminecraft/tools/MapRender.java` for the reference bytes), plus a
-  banner-placement pass via the anvil auto-fill handler.
+- **Run it end-to-end once.** Boot Layer B locally (`scripts/smoke-test.sh` and
+  `scripts/smoke-test.sh --video preview-map`) on a machine with `xvfb`, `ffmpeg`, and
+  network to seed the Loom asset cache, and confirm the verdicts are `PASS` and the videos
+  show the expected behavior. Tune the `waitTicks` in the `docs/tools/smoke/*.json` scenarios
+  if a step needs longer under software GL (import/preview are slower there).
+- **Validate `preview-map.json`.** Its framed-map + preview steps are copied from the proven
+  `docs/tools/game-shots.json` sequence but have not been booted here; the video-emitting run
+  is exactly how a human confirms it.
+- **Enable the CI job.** Flip `if: false` on the `smoke-test` job in
+  `.github/workflows/build.yml` and add Minecraft-asset caching so it doesn't re-download
+  every run. Optionally upload the recorded `docs/videos/out/smoke/*.mp4` as job artifacts.
+- **Wire the release gate.** Add `scripts/smoke-release.sh` (+ human review of `APPROVAL.md`)
+  to the release steps in `CLAUDE.md`, before `git tag`.
+- **Grow the scenario suite.** Add scenarios mirroring the rest of the video series
+  (banner anvil-fill placement, carpet platform via `placeCarpets`, animated/sRGB art) —
+  each new `docs/tools/smoke/*.json` is picked up automatically by `smoke-release.sh`.
+- **Deepen the assertions (optional).** The current checks stop at "import produced a
+  populated `PayloadState`." A fuller flow could let `MapBannerDecoder` decode the framed map
+  and assert the rendered `MapState.colors` match expected pixels (reuse
+  `src/test/java/net/zerohpminecraft/tools/MapRender.java` for the reference bytes).

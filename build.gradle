@@ -157,18 +157,28 @@ loom {
 			programArgs "--width", "1920", "--height", "1080"
 		}
 		// Live in-game SMOKE test: boots a real headless client into a throwaway
-		// superflat integrated-server world (NO network), drives docs/tools/smoke.json
-		// (import + PayloadState assertions), and writes a PASS/FAIL verdict to
-		// run-smoke/smoke-result.txt. Sandboxed in its own runDir so it never touches
-		// the docs run/ or any real Minecraft install. Wrapper: scripts/smoke-test.sh.
+		// superflat integrated-server world (NO network), drives a scenario script from
+		// docs/tools/smoke/ (import + PayloadState assertions), and writes a PASS/FAIL
+		// verdict to a result file. Sandboxed in its own runDir so it never touches the
+		// docs run/ or any real Minecraft install. Wrapper: scripts/smoke-test.sh.
+		//
+		// The scenario, result path, and window size are overridable so the same run can
+		// drive the whole suite (scripts/smoke-release.sh) and record video (larger window):
+		//   ./gradlew runSmokeTest -PsmokeScript=docs/tools/smoke/preview-map.json \
+		//                          -PsmokeResult=run-smoke/preview-map.txt -PsmokeW=1920 -PsmokeH=1080
 		smokeTest {
 			client()
 			ideConfigGenerated = false
 			runDir "run-smoke"
+			def smokeScript = providers.gradleProperty("smokeScript")
+				.getOrElse("${rootDir}/docs/tools/smoke/import-basic.json")
+			def smokeResult = providers.gradleProperty("smokeResult")
+				.getOrElse("${rootDir}/run-smoke/smoke-result.txt")
 			vmArg "-Dloominary.docs=true"
-			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/smoke.json"
-			vmArg "-Dloominary.smoke.result=${rootDir}/run-smoke/smoke-result.txt"
-			programArgs "--width", "640", "--height", "480"
+			vmArg "-Dloominary.docs.script=${smokeScript}"
+			vmArg "-Dloominary.smoke.result=${smokeResult}"
+			programArgs "--width", providers.gradleProperty("smokeW").getOrElse("640"),
+			            "--height", providers.gradleProperty("smokeH").getOrElse("480")
 		}
 	}
 }

@@ -36,6 +36,7 @@ import net.zerohpminecraft.CarpetChannel;
 import net.zerohpminecraft.CodecMode;
 import net.zerohpminecraft.LitematicaBridge;
 import net.zerohpminecraft.MuxAllocator;
+import net.zerohpminecraft.PrintVerifier;
 import net.zerohpminecraft.WaypointMover;
 import net.zerohpminecraft.MapBannerDecoder;
 import net.zerohpminecraft.MapEncryption;
@@ -1275,6 +1276,12 @@ public class LoominaryCommand {
                                                                 IntegerArgumentType.getInteger(ctx, "width"));
                                                         return autoPrintStart(ctx.getSource());
                                                     })))
+                                    // Verify the printed floor would capture exactly (no empty map used);
+                                    // highlights misplaced carpets/obstructions with boxes.
+                                    .then(ClientCommandManager.literal("verify")
+                                            .executes(ctx -> autoPrintVerify(ctx.getSource()))
+                                            .then(ClientCommandManager.literal("clear")
+                                                    .executes(ctx -> autoPrintVerifyClear(ctx.getSource()))))
                                     .then(ClientCommandManager.argument("on", IntegerArgumentType.integer(1, 12000))
                                             .then(ClientCommandManager.argument("off", IntegerArgumentType.integer(0, 12000))
                                                     .executes(ctx -> autoWalkSetTimings(ctx.getSource(),
@@ -3158,11 +3165,12 @@ public class LoominaryCommand {
     private static int stopAll(FabricClientCommandSource source) {
         MinecraftClient client = MinecraftClient.getInstance();
         boolean any = AutoPrintHandler.isActive() || CarpetFillHandler.isActive()
-                || AutoWalkHandler.isActive();
+                || AutoWalkHandler.isActive() || PrintVerifier.isActive();
         AutoPrintHandler.stop(client);              // also stops a fill/catalogue it's driving
         if (CarpetFillHandler.isActive()) CarpetFillHandler.stop();   // a standalone fill/catalogue
         AutoWalkHandler.stop(client);
         WaypointMover.stop();
+        PrintVerifier.clear();                      // cancel any scan + hide highlight boxes
         source.sendFeedback(Text.literal(any
                 ? "§e§lLoominary§r §7stopped all automation."
                 : "§7Loominary: nothing was running."));
@@ -3177,6 +3185,18 @@ public class LoominaryCommand {
 
     private static int autoPrintStop(FabricClientCommandSource source) {
         AutoPrintHandler.stop(MinecraftClient.getInstance());
+        return 1;
+    }
+
+    /** /loominary walk verify: check the printed floor would capture exactly, highlighting problems. */
+    private static int autoPrintVerify(FabricClientCommandSource source) {
+        PrintVerifier.start(MinecraftClient.getInstance());
+        return 1;
+    }
+
+    /** /loominary walk verify clear: hide the verify highlight boxes. */
+    private static int autoPrintVerifyClear(FabricClientCommandSource source) {
+        PrintVerifier.clear();
         return 1;
     }
 

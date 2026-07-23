@@ -707,15 +707,8 @@ public class CarpetBalanceHandler {
         lastLoadRegions.clear();
         if (client.player == null || client.world == null) return null;
 
-        World schematic;
-        try {
-            Object sw = Class.forName("fi.dy.masa.litematica.world.SchematicWorldHandler")
-                    .getMethod("getSchematicWorld").invoke(null);
-            if (!(sw instanceof World w)) return null;
-            schematic = w;
-        } catch (Throwable t) {
-            return null;
-        }
+        World schematic = schematicWorld();
+        if (schematic == null) return null;
 
         // One inventory-load = the number of usable carpet slots, each of which the player
         // will carry as a *full* stack. We cap the walk by stacks (not raw cells) so the
@@ -865,6 +858,50 @@ public class CarpetBalanceHandler {
     /** Band index of column {@code x}, counted from the player's working edge. */
     static int bandOf(int x, int minX, int maxX, int W, boolean eastSide) {
         return (eastSide ? (maxX - x) : (x - minX)) / W;
+    }
+
+    // ── Schematic (ghost-world) queries for the printer / verifier ──────────────
+
+    /** How far above the floor a carpet stack can legitimately rise (shade staircase max). */
+    private static final int MAX_STACK_SCAN = 128;
+
+    /**
+     * Litematica's schematic (ghost) world, or {@code null} when Litematica is absent or nothing is
+     * loaded. Resolved by reflection — Litematica is a soft dependency, not a compile dependency.
+     */
+    public static World schematicWorld() {
+        try {
+            Object sw = Class.forName("fi.dy.masa.litematica.world.SchematicWorldHandler")
+                    .getMethod("getSchematicWorld").invoke(null);
+            return (sw instanceof World w) ? w : null;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Highest Y in column ({@code x},{@code z}) where the schematic wants a carpet, scanning up from
+     * {@code floorY} through the contiguous stack; {@link Integer#MIN_VALUE} if the schematic has no
+     * carpet at {@code floorY}. Carpet platforms always start at the floor — flat art is a single
+     * carpet, a shade staircase is a contiguous run of filler carpets up to the data carpet on top —
+     * so the first gap above the floor ends the stack.
+     */
+    public static int schematicTopCarpetY(World schematic, int x, int z, int floorY) {
+        if (schematic == null) return Integer.MIN_VALUE;
+        BlockPos.Mutable p = new BlockPos.Mutable();
+        int top = Integer.MIN_VALUE;
+        for (int y = floorY; y <= floorY + MAX_STACK_SCAN; y++) {
+            p.set(x, y, z);
+            boolean carpet;
+            try {
+                carpet = isCarpet(schematic.getBlockState(p).getBlock().asItem());
+            } catch (Exception e) {
+                break;   // unloaded schematic chunk etc.
+            }
+            if (carpet) top = y;
+            else break;   // past the top of the contiguous stack (or no carpet at the floor)
+        }
+        return top;
     }
 
     static Map<Item, Integer> readCarpetMaterials() throws Exception {

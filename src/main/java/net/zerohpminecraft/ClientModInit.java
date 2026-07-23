@@ -29,6 +29,7 @@ public class ClientModInit implements ClientModInitializer {
         AutoWalkHandler.register();
         WaypointMover.register();
         AutoPrintHandler.register();
+        PrintVerifier.register();
 
         // Docs screenshot harness — dev-only. The class is excluded from the release
         // jar (build.gradle), and lazy class loading means this reference is safe:

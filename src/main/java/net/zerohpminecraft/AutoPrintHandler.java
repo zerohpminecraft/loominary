@@ -10,6 +10,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.world.World;
 
 import java.util.HashMap;
 import java.util.HashSet;
@@ -60,6 +61,15 @@ public final class AutoPrintHandler {
     private static final int RECOVER_TIMEOUT    = 60;   // give up on one miss after this
     private static final int MAX_WRONG_BREAKS   = 3;    // break a wrong-coloured carpet at most this often
 
+    // Errant-carpet removal: a carpet double-placed *above* the schematic's intended surface. It
+    // becomes the highest block the map scan reads, corrupting that pixel's colour and the shade of
+    // it and its southern neighbour. Only columns the schematic wants a carpet in are touched (so a
+    // stray carpet outside the art — e.g. a noobline row north of the edge — is never broken), and
+    // the schematic wants air where we break, so the printer won't re-lay it.
+    private static final int ERRANT_SCAN_INTERVAL = 8;    // ticks between errant-carpet scans
+    private static final int ERRANT_TIMEOUT       = 40;   // give up breaking one errant carpet after this
+    private static final int ERRANT_MAX_HEIGHT    = 3;    // blocks above the intended top to check
+
     private enum State { PLAN, RESTOCK_CHECK, CATALOGUE, RESTOCK, PRINTING, DONE }
 
     private static boolean active = false;
@@ -91,6 +101,13 @@ public final class AutoPrintHandler {
     private static int      wrongBreaks = 0;       // wrong carpets broken at the current target
     private static boolean  breakingWrong = false; // mid-break of a wrong carpet at the current target
     private static final Set<Long> recoverSkip = new HashSet<>();   // misses we gave up on this load
+
+    // Errant-carpet removal state.
+    private static boolean  breakingErrant = false;
+    private static BlockPos errantTarget = null;
+    private static int      errantTimer = 0;
+    private static int      errantScanCooldown = 0;
+    private static final Set<BlockPos> errantSkip = new HashSet<>();   // errant carpets we couldn't clear
 
     private static boolean restockPending = false;
     private static int     restockAttempts = 0;
@@ -155,6 +172,8 @@ public final class AutoPrintHandler {
         unbuilt = null;
         recovering = false;
         recoverTarget = null;
+        breakingErrant = false;
+        errantTarget = null;
         positioning = false;
         if (pauseOverridden) {
             MinecraftClient c = MinecraftClient.getInstance();
@@ -190,6 +209,7 @@ public final class AutoPrintHandler {
         if (plan == null || plan.waypoints.isEmpty()) {
             feedback(client, "§a" + TAG + " Auto-print done — nothing left to build nearby.");
             hardStop();
+            PrintVerifier.start(client);   // confirm the finished floor would capture cleanly
             return;
         }
         waypoints = plan.waypoints;
@@ -201,6 +221,10 @@ public final class AutoPrintHandler {
         recovering = false;
         recoverTarget = null;
         recoverSkip.clear();
+        breakingErrant = false;
+        errantTarget = null;
+        errantSkip.clear();
+        errantScanCooldown = 0;
         state = State.RESTOCK_CHECK;
     }
 
@@ -284,6 +308,21 @@ public final class AutoPrintHandler {
         engagePrinter();   // idempotent; re-assert in case anything toggled it off
 
         if (recovering) { recoverStep(client); return; }
+
+        // Clear any carpet errantly stacked above the intended surface before laying more of the
+        // floor — an extra carpet is what the top-down map scan reads, so it corrupts the capture.
+        if (breakingErrant) { breakErrantStep(client); return; }
+        if (--errantScanCooldown <= 0) {
+            errantScanCooldown = ERRANT_SCAN_INTERVAL;
+            BlockPos errant = findErrantCarpet(client);
+            if (errant != null) {
+                breakingErrant = true;
+                errantTarget = errant;
+                errantTimer = 0;
+                WaypointMover.stop();
+                return;
+            }
+        }
 
         // Did we leave an unbuilt cell in a band the sweep already passed? Dart back for it before
         // carrying on, so skipped edge cells don't pile up on the worked side and stall the frontier.
@@ -478,6 +517,68 @@ public final class AutoPrintHandler {
 
     private static boolean isBuilt(MinecraftClient client, BlockPos pos, Item expected) {
         return client.world != null && client.world.getBlockState(pos).getBlock().asItem() == expected;
+    }
+
+    /**
+     * The nearest carpet stacked <em>above</em> the schematic's intended top in its column — a
+     * printer double-place. Only columns the schematic actually wants a carpet in are considered, so
+     * a stray carpet outside the art (e.g. a noobline row north of the edge, which is not in the
+     * schematic) is never touched. Null if none within {@link #RECOVERY_RADIUS}.
+     */
+    private static BlockPos findErrantCarpet(MinecraftClient client) {
+        if (client.player == null || client.world == null) return null;
+        World schematic = CarpetBalanceHandler.schematicWorld();
+        if (schematic == null) return null;
+
+        int bx = client.player.getBlockX(), bz = client.player.getBlockZ();
+        double px = client.player.getX(), pz = client.player.getZ();
+        double radSq = RECOVERY_RADIUS * RECOVERY_RADIUS;
+        BlockPos best = null;
+        double bestSq = Double.MAX_VALUE;
+        for (int dx = -RECOVERY_RADIUS; dx <= RECOVERY_RADIUS; dx++) {
+            for (int dz = -RECOVERY_RADIUS; dz <= RECOVERY_RADIUS; dz++) {
+                int cx = bx + dx, cz = bz + dz;
+                double rx = (cx + 0.5) - px, rz = (cz + 0.5) - pz;
+                double distSq = rx * rx + rz * rz;
+                if (distSq > radSq || distSq >= bestSq) continue;
+                int top = CarpetBalanceHandler.schematicTopCarpetY(schematic, cx, cz, planY);
+                if (top == Integer.MIN_VALUE) continue;   // no carpet wanted here — leave it alone
+                for (int y = top + 1; y <= top + ERRANT_MAX_HEIGHT; y++) {
+                    BlockPos pos = new BlockPos(cx, y, cz);
+                    if (errantSkip.contains(pos)) continue;
+                    Item it = worldItemAt(client, pos);
+                    if (it != null && CarpetBalanceHandler.isCarpet(it)) {
+                        bestSq = distSq; best = pos;
+                        break;   // one per column — the lowest errant carpet
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Hold position and mine the errant carpet until it's gone (or we time out), then resume. */
+    private static void breakErrantStep(MinecraftClient client) {
+        Item at = worldItemAt(client, errantTarget);
+        boolean gone = at == null || !CarpetBalanceHandler.isCarpet(at);
+        if (gone || ++errantTimer > ERRANT_TIMEOUT) {
+            if (!gone) errantSkip.add(errantTarget);   // out of reach / can't clear — stop retrying
+            breakingErrant = false;
+            errantTarget = null;
+            if (waypoints != null && wpIndex < waypoints.size()) {
+                WaypointMover.setWaypoint(waypoints.get(wpIndex));   // resume the serpentine
+            }
+            return;
+        }
+        double reachSq = LitematicaBridge.printerRange() * LitematicaBridge.printerRange();
+        double distSq = client.player.squaredDistanceTo(
+                errantTarget.getX() + 0.5, errantTarget.getY() + 0.5, errantTarget.getZ() + 0.5);
+        if (distSq > reachSq) {
+            if (!WaypointMover.isActive()) WaypointMover.setWaypoint(errantTarget);
+            return;
+        }
+        WaypointMover.stop();
+        breakBlockAt(client, errantTarget);
     }
 
     /** Unit vector of travel: toward the current waypoint, else the player's facing. */

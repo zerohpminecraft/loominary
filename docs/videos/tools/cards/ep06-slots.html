@@ -1,0 +1,19 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .art { width:150px; height:150px; border-radius:16px; margin-top:40px;
+         background:conic-gradient(from 20deg,#3a6ea5,#b04a3c,#3a8c5c,#a08a3c,#3a6ea5);
+         border:1px solid #2a3a5c; filter:drop-shadow(0 0 26px rgba(111,179,255,0.25)); }
+  .keys { display:flex; gap:22px; margin-top:44px; }
+  .key { display:inline-flex; align-items:center; gap:12px; font-size:34px;
+         font-family:'DejaVu Sans Mono',monospace; color:#a8d2ff;
+         background:#1b2946; border:1px solid #3a5c8c; padding:12px 22px; border-radius:12px; }
+  .key .k { font-size:30px; }
+</style>
+<h1 style="font-size:78px">One art, <span class="accent">many keys</span></h1>
+<div class="art"></div>
+<div class="keys">
+  <span class="key"><span class="k">🔑</span>guild</span>
+  <span class="key"><span class="k">🔑</span>officers</span>
+  <span class="key"><span class="k">🔑</span>you</span>
+</div>
+<p class="sub" style="margin-top:40px">AES-256-GCM &mdash; each password its own slot</p>

@@ -1,0 +1,42 @@
+{
+  "sourceFilename": "ball.gif",
+  "columns": 1,
+  "rows": 1,
+  "activeTileIndex": 0,
+  "allShades": false,
+  "dither": false,
+  "title": "Bouncing Ball",
+  "codecMode": "CARPET",
+  "authorOverride": null,
+  "whitelist": [],
+  "tiles": [
+    {
+      "chunks": [],
+      "currentIndex": 0,
+      "nonce": 11,
+      "frameCount": 12,
+      "frameDelays": [
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90
+      ],
+      "frameSourceIndices": null,
+      "carpetEncoded": true,
+      "loomEncoded": false,
+      "carpetCompressedB64": "KLUv/aAlAAMA5AUAJAMEJQIBAQAAu+eMogANQm91bmNpbmcgQmFsbAAAAAsADABavz6/Pj4+v7+/v7+/v78+BCqgIZ81678B0ExiJsgo8EfAN3LK374owO8pQ6TvX1VQ+WnDAABv5AvN+j7AXwg/K2HvtBaJ8Avh3yT3X4txz+do92e+MN1v0gCQfl1Q/85Fpz+ZoR/++R/dRVRbwQcS1E64aUvuH2xQaAaxCuh0q0W89SBqYEsRsAUme2+gRN+40lFY8DNAqQJtAQAIBAzw/Q8A/JS+yKzvH/9C+L0Je461SIRfCH8zuW9ZjHu+M7uv9cVp/3j64Qw=",
+      "muxed": false,
+      "muxReceiver": false,
+      "isDonorOnly": false,
+      "muxCargoB64": null
+    }
+  ]
+}

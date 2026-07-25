@@ -99,39 +99,39 @@ anim_marks = json.load(open(ROOT / 'web/e2e/media/anim-marks.json'))
 # caption layout uses, so boxes always track the narration.
 SEGS = [
     ('game', 'reveal', 4.0, [
-        "This is a Minecraft map. Completely vanilla. Completely legal.",
-        "It is showing a full-color image, because I put one there. Anyone with the mod sees it. Anyone without sees decorative carpet. Their loss.",
+        "This is a Minecraft map. Completely vanilla, on a completely vanilla server.",
+        "It is showing a full-color image. Anyone with the mod sees it. Anyone without sees decorative carpet.",
     ]),
     ('card', CARDS / 'card-title.png', 6.5, [
-        "The tool is called Loominary. A client-side mod, plus a web editor. Nothing is uploaded. No server plugins. No permission slips.",
+        "The tool is called Loominary. A client-side mod, plus a web editor. Nothing is uploaded. No server plugins, no special permissions.",
     ]),
     ('fmvideo', RAW / 'fm-install.webm', None, [
-        "Installation is the usual Fabric routine: Loominary, Fabric API, Litematica, and IceTank's printer fork, into the mods folder. Four files. The order does not matter. You will put them in an order anyway.",
+        "Installation is the usual Fabric routine: Loominary, Fabric API, Litematica, and IceTank's printer fork, into the mods folder. Four files. The order does not matter.",
     ]),
     ('broll', (wiz, 0.0, min(11.0, wiz_d * 0.4)), None, [
         "Open the web editor and drop in your image. Nothing uploads. Your browser does all the work.",
-        "The preview is not a mockup. It is the exact in-game result, quantized to Minecraft's actual map palette. All 248 colors. You were going to count them. I know. I counted too.",
+        "The preview is not a mockup. It is the exact in-game result, quantized to Minecraft's actual map palette. All 183 colors.",
     ], [(0, 12, 256, 336, 132), (1, 776, 84, 948, 916)]),
     ('broll', (adj, 1.0, min(10.0, adj_d - 1)), None, [
-        "The palette is muted, so give the saturation a nudge. There is a match-quality score. You are going to optimize it. This is correct behavior.",
-        "The dithering does the heavy lifting on the gradients. It does not complain. Learn from it.",
+        "The palette is muted, so give the saturation a nudge. There is a match-quality score if you want to measure it.",
+        "The dithering does the heavy lifting on the gradients.",
     ], [(0, 12, 856, 336, 210)]),
     ('broll', (tools, 1.0, min(7.5, tools_d - 1)), None, [
-        "Step two is a full pixel editor. Something in there is one pixel off. You already saw it. Go fix it. Neither of us was going to sleep anyway.",
+        "Step two is a full pixel editor, if you want to touch anything up.",
     ]),
     ('broll', (wiz, wiz_d * 0.72, wiz_d * 0.28), None, [
         "Step three: export. This screen shows exactly how your image travels. Carpet colors carry most of the bytes; banners catch the overflow.",
-        "Pick a codec. Press Export ZIP. Try to look busy while it encodes.",
+        "Pick a codec. Press Export ZIP.",
     ], [(0, 12, 230, 344, 560), (0, 392, 640, 1510, 110)]),
     ('fmvideo', RAW / 'fm-files.webm', None, [
-        "Two files matter. The state JSON goes to your config folder. The litematic goes to your schematics folder. Do not improvise here.",
+        "Two files matter. The state JSON goes to your config folder. The litematic goes to your schematics folder.",
     ]),
     ('game', 'status', None, [
-        "In game, loominary status confirms the mod loaded your art. It loaded. It always loads.",
+        "In game, loominary status confirms the mod loaded your art.",
     ], [(0, 0, 880, 690, 150)]),
     ('game', 'plat', 4.5, [
-        "Load the schematic with Litematica and place the platform: a 128 by 128 sheet of carpet, with one polite row of blocks up north so the map shades correctly. The grid alignment must be exact. This will not be a problem for you.",
-        "Yes, you can place it by hand from the ghost. Yes, there is a feature that walks out and places every carpet for you. That is another video. Contain yourself.",
+        "Load the schematic with Litematica and place the platform: a 128 by 128 sheet of carpet, with one row of blocks up north so the map shades correctly. The grid alignment must be exact.",
+        "You can place it by hand from the ghost, or use the feature that walks out and places every carpet for you. That is another video.",
     ]),
     ('game', 'scan', None, [
         "Stand on the platform and use an empty map. That snapshot is the entire trick.",
@@ -139,21 +139,21 @@ SEGS = [
     ], [(1, 650, 585, 640, 100)]),
     ('game', ('dec', 2.5), None, [
         "Lock the map at a cartography table so it never redraws. Frame it.",
-        "The mod reads the data off the map and paints the real image. No servers were consulted.",
-        "Everyone with Loominary sees art. Everyone else sees modern art.",
+        "The mod reads the data off the map and paints the real image. No server was involved.",
+        "Everyone with Loominary sees the image. Everyone else sees a carpet pattern.",
     ]),
     ('broll', (anim, anim_marks['editorPlay'] + 0.1, 5.8), None, [
-        "It does animated GIFs. Press play in the editor. Every frame gets the same obsessive treatment.",
+        "It does animated GIFs. Press play in the editor. Every frame gets the same treatment.",
     ]),
     ('broll', (anim, anim_marks['exportPreview'] + 0.3, 5.5), None, [
-        "The export preview is the encoded animation, already playing. What ships is what you see. We checked. Twice.",
+        "The export preview is the encoded animation, already playing. What ships is what you see.",
     ]),
-    ('still', SHOTS_WEB / 'export-multitile.png', 4.0, ["Wall-sized murals."]),
+    ('still', SHOTS_WEB / 'export-multitile.png', 4.0, ["Wall-sized art."]),
     ('still', SHOTS_GAME / 'status-locked.png', 4.5, [
-        "And password-locked art, for your secrets. All coming up in this series.",
+        "And password-locked art. All coming up in this series.",
     ]),
     ('card', CARDS / 'card-end.png', 6.0, [
-        "Editor and wiki are linked below. This video will not make eye contact with you. Go make something, mapautists. The carpet is waiting.",
+        "Editor and wiki are linked below. Go make something.",
     ]),
 ]
 # Normalize: every entry is (kind, src, dur, cues, boxes).
@@ -263,8 +263,23 @@ def fmt_ts(t):
     ms = int(round(t * 1000)); h, ms = divmod(ms, 3600000); m, ms = divmod(ms, 60000); s, ms = divmod(ms, 1000)
     return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
 
-srt, cue_events, cue_n, t0 = [], [], 1, 0.0
-vo_cursor = 0.0   # GUARDRAIL: narration is strictly sequential — never overlapping
+# Burned captions never exceed one row: split each cue into short word-boundary
+# chunks shown sequentially across its window; full sentences stay in the .srt.
+MAX_CAP_CHARS = 48
+def wrap_chunks(text, max_chars=MAX_CAP_CHARS):
+    text = text.replace('—', ',')
+    words, lines, cur = text.split(), [], ''
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > max_chars:
+            lines.append(cur); cur = w
+        else:
+            cur = f'{cur} {w}'.strip()
+    if cur: lines.append(cur)
+    return lines
+
+srt, burn, cue_events, t0 = [], [], [], 0.0
+srt_n = burn_n = 1
+vo_cursor = 0.0   # GUARDRAIL: narration is strictly sequential, never overlapping
 VO_GAP = 0.35
 for i, ((kind, src, dur, cues, _b), (clip, _a)) in enumerate(zip(SEGS, clips)):
     d_real = probe(clip)
@@ -275,15 +290,21 @@ for i, ((kind, src, dur, cues, _b), (clip, _a)) in enumerate(zip(SEGS, clips)):
         # Never start a cue before the previous voice line has finished.
         t = max(t, vo_cursor + VO_GAP if vo_cursor else t)
         end = min(t + cd, t0 + d_real - 0.1)
-        if end <= t:   # segment overfull despite the clip guardrail — surface it
-            print(f'WARNING: cue {cue_n} ("{cue[:40]}…") does not fit segment {i}; '
-                  f'voice slides past the segment boundary')
+        if end <= t:   # segment overfull despite the clip guardrail, surface it
+            print(f'WARNING: cue {srt_n} ("{cue[:40]}…") does not fit segment {i}')
             end = t + cd
-        srt.append(f'{cue_n}\n{fmt_ts(t)} --> {fmt_ts(end)}\n{cue}\n')
+        srt.append(f'{srt_n}\n{fmt_ts(t)} --> {fmt_ts(end)}\n{cue}\n'); srt_n += 1
+        chunks = wrap_chunks(cue)
+        tot = sum(len(c) for c in chunks) or 1
+        ct = t
+        for k, c in enumerate(chunks):
+            c_end = end if k == len(chunks) - 1 else ct + (end - t) * (len(c) / tot)
+            burn.append(f'{burn_n}\n{fmt_ts(ct)} --> {fmt_ts(c_end)}\n{c}\n'); burn_n += 1
+            ct = c_end
         if (i, j) in vo:
             cue_events.append((t + 0.1, vo[(i, j)][0]))
             vo_cursor = t + 0.1 + vo[(i, j)][1]
-        cue_n += 1; t = end
+        t = end
     t0 += d_real
 
 # Hard assertion: no two narration clips may overlap on the final timeline.
@@ -293,6 +314,8 @@ for (a_t, a_w), (b_t, _b_w) in zip(cue_events, cue_events[1:]):
 
 srt_path = OUT / 'ep01-first-map-art.srt'
 srt_path.write_text('\n'.join(srt))
+burn_path = TMP / 'burn.srt'
+burn_path.write_text('\n'.join(burn))
 
 # ── Concat video; audio = music bed (ducked) + narration + game sound ─────────
 concat = TMP / 'concat.txt'
@@ -388,11 +411,11 @@ else:
 
 final = OUT / 'ep01-first-map-art.mp4'
 run(*inputs, '-filter_complex', ';'.join(filters + [
-        f"[0:v]subtitles={srt_path}:force_style='{sub_style}'[vout]"]),
+        f"[0:v]subtitles={burn_path}:force_style='{sub_style}'[vout]"]),
     '-map', '[vout]', '-map', '[aout]',
     '-r', '30', *VCODEC, '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', final)
 
 print(f'{final}  ({probe(final):.1f}s, {final.stat().st_size/1e6:.1f} MB)'
       + ('' if VOICE else '  [no narration: espeak-ng not found]'))
-print(f'{srt_path}  ({cue_n - 1} cues)')
+print(f'{srt_path}  ({srt_n - 1} cues, {burn_n - 1} burned rows)')

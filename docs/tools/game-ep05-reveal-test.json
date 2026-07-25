@@ -1,0 +1,211 @@
+[
+ {
+  "cmd": "gamerule doDaylightCycle false"
+ },
+ {
+  "cmd": "gamerule doWeatherCycle false"
+ },
+ {
+  "cmd": "gamerule doMobSpawning false"
+ },
+ {
+  "cmd": "time set noon"
+ },
+ {
+  "cmd": "weather clear"
+ },
+ {
+  "cmd": "kill @e[type=!player]"
+ },
+ {
+  "cmd": "fill -70 -60 -75 70 -60 -20 minecraft:smooth_stone"
+ },
+ {
+  "cmd": "fill -4 -59 -56 4 -54 -56 minecraft:stone_bricks"
+ },
+ {
+  "cmd": "clear"
+ },
+ {
+  "cmd": "give @s minecraft:white_carpet 320"
+ },
+ {
+  "cmd": "give @s minecraft:orange_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:magenta_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:light_blue_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:yellow_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:lime_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:pink_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:gray_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:light_gray_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:cyan_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:purple_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:blue_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:brown_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:green_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:red_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:black_carpet 128"
+ },
+ {
+  "waitTicks": 10
+ },
+ {
+  "cmd": "loominary load ball"
+ },
+ {
+  "tp": [
+   0.5,
+   -59,
+   -70,
+   0,
+   12
+  ]
+ },
+ {
+  "placeSchematic": {
+   "w": 128,
+   "d": 6,
+   "origin": [
+    -64,
+    -59,
+    -65
+   ]
+  }
+ },
+ {
+  "waitTicks": 40
+ },
+ {
+  "perspective": "third"
+ },
+ {
+  "hud": true
+ },
+ {
+  "cmd": "loominary walk print"
+ },
+ {
+  "waitTicks": 1700
+ },
+ {
+  "screenshot": "mk-rv-printed"
+ },
+ {
+  "cmd": "clear @s"
+ },
+ {
+  "cmd": "give @s minecraft:map"
+ },
+ {
+  "cmd": "give @s minecraft:item_frame"
+ },
+ {
+  "waitTicks": 8
+ },
+ {
+  "perspective": "first"
+ },
+ {
+  "tp": [
+   0.5,
+   -59,
+   -62,
+   0,
+   55
+  ]
+ },
+ {
+  "waitTicks": 10
+ },
+ {
+  "select": "minecraft:map"
+ },
+ {
+  "useItem": true
+ },
+ {
+  "waitTicks": 10
+ },
+ {
+  "tp": [
+   0.5,
+   -59,
+   -58,
+   0,
+   0
+  ]
+ },
+ {
+  "waitTicks": 5
+ },
+ {
+  "select": "minecraft:item_frame"
+ },
+ {
+  "useBlock": true
+ },
+ {
+  "waitTicks": 5
+ },
+ {
+  "select": "minecraft:filled_map"
+ },
+ {
+  "useEntity": true
+ },
+ {
+  "waitTicks": 25
+ },
+ {
+  "tp": [
+   0.5,
+   -58.4,
+   -58.9,
+   0,
+   -2
+  ]
+ },
+ {
+  "waitTicks": 30
+ },
+ {
+  "screenshot": "mk-rv-decode1"
+ },
+ {
+  "waitTicks": 25
+ },
+ {
+  "screenshot": "mk-rv-decode2"
+ },
+ {
+  "exit": true
+ }
+]

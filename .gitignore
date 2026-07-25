@@ -35,3 +35,6 @@ loominary_exports/
 hs_err_pid*.log
 web/e2e/media/
 docs/videos/out/
+
+# Python bytecode cache (video assemble tooling)
+__pycache__/

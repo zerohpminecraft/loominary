@@ -1,0 +1,19 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .stack { display:flex; flex-direction:column; gap:14px; margin-top:50px; }
+  .layer { display:flex; align-items:center; gap:20px; font-size:40px;
+           font-family:'DejaVu Sans Mono',monospace; color:#a8d2ff; }
+  .layer .box { min-width:220px; padding:10px 22px; border-radius:12px;
+                background:#1b2946; border:1px solid #3a5c8c; text-align:center; }
+  .layer .arrow { color:#6fb3ff; font-size:40px; }
+  .layer.dim { color:#7788a5; }
+  .layer.dim .box { color:#9fb0cc; border-color:#2a3a5c; }
+</style>
+<h1 style="font-size:104px">Under the <span class="accent">hood</span></h1>
+<p class="sub">How the whole thing actually works</p>
+<div class="stack">
+  <div class="layer"><span class="box">image</span><span class="arrow">&rarr;</span><span class="box">nibbles</span></div>
+  <div class="layer dim"><span class="box">carpets</span><span class="arrow">&rarr;</span><span class="box">banners</span></div>
+  <div class="layer"><span class="box">map</span><span class="arrow">&rarr;</span><span class="box">art</span></div>
+</div>
+<p class="small">episode eight</p>

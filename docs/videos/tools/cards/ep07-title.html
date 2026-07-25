@@ -1,0 +1,20 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .banners { display:flex; gap:26px; margin-top:54px; }
+  .flag { width:70px; height:120px; border-radius:6px 6px 4px 4px;
+          border:1px solid #2a3a5c; position:relative; }
+  .flag::after { content:""; position:absolute; left:50%; top:-18px;
+                 width:3px; height:22px; background:#5a6a86; transform:translateX(-50%); }
+  .f1 { background:linear-gradient(160deg,#3a6ea5,#20406e); }
+  .f2 { background:linear-gradient(160deg,#b04a3c,#6e2820); }
+  .f3 { background:linear-gradient(160deg,#3a8c5c,#1f5c38); }
+  .f4 { background:linear-gradient(160deg,#a08a3c,#6e5c20); }
+</style>
+<h1 style="font-size:96px">It's the <span class="accent">names</span>.</h1>
+<p class="sub">A whole image, carried in banner names</p>
+<div class="banners">
+  <div class="flag f1"></div>
+  <div class="flag f2"></div>
+  <div class="flag f3"></div>
+  <div class="flag f4"></div>
+</div>

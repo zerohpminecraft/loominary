@@ -1,0 +1,25 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .flow { display:flex; align-items:center; gap:34px; margin-top:44px; }
+  .frames { display:flex; gap:10px; }
+  .frame { width:92px; height:92px; border-radius:8px; border:1px solid #2a3a5c;
+           background:linear-gradient(135deg,#20406e,#3a6ea5); }
+  .frame:nth-child(2){ filter:brightness(1.04); }
+  .frame:nth-child(3){ filter:brightness(0.97); }
+  .frame:nth-child(4){ filter:brightness(1.06); }
+  .frame:nth-child(5){ filter:brightness(0.95); }
+  .av1 { display:inline-flex; align-items:center; justify-content:center;
+         width:160px; height:112px; border-radius:12px; background:#1b2946;
+         color:#a8d2ff; font-family:'DejaVu Sans Mono',monospace; font-size:46px;
+         border:1px solid #3a5c8c; }
+</style>
+<h1 style="font-size:74px">Frames <span class="accent">repeat</span></h1>
+<div class="flow">
+  <div class="frames">
+    <div class="frame"></div><div class="frame"></div><div class="frame"></div>
+    <div class="frame"></div><div class="frame"></div>
+  </div>
+  <span class="arrow" style="font-size:74px">&rarr;</span>
+  <div class="av1">AV1</div>
+</div>
+<p class="sub" style="margin-top:48px">a video codec exploits that</p>

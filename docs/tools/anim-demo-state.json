@@ -1,0 +1,46 @@
+{
+  "sourceFilename": "demo.gif",
+  "columns": 1,
+  "rows": 1,
+  "activeTileIndex": 0,
+  "allShades": true,
+  "dither": false,
+  "title": "Bouncing Ball",
+  "codecMode": "CARPET",
+  "authorOverride": null,
+  "whitelist": [],
+  "tiles": [
+    {
+      "chunks": [],
+      "currentIndex": 0,
+      "nonce": 17,
+      "frameCount": 16,
+      "frameDelays": [
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90
+      ],
+      "frameSourceIndices": null,
+      "carpetEncoded": true,
+      "loomEncoded": false,
+      "carpetCompressedB64": "KLUv/aAlAAQAtBoA4o4gH6AprQGryn1RnCtVUZUYpPf/WyQHqZH7++CG5DO103b/P03/n/7///Svf/////T/Zmf2/y8NRQ2UaiIQ1ahmIlGUgVKKsTNjzpqZ2b1bszu7S3d3K6VLK6W11vOklZKzVnLWs5azHAtUQAaEUNMwCkRqMK7hKAUBPSyHCkIAQCAhCIHoqIFmSZb9M9FZU9Sm1AFSCBIEFAZBOAZCGASDeAYiOCF4BSFAEATiFicdRDgApLEqLIYkyteS9u21FBVMGhgdcnl2gAErjKOc2dCXoy7QalMfKEq5FlWLtS9JErEcxtKCNAD8oELw02PNyZY+yWjfW0upgJNVGVhZSdBEzrU4ESC4Q4ug7Eo1EBZ6A9bA8+UCsCuGQX8FZFGAbpFNu9Lw0+GaLk/lTaStVK1IUSRMN6JEQ0tRlB9KO6GIrqAqRbylQ6nGtjrlBm5eRPjEx6wCOiYAuoU5DQCUlqIek4R9lGGqmwcV8P4h6GHKBggrZxRMOXu9KwnAAGUmBlBJ/gna0jJuoY8cl4EAxhjXgEPJIBTElSX1TLWYfYksEWcw6STKapUM6JCqcRK7nHSBR1RaQHnlQlXCpBYE5YgWlOpnaScIEStoVdG31BAVsa2nusXNS2SJOIOx9AYxAPwt3AwAPMZzZBwQWIefMxuMaA8sHgu0762lVMDJUgys8Uj0EPgJJyv0epQDotr0C2opV0VqYO0rlQyWh4U0jh4A1gAQuxDwL3iZgAbYrOn3d/kzARhAcvpsHmYfd8O8k5e9SbXvW8uowNLAzpFzeAAD1uNAz+zow1CTaLWpDxSlXIuqxdqXJIlYDmNpFjsA/Nr+BoDySCZUSyK/XKUPG01aq9FNotI6VOuEvHZ5vIA4UA3pf0wkg2v9fOwcA9DGhFpTMRFgPFAAgOsDwnUOMcBJBxBqPsDdElsiDnDA9kb3DyASqYC9P4Yf9AdkbjgWTUiUCP0J+mIA43NHeiQDZRi6r4eZMMCnBfkiYADLmTvw63MAnN1XoJ0by/8DWxOgAaVo+/d9jk0ABoZcH50PH8Sae7kuyG/07Y7/ZmQ2/w8o+f/gb8XYZWny0XsZmwAMDLm+nAefdxl+jNY9WHlxVz/AtysdNiARk0mWT2MuJT/NuD+mpApUAAAAAgC/gB92tgdA5Q4AU8gE/7/T////////////T////9//X4FqqJH6AUFm5aRGYxI4AyFAOBDFUAxJAQlGMIIQfEIAERBCCDwsSA6WGa9aGvosNNsvfIrHkgcZh4zDAAyw7f68P28eB6CdUwWqZmsFtUF6C5LvWNA7URoGKw0ASOenw+lkio+bZvOVW3my1GrgvoI2cDpwQoA2QpWguqJKt4I9RkOLAykKx33IR6gqJwbY45RzrWF+WliNRPC+pZGsGgD+QkGdBCddTyF9hAgLNggwhW5wJuhcQBegCVFIaWNqDWuKWgC/V5KtEF+anzlarAFsLqRlbxu0KlkDqEtKAaBOaCbowFlkZyIUCe2ANkxZoCZa/6QN6S1QPgwsSsYZoJVNhFUgLfDmUlugFYI6gzQApQBthCo5JTgToBWhBWgGqSX14RqKWoC9m+RrA7C1L1/dBgDsAbJeyUzSzD+uzcYrL+XLEqCBuyceRAyIzxdQS6gQtFKqQVV4rSRtQG9J8jFgcUFFrF6Z+L7UklkpKe+J18dJ418AtzX5yYQioRugllIG1JkWftME/BZJvgMSL3ZhBDUAQCPOxWvLQ18LbeuFn+KdPIB72QF28rfzANoQlQQVSmtQNVsV1A7SW5DMRhATDzv86QE=",
+      "muxed": false,
+      "muxReceiver": false,
+      "isDonorOnly": false,
+      "muxCargoB64": null
+    }
+  ]
+}

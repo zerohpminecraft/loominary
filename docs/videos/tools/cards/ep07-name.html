@@ -1,0 +1,19 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .flow { display:flex; align-items:center; gap:40px; margin-top:54px; }
+  .chip { display:inline-flex; align-items:center;
+          padding:18px 34px; border-radius:12px; background:#1b2946;
+          color:#a8d2ff; font-family:'DejaVu Sans Mono',monospace; font-size:52px;
+          border:1px solid #3a5c8c; }
+  .idx { color:#6fb3ff; background:#122038; padding:6px 18px; border-radius:8px;
+         margin-right:26px; border:1px solid #2a4a7c; }
+  .cjk { letter-spacing:0.06em; }
+  .lbl { font-size:48px; color:#9fb0cc; }
+</style>
+<h1 style="font-size:74px">One banner, <span class="accent">84 bytes</span></h1>
+<div class="flow">
+  <div class="chip"><span class="idx">00</span><span class="cjk">丂丄丅两丩乇</span></div>
+  <span class="arrow" style="font-size:74px">&rarr;</span>
+  <span class="lbl">14 bits each</span>
+</div>
+<p class="sub" style="margin-top:56px">2 hex index + 48 characters = 50-char anvil name</p>

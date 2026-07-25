@@ -1,0 +1,29 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .panels { display:flex; gap:48px; margin-top:54px; }
+  .panel { width:520px; padding:40px 36px; border-radius:18px;
+           background:#141c30; border:2px solid #2a3a5c;
+           display:flex; flex-direction:column; align-items:center; }
+  .panel.alt { background:#16233c; border-color:#3a5c8c; }
+  .ptitle { font-size:40px; color:#6fb3ff; font-family:'DejaVu Sans Mono',monospace;
+            margin-bottom:26px; letter-spacing:0.04em; }
+  .add { font-size:42px; color:#9fb0cc; }
+  .big { font-size:76px; color:#e8ecf4; margin-top:18px; font-weight:600; }
+  .big .accent { color:#6fb3ff; }
+  .note { font-size:30px; color:#7788a5; margin-top:26px; }
+</style>
+<h1 style="font-size:74px">Two ways to use them</h1>
+<div class="panels">
+  <div class="panel">
+    <div class="ptitle">banner-only</div>
+    <div class="add">63 banners</div>
+    <div class="big">&asymp; <span class="accent">5,290</span> bytes</div>
+    <div class="note">no carpet, no grid alignment</div>
+  </div>
+  <div class="panel alt">
+    <div class="ptitle">carpet + banners</div>
+    <div class="add">8,176 + 5,290</div>
+    <div class="big">&asymp; <span class="accent">13,466</span> bytes</div>
+    <div class="note">no height staircase</div>
+  </div>
+</div>

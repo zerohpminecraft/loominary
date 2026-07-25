@@ -1,0 +1,21 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  table.codecs { border-collapse: collapse; font-size: 40px; margin-top: 44px; }
+  table.codecs td { padding: 13px 34px; text-align: left; }
+  table.codecs td.b { color: #6fb3ff; font-family: 'DejaVu Sans Mono', monospace; text-align: right; }
+  table.codecs tr + tr td { border-top: 1px solid #223252; }
+  .chip { display: inline-block; width: 34px; height: 34px; border-radius: 8px; margin-right: 10px; vertical-align: -4px; }
+  .c-carpet { background: #b04a3c; }
+  .c-shade  { background: #7a6bd8; }
+  .c-banner { background: #3f9d62; }
+  p.legend { font-size: 32px; color: #9fb0cc; margin-top: 34px; }
+</style>
+<h1 style="font-size:76px">Bytes per <span class="accent">tile</span></h1>
+<table class="codecs">
+  <tr><td><span class="chip c-banner"></span>banners</td><td class="b">5,290</td></tr>
+  <tr><td><span class="chip c-carpet"></span>carpet</td><td class="b">8,176</td></tr>
+  <tr><td><span class="chip c-carpet"></span><span class="chip c-shade"></span>carpet + shade</td><td class="b">10,192</td></tr>
+  <tr><td><span class="chip c-carpet"></span><span class="chip c-banner"></span>carpet + banners</td><td class="b">13,466</td></tr>
+  <tr><td><span class="chip c-carpet"></span><span class="chip c-shade"></span><span class="chip c-banner"></span>carpet + shade + banners</td><td class="b">15,482</td></tr>
+</table>
+<p class="legend"><span class="chip c-carpet"></span>carpet colors &nbsp; <span class="chip c-shade"></span>shade heights &nbsp; <span class="chip c-banner"></span>banner names</p>

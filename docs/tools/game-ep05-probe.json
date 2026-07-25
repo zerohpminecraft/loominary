@@ -1,0 +1,8 @@
+[
+  {"waitTicks": 30},
+  {"cmd": "loominary walk printer on"},
+  {"waitTicks": 15},
+  {"cmd": "loominary walk printer off"},
+  {"waitTicks": 15},
+  {"exit": true}
+]

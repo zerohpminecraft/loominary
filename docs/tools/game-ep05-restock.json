@@ -1,0 +1,193 @@
+[
+ {
+  "cmd": "gamerule doDaylightCycle false"
+ },
+ {
+  "cmd": "gamerule doWeatherCycle false"
+ },
+ {
+  "cmd": "gamerule doMobSpawning false"
+ },
+ {
+  "cmd": "time set noon"
+ },
+ {
+  "cmd": "weather clear"
+ },
+ {
+  "cmd": "kill @e[type=!player]"
+ },
+ {
+  "cmd": "fill -3 -60 -5 44 -60 28 minecraft:smooth_stone"
+ },
+ {
+  "cmd": "setblock 20 -59 -3 minecraft:chest[facing=south]{Items:[{Slot:0b,id:\"minecraft:red_carpet\",count:64},{Slot:1b,id:\"minecraft:red_carpet\",count:64},{Slot:2b,id:\"minecraft:red_carpet\",count:64},{Slot:3b,id:\"minecraft:red_carpet\",count:64},{Slot:4b,id:\"minecraft:orange_carpet\",count:64},{Slot:5b,id:\"minecraft:orange_carpet\",count:64},{Slot:6b,id:\"minecraft:orange_carpet\",count:64},{Slot:7b,id:\"minecraft:orange_carpet\",count:64},{Slot:8b,id:\"minecraft:yellow_carpet\",count:64},{Slot:9b,id:\"minecraft:yellow_carpet\",count:64},{Slot:10b,id:\"minecraft:yellow_carpet\",count:64},{Slot:11b,id:\"minecraft:yellow_carpet\",count:64},{Slot:12b,id:\"minecraft:lime_carpet\",count:64},{Slot:13b,id:\"minecraft:lime_carpet\",count:64},{Slot:14b,id:\"minecraft:lime_carpet\",count:64},{Slot:15b,id:\"minecraft:lime_carpet\",count:64},{Slot:16b,id:\"minecraft:light_blue_carpet\",count:64},{Slot:17b,id:\"minecraft:light_blue_carpet\",count:64},{Slot:18b,id:\"minecraft:light_blue_carpet\",count:64},{Slot:19b,id:\"minecraft:light_blue_carpet\",count:64},{Slot:20b,id:\"minecraft:magenta_carpet\",count:64},{Slot:21b,id:\"minecraft:magenta_carpet\",count:64},{Slot:22b,id:\"minecraft:magenta_carpet\",count:64},{Slot:23b,id:\"minecraft:magenta_carpet\",count:64}]}"
+ },
+ {
+  "cmd": "clear"
+ },
+ {
+  "cmd": "give @s minecraft:red_carpet 48"
+ },
+ {
+  "cmd": "give @s minecraft:orange_carpet 48"
+ },
+ {
+  "cmd": "give @s minecraft:yellow_carpet 48"
+ },
+ {
+  "cmd": "give @s minecraft:lime_carpet 48"
+ },
+ {
+  "cmd": "give @s minecraft:light_blue_carpet 48"
+ },
+ {
+  "cmd": "give @s minecraft:magenta_carpet 48"
+ },
+ {
+  "waitTicks": 10
+ },
+ {
+  "tp": [
+   20.5,
+   -59,
+   0,
+   0,
+   20
+  ]
+ },
+ {
+  "placeSchematic": {
+   "w": 40,
+   "d": 28,
+   "origin": [
+    0,
+    -59,
+    1
+   ]
+  }
+ },
+ {
+  "waitTicks": 40
+ },
+ {
+  "hud": false
+ },
+ {
+  "screenshot": "mk-r-a"
+ },
+ {
+  "cmd": "loominary walk print 10"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-00"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-01"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-02"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-03"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-04"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-05"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-06"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-07"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-08"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-09"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-10"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-11"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-12"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-13"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-14"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-15"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-16"
+ },
+ {
+  "waitTicks": 120
+ },
+ {
+  "screenshot": "mk-r-17"
+ },
+ {
+  "exit": true
+ }
+]

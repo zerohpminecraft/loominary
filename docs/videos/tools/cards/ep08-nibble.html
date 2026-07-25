@@ -1,0 +1,29 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .flow { display:flex; align-items:center; gap:40px; margin-top:52px; }
+  .carpets { display:flex; gap:12px; }
+  .carpet { width:88px; height:88px; border-radius:8px; border:1px solid #2a3a5c; }
+  .c1 { background:#c0392b; }
+  .c2 { background:#e67e22; }
+  .c3 { background:#f1c40f; }
+  .c4 { background:#27ae60; }
+  .c5 { background:#2980b9; }
+  .c6 { background:#8e44ad; }
+  .chip { display:inline-flex; align-items:center; justify-content:center;
+          padding:16px 34px; border-radius:12px; background:#1b2946;
+          color:#a8d2ff; font-family:'DejaVu Sans Mono',monospace; font-size:52px;
+          border:1px solid #3a5c8c; }
+  .lbl { font-size:44px; color:#9fb0cc; }
+</style>
+<h1 style="font-size:74px">Two carpets, <span class="accent">one byte</span></h1>
+<div class="flow">
+  <div class="carpets">
+    <div class="carpet c1"></div><div class="carpet c2"></div>
+    <div class="carpet c3"></div><div class="carpet c4"></div>
+    <div class="carpet c5"></div><div class="carpet c6"></div>
+  </div>
+  <span class="arrow" style="font-size:74px">&rarr;</span>
+  <div class="chip">4 bits</div>
+  <span class="lbl">16 colors = 4 bits</span>
+</div>
+<p class="sub" style="margin-top:56px">128&times;128 carpets &asymp; 8,000 bytes</p>

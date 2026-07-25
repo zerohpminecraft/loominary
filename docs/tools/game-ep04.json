@@ -1,0 +1,281 @@
+[
+ {
+  "cmd": "gamerule doDaylightCycle false"
+ },
+ {
+  "cmd": "gamerule doWeatherCycle false"
+ },
+ {
+  "cmd": "time set noon"
+ },
+ {
+  "cmd": "weather clear"
+ },
+ {
+  "cmd": "fill -8 -60 -6 8 -54 -6 minecraft:smooth_stone"
+ },
+ {
+  "cmd": "fill -8 -60 -7 8 -54 -7 minecraft:stone_bricks"
+ },
+ {
+  "cmd": "clear"
+ },
+ {
+  "cmd": "give @s minecraft:item_frame 64"
+ },
+ {
+  "cmd": "give @s minecraft:map 64"
+ },
+ {
+  "waitTicks": 10
+ },
+ {
+  "hud": false
+ },
+ {
+  "screenshot": "mk-place-a"
+ },
+ {
+  "cmd": "clear @s minecraft:filled_map"
+ },
+ {
+  "waitTicks": 2
+ },
+ {
+  "tp": [
+   -0.5,
+   -60,
+   -3,
+   180,
+   3
+  ]
+ },
+ {
+  "select": "minecraft:item_frame"
+ },
+ {
+  "useBlock": true
+ },
+ {
+  "select": "minecraft:map"
+ },
+ {
+  "useItem": true
+ },
+ {
+  "waitTicks": 6
+ },
+ {
+  "select": "minecraft:filled_map"
+ },
+ {
+  "useEntity": true
+ },
+ {
+  "waitTicks": 4
+ },
+ {
+  "cmd": "clear @s minecraft:filled_map"
+ },
+ {
+  "waitTicks": 2
+ },
+ {
+  "tp": [
+   0.5,
+   -60,
+   -3,
+   180,
+   3
+  ]
+ },
+ {
+  "select": "minecraft:item_frame"
+ },
+ {
+  "useBlock": true
+ },
+ {
+  "select": "minecraft:map"
+ },
+ {
+  "useItem": true
+ },
+ {
+  "waitTicks": 6
+ },
+ {
+  "select": "minecraft:filled_map"
+ },
+ {
+  "useEntity": true
+ },
+ {
+  "waitTicks": 4
+ },
+ {
+  "cmd": "loominary load wide"
+ },
+ {
+  "waitTicks": 4
+ },
+ {
+  "tp": [
+   -0.5,
+   -60,
+   -3,
+   180,
+   3
+  ]
+ },
+ {
+  "cmd": "loominary preview"
+ },
+ {
+  "waitTicks": 4
+ },
+ {
+  "cmd": "loominary tile next"
+ },
+ {
+  "waitTicks": 3
+ },
+ {
+  "tp": [
+   0.5,
+   -60,
+   -3,
+   180,
+   3
+  ]
+ },
+ {
+  "cmd": "loominary preview"
+ },
+ {
+  "waitTicks": 6
+ },
+ {
+  "cmd": "clear @s minecraft:filled_map"
+ },
+ {
+  "waitTicks": 2
+ },
+ {
+  "tp": [
+   2.5,
+   -60,
+   -3,
+   180,
+   3
+  ]
+ },
+ {
+  "select": "minecraft:item_frame"
+ },
+ {
+  "useBlock": true
+ },
+ {
+  "select": "minecraft:map"
+ },
+ {
+  "useItem": true
+ },
+ {
+  "waitTicks": 6
+ },
+ {
+  "select": "minecraft:filled_map"
+ },
+ {
+  "useEntity": true
+ },
+ {
+  "waitTicks": 4
+ },
+ {
+  "cmd": "clear @s minecraft:filled_map"
+ },
+ {
+  "waitTicks": 2
+ },
+ {
+  "tp": [
+   3.5,
+   -60,
+   -3,
+   180,
+   3
+  ]
+ },
+ {
+  "select": "minecraft:item_frame"
+ },
+ {
+  "useBlock": true
+ },
+ {
+  "select": "minecraft:map"
+ },
+ {
+  "useItem": true
+ },
+ {
+  "waitTicks": 6
+ },
+ {
+  "select": "minecraft:filled_map"
+ },
+ {
+  "useEntity": true
+ },
+ {
+  "waitTicks": 4
+ },
+ {
+  "screenshot": "mk-place-b"
+ },
+ {
+  "waitTicks": 20
+ },
+ {
+  "screenshot": "mk-donors-a"
+ },
+ {
+  "tp": [
+   1.0,
+   -57.5,
+   4.0,
+   180,
+   6
+  ]
+ },
+ {
+  "waitTicks": 80
+ },
+ {
+  "screenshot": "mk-donors-b"
+ },
+ {
+  "screenshot": "mk-grid-a"
+ },
+ {
+  "tp": [
+   -0.1,
+   -59.2,
+   -2.2,
+   180,
+   -1
+  ]
+ },
+ {
+  "waitTicks": 90
+ },
+ {
+  "screenshot": "mk-grid-b"
+ },
+ {
+  "exit": true
+ }
+]

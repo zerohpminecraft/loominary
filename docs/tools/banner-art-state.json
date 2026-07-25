@@ -1,0 +1,36 @@
+{
+  "sourceFilename": "heart.png",
+  "columns": 1,
+  "rows": 1,
+  "activeTileIndex": 0,
+  "allShades": true,
+  "dither": false,
+  "title": "Heart",
+  "codecMode": "BANNER",
+  "authorOverride": null,
+  "whitelist": [],
+  "tiles": [
+    {
+      "chunks": [
+        "00乵肋抿譠厏蓐蘁恊匆夂水侔塒朩怚橄潍堧忆癐検弍荩業筕擛捫掶荍瓛捨箥坈衖嚎獓牄簹巿跿跿蛿臿跿旒庠七癙",
+        "01琘縉礡最嘂两嘢仝砐挪瘳褛縆眺帴瀈焈堄侀昞伈廌幀済溄倀耈渐滈伀柄櫉蒴渗荀海俆蜈蟯謃磞墡宺唈綟瞅劏喊",
+        "02蚘澅噭挖洁熦搦祇擄胉虩炄艩烂襜嫶兯耭禯趶旀倜労廌码艂瀫丬舡屈堒悪瘎僊渏惟羼徶嵴巢伬惭嘼樦捷庣沙摚",
+        "03峔怍猳哆岟萀昱谌窱澈絪粈偘刊萘謢柃勬厺臊俌盠嘌梼栢屫礌舷裙滴奝而嶮塜懈蜆笇欇皯癿芇蜍圚菳栘疟囨僮",
+        "04创繣厱伅蚽夓壓汉厯咆胬古詪孯忹妲疫戋縇熢烇璩痽娉篳紣膟弴嘏毨蒸磞棽刌暀焮呦诽樦誊僸摌橝参秙朧籹弦",
+        "05琅虸傴偔潿峮奉碖崐塓簁砙羧婎蛎廖囦恡珵觥袽櫽膴捐紭廼偝厈誇拁戀"
+      ],
+      "currentIndex": 0,
+      "nonce": 21,
+      "frameCount": 1,
+      "frameDelays": null,
+      "frameSourceIndices": null,
+      "carpetEncoded": false,
+      "loomEncoded": false,
+      "carpetCompressedB64": null,
+      "muxed": false,
+      "muxReceiver": false,
+      "isDonorOnly": false,
+      "muxCargoB64": null
+    }
+  ]
+}

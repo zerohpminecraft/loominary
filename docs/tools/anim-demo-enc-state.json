@@ -1,0 +1,46 @@
+{
+  "sourceFilename": "demo.gif",
+  "columns": 1,
+  "rows": 1,
+  "activeTileIndex": 0,
+  "allShades": true,
+  "dither": false,
+  "title": "Secret Ball",
+  "codecMode": "CARPET",
+  "authorOverride": null,
+  "whitelist": [],
+  "tiles": [
+    {
+      "chunks": [],
+      "currentIndex": 0,
+      "nonce": 17,
+      "frameCount": 16,
+      "frameDelays": [
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90,
+        90
+      ],
+      "frameSourceIndices": null,
+      "carpetEncoded": true,
+      "loomEncoded": false,
+      "carpetCompressedB64": "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",
+      "muxed": false,
+      "muxReceiver": false,
+      "isDonorOnly": false,
+      "muxCargoB64": null
+    }
+  ]
+}

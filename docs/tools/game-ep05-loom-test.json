@@ -1,0 +1,142 @@
+[
+ {
+  "cmd": "gamerule doDaylightCycle false"
+ },
+ {
+  "cmd": "gamerule doWeatherCycle false"
+ },
+ {
+  "cmd": "gamerule doMobSpawning false"
+ },
+ {
+  "cmd": "time set noon"
+ },
+ {
+  "cmd": "weather clear"
+ },
+ {
+  "cmd": "kill @e[type=!player]"
+ },
+ {
+  "cmd": "fill -70 -60 -70 70 -60 -20 minecraft:smooth_stone"
+ },
+ {
+  "cmd": "clear"
+ },
+ {
+  "cmd": "give @s minecraft:white_carpet 320"
+ },
+ {
+  "cmd": "give @s minecraft:orange_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:magenta_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:light_blue_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:yellow_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:lime_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:pink_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:gray_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:light_gray_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:cyan_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:purple_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:blue_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:brown_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:green_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:red_carpet 128"
+ },
+ {
+  "cmd": "give @s minecraft:black_carpet 128"
+ },
+ {
+  "waitTicks": 10
+ },
+ {
+  "cmd": "loominary load ball"
+ },
+ {
+  "tp": [
+   0.5,
+   -59,
+   -70,
+   0,
+   12
+  ]
+ },
+ {
+  "placeSchematic": {
+   "w": 128,
+   "d": 6,
+   "origin": [
+    -64,
+    -59,
+    -65
+   ]
+  }
+ },
+ {
+  "waitTicks": 40
+ },
+ {
+  "perspective": "third"
+ },
+ {
+  "hud": true
+ },
+ {
+  "screenshot": "mk-lt-ghost"
+ },
+ {
+  "cmd": "loominary walk print"
+ },
+ {
+  "waitTicks": 250
+ },
+ {
+  "screenshot": "mk-lt-1"
+ },
+ {
+  "waitTicks": 500
+ },
+ {
+  "screenshot": "mk-lt-2"
+ },
+ {
+  "waitTicks": 600
+ },
+ {
+  "screenshot": "mk-lt-3"
+ },
+ {
+  "waitTicks": 600
+ },
+ {
+  "screenshot": "mk-lt-4"
+ },
+ {
+  "exit": true
+ }
+]

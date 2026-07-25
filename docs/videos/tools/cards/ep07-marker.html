@@ -1,0 +1,31 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .flow { display:flex; align-items:center; gap:40px; margin-top:52px; }
+  .pair { display:flex; align-items:center; gap:24px; }
+  .banner { width:88px; height:120px; border-radius:6px;
+            background:linear-gradient(160deg,#3a6ea5,#20406e); border:1px solid #2a3a5c; }
+  .map { width:150px; height:150px; border-radius:8px; position:relative;
+         background:#d8c9a0; border:6px solid #6e5c34; }
+  .map.plain::after { content:""; }
+  .pin { position:absolute; left:50%; top:44%; transform:translate(-50%,-50%);
+         width:26px; height:26px; border-radius:50% 50% 50% 0;
+         background:#b04a3c; border:2px solid #f0b8b0; rotate:-45deg; }
+  .caption { font-size:30px; color:#7788a5; margin-top:16px; text-align:center; }
+  .stack { display:flex; flex-direction:column; align-items:center; }
+</style>
+<h1 style="font-size:66px">The mod reads <span class="accent">markers</span>, not banners</h1>
+<div class="flow">
+  <div class="stack">
+    <div class="pair">
+      <div class="banner"></div>
+      <div class="map plain"></div>
+    </div>
+    <div class="caption">hold map, right-click banner</div>
+  </div>
+  <span class="arrow" style="font-size:74px">&rarr;</span>
+  <div class="stack">
+    <div class="map"><div class="pin"></div></div>
+    <div class="caption">marker on the map</div>
+  </div>
+</div>
+<p class="sub" style="margin-top:48px">the banner's name becomes a marker on the map</p>

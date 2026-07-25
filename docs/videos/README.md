@@ -1,6 +1,6 @@
-# Loominary video series — production cards
+# Loominary video series: production cards
 
-One card per episode. Each contains: title/thumbnail/description (paste into YouTube), a full narration script, a timestamped shot list, a setup checklist, and a **B-roll manifest** tagged `generated:` (produced by our tooling — regenerate on demand) vs `manual:` (film in your own client).
+One card per episode. Each contains: title/thumbnail/description (paste into YouTube), a full narration script, a timestamped shot list, a setup checklist, and a **B-roll manifest** tagged `generated:` (produced by our tooling, regenerate on demand) vs `manual:` (film in your own client).
 
 ## Generating the B-roll
 
@@ -13,10 +13,10 @@ One card per episode. Each contains: title/thumbnail/description (paste into You
 
 ## Episode list
 
-1. [Your First Map Art in 10 Minutes](ep01-first-map-art.md) — the end-to-end hook
-2. [The Web Editor Deep-Dive](ep02-web-editor.md) — tools, palette, dithering
-3. [Animated Map Art](ep03-animated-art.md) — GIF → AV1 → playing map
-4. [Giant Murals: Multi-Tile & Mux](ep04-murals-and-mux.md)
+1. [Your First Map Art in 10 Minutes](ep01-first-map-art.md), the end-to-end hook
+2. [The Web Editor Deep-Dive](ep02-web-editor.md), tools, palette, dithering
+3. [Animated Map Art](ep03-animated-art.md), GIF → AV1 → playing map
+4. [Mux & Multi-Tile Art](ep04-murals-and-mux.md), bigger animations spread across maps
 5. [Fully Autonomous Printing](ep05-autonomous-printing.md)
 6. [Encrypted Map Art & Sharing](ep06-encryption-sharing.md)
 7. [Archiving Existing Map Art](ep07-archiving.md)

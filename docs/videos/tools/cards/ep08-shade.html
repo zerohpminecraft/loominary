@@ -1,0 +1,26 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .flow { display:flex; align-items:flex-end; gap:44px; margin-top:60px; }
+  .stairs { display:flex; align-items:flex-end; gap:12px; }
+  .step { width:80px; border-radius:8px 8px 0 0; border:1px solid #2a3a5c;
+          background:linear-gradient(180deg,#3a6ea5,#20406e); }
+  .s1 { height:70px; }
+  .s2 { height:120px; }
+  .s3 { height:170px; }
+  .s4 { height:220px; }
+  .grad { width:360px; height:80px; border-radius:12px; border:1px solid #3a5c8c;
+          background:linear-gradient(90deg,#dfe8f5,#9fb0cc,#4a5a78,#161d2b);
+          display:flex; align-items:center; justify-content:center;
+          color:#e8ecf4; font-family:'DejaVu Sans Mono',monospace; font-size:40px;
+          text-shadow:0 1px 4px rgba(0,0,0,0.6); }
+</style>
+<h1 style="font-size:70px">Height is a <span class="accent">second channel</span></h1>
+<div class="flow">
+  <div class="stairs">
+    <div class="step s1"></div><div class="step s2"></div>
+    <div class="step s3"></div><div class="step s4"></div>
+  </div>
+  <span class="arrow" style="font-size:74px; margin-bottom:24px">&rarr;</span>
+  <div class="grad">shade</div>
+</div>
+<p class="sub" style="margin-top:56px">balanced staircases &asymp; 2,000 bytes</p>

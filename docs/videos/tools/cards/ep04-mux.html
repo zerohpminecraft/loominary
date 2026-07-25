@@ -1,0 +1,23 @@
+<link rel="stylesheet" href="card.css">
+<style>
+  .row { display:flex; align-items:center; gap:44px; margin-top:50px; }
+  .tile { width:150px; height:150px; border-radius:12px; display:flex; align-items:center;
+          justify-content:center; font-size:30px; text-align:center; border:2px solid #3a5c8c; }
+  .recv { background:#3a1f24; border-color:#b04a3c; color:#f0b8b0; }
+  .donor { background:#1b2946; color:#a8d2ff; }
+  .blank { background:#141a28; color:#5a6a86; border-style:dashed; }
+  .arrow { color:#6fb3ff; font-size:56px; }
+  .stack { display:flex; flex-direction:column; gap:26px; }
+  .small2 { font-size:24px; color:#7788a5; line-height:1.4; text-align:left; }
+</style>
+<h1 style="font-size:58px">Receiver <span class="accent">spills into</span> donors</h1>
+<div class="row">
+  <div class="tile recv">over<br>budget</div>
+  <span class="arrow">&rarr;</span>
+  <div class="stack">
+    <div class="tile donor" style="height:60px">donor</div>
+    <div class="tile blank" style="height:60px">blank donor</div>
+  </div>
+  <div class="small2">each donor stamps<br>a routing descriptor</div>
+</div>
+<p class="sub" style="margin-top:56px">one allocator, both sides, so it always reassembles</p>

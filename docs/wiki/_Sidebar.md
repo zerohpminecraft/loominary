@@ -2,6 +2,7 @@
 * [Home](Home)
 * [Installation](Installation)
 * [Quick Start](Quick-Start)
+* [Video series](Video-Series)
 
 **The web editor**
 * [1 · Import](Web-Editor-Import)

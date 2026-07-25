@@ -25,6 +25,16 @@ dependencies {
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 
+	// Ep05 capture harness ONLY (headless filming of autonomous printing): load
+	// Litematica + malilib + the continuous printer fork into the dev run so
+	// `/loominary walk print` can actually print. Gated behind -Pep05capture so
+	// normal builds / CI never resolve or remap these local jars.
+	if (project.hasProperty('ep05capture')) {
+		modRuntimeOnly files("${rootDir}/run/localmods/malilib-fabric-1.21.4-0.23.5.jar")
+		modRuntimeOnly files("${rootDir}/run/localmods/litematica-fabric-1.21.4-0.21.6.jar")
+		modRuntimeOnly files("${rootDir}/run/localmods/litematica-printer-3.4.0-mc1.21.4.jar")
+	}
+
     implementation "com.github.luben:zstd-jni:1.5.6-6"
     include       "com.github.luben:zstd-jni:1.5.6-6"
 
@@ -153,7 +163,7 @@ loom {
 			ideConfigGenerated = false
 			runDir "run"
 			vmArg "-Dloominary.docs=true"
-			vmArg "-Dloominary.docs.script=${rootDir}/docs/tools/game-video.json"
+			vmArg "-Dloominary.docs.script=${project.findProperty('docsScript') ?: rootDir.toString() + '/docs/tools/game-video.json'}"
 			programArgs "--width", "1920", "--height", "1080"
 		}
 		// Live in-game SMOKE test: boots a real headless client into a throwaway

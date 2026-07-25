@@ -7,7 +7,15 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.TitleScreen;
 import net.minecraft.client.util.ScreenshotRecorder;
+import net.minecraft.nbt.NbtCompound;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.util.DyeColor;
 import net.minecraft.util.math.BlockPos;
+
+import java.io.DataOutputStream;
+import java.io.OutputStream;
+import java.util.zip.GZIPOutputStream;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.resource.DataConfiguration;
 import net.minecraft.resource.featuretoggle.FeatureFlags;
@@ -76,6 +84,8 @@ public final class DocsDriver {
     private static int stepIndex = 0;
     private static int waitTicks = 0;
     private static int settleTicks = 0;
+    private static boolean idleWait = false;   // block the script until autonomy (print/fill) finishes
+    private static int idleCap = 0;            // 10-tick polls left before giving up the idle wait
 
     // Smoke-test bookkeeping (inert unless -Dloominary.smoke.result is set).
     private static int smokeChecks = 0;
@@ -130,6 +140,13 @@ public final class DocsDriver {
             }
             case RUNNING -> {
                 if (waitTicks > 0) { waitTicks--; return; }
+                if (idleWait) {
+                    boolean busy = net.zerohpminecraft.AutoPrintHandler.isActive()
+                            || net.zerohpminecraft.CarpetFillHandler.isActive();
+                    if (busy && idleCap-- > 0) { waitTicks = 10; return; }
+                    idleWait = false;
+                    System.out.println(TAG + " waitIdle finished (" + (busy ? "cap reached" : "idle") + ")");
+                }
                 if (stepIndex >= steps.size()) { phase = Phase.DONE; return; }
                 JsonObject step = steps.get(stepIndex++);
                 try {
@@ -142,6 +159,25 @@ public final class DocsDriver {
         }
     }
 
+    /**
+     * Run block/registry work on the integrated-server thread, guarded so a throw there can
+     * never crash the server thread and abort a headless capture. run() itself is wrapped in
+     * a try/catch in tick(), but that guard does NOT extend into a deferred server.execute()
+     * lambda — this does. Also null-checks the server so a missing integrated server logs
+     * instead of NPEing.
+     */
+    private static void serverExec(MinecraftClient client, String what, Runnable body) {
+        var server = client.getServer();
+        if (server == null) { System.err.println(TAG + " " + what + ": no integrated server"); return; }
+        server.execute(() -> {
+            try {
+                body.run();
+            } catch (Exception e) {
+                System.err.println(TAG + " " + what + " failed on server thread: " + e);
+            }
+        });
+    }
+
     private static void run(MinecraftClient client, JsonObject step) {
         if (step.has("cmd")) {
             String cmd = step.get("cmd").getAsString();
@@ -151,8 +187,84 @@ public final class DocsDriver {
         } else if (step.has("chat")) {
             client.getNetworkHandler().sendChatMessage(step.get("chat").getAsString());
             waitTicks = 2;
+        } else if (step.has("placeBanners")) {
+            // Ep07: place a grid of banner blocks (a visible "wall of banners") on the server.
+            // Args {"origin":[x,y,z], "cols":N, "step":M}. Colour cycles for a lively look.
+            JsonObject o = step.getAsJsonObject("placeBanners");
+            JsonArray org = o.getAsJsonArray("origin");
+            final int ox = org.get(0).getAsInt(), oy = org.get(1).getAsInt(), oz = org.get(2).getAsInt();
+            final int cols = o.has("cols") ? o.get("cols").getAsInt() : 8;
+            final int stepB = o.has("step") ? o.get("step").getAsInt() : 1;
+            final int count = o.has("count") ? o.get("count").getAsInt()
+                    : net.zerohpminecraft.PayloadState.tiles.get(net.zerohpminecraft.PayloadState.activeTileIndex).chunks.size();
+            final String[] cc = {"white","light_blue","pink","yellow","lime","orange","magenta","cyan"};
+            serverExec(client, "placeBanners", () -> {
+                var world = client.getServer().getOverworld();
+                for (int i = 0; i < count; i++) {
+                    int bx = ox + (i % cols) * stepB, bz = oz + (i / cols) * stepB;
+                    var id = net.minecraft.util.Identifier.of("minecraft", cc[i % cc.length] + "_banner");
+                    var st = net.minecraft.registry.Registries.BLOCK.get(id).getDefaultState();
+                    world.setBlockState(new BlockPos(bx, oy, bz), st);
+                }
+                System.out.println(TAG + " placed " + count + " banners");
+            });
+            waitTicks = 20;
+        } else if (step.has("registerBanners")) {
+            // Ep07: attach the active BANNER-tile's chunk strings as banner map-decorations onto
+            // the crosshair/held filled map, the same records a right-click would create. The mod's
+            // decoder reads decoration names matching [0-9a-f]{2}.* and rebuilds the image.
+            var tile = net.zerohpminecraft.PayloadState.tiles.get(net.zerohpminecraft.PayloadState.activeTileIndex);
+            net.minecraft.item.ItemStack mapStack = client.player.getMainHandStack();
+            if (!(mapStack.getItem() instanceof net.minecraft.item.FilledMapItem)) {
+                for (int i = 0; i < 9; i++) {
+                    var s = client.player.getInventory().getStack(i);
+                    if (s.getItem() instanceof net.minecraft.item.FilledMapItem) { mapStack = s; break; }
+                }
+            }
+            var mapId = mapStack.get(net.minecraft.component.DataComponentTypes.MAP_ID);
+            if (mapId == null) {
+                System.err.println(TAG + " registerBanners: no filled map in hand");
+            } else {
+                final var fMapId = mapId;
+                final java.util.List<String> chunks = new java.util.ArrayList<>(tile.chunks);
+                // Add the chunk strings as banner decorations on the SERVER MapState and mark it
+                // dirty, so the server syncs them to the client the way a real right-click would.
+                serverExec(client, "registerBanners", () -> {
+                    var sworld = client.getServer().getOverworld();
+                    var mapState = sworld.getMapState(fMapId);
+                    if (mapState == null) { System.err.println(TAG + " registerBanners: no server map state"); return; }
+                    var decos = ((net.zerohpminecraft.mixin.MapStateAccessor) (Object) mapState).getDecorations();
+                    int i = 0;
+                    for (String chunk : chunks) {
+                        byte mx = (byte) (-120 + (i % 12) * 20);
+                        byte mz = (byte) (-120 + (i / 12) * 20);
+                        decos.put("loom_banner_" + i, new net.minecraft.item.map.MapDecoration(
+                                net.minecraft.item.map.MapDecorationTypes.BANNER_WHITE,
+                                mx, mz, (byte) 0, java.util.Optional.of(net.minecraft.text.Text.literal(chunk))));
+                        i++;
+                    }
+                    mapState.markDirty();
+                    System.out.println(TAG + " registered " + i + " banner decorations (server)");
+                });
+            }
+            waitTicks = 30;
+        } else if (step.has("decodeToggle")) {
+            // Ep06: flip every claimed map between the decoded art and the raw carpet/banner view
+            // the unmodded world sees (the key.loominary.decode_toggle binding calls the same thing).
+            net.zerohpminecraft.MapBannerDecoder.toggle(client);
+            System.out.println(TAG + " decodeToggle");
+            waitTicks = 10;
         } else if (step.has("waitTicks")) {
             waitTicks = step.get("waitTicks").getAsInt();
+        } else if (step.has("waitIdle")) {
+            // Block the script until the autonomous printer/fill finishes (or maxTicks elapses).
+            // Used so ep05's catalogue and print beats wait on the real thing, not a fixed guess.
+            int maxTicks = step.get("waitIdle").isJsonPrimitive() && step.get("waitIdle").getAsJsonPrimitive().isNumber()
+                    ? step.get("waitIdle").getAsInt() : 24000;
+            idleWait = true;
+            idleCap = Math.max(1, maxTicks / 10);
+            waitTicks = 20;   // grace for the autonomy to spin up before we start polling
+            System.out.println(TAG + " waitIdle up to " + maxTicks + " ticks");
         } else if (step.has("tp")) {
             JsonArray a = step.getAsJsonArray("tp");
             client.getNetworkHandler().sendChatCommand(String.format(
@@ -234,29 +346,89 @@ public final class DocsDriver {
             int x0 = a.get(0).getAsInt(), y0 = a.get(1).getAsInt(), z0 = a.get(2).getAsInt();
             var tile = net.zerohpminecraft.PayloadState.tiles.get(
                     net.zerohpminecraft.PayloadState.activeTileIndex);
+            if (tile.carpetCompressedB64 == null) {
+                System.err.println(TAG + " placeCarpets: active tile has no carpet payload"
+                        + " (banner-only tile); nothing to place");
+                return;
+            }
             byte[] compressed = java.util.Base64.getDecoder().decode(tile.carpetCompressedB64);
             byte[] header = net.zerohpminecraft.CarpetChannel.buildLoomHeader(
                     0, 0, 0, compressed.length, compressed.length, null);
             byte[] cargo = new byte[header.length + compressed.length];
             System.arraycopy(header, 0, cargo, 0, header.length);
             System.arraycopy(compressed, 0, cargo, header.length, compressed.length);
-            int carpetBytes = Math.min(cargo.length, net.zerohpminecraft.CarpetChannel.MAX_CARPET_BYTES);
-            var world = client.getServer().getOverworld();
-            var colors = net.minecraft.util.DyeColor.values();
-            var white = net.minecraft.registry.Registries.BLOCK.get(
-                    net.minecraft.util.Identifier.of("minecraft", "white_carpet")).getDefaultState();
-            for (int x = 0; x < 128; x++) world.setBlockState(new BlockPos(x0 + x, y0, z0 - 1), white);
-            int placed = 128;
-            for (int i = 0; i < carpetBytes * 2; i++) {
-                int b = cargo[i / 2] & 0xFF;
-                int nib = (i % 2 == 0) ? (b >> 4) & 0xF : b & 0xF;
-                var id = net.minecraft.util.Identifier.of("minecraft", colors[nib].getName() + "_carpet");
-                var block = net.minecraft.registry.Registries.BLOCK.get(id);
-                world.setBlockState(new BlockPos(x0 + (i % 128), y0, z0 + (i / 128)), block.getDefaultState());
-                placed++;
-            }
-            System.out.println(TAG + " placed " + placed + " carpets (LOOM header + "
-                    + compressed.length + " payload bytes, noobline row at z=" + (z0 - 1) + ")");
+            final int carpetBytes = Math.min(cargo.length, net.zerohpminecraft.CarpetChannel.MAX_CARPET_BYTES);
+            final byte[] fCargo = cargo;
+            final int fx0 = x0, fy0 = y0, fz0 = z0;
+            final int payloadLen = compressed.length;
+            // Place on the SERVER thread: a render-thread setBlockState is racy for large platforms,
+            // leaving some carpets unplaced when the scanned map captures colours (the decode then
+            // trips "Non-carpet map color at nibble …"). server.execute() places them all coherently.
+            serverExec(client, "placeCarpets", () -> {
+                var world = client.getServer().getOverworld();
+                var colors = net.minecraft.util.DyeColor.values();
+                var white = net.minecraft.registry.Registries.BLOCK.get(
+                        net.minecraft.util.Identifier.of("minecraft", "white_carpet")).getDefaultState();
+                for (int x = 0; x < 128; x++) world.setBlockState(new BlockPos(fx0 + x, fy0, fz0 - 1), white);
+                int placed = 128;
+                for (int i = 0; i < carpetBytes * 2; i++) {
+                    int b = fCargo[i / 2] & 0xFF;
+                    int nib = (i % 2 == 0) ? (b >> 4) & 0xF : b & 0xF;
+                    var id = net.minecraft.util.Identifier.of("minecraft", colors[nib].getName() + "_carpet");
+                    var block = net.minecraft.registry.Registries.BLOCK.get(id);
+                    world.setBlockState(new BlockPos(fx0 + (i % 128), fy0, fz0 + (i / 128)), block.getDefaultState());
+                    placed++;
+                }
+                System.out.println(TAG + " placed " + placed + " carpets (LOOM header + "
+                        + payloadLen + " payload bytes, noobline row at z=" + (fz0 - 1) + ")");
+            });
+            waitTicks = 25;
+        } else if (step.has("stockChests")) {
+            // Ep05 capture: place a row of single chests on the integrated server, each
+            // filled with one carpet colour, so /loominary walk print has real storage to
+            // catalogue and restock from. Filling the server-side ChestBlockEntity directly
+            // (not setblock NBT) guarantees the contents are present and sync to the client
+            // the moment the bot opens each chest. Args:
+            //   {"start":[x,y,z], "axis":"x"|"z", "step":2, "facing":"south",
+            //    "slots":27, "count":64, "colors":["white","orange", …]}
+            JsonObject o = step.getAsJsonObject("stockChests");
+            JsonArray st = o.getAsJsonArray("start");
+            final int sx = st.get(0).getAsInt(), sy = st.get(1).getAsInt(), sz = st.get(2).getAsInt();
+            final String axis = o.has("axis") ? o.get("axis").getAsString() : "x";
+            final int stepBlocks = o.has("step") ? o.get("step").getAsInt() : 2;
+            final int slots = o.has("slots") ? o.get("slots").getAsInt() : 27;
+            final int count = o.has("count") ? o.get("count").getAsInt() : 64;
+            final String facing = o.has("facing") ? o.get("facing").getAsString() : "south";
+            final JsonArray cols = o.getAsJsonArray("colors");
+            // Place + fill on the SERVER thread: DocsDriver.tick runs on the render thread, and
+            // mutating/reading the integrated server's block entities from there is racy (the BE
+            // read back null right after setBlockState, so the chests placed but stayed empty).
+            // server.execute() runs this coherently on the server thread next tick; contents then
+            // sync to the client when the bot opens each chest.
+            serverExec(client, "stockChests", () -> {
+                var world = client.getServer().getOverworld();
+                var dir = net.minecraft.util.math.Direction.byName(facing);
+                var chestState = net.minecraft.block.Blocks.CHEST.getDefaultState()
+                        .with(net.minecraft.block.ChestBlock.FACING, dir)
+                        .with(net.minecraft.block.ChestBlock.CHEST_TYPE, net.minecraft.block.enums.ChestType.SINGLE);
+                int stocked = 0;
+                for (int i = 0; i < cols.size(); i++) {
+                    int cx = sx + (axis.equals("x") ? i * stepBlocks : 0);
+                    int cz = sz + (axis.equals("z") ? i * stepBlocks : 0);
+                    BlockPos pos = new BlockPos(cx, sy, cz);
+                    world.setBlockState(pos, chestState);
+                    if (world.getBlockEntity(pos) instanceof net.minecraft.block.entity.ChestBlockEntity chest) {
+                        var item = net.minecraft.registry.Registries.ITEM.get(net.minecraft.util.Identifier.of(
+                                "minecraft", cols.get(i).getAsString() + "_carpet"));
+                        for (int s = 0; s < slots && s < chest.size(); s++)
+                            chest.setStack(s, new net.minecraft.item.ItemStack(item, count));
+                        chest.markDirty();
+                        stocked++;
+                    }
+                }
+                System.out.println(TAG + " stocked " + stocked + " chests (" + slots + " slots × "
+                        + count + " carpet each)");
+            });
             waitTicks = 20;
         } else if (step.has("cursor")) {
             // Park the mouse pointer (window-relative fractions) so slot tooltips
@@ -283,6 +455,20 @@ public final class DocsDriver {
             waitTicks = 5;
         } else if (step.has("hud")) {
             client.options.hudHidden = !step.get("hud").getAsBoolean();
+        } else if (step.has("perspective")) {
+            String p = step.get("perspective").getAsString();
+            net.minecraft.client.option.Perspective persp =
+                    p.startsWith("third")
+                        ? (p.contains("front") ? net.minecraft.client.option.Perspective.THIRD_PERSON_FRONT
+                                               : net.minecraft.client.option.Perspective.THIRD_PERSON_BACK)
+                        : net.minecraft.client.option.Perspective.FIRST_PERSON;
+            client.options.setPerspective(persp);
+            System.out.println(TAG + " perspective → " + persp);
+            waitTicks = 2;
+        } else if (step.has("openInventory")) {
+            if (client.player != null)
+                client.setScreen(new net.minecraft.client.gui.screen.ingame.InventoryScreen(client.player));
+            waitTicks = 5;
         } else if (step.has("screenshot")) {
             String name = step.get("screenshot").getAsString();
             if (!name.endsWith(".png")) name += ".png";
@@ -332,6 +518,55 @@ public final class DocsDriver {
             writeSmokeResult();
             phase = Phase.DONE;
             client.scheduleStop();
+        } else if (step.has("placeSchematic")) {
+            // Ep05 capture: generate a small carpet-floor .litematic and place its
+            // Litematica ghost, so /loominary walk print has a real placement to
+            // print. Args: {"w":40,"d":32,"origin":[x,y,z]}. Litematica + the printer
+            // fork must be on the classpath (dev run with -Pep05capture). tick() is
+            // already on the client thread, so the placement API can be called here.
+            JsonObject o = step.getAsJsonObject("placeSchematic");
+            int w = o.get("w").getAsInt(), d = o.get("d").getAsInt();
+            JsonArray p = o.getAsJsonArray("origin");
+            int ox = p.get(0).getAsInt(), oy = p.get(1).getAsInt(), oz = p.get(2).getAsInt();
+            try {
+                Path dir = client.runDirectory.toPath().resolve("schematics");
+                Files.createDirectories(dir);
+                Path file = dir.resolve("ep05demo.litematic");
+                var st = net.zerohpminecraft.PayloadState.tiles;
+                boolean haveCarpet = !st.isEmpty()
+                        && st.get(net.zerohpminecraft.PayloadState.activeTileIndex).carpetCompressedB64 != null;
+                if (haveCarpet) {
+                    int[] dim = writeLoomSchematic(file);   // real LOOM platform → decodes back to the image
+                    w = dim[0]; d = dim[1];
+                    System.out.println(TAG + " built LOOM schematic from loaded state: " + w + "x" + d);
+                } else {
+                    writeCarpetSchematic(w, d, file);       // fallback demo pattern (no carpet payload loaded)
+                }
+
+                Class<?> cLS = Class.forName("fi.dy.masa.litematica.schematic.LitematicaSchematic");
+                Class<?> cFT = Class.forName("fi.dy.masa.litematica.util.FileType");
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                Object lite = Enum.valueOf((Class) cFT, "LITEMATICA_SCHEMATIC");
+                Object schem = cLS.getMethod("createFromFile", java.io.File.class, String.class, cFT)
+                        .invoke(null, file.getParent().toFile(), file.getFileName().toString(), lite);
+                if (schem == null) {
+                    System.err.println(TAG + " placeSchematic: Litematica failed to load the file");
+                } else {
+                    Class<?> cSP = Class.forName("fi.dy.masa.litematica.schematic.placement.SchematicPlacement");
+                    Object placement = cSP.getMethod("createFor", cLS, BlockPos.class, String.class,
+                            boolean.class, boolean.class)
+                            .invoke(null, schem, new BlockPos(ox, oy, oz), "loominary", true, true);
+                    Class<?> cDM = Class.forName("fi.dy.masa.litematica.data.DataManager");
+                    Object mgr = cDM.getMethod("getSchematicPlacementManager").invoke(null);
+                    mgr.getClass().getMethod("addSchematicPlacement", cSP, boolean.class)
+                            .invoke(mgr, placement, false);
+                    System.out.println(TAG + " placed schematic " + w + "x" + d + " ghost at "
+                            + ox + "," + oy + "," + oz);
+                }
+            } catch (Exception e) {
+                System.err.println(TAG + " placeSchematic failed: " + e);
+            }
+            waitTicks = 30;
         } else {
             System.err.println(TAG + " unknown step: " + step);
         }
@@ -363,5 +598,138 @@ public final class DocsDriver {
         } catch (Exception e) {
             System.err.println(TAG + " could not write smoke result " + out + ": " + e);
         }
+    }
+
+    /** Builds the ACTIVE loaded Loominary tile's real LOOM carpet platform as a
+     *  .litematic ghost (128 wide × data rows, with a white noobline row at z=0),
+     *  matching the placeCarpets nibble layout so the printed floor decodes back to
+     *  the source image/animation. Returns {width, depth}. */
+    private static int[] writeLoomSchematic(Path file) throws java.io.IOException {
+        var tile = net.zerohpminecraft.PayloadState.tiles.get(net.zerohpminecraft.PayloadState.activeTileIndex);
+        byte[] compressed = java.util.Base64.getDecoder().decode(tile.carpetCompressedB64);
+        byte[] header = net.zerohpminecraft.CarpetChannel.buildLoomHeader(0, 0, 0,
+                compressed.length, compressed.length, null);
+        byte[] cargo = new byte[header.length + compressed.length];
+        System.arraycopy(header, 0, cargo, 0, header.length);
+        System.arraycopy(compressed, 0, cargo, header.length, compressed.length);
+        int carpetBytes = Math.min(cargo.length, net.zerohpminecraft.CarpetChannel.MAX_CARPET_BYTES);
+        int dataNibbles = carpetBytes * 2;
+        int dataRows = (dataNibbles + 127) / 128;
+        int W = 128, D = dataRows + 1;               // region z=0 = noobline, z=1.. = data
+        DyeColor[] colors = DyeColor.values();
+
+        NbtList palette = new NbtList();
+        NbtCompound air = new NbtCompound(); air.putString("Name", "minecraft:air"); palette.add(air);
+        for (DyeColor c : colors) {
+            NbtCompound e = new NbtCompound(); e.putString("Name", "minecraft:" + c.getName() + "_carpet"); palette.add(e);
+        }
+        int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(palette.size() - 1));
+        int[] idx = new int[W * D];
+        int white = 1 + DyeColor.WHITE.ordinal();
+        for (int x = 0; x < W; x++) idx[x] = white;   // noobline
+        for (int i = 0; i < dataNibbles; i++) {
+            int b = cargo[i / 2] & 0xFF;
+            int nib = (i % 2 == 0) ? (b >> 4) & 0xF : b & 0xF;
+            idx[(i / 128 + 1) * W + (i % 128)] = 1 + nib;
+        }
+        long[] blockStates = packBlockIndices(idx, bits);
+
+        NbtCompound root = new NbtCompound();
+        root.putInt("Version", 6); root.putInt("SubVersion", 1); root.putInt("MinecraftDataVersion", 4189);
+        NbtCompound meta = new NbtCompound();
+        meta.putString("Name", "loomfloor"); meta.putString("Author", "Loominary");
+        meta.putString("Description", "Loominary carpet platform");
+        meta.putInt("RegionCount", 1);
+        meta.putLong("TimeCreated", 1_752_000_000_000L); meta.putLong("TimeModified", 1_752_000_000_000L);
+        meta.putInt("TotalBlocks", W * D); meta.putInt("TotalVolume", W * D);
+        NbtCompound es = new NbtCompound(); es.putInt("x", W); es.putInt("y", 1); es.putInt("z", D);
+        meta.put("EnclosingSize", es);
+        root.put("Metadata", meta);
+        NbtCompound region = new NbtCompound();
+        NbtCompound pos = new NbtCompound(); pos.putInt("x", 0); pos.putInt("y", 0); pos.putInt("z", 0);
+        region.put("Position", pos);
+        NbtCompound size = new NbtCompound(); size.putInt("x", W); size.putInt("y", 1); size.putInt("z", D);
+        region.put("Size", size);
+        region.put("BlockStatePalette", palette);
+        region.putLongArray("BlockStates", blockStates);
+        region.put("TileEntities", new NbtList()); region.put("Entities", new NbtList());
+        region.put("PendingBlockTicks", new NbtList()); region.put("PendingFluidTicks", new NbtList());
+        NbtCompound regions = new NbtCompound(); regions.put("loomfloor", region);
+        root.put("Regions", regions);
+        try (OutputStream fos = Files.newOutputStream(file);
+             GZIPOutputStream gz = new GZIPOutputStream(fos);
+             DataOutputStream dos = new DataOutputStream(gz)) {
+            NbtIo.write(root, dos);
+        }
+        return new int[]{W, D};
+    }
+
+    /** Writes a small W×D×1 carpet-floor schematic (.litematic v6) with a repeating
+     *  multi-colour pattern (fallback when no Loominary state is loaded). */
+    private static void writeCarpetSchematic(int w, int d, Path file) throws java.io.IOException {
+        int[] pick = {
+            DyeColor.RED.ordinal(), DyeColor.ORANGE.ordinal(), DyeColor.YELLOW.ordinal(),
+            DyeColor.LIME.ordinal(), DyeColor.LIGHT_BLUE.ordinal(), DyeColor.MAGENTA.ordinal(),
+        };
+        NbtList palette = new NbtList();
+        NbtCompound air = new NbtCompound(); air.putString("Name", "minecraft:air"); palette.add(air);
+        for (DyeColor c : DyeColor.values()) {
+            NbtCompound e = new NbtCompound();
+            e.putString("Name", "minecraft:" + c.getName() + "_carpet");
+            palette.add(e);
+        }
+        int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(palette.size() - 1)); // 5 for 17 entries
+        int[] idx = new int[w * d];
+        for (int z = 0; z < d; z++)
+            for (int x = 0; x < w; x++)
+                idx[z * w + x] = 1 + pick[((x / 4) + (z / 4)) % pick.length];
+        long[] blockStates = packBlockIndices(idx, bits);
+
+        NbtCompound root = new NbtCompound();
+        root.putInt("Version", 6); root.putInt("SubVersion", 1); root.putInt("MinecraftDataVersion", 4189);
+        NbtCompound meta = new NbtCompound();
+        meta.putString("Name", "ep05demo"); meta.putString("Author", "Loominary");
+        meta.putString("Description", "ep05 autonomous-print demo floor");
+        meta.putInt("RegionCount", 1);
+        meta.putLong("TimeCreated", 1_752_000_000_000L); meta.putLong("TimeModified", 1_752_000_000_000L);
+        meta.putInt("TotalBlocks", w * d); meta.putInt("TotalVolume", w * d);
+        NbtCompound es = new NbtCompound(); es.putInt("x", w); es.putInt("y", 1); es.putInt("z", d);
+        meta.put("EnclosingSize", es);
+        root.put("Metadata", meta);
+
+        NbtCompound region = new NbtCompound();
+        NbtCompound pos = new NbtCompound(); pos.putInt("x", 0); pos.putInt("y", 0); pos.putInt("z", 0);
+        region.put("Position", pos);
+        NbtCompound size = new NbtCompound(); size.putInt("x", w); size.putInt("y", 1); size.putInt("z", d);
+        region.put("Size", size);
+        region.put("BlockStatePalette", palette);
+        region.putLongArray("BlockStates", blockStates);
+        region.put("TileEntities", new NbtList()); region.put("Entities", new NbtList());
+        region.put("PendingBlockTicks", new NbtList()); region.put("PendingFluidTicks", new NbtList());
+        NbtCompound regions = new NbtCompound(); regions.put("ep05demo", region);
+        root.put("Regions", regions);
+
+        try (OutputStream fos = Files.newOutputStream(file);
+             GZIPOutputStream gz = new GZIPOutputStream(fos);
+             DataOutputStream dos = new DataOutputStream(gz)) {
+            NbtIo.write(root, dos);
+        }
+    }
+
+    /** Litematica spanning bit-pack (entries may cross long boundaries). */
+    private static long[] packBlockIndices(int[] indices, int bitsPerEntry) {
+        long totalBits = (long) indices.length * bitsPerEntry;
+        long[] longs = new long[(int) ((totalBits + 63) / 64)];
+        long mask = (1L << bitsPerEntry) - 1;
+        for (int i = 0; i < indices.length; i++) {
+            long bitIndex = (long) i * bitsPerEntry;
+            int li = (int) (bitIndex >> 6);
+            int bitOffset = (int) (bitIndex & 63);
+            long value = indices[i] & mask;
+            longs[li] |= value << bitOffset;
+            int bitsInFirstLong = 64 - bitOffset;
+            if (bitsInFirstLong < bitsPerEntry) longs[li + 1] |= value >>> bitsInFirstLong;
+        }
+        return longs;
     }
 }
